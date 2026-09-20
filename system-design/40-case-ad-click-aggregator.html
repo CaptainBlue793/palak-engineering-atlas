@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Ad Click Aggregator</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('sd-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .step-banner { display:flex; gap:10px; align-items:center; margin:60px 0 -40px; }
+  .step-banner span { font-family:var(--mono); font-size:12px; font-weight:800; color:#fff; background:linear-gradient(90deg,var(--pink),var(--accent)); padding:4px 10px; border-radius:8px; }
+  .req-list { display:grid; gap:8px; }
+  .req { display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); font-size:14.5px; }
+  .req .chk { flex:none; width:20px; height:20px; border-radius:6px; background:var(--green); color:#fff; display:grid; place-items:center; font-size:12px; font-weight:800; }
+  .parts { display:grid; gap:7px; margin-top:12px; }
+  .part { display:grid; grid-template-columns:110px 1fr 110px; gap:10px; align-items:center; font-size:12.5px; }
+  .part .nm { font-family:var(--mono); font-weight:700; font-size:11.5px; color:var(--muted); }
+  .part .tr { height:20px; border-radius:7px; background:var(--surface-3); overflow:hidden; position:relative; }
+  .part .tr i { position:absolute; left:0; top:0; bottom:0; background:var(--green); transition:width .2s; }
+  .part .tr i.hot { background:var(--red); }
+  .part .lg { font-family:var(--mono); font-size:11.5px; text-align:right; }
+  .part .lg.bad { color:var(--red); font-weight:800; }
+  .rollup { font-family:var(--mono); font-size:12px; }
+  .rollup table { width:100%; border-collapse:collapse; }
+  .rollup th { text-align:left; font-size:10.5px; color:var(--muted); padding:4px 6px; }
+  .rollup td { padding:4px 6px; border-top:1px solid var(--border); }
+  .rollup tr.hit td { background:var(--accent-soft); color:var(--accent); font-weight:700; }
+</style>
+</head>
+<body data-chapter="40">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 40</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Design an <span class="grad">Ad Click Aggregator</span></h1>
+    <p class="lead">Advertisers spend real money based on these numbers, so this system has an unusual combination of demands: ingest a million events per second, show counts that are <b>fresh within a minute</b>, and produce billing numbers that are <b>exactly right</b> even after machines crash, events arrive late, and bots try to inflate the totals. It's the practical showcase for everything in the streaming chapter.</p>
+    <ul class="objectives">
+      <li>Ingest ad clicks at a million events per second</li>
+      <li>Aggregate with windows, watermarks and late data</li>
+      <li>Avoid hot partitions caused by viral ads</li>
+      <li>Get exactly-once counts despite crashes and retries</li>
+      <li>Serve dashboard queries from rollups in milliseconds</li>
+      <li>Reconcile streaming results with a batch recompute for billing</li>
+    </ul>
+  </section>
+
+  <div class="step-banner"><span>STEP 1 / 6</span></div>
+  <h2>Requirements</h2>
+  <div class="split">
+    <div><h4 class="mt0">🛠️ Functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span>Record every ad <b>impression and click</b> with attributes (ad, campaign, country, device)</span></div>
+      <div class="req"><span class="chk">✓</span><span>Advertiser dashboard: clicks over time, filtered and grouped, for any range up to a year</span></div>
+      <div class="req"><span class="chk">✓</span><span>Billing-grade totals per campaign per day</span></div>
+      <div class="req"><span class="chk">✓</span><span>Filter invalid/bot traffic; support reprocessing after logic changes</span></div>
+    </div></div>
+    <div><h4 class="mt0">📏 Non-functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span><b>Scale:</b> 10B events/day, peak ~1M/s</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Freshness:</b> dashboards within ~1 minute</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Exactly-once for billing</b>; approximate is fine for live dashboards</span></div>
+      <div class="req"><span class="chk">✓</span><span>Queries p99 &lt; 1 s over months of data</span></div>
+      <div class="req"><span class="chk">✓</span><span>The click redirect itself must be instant — users must never wait for analytics</span></div>
+    </div></div>
+  </div>
+
+  <div class="step-banner"><span>STEP 2 / 6</span></div>
+  <h2>Estimate the scale</h2>
+  <div class="stats">
+    <div class="stat"><div class="k">Clicks / day</div><div class="v">10B</div></div>
+    <div class="stat acc"><div class="k">Average / peak</div><div class="v">115K/s · 1M/s</div></div>
+    <div class="stat"><div class="k">Event size</div><div class="v">~100 B</div></div>
+    <div class="stat warn"><div class="k">Raw per day</div><div class="v">~1 TB <small>compressed ~250 GB</small></div></div>
+    <div class="stat good"><div class="k">Aggregated rows/day</div><div class="v">~200M <small>ad × minute × dims</small></div></div>
+    <div class="stat"><div class="k">Dashboard QPS</div><div class="v">~5K</div></div>
+  </div>
+  <p style="margin-top:16px">The raw stream is huge but the <b>aggregates are small</b> — that asymmetry is the whole design. Keep raw events cheaply in object storage for reprocessing and audits, and serve every query from pre-aggregated rollups.</p>
+
+  <div class="step-banner"><span>STEP 3 / 6</span></div>
+  <h2>High-level design</h2>
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Click → count → dashboard → invoice</span><span class="p-tag">Step-through</span></div>
+    <div class="panel-body svg-scroll">
+      <svg id="aSvg" class="diagram" viewBox="0 0 900 380">
+        <path id="a-e1" class="edge dimmable" d="M120,60 L180,60"/>
+        <path id="a-e2" class="edge dimmable" d="M320,60 L380,60"/>
+        <path id="a-e3" class="edge dimmable" d="M520,60 L580,60"/>
+        <path id="a-e4" class="edge dimmable" d="M720,90 L720,150"/>
+        <path id="a-e5" class="edge dimmable" d="M660,190 L520,190"/>
+        <path id="a-e6" class="edge dimmable" d="M450,100 L450,150"/>
+        <path id="a-e7" class="edge dash dimmable" d="M450,230 L450,290"/>
+        <path id="a-e8" class="edge dash dimmable" d="M520,320 L660,320 L720,290"/>
+        <path id="a-e9" class="edge dimmable" d="M380,190 L250,190"/>
+        <g id="a-u" class="node dimmable" transform="translate(10,30)"><rect width="110" height="60" rx="12"/><text x="55" y="26">👆 User</text><text x="55" y="44" class="lbl">clicks an ad</text></g>
+        <g id="a-rd" class="node dimmable" transform="translate(180,30)"><rect width="140" height="60" rx="12"/><text x="70" y="26">↪️ Redirect svc</text><text x="70" y="44" class="lbl">302 in ~5 ms</text></g>
+        <g id="a-k" class="node dimmable" transform="translate(380,30)"><rect width="140" height="60" rx="12"/><text x="70" y="26">📬 Kafka</text><text x="70" y="44" class="lbl mono" id="aK">clicks · 64 parts</text></g>
+        <g id="a-f" class="node dimmable" transform="translate(580,30)"><rect width="140" height="60" rx="12"/><text x="70" y="26">🌊 Flink</text><text x="70" y="44" class="lbl">window + dedupe</text></g>
+        <g id="a-olap" class="node dimmable" transform="translate(650,150)"><rect width="140" height="70" rx="12"/><text x="70" y="26">📊 OLAP store</text><text x="70" y="46" class="lbl">minute rollups</text></g>
+        <g id="a-dash" class="node dimmable" transform="translate(380,150)"><rect width="140" height="70" rx="12"/><text x="70" y="26">📈 Dashboard API</text><text x="70" y="46" class="lbl">&lt; 1 s queries</text></g>
+        <g id="a-adv" class="node dimmable" transform="translate(110,150)"><rect width="140" height="70" rx="12"/><text x="70" y="26">🧑‍💼 Advertiser</text></g>
+        <g id="a-lake" class="node dimmable" transform="translate(380,290)"><rect width="140" height="60" rx="12"/><text x="70" y="24">🪣 Data lake</text><text x="70" y="44" class="lbl">raw events</text></g>
+        <g id="a-batch" class="node dimmable" transform="translate(660,290)"><rect width="200" height="60" rx="12"/><text x="100" y="24">🧮 Nightly batch recompute</text><text x="100" y="44" class="lbl">billing truth · reconciliation</text></g>
+      </svg>
+    </div>
+    <div class="stepper" id="aStep" data-diagram="aSvg">
+      <ol class="steps">
+        <li data-title="The click path must be instant" data-on="a-u a-rd a-e1" data-packet="a-u>a-rd">The ad links to <code>/click?ad=…&amp;sig=…</code>. The redirect service validates a signature (so clicks can't be forged), assigns a <b>click_id</b>, writes the event to a local buffer and returns a <code>302</code> to the advertiser's page within milliseconds. Nothing downstream is on the user's critical path.</li>
+        <li data-title="Buffer into Kafka" data-on="a-rd a-k a-e2" data-packet="a-rd>a-k" data-color="var(--accent-2)">Events are batched into Kafka, partitioned to spread load and preserve per-key ordering. Kafka absorbs the 1M/s spikes and lets several independent consumers read the same stream (Chapter 14).</li>
+        <li data-title="Stream aggregation" data-on="a-k a-f a-e3" data-packet="a-k>a-f" data-color="var(--amber)">Flink keys by <code>(ad_id, country, device)</code>, drops duplicates by <code>click_id</code>, filters known bots, and counts into <b>1-minute tumbling windows</b> with a watermark allowing ~2 minutes of lateness (Chapter 18).</li>
+        <li data-title="Write rollups" data-on="a-f a-olap a-e4" data-packet="a-f>a-olap" data-color="var(--green)">Completed windows are <b>upserted</b> into an OLAP store keyed by <code>(minute, ad_id, dims)</code>. Upserts make the write idempotent: reprocessing the same window overwrites rather than double-counts.</li>
+        <li data-title="Dashboards query rollups" data-on="a-adv a-dash a-olap a-e5 a-e9" data-packet="a-adv>a-dash,a-dash>a-olap" data-color="var(--green)">“Clicks per hour for campaign 42 in Germany, last 30 days” reads a few thousand pre-aggregated rows instead of scanning billions of events.</li>
+        <li data-title="Keep the raw truth" data-on="a-k a-lake a-e6 a-e7" data-packet="a-k>a-lake" data-color="var(--pink)">A second consumer archives raw events to the data lake as Parquet, partitioned by hour (Chapter 9). This is the source of truth for audits, backfills and any change to counting logic.</li>
+        <li data-title="Batch recompute for billing" data-on="a-lake a-batch a-olap a-e8" data-packet="a-lake>a-batch" data-color="var(--pink)">Overnight, a batch job recomputes yesterday from raw data with the full fraud model, and reconciles against the streaming numbers. Small drift is expected and corrected; large drift pages someone. Advertisers are billed from the batch result.</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="callout tip"><div class="ico">λ</div><div class="body"><div class="title">This is a lambda architecture — on purpose</div><p>Streaming gives <b>freshness</b> (dashboards in seconds) and batch gives <b>correctness</b> (complete, late-inclusive, re-runnable). Money justifies running both. If you only needed dashboards, a single streaming path (kappa) would be simpler — and if you only needed invoices, a nightly batch job alone would do.</p></div></div>
+
+  <div class="step-banner"><span>STEP 4 / 6</span></div>
+  <h2>Deep dive: hot partitions</h2>
+  <p>Partitioning by <code>ad_id</code> keeps each ad's events in order on one partition — until a Super Bowl ad becomes 40% of all traffic. That partition's consumer can't keep up, its lag grows, and dashboards for <b>every</b> ad on that partition fall behind.</p>
+
+  <div class="panel" id="hpPanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">8 Kafka partitions, one consumer each</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <div class="seg" id="hpMode"><button data-v="plain" class="active">🔑 key = ad_id</button><button data-v="salt">🧂 key = ad_id:salt(0–7)</button></div>
+        <button class="btn sm primary" id="hpViral">🔥 An ad goes viral (60% of traffic)</button>
+        <button class="btn sm" id="hpCalm">😌 Back to normal</button>
+        <button class="btn sm" id="hpReset">↺ Reset</button>
+      </div>
+      <div class="parts" id="hpParts"></div>
+      <div class="stats">
+        <div class="stat acc"><div class="k">Ingest rate</div><div class="v" id="hpRate">–</div></div>
+        <div class="stat bad"><div class="k">Max consumer lag</div><div class="v" id="hpLag">0</div></div>
+        <div class="stat"><div class="k">Dashboard freshness</div><div class="v" id="hpFresh">–</div></div>
+        <div class="stat good"><div class="k">Processed / s</div><div class="v" id="hpDone">–</div></div>
+      </div>
+    </div>
+    <div class="panel-foot">🧪 Go viral with <b>key = ad_id</b>: one partition's lag explodes while seven consumers idle. Switch to a <b>salted key</b>: the viral ad spreads over all partitions, each producing a partial count that the aggregator sums by <code>ad_id</code>. The cost is that per-ad ordering is lost — fine for counting, not for event sequences that must stay ordered.</div>
+  </div>
+
+  <h2>Deep dive: counting exactly once</h2>
+  <p>Three independent things can inflate or lose counts: the client retrying, the consumer reprocessing after a crash, and bots. Each needs its own defence.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Counting under failure</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="exDedupe" style="accent-color:var(--accent)"> Dedupe by click_id (state store, 24 h TTL)</label>
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="exUpsert" style="accent-color:var(--accent)"> Idempotent upsert of (window, ad) instead of increment</label>
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="exBot" style="accent-color:var(--accent)"> Bot filtering</label>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="exReal">👆 1,000 genuine clicks</button>
+        <button class="btn sm" id="exRetry">🔁 Client retries (200 duplicate click_ids)</button>
+        <button class="btn sm" id="exCrash">💥 Consumer crashes & replays last window</button>
+        <button class="btn sm" id="exBotBtn">🤖 Bot farm sends 5,000 clicks</button>
+        <button class="btn sm" id="exReset">↺ Reset</button>
+      </div>
+      <div class="stats">
+        <div class="stat good"><div class="k">True billable clicks</div><div class="v" id="exTruth">0</div></div>
+        <div class="stat acc"><div class="k">System count</div><div class="v" id="exCount">0</div></div>
+        <div class="stat bad"><div class="k">Error</div><div class="v" id="exErr">0%</div></div>
+        <div class="stat"><div class="k">Money at stake ($0.50 CPC)</div><div class="v" id="exMoney">$0</div></div>
+      </div>
+      <div class="log" id="exLog" style="margin-top:10px;height:130px"></div>
+    </div>
+    <div class="panel-foot">🧪 Run everything with all three defences off, then turn them on one at a time. Note that <b>dedupe</b> fixes client retries, <b>idempotent upserts</b> fix consumer replays (an increment would double-count; writing the window's total is naturally repeatable), and only <b>filtering</b> fixes bots — no amount of exactly-once machinery makes fraudulent clicks disappear.</div>
+  </div>
+
+  <div class="step-banner"><span>STEP 5 / 6</span></div>
+  <h2>Deep dive: serving queries fast</h2>
+  <p>Advertisers slice by campaign, country, device and time, over ranges from “last hour” to “this year”. Scanning raw events per query is impossible; the answer is a <b>hierarchy of rollups</b> plus a columnar store.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Which table answers this query?</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <label class="small">Range <select class="inp" id="qRange"><option value="1">Last hour</option><option value="24">Last 24 hours</option><option value="720" selected>Last 30 days</option><option value="8760">Last year</option></select></label>
+        <label class="small">Granularity <select class="inp" id="qGran"><option value="minute">Per minute</option><option value="hour" selected>Per hour</option><option value="day">Per day</option></select></label>
+      </div>
+      <div class="rollup" style="margin-top:12px"><table id="qTable"></table></div>
+      <div class="stats">
+        <div class="stat acc"><div class="k">Table used</div><div class="v" id="qUsed" style="font-size:15px">–</div></div>
+        <div class="stat"><div class="k">Rows scanned</div><div class="v" id="qRows">–</div></div>
+        <div class="stat bad"><div class="k">If scanning raw events</div><div class="v" id="qRaw">–</div></div>
+        <div class="stat good"><div class="k">Estimated latency</div><div class="v" id="qLat">–</div></div>
+      </div>
+    </div>
+    <div class="panel-foot">Rollups are built by chaining stream jobs (minute → hour → day) or by the OLAP engine itself (Druid/ClickHouse materialized views). Unique-user metrics use <b>HyperLogLog sketches</b> (Chapter 20), which merge across rollup levels — plain counts of distinct users cannot.</div>
+  </div>
+
+  <div class="step-banner"><span>STEP 6 / 6</span></div>
+  <h2>Wrap-up</h2>
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">🤖</div><h4>Invalid traffic</h4><p>Real-time heuristics (rate per IP/device, impossible timings, known bot ASNs) plus offline ML review. Billing waits for the hold-back window so refunds for invalid clicks are computed before invoicing.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🔁</div><h4>Reprocessing</h4><p>Because raw events live in the lake and rollups are idempotent upserts, you can replay a month through fixed logic and overwrite the affected windows — no manual patching of counters.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">⏱️</div><h4>Late events</h4><p>Mobile SDKs upload offline clicks hours later. Allow lateness for a bounded window, route the rest to a side output, and let the nightly batch job fold them into the final numbers.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🌍</div><h4>Multi-region</h4><p>Aggregate locally in each region and merge partial counts centrally — counting is associative, so partial sums merge cleanly (and HLL sketches merge too).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">💾</div><h4>Retention & cost</h4><p>Raw events for 30–90 days in hot storage then archive; minute rollups for 3 months; hour for a year; day forever. Storage cost is dominated by raw data, query cost by granularity.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🔭</div><h4>Monitoring the pipeline</h4><p>Consumer lag per partition, watermark delay, dropped-late-event count, streaming-vs-batch drift, and rollup freshness — these are the SLIs that tell you the numbers can be trusted.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Doing analytics work in the redirect.</b> The user's click must be a fast 302; everything else is asynchronous.</li>
+      <li><b>Incrementing counters on reprocessing.</b> Upsert the window total instead, so replays are idempotent.</li>
+      <li><b>Deleting raw events.</b> Without them you can't backfill, re-run corrected logic, or defend an invoice.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Design:</b> Advertisers dispute a bill. What lets you answer them?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Raw events in the lake, partitioned by hour, with a click ID per event and the signature that proved the click was legitimate. The nightly batch job recomputes the invoice from that raw data with the current fraud model, and its output — not the streaming dashboard — is what's billed. You can show the drift between streaming and batch, the number of events filtered as invalid, and replay any window to demonstrate the number.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Scale:</b> One advertiser's campaign is 60% of all traffic. What do you change?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Salt the partition key (<code>ad_id:0–N</code>) so that campaign's events spread across partitions, and sum the partial counts by <code>ad_id</code> downstream — counting is associative, so partial aggregates merge cleanly. Ordering within the ad is lost, which is fine for counting. Also check the serving store: the same hot key can become a hot row there, so pre-aggregate before writing and consider a separate partition for the whale.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Keep the user-facing click redirect instant; everything analytical happens asynchronously behind Kafka.</li>
+      <li>Aggregate in event-time windows with watermarks; expect and handle late events.</li>
+      <li>Hot keys create hot partitions — salt the key and merge partial counts.</li>
+      <li>Exactly-once counting needs dedupe by event ID plus idempotent upserts of window totals.</li>
+      <li>Bot filtering is a separate problem from exactly-once processing.</li>
+      <li>Serve dashboards from a hierarchy of rollups in a columnar OLAP store; use HLL sketches for uniques.</li>
+      <li>Archive raw events so any logic change can be replayed; bill from a nightly batch recompute reconciled against the stream.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+    <div class="quiz" data-answer="1">
+      <p class="q">A single ad generates 60% of all clicks. Events are keyed by ad_id. What happens and what's the fix?</p>
+      <div class="opts"><button class="opt">Kafka rebalances automatically; nothing to do</button><button class="opt">One partition's consumer falls behind; salt the key (ad_id:0–N) and sum partial counts</button><button class="opt">Add more partitions with the same key</button><button class="opt">Switch to at-most-once delivery</button></div>
+      <div class="explain">All events with the same key land on one partition. Salting spreads them; counting is associative so partials merge.</div>
+    </div>
+    <div class="quiz" data-answer="2">
+      <p class="q">A consumer crashes and reprocesses the last minute of events. Why does writing the window total (upsert) beat incrementing a counter?</p>
+      <div class="opts"><button class="opt">Upserts are faster</button><button class="opt">Increments are not supported in OLAP stores</button><button class="opt">Re-writing the same window total is idempotent, while replayed increments double-count</button><button class="opt">It avoids the need for watermarks</button></div>
+      <div class="explain">Idempotent writes make reprocessing safe — the cornerstone of exactly-once <i>effects</i>.</div>
+    </div>
+    <div class="quiz" data-answer="0">
+      <p class="q">Why keep raw events in a data lake when rollups answer every dashboard query?</p>
+      <div class="opts"><button class="opt">To reprocess after logic or fraud-model changes, to backfill, and for audits and billing disputes</button><button class="opt">Because Kafka deletes data after 7 days and cannot be configured</button><button class="opt">To make queries faster</button><button class="opt">It isn't needed</button></div>
+      <div class="explain">Aggregates are lossy. Raw data is the only way to answer a question you didn't anticipate — or to prove the invoice.</div>
+    </div>
+    <div class="quiz" data-answer="3">
+      <p class="q">A mobile SDK uploads clicks that happened 3 hours ago, past the 2-minute allowed lateness. What should happen?</p>
+      <div class="opts"><button class="opt">Count them in the current minute</button><button class="opt">Drop them silently</button><button class="opt">Extend the watermark delay to 3 hours</button><button class="opt">Route them to a side output and let the nightly batch job include them in the final numbers</button></div>
+      <div class="explain">Counting them "now" corrupts the timeline, and a 3-hour watermark would make every dashboard 3 hours stale. Batch fixes the record.</div>
+    </div>
+    <div class="quiz" data-answer="1">
+      <p class="q">Why can't you sum “unique users per hour” from 60 per-minute unique-user counts?</p>
+      <div class="opts"><button class="opt">Because minutes and hours use different time zones</button><button class="opt">The same user can appear in several minutes, so counts of distinct values aren't additive — use mergeable HLL sketches</button><button class="opt">Because the OLAP store doesn't support SUM</button><button class="opt">You can, it's exact</button></div>
+      <div class="explain">Distinct counts aren't additive. Storing HyperLogLog sketches per minute lets you merge them into any larger window.</div>
+    </div>
+  </div>
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = SD;
+
+  /* ================= Step labels ================= */
+  $('#aStep').addEventListener('step', e => { $('#aK').textContent = e.detail.index >= 1 ? 'clicks · 64 parts · 1M/s' : 'clicks · 64 parts'; });
+
+  /* ================= Hot partitions ================= */
+  const P = 8, CAP = 130; // each consumer processes 130 events/tick
+  let H, hVisible = false;
+  function hReset() { H = { lag: new Array(P).fill(0), rate: 800, viral: false, done: 0, hist: [] }; hRender(); }
+  const salted = () => $('#hpMode').dataset.value === 'salt';
+  function hStep() {
+    const total = H.rate;
+    const add = new Array(P).fill(0);
+    if (H.viral) {
+      const viralShare = Math.round(total * 0.6);
+      if (salted()) for (let i = 0; i < P; i++) add[i] += Math.round(viralShare / P);
+      else add[3] += viralShare; // ad_id hashes to partition 3
+      const rest = total - viralShare;
+      for (let i = 0; i < P; i++) add[i] += Math.round(rest / P);
+    } else for (let i = 0; i < P; i++) add[i] += Math.round(total / P);
+    let processed = 0;
+    for (let i = 0; i < P; i++) {
+      H.lag[i] += add[i];
+      const take = Math.min(H.lag[i], CAP);
+      H.lag[i] -= take; processed += take;
+    }
+    H.done = processed;
+  }
+  function hRender() {
+    const max = Math.max(200, ...H.lag);
+    $('#hpParts').innerHTML = Array.from({ length: P }, (_, i) => {
+      const hot = H.lag[i] > 400;
+      return `<div class="part"><span class="nm">partition ${i}</span><div class="tr"><i class="${hot ? 'hot' : ''}" style="width:${Math.min(100, H.lag[i] / max * 100)}%"></i></div><span class="lg ${hot ? 'bad' : ''}">${H.lag[i].toLocaleString()} behind</span></div>`;
+    }).join('');
+    const maxLag = Math.max(...H.lag);
+    $('#hpRate').textContent = (H.rate * 10).toLocaleString() + '/s';
+    $('#hpLag').textContent = maxLag.toLocaleString();
+    $('#hpLag').parentElement.className = 'stat ' + (maxLag > 400 ? 'bad' : 'good');
+    $('#hpFresh').textContent = maxLag > 50 ? (maxLag / CAP / 10).toFixed(1) + ' s behind' : 'real time ✓';
+    $('#hpDone').textContent = (H.done * 10).toLocaleString();
+  }
+  setInterval(() => { if (hVisible) { hStep(); hRender(); } }, 100);
+  SD.whenVisible($('#hpPanel'), () => hVisible = true, () => hVisible = false);
+  $('#hpViral').onclick = () => { H.viral = true; H.rate = 1400; SD.toast('Ad 4471 is trending — 60% of all clicks'); };
+  $('#hpCalm').onclick = () => { H.viral = false; H.rate = 800; };
+  $('#hpReset').onclick = hReset;
+  $('#hpMode').addEventListener('segchange', () => { H.lag = new Array(P).fill(0); hRender(); });
+  hReset();
+
+  /* ================= Exactly-once counting ================= */
+  let E;
+  function eReset() { E = { truth: 0, count: 0, lastWindow: 0, lastWindowCounted: 0 }; $('#exLog').innerHTML = ''; eRender(); }
+  function eRender() {
+    $('#exTruth').textContent = E.truth.toLocaleString();
+    $('#exCount').textContent = E.count.toLocaleString();
+    const err = E.truth ? (E.count - E.truth) / E.truth * 100 : 0;
+    $('#exErr').textContent = (err >= 0 ? '+' : '') + err.toFixed(1) + '%';
+    $('#exErr').parentElement.className = 'stat ' + (Math.abs(err) < 0.5 ? 'good' : Math.abs(err) < 5 ? 'warn' : 'bad');
+    $('#exMoney').textContent = '$' + Math.round(Math.abs(E.count - E.truth) * 0.5).toLocaleString();
+  }
+  const log = (m, c) => SD.log($('#exLog'), m, c);
+  $('#exReal').onclick = () => { E.truth += 1000; E.count += 1000; E.lastWindow = 1000; E.lastWindowCounted = 1000; log('👆 1,000 genuine clicks ingested and counted', 'ok'); eRender(); };
+  $('#exRetry').onclick = () => {
+    const dd = $('#exDedupe').checked;
+    if (dd) log('🔁 200 retried clicks arrived with click_ids already in the dedupe store → ignored ✓', 'ok');
+    else { E.count += 200; E.lastWindow += 200; log('🔁 200 retried clicks counted again — advertiser overbilled ✕', 'bad'); }
+    eRender();
+  };
+  $('#exCrash').onclick = () => {
+    const up = $('#exUpsert').checked;
+    if (up) log(`💥 consumer restarted and reprocessed the window → upsert rewrote the same total (${E.lastWindow}) — count unchanged ✓`, 'ok');
+    else { E.count += E.lastWindowCounted; log(`💥 consumer restarted and re-incremented ${E.lastWindowCounted} clicks — double counted ✕`, 'bad'); }
+    eRender();
+  };
+  $('#exBotBtn').onclick = () => {
+    if ($('#exBot').checked) log('🤖 5,000 bot clicks detected (impossible click rate per device) and excluded ✓', 'ok');
+    else { E.count += 5000; log('🤖 5,000 bot clicks counted as real — the advertiser pays for fraud ✕', 'bad'); }
+    eRender();
+  };
+  $('#exReset').onclick = eReset;
+  eReset();
+
+  /* ================= Rollup query planner ================= */
+  const ADS = 50000, DIMS = 20; // dimension combinations kept per ad
+  function plan() {
+    const hours = +$('#qRange').value, gran = $('#qGran').value;
+    const tables = [
+      ['click_minute', 60 * hours, 'minute', 7 * 24],
+      ['click_hour', hours, 'hour', 365 * 24],
+      ['click_day', Math.max(1, Math.round(hours / 24)), 'day', 100000],
+    ];
+    const order = { minute: 0, hour: 1, day: 2 }[gran];
+    let pick = order;
+    if (hours > tables[order][3]) pick = Math.min(2, pick + 1); // fall back to a coarser table if retention is exceeded
+    $('#qTable').innerHTML = '<tr><th>table</th><th>granularity</th><th>rows for one ad+dim</th><th>retention</th></tr>' + tables.map(([n, rows, g, ret], i) =>
+      `<tr class="${i === pick ? 'hit' : ''}"><td>${n}</td><td>${g}</td><td>${rows.toLocaleString()}</td><td>${ret >= 100000 ? 'forever' : Math.round(ret / 24) + ' days'}</td></tr>`).join('');
+    const rows = tables[pick][1] * 1; // one ad, one dimension slice
+    const rawRows = hours * 3600 * 115000 / ADS; // events for this ad in range
+    $('#qUsed').textContent = tables[pick][0];
+    $('#qRows').textContent = Math.round(rows).toLocaleString();
+    $('#qRaw').textContent = SD.fmt(rawRows) + ' events';
+    $('#qLat').textContent = rows < 2000 ? '~20 ms' : rows < 50000 ? '~120 ms' : '~600 ms';
+    if (pick !== order) SD.toast(`${gran} data isn't retained that far back — query rewritten to ${tables[pick][0]}`);
+  }
+  ['#qRange', '#qGran'].forEach(s => $(s).addEventListener('change', plan));
+  plan();
+})();
+</script>
+</body>
+</html>

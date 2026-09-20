@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Graph & Social Data</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('sd-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  #gSvg, #bSvg { background:var(--surface-2); border-radius:14px; cursor:pointer; }
+  #gSvg .lbl2, #bSvg .lbl2 { font-size:9px; fill:var(--muted); font-family:var(--mono); pointer-events:none; }
+  .pymk { display:grid; gap:6px; }
+  .pymk div { display:grid; grid-template-columns:1fr auto auto; gap:10px; align-items:center; padding:7px 10px; border-radius:9px; background:var(--surface-2); border:1px solid var(--border); font-size:13px; animation:fadeUp .25s; }
+  .pymk .m { font-family:var(--mono); font-size:11.5px; color:var(--muted); }
+  .pymk .sc { font-family:var(--mono); font-weight:800; color:var(--accent); }
+  .depth-row { display:grid; grid-template-columns:70px 1fr 120px; gap:10px; align-items:center; font-size:13px; margin-bottom:6px; }
+  .depth-row .tr { height:20px; border-radius:6px; background:var(--surface-3); overflow:hidden; }
+  .depth-row .tr i { display:block; height:100%; background:var(--accent); transition:width .4s; }
+  .depth-row .n { font-family:var(--mono); text-align:right; font-size:12px; }
+</style>
+</head>
+<body data-chapter="12">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 12</span><span class="pill">Intermediate</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Graph & <span class="grad">Social Data</span></h1>
+    <p class="lead">Followers, friends, org charts, permissions, fraud rings, recommendations, dependency trees — a huge share of interesting data is <b>relationships</b>. Relational databases store relationships fine but traverse them badly, and “who are the friends of my friends?” turns into a query that melts a production database.</p>
+    <ul class="objectives">
+      <li>See why multi-hop queries explode in SQL</li>
+      <li>Model graphs as edge tables, adjacency lists or property graphs</li>
+      <li>Traverse efficiently — including bidirectional search</li>
+      <li>Build “people you may know” from mutual friends</li>
+      <li>Understand how Facebook-scale social graphs are actually served</li>
+      <li>Know when a graph database is (and isn't) the answer</li>
+    </ul>
+  </section>
+
+  <h2>The multi-hop problem</h2>
+  <p>In SQL, each hop is another <b>self-join</b> on the friendship table. With an average of 200 friends each, one hop touches 200 rows, two hops 40,000, three hops 8 million — and the database does a lot of duplicate work because most of those paths lead to the same people.</p>
+<pre class="code"><span class="c">-- "Friends of friends of friends" — three self-joins, exponential intermediate rows</span>
+<span class="k">SELECT DISTINCT</span> f3.friend_id <span class="k">FROM</span> friends f1
+  <span class="k">JOIN</span> friends f2 <span class="k">ON</span> f2.user_id = f1.friend_id
+  <span class="k">JOIN</span> friends f3 <span class="k">ON</span> f3.user_id = f2.friend_id
+<span class="k">WHERE</span> f1.user_id = <span class="g">42</span>;</pre>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Cost of N hops: joins vs traversal</span><span class="p-tag">Calculator</span></div>
+    <div class="panel-body">
+      <div class="range-row"><label>Average friends per person</label><input type="range" id="hDeg" min="20" max="500" step="10" value="200"><output id="hDegO">200</output></div>
+      <div class="range-row"><label>Hops</label><input type="range" id="hHops" min="1" max="5" value="3"><output id="hHopsO">3</output></div>
+      <div id="hRows"></div>
+      <div class="stats">
+        <div class="stat bad"><div class="k">Rows a naive join produces</div><div class="v" id="hJoin">–</div></div>
+        <div class="stat good"><div class="k">Distinct people actually reached</div><div class="v" id="hReach">–</div></div>
+        <div class="stat acc"><div class="k">Wasted work</div><div class="v" id="hWaste">–</div></div>
+        <div class="stat"><div class="k">Whole population reached at</div><div class="v" id="hAll">–</div></div>
+      </div>
+      <p class="small muted mb0" style="margin-top:10px">Real social graphs are “small world”: with 200 friends each, <b>almost everyone is within 4–5 hops</b>. So unbounded traversals don't just get slow — they end up returning half the planet. Practical systems cap depth, cap fan-out per node, and rank aggressively.</p>
+    </div>
+  </div>
+
+  <h2>Three ways to store a graph</h2>
+  <div class="tabs">
+    <div class="tab-list"><button>📋 Edge table (SQL)</button><button>🗂️ Adjacency lists (KV)</button><button>🕸️ Property graph</button></div>
+    <div class="tab-panel">
+      <p>A simple table of <code>(from_id, to_id, type, created_at)</code> with indexes both ways. Transactional, familiar and perfectly good for one or two hops.</p>
+<pre class="code"><span class="k">CREATE TABLE</span> edges (
+  from_id  <span class="k">BIGINT</span>, to_id <span class="k">BIGINT</span>, type <span class="k">SMALLINT</span>, created_at <span class="k">TIMESTAMPTZ</span>,
+  <span class="k">PRIMARY KEY</span> (from_id, type, to_id)          <span class="c">-- "who do I follow?" is a range scan</span>
+);
+<span class="k">CREATE INDEX</span> <span class="k">ON</span> edges (to_id, type, from_id);    <span class="c">-- "who follows me?" — the reverse index</span></pre>
+      <p class="small"><b>Sharded by <code>from_id</code></b>, so one user's outgoing edges live together. The reverse index must be maintained separately — often as a second row written in the same transaction, or asynchronously via an outbox (Chapter 17).</p>
+    </div>
+    <div class="tab-panel">
+      <p>Store each node's neighbours as a <b>single value</b>: a list, a wide-column row, or a Redis sorted set. One key lookup returns the whole neighbourhood, which is exactly what a traversal wants.</p>
+<pre class="code"><span class="c"># Redis / wide-column shape</span>
+following:42        → [17, 88, 1201, …]        <span class="c"># sorted set scored by time</span>
+followers:42        → [3, 17, 954, …]
+counts:42           → {following: 312, followers: 11840}   <span class="c"># denormalized counters</span></pre>
+      <div class="pros-cons"><div class="pros"><h5>Strengths</h5><ul><li>One read per hop, no joins</li><li>Trivially cacheable and shardable by node</li><li>Fast “is A connected to B?” with a set membership check</li></ul></div><div class="cons"><h5>Weaknesses</h5><ul><li>Huge lists for celebrities (millions of entries)</li><li>Two writes per edge (both directions) → consistency work</li><li>No ad-hoc query language</li></ul></div></div>
+    </div>
+    <div class="tab-panel">
+      <p>A dedicated graph database stores nodes and edges as first-class objects with properties, and uses <b>index-free adjacency</b>: each node holds direct pointers to its edges, so a hop is a pointer dereference rather than an index lookup.</p>
+<pre class="code"><span class="c">// Cypher (Neo4j): people my friends know, that I don't, ranked by mutual friends</span>
+<span class="k">MATCH</span> (me:Person {id: <span class="g">42</span>})-[:FRIEND]->(f)-[:FRIEND]->(fof)
+<span class="k">WHERE</span> fof &lt;&gt; me <span class="k">AND NOT</span> (me)-[:FRIEND]->(fof)
+<span class="k">RETURN</span> fof.name, <span class="f">count</span>(f) <span class="k">AS</span> mutuals
+<span class="k">ORDER BY</span> mutuals <span class="k">DESC LIMIT</span> <span class="g">10</span>;</pre>
+      <p class="small">Good when the <b>shape of the traversal is the query</b>: fraud rings, supply chains, permissions hierarchies, knowledge graphs. Less good as a primary store for high-volume transactional data, and horizontal scaling is genuinely hard (see below).</p>
+    </div>
+  </div>
+
+  <h2>Traversing a real graph</h2>
+  <p>Click a person to explore outward from them. Depth 1 is their friends, depth 2 friends-of-friends, and so on.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Social graph explorer</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="range-row"><label>Traversal depth</label><input type="range" id="gDepth" min="1" max="4" value="2"><output id="gDepthO">2</output></div>
+      <div class="split" style="grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);margin-top:10px">
+        <svg id="gSvg" viewBox="0 0 420 380"></svg>
+        <div>
+          <div class="stats" style="margin-top:0;grid-template-columns:1fr 1fr">
+            <div class="stat acc"><div class="k">Start</div><div class="v" id="gWho" style="font-size:16px">–</div></div>
+            <div class="stat"><div class="k">People reached</div><div class="v" id="gReach">–</div></div>
+            <div class="stat good"><div class="k">Edges traversed</div><div class="v" id="gEdges">–</div></div>
+            <div class="stat warn"><div class="k">% of network</div><div class="v" id="gPct">–</div></div>
+          </div>
+          <div class="small" style="font-weight:700;margin:12px 0 6px">🤝 People you may know <span class="muted">(2 hops, ranked by mutual friends)</span></div>
+          <div class="pymk" id="gPymk"></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel-foot">🧪 Notice how quickly depth 3 covers most of the graph — that's the small-world effect. Production “people you may know” doesn't traverse live: it precomputes candidates in a batch job (Chapter 18) and ranks them with a model, because doing this per page load for 3 billion users is impossible.</div>
+  </div>
+
+  <h2>Shortest path: search from both ends</h2>
+  <p>“How am I connected to this person?” is a shortest-path query. A one-directional BFS to depth 4 with 200 friends each visits ~1.6 billion nodes. Searching from <b>both endpoints</b> and meeting in the middle visits two searches of depth 2 instead — roughly <b>the square root</b> of the work.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One-directional vs bidirectional BFS</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <button class="btn sm primary" id="bRun">▶ Find a path between two random people</button>
+        <button class="btn sm" id="bReset">↺ Reset</button>
+      </div>
+      <svg id="bSvg" viewBox="0 0 420 380" style="margin-top:10px"></svg>
+      <div class="stats">
+        <div class="stat"><div class="k">Path found</div><div class="v" id="bPath" style="font-size:14px">–</div></div>
+        <div class="stat bad"><div class="k">One-directional visits</div><div class="v" id="bOne">–</div></div>
+        <div class="stat good"><div class="k">Bidirectional visits</div><div class="v" id="bBi">–</div></div>
+        <div class="stat acc"><div class="k">Saving</div><div class="v" id="bSave">–</div></div>
+      </div>
+      <p class="small muted mb0" style="margin-top:10px">With real-world degrees the saving is dramatic: LinkedIn's “3rd degree” badge and Facebook's friend-path features are bidirectional searches with per-hop fan-out caps and heavy caching.</p>
+    </div>
+  </div>
+
+  <h2>How a social graph is really served</h2>
+  <p>Facebook's <b>TAO</b> is the canonical design, and it's deliberately boring: the source of truth is sharded MySQL, and everything fast is caching.</p>
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A read-mostly graph service</span><span class="p-tag">Step-through</span></div>
+    <div class="panel-body svg-scroll">
+      <svg id="tSvg" class="diagram" viewBox="0 0 880 300">
+        <path id="t-e1" class="edge dimmable" d="M140,90 L210,90"/>
+        <path id="t-e2" class="edge dimmable" d="M370,90 L440,90"/>
+        <path id="t-e3" class="edge dimmable" d="M600,90 L670,90"/>
+        <path id="t-e4" class="edge dash dimmable" d="M510,130 L510,200"/>
+        <path id="t-e5" class="edge dash dimmable" d="M740,130 L740,200 L590,220"/>
+        <g id="t-app" class="node dimmable" transform="translate(10,60)"><rect width="130" height="60" rx="12"/><text x="65" y="26">🧩 Product code</text><text x="65" y="44" class="lbl">assoc_get(42, friends)</text></g>
+        <g id="t-l1" class="node dimmable" transform="translate(210,50)"><rect width="160" height="80" rx="12"/><text x="80" y="28">⚡ Follower cache</text><text x="80" y="48" class="lbl">per-region, per-shard</text><text x="80" y="66" class="lbl mono" id="tL1">–</text></g>
+        <g id="t-l2" class="node dimmable" transform="translate(440,50)"><rect width="160" height="80" rx="12"/><text x="80" y="28">⚡ Leader cache</text><text x="80" y="48" class="lbl">one per shard</text><text x="80" y="66" class="lbl mono" id="tL2">–</text></g>
+        <g id="t-db" class="node dimmable" transform="translate(670,50)"><rect width="190" height="80" rx="12"/><text x="95" y="28">🗄️ Sharded MySQL</text><text x="95" y="48" class="lbl">edges by from_id</text><text x="95" y="66" class="lbl mono" id="tDb">source of truth</text></g>
+        <g id="t-inv" class="node dimmable" transform="translate(420,200)"><rect width="170" height="60" rx="12"/><text x="85" y="24">📣 Invalidation</text><text x="85" y="44" class="lbl">writes → caches</text></g>
+        <g id="t-rev" class="node dimmable" transform="translate(660,200)"><rect width="200" height="60" rx="12"/><text x="100" y="24">🔁 Reverse edge write</text><text x="100" y="44" class="lbl">async, idempotent</text></g>
+      </svg>
+    </div>
+    <div class="stepper" id="tStep" data-diagram="tSvg">
+      <ol class="steps">
+        <li data-title="Everything is an object or an association" data-on="t-app">The API is deliberately tiny: <code>obj_get(id)</code>, <code>assoc_get(id, type, limit)</code>, <code>assoc_count(id, type)</code>, <code>assoc_range</code>. No ad-hoc queries means every access pattern is bounded and cacheable.</li>
+        <li data-title="Two cache tiers" data-on="t-app t-l1 t-e1" data-packet="t-app>t-l1" data-color="var(--accent-2)">A <b>follower cache</b> near the application absorbs most reads. On a miss it asks the <b>leader cache</b> for that shard, which serializes writes and protects the database from stampedes (Chapter 6).</li>
+        <li data-title="Database only on a miss" data-on="t-l1 t-l2 t-db t-e2 t-e3" data-packet="t-l1>t-l2,t-l2>t-db" data-color="var(--amber)">Cache hit rates are in the high 90s, so MySQL sees a trickle. Edges are sharded by <code>from_id</code>, so a neighbourhood read is a single-shard range scan.</li>
+        <li data-title="Writes go through the leader" data-on="t-l2 t-db t-inv t-e4" data-packet="t-l2>t-inv" data-color="var(--green)">A new friendship writes the edge, bumps the counter, and <b>invalidates</b> the affected cache entries in every region. Counts are denormalized because <code>COUNT(*)</code> on 10 million followers is not a thing you do per page view.</li>
+        <li data-title="Reverse edges, eventually" data-on="t-db t-rev t-e5" data-packet="t-db>t-rev" data-color="var(--pink)">“A follows B” also needs B's follower list. That second write is asynchronous and idempotent, so the two directions can be briefly inconsistent — an accepted trade-off at this scale (Chapter 17).</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">⭐</div><h4>Celebrity nodes</h4><p>A node with 100M edges breaks every assumption: you can't read the list, cache it, or fan out to it. Store counts separately, page the list, and treat celebrities as a special case (Chapter 27's hybrid fan-out).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">✂️</div><h4>Partitioning is genuinely hard</h4><p>Splitting a graph means cutting edges, and every cut edge becomes a network call. Balanced graph partitioning is NP-hard, so systems shard by node ID and <b>accept</b> cross-shard edges — another reason to keep traversals shallow.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🔒</div><h4>Privacy at read time</h4><p>Visibility (blocked, private, friends-only) must be applied on every read of a relationship, which is a per-viewer authorization check on potentially thousands of edges (Chapter 11). Precomputed results still need filtering before display.</p></div>
+  </div>
+
+  <h2>Graph algorithms you'll be asked about</h2>
+  <div class="table-wrap">
+    <table class="t">
+      <thead><tr><th>Problem</th><th>Approach</th><th>Where it's used</th></tr></thead>
+      <tbody>
+        <tr><td>Mutual friends / PYMK</td><td>2-hop neighbourhood intersection, ranked by count + features</td><td>Friend suggestions, LinkedIn's degrees</td></tr>
+        <tr><td>Degrees of separation</td><td>Bidirectional BFS with fan-out caps</td><td>Connection paths, spam-ring analysis</td></tr>
+        <tr><td>Influence / authority</td><td><b>PageRank</b>: iterative weight propagation until it converges</td><td>Web search, recommendation seeds, trust scoring</td></tr>
+        <tr><td>Communities</td><td>Label propagation, Louvain modularity</td><td>Group suggestions, fraud rings, topic clusters</td></tr>
+        <tr><td>Similar items / people</td><td>Node embeddings (node2vec, GNNs) + vector search</td><td>Recommendations (Chapter 10's ANN index)</td></tr>
+        <tr><td>Triangle counting / clustering coefficient</td><td>Edge intersection over neighbours</td><td>Spam detection, network health metrics</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout tip"><div class="ico">🧮</div><div class="body"><div class="title">Online vs offline</div><p>Heavy algorithms (PageRank, communities, embeddings) run <b>offline</b> over a snapshot of the graph in a batch system (Spark GraphX, Pregel-style engines) and publish results to a fast store. Online serving only does 1–2 hop lookups plus a ranking model. Confusing the two is the classic design mistake here.</p></div></div>
+
+  <h2>Do you actually need a graph database?</h2>
+  <div class="pros-cons">
+    <div class="pros"><h5>Reach for one when…</h5><ul><li>Variable-depth traversals are the core query (“how is X connected to Y?”)</li><li>The schema is genuinely heterogeneous: many node and edge types with properties</li><li>Analysts need to explore relationships ad hoc</li><li>The dataset fits comfortably on a few machines</li></ul></div>
+    <div class="cons"><h5>Stick to SQL/KV when…</h5><ul><li>Queries are 1–2 hops (“my followers”, “my permissions”) — an indexed edge table is faster and simpler</li><li>You need extreme write throughput or petabyte scale</li><li>You'd be adding a second database (and a second consistency problem) for one feature</li></ul></div>
+  </div>
+  <p class="small muted">Examples: Neo4j and Memgraph (property graph, Cypher), Amazon Neptune and JanusGraph (Gremlin/SPARQL), TigerGraph and Nebula (analytics at scale), plus <code>pgRouting</code>/recursive CTEs when you just need a little traversal in Postgres.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Unbounded traversals.</b> Three hops in a social graph reaches most of the network; always cap depth and fan-out per node.</li>
+      <li><b>Running PageRank or community detection online.</b> Those are batch jobs whose results are served from a store, not per-request queries.</li>
+      <li><b>Forgetting the reverse edge.</b> “Who follows me” needs its own index, written transactionally or asynchronously — and it will be briefly inconsistent if async.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Design:</b> Design “mutual friends” shown on every profile view, for 500M users.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It's a 2-hop intersection, far too expensive to compute live at profile-view rates for large accounts. Keep each user's friend set in a cache (sorted set or bitmap); for two normal users, intersect the smaller set against the larger with a membership check — microseconds. For high-degree accounts, cap the work: sample, or show “50+ mutual friends” rather than an exact count. Precompute nothing per pair; there are too many pairs.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Scale:</b> A celebrity with 100M followers posts. What breaks in a graph store, and what do you do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Reading or fanning out to that edge list is impossible at request time, and the follower list can't be cached as one value. Treat high-degree nodes as a special case: store counts separately (denormalized counters), page the edge list, and switch from fan-out-on-write to fan-out-on-read for that account — consumers pull the celebrity's posts at read time and merge (Chapter 27).</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Each extra hop multiplies work in SQL; graphs are small worlds, so unbounded traversals reach everyone.</li>
+      <li>Store edges in an indexed edge table or adjacency lists, sharded by node, with a separately maintained reverse index.</li>
+      <li>Graph databases use index-free adjacency, which pays off when variable-depth traversal <i>is</i> the query.</li>
+      <li>Bidirectional search turns depth-4 problems into two depth-2 problems.</li>
+      <li>Serve social graphs from heavy caching over a boring sharded database, with denormalized counters.</li>
+      <li>Celebrity nodes, cross-shard edges and per-viewer privacy are the real scaling problems.</li>
+      <li>Run PageRank, communities and embeddings offline; keep online queries to 1–2 hops plus ranking.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+    <div class="quiz" data-answer="1">
+      <p class="q">Why does a 3-hop friends-of-friends query bring down a relational database?</p>
+      <div class="opts"><button class="opt">Foreign keys aren't indexed</button><button class="opt">Each hop is a self-join whose intermediate result grows multiplicatively with average degree</button><button class="opt">SQL can't express recursion</button><button class="opt">Because of MVCC</button></div>
+      <div class="explain">200 → 40,000 → 8,000,000 intermediate rows, most of them duplicate paths to the same people.</div>
+    </div>
+    <div class="quiz" data-answer="2">
+      <p class="q">You need “who follows me?” as well as “who do I follow?”. What does that imply?</p>
+      <div class="opts"><button class="opt">Nothing — one index serves both</button><button class="opt">Graph databases are required</button><button class="opt">You must maintain a reverse index/edge, written transactionally or asynchronously, and accept brief inconsistency if async</button><button class="opt">Store the follower list inside the user row</button></div>
+      <div class="explain">Edges are directional; the reverse view needs its own index or row, which is extra write work to keep correct.</div>
+    </div>
+    <div class="quiz" data-answer="0">
+      <p class="q">Finding a connection path of length 4 between two users: what's the efficient approach?</p>
+      <div class="opts"><button class="opt">Bidirectional BFS — two searches of depth 2 meeting in the middle</button><button class="opt">One-directional DFS to depth 4</button><button class="opt">Precompute all pairs' shortest paths</button><button class="opt">Sort users by degree</button></div>
+      <div class="explain">Work drops from roughly d⁴ to 2·d², and all-pairs precomputation is impossible at social-network sizes.</div>
+    </div>
+    <div class="quiz" data-answer="3">
+      <p class="q">How should “people you may know” be produced for 500M users?</p>
+      <div class="opts"><button class="opt">Live 3-hop traversal on each page load</button><button class="opt">A graph database with more RAM</button><button class="opt">Random sampling of users</button><button class="opt">Offline batch job generating ranked candidates, stored for fast lookup and filtered at read time</button></div>
+      <div class="explain">Candidate generation is expensive and tolerant of staleness — exactly the profile for batch precomputation.</div>
+    </div>
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is sharding a social graph across machines fundamentally awkward?</p>
+      <div class="opts"><button class="opt">Node IDs can't be hashed</button><button class="opt">Any partition cuts edges, so traversals become cross-machine calls — and balanced partitioning is NP-hard</button><button class="opt">Graphs must fit in one file</button><button class="opt">Because of consistent hashing</button></div>
+      <div class="explain">This is why large systems shard by node, keep traversals shallow, and lean on caching rather than distributed traversal.</div>
+    </div>
+  </div>
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, svg, sleep } = SD;
+
+  /* ================= Hop calculator ================= */
+  const POP = 3e9;
+  function hops() {
+    const d = +$('#hDeg').value, h = +$('#hHops').value;
+    $('#hDegO').textContent = d; $('#hHopsO').textContent = h;
+    let join = 0, reach = 0, rows = '';
+    for (let i = 1; i <= h; i++) {
+      const j = Math.pow(d, i);
+      join += j;
+      // distinct reach saturates at the population (small-world, with overlap)
+      reach = Math.min(POP, reach + j * Math.pow(0.85, i - 1));
+      rows += `<div class="depth-row"><span>hop ${i}</span><div class="tr"><i style="width:${Math.min(100, Math.log10(j + 1) / Math.log10(POP) * 100)}%"></i></div><span class="n">${SD.fmt(j)} rows</span></div>`;
+    }
+    $('#hRows').innerHTML = rows;
+    $('#hJoin').textContent = SD.fmt(join);
+    $('#hReach').textContent = SD.fmt(reach);
+    $('#hWaste').textContent = reach ? (join / reach).toFixed(1) + '× duplicated' : '–';
+    let all = 1; let hop = 0;
+    while (all < POP && hop < 12) { hop++; all *= d * 0.85; }
+    $('#hAll').textContent = hop + ' hops';
+  }
+  ['#hDeg', '#hHops'].forEach(s => $(s).addEventListener('input', hops));
+  hops();
+
+  /* ================= Graph data ================= */
+  const NAMES = ['Ana', 'Bo', 'Cy', 'Dee', 'Eli', 'Fay', 'Gus', 'Hana', 'Ivo', 'Jo', 'Kit', 'Lia', 'Max', 'Nia', 'Oli', 'Pia', 'Quin', 'Rex', 'Sam', 'Tia', 'Uma', 'Vik', 'Wes', 'Xia'];
+  function rng(seed) { return () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; }; }
+  const R = rng(12345);
+  const N = NAMES.length;
+  const POS = NAMES.map((_, i) => {
+    const cluster = i % 3, a = (i / N) * Math.PI * 2;
+    return { x: 210 + Math.cos(a) * (120 + cluster * 28) + (R() - .5) * 26, y: 190 + Math.sin(a) * (120 + cluster * 22) + (R() - .5) * 26 };
+  });
+  const ADJ = NAMES.map(() => new Set());
+  (function build() {
+    const add = (a, b) => { if (a !== b) { ADJ[a].add(b); ADJ[b].add(a); } };
+    for (let i = 0; i < N; i++) { add(i, (i + 1) % N); add(i, (i + 3) % N); }         // ring + skips
+    for (let k = 0; k < 26; k++) add(Math.floor(R() * N), Math.floor(R() * N));       // random long ties
+    for (let i = 0; i < 6; i++) add(i, Math.floor(R() * N));                          // a few hubs
+  })();
+  const EDGES = [];
+  ADJ.forEach((set, a) => set.forEach(b => { if (a < b) EDGES.push([a, b]); }));
+
+  function bfs(start, maxDepth) {
+    const dist = new Map([[start, 0]]);
+    let frontier = [start], edges = 0;
+    for (let d = 1; d <= maxDepth; d++) {
+      const next = [];
+      for (const u of frontier) for (const v of ADJ[u]) { edges++; if (!dist.has(v)) { dist.set(v, d); next.push(v); } }
+      frontier = next;
+      if (!frontier.length) break;
+    }
+    return { dist, edges };
+  }
+
+  /* ================= Explorer ================= */
+  const gs = $('#gSvg');
+  let start = 0;
+  function drawGraph() {
+    const depth = +$('#gDepth').value;
+    $('#gDepthO').textContent = depth;
+    const { dist, edges } = bfs(start, depth);
+    gs.innerHTML = '';
+    const COL = ['var(--accent)', 'var(--accent-2)', 'var(--green)', 'var(--amber)', 'var(--pink)'];
+    EDGES.forEach(([a, b]) => {
+      const inside = dist.has(a) && dist.has(b) && Math.abs(dist.get(a) - dist.get(b)) <= 1;
+      svg('line', { x1: POS[a].x, y1: POS[a].y, x2: POS[b].x, y2: POS[b].y, stroke: inside ? 'var(--accent)' : 'var(--border-strong)', 'stroke-width': inside ? 1.6 : .8, opacity: inside ? .75 : .3 }, gs);
+    });
+    NAMES.forEach((nm, i) => {
+      const d = dist.get(i);
+      const g = svg('g', { class: 'gnode', style: 'cursor:pointer' }, gs);
+      svg('circle', { cx: POS[i].x, cy: POS[i].y, r: i === start ? 13 : d != null ? 9 : 6.5, fill: i === start ? 'var(--text)' : d != null ? COL[Math.min(d, 4)] : 'var(--surface-3)', stroke: 'var(--surface)', 'stroke-width': 1.5 }, g);
+      svg('text', { x: POS[i].x, y: POS[i].y + 21, 'text-anchor': 'middle', class: 'lbl2', text: nm + (d != null && d > 0 ? ' ·' + d : '') }, g);
+      g.addEventListener('click', () => { start = i; drawGraph(); });
+    });
+    $('#gWho').textContent = NAMES[start];
+    $('#gReach').textContent = dist.size - 1;
+    $('#gEdges').textContent = edges;
+    $('#gPct').textContent = Math.round((dist.size - 1) / (N - 1) * 100) + '%';
+    // people you may know: 2 hops, ranked by mutual friends
+    const friends = ADJ[start];
+    const cand = new Map();
+    friends.forEach(f => ADJ[f].forEach(ff => { if (ff !== start && !friends.has(ff)) cand.set(ff, (cand.get(ff) || 0) + 1); }));
+    const top = [...cand.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+    $('#gPymk').innerHTML = top.length ? top.map(([id, m]) => {
+      const via = [...ADJ[id]].filter(x => friends.has(x)).map(x => NAMES[x]).slice(0, 3).join(', ');
+      return `<div><span><b>${NAMES[id]}</b><br><span class="m">via ${via}</span></span><span class="m">${m} mutual</span><span class="sc">${(m / friends.size * 100).toFixed(0)}%</span></div>`;
+    }).join('') : '<div class="small muted">No suggestions — already connected to everyone within 2 hops.</div>';
+  }
+  $('#gDepth').addEventListener('input', drawGraph);
+  drawGraph();
+
+  /* ================= Bidirectional BFS ================= */
+  const bs = $('#bSvg');
+  let bState = null;
+  function drawBi() {
+    bs.innerHTML = '';
+    EDGES.forEach(([a, b]) => svg('line', { x1: POS[a].x, y1: POS[a].y, x2: POS[b].x, y2: POS[b].y, stroke: 'var(--border-strong)', 'stroke-width': .8, opacity: .3 }, bs));
+    if (bState) {
+      const { pathEdges, fromSet, toSet, s, t } = bState;
+      pathEdges.forEach(([a, b]) => svg('line', { x1: POS[a].x, y1: POS[a].y, x2: POS[b].x, y2: POS[b].y, stroke: 'var(--green)', 'stroke-width': 3 }, bs));
+      NAMES.forEach((nm, i) => {
+        const inF = fromSet.has(i), inT = toSet.has(i);
+        const fill = i === s || i === t ? 'var(--text)' : inF && inT ? 'var(--green)' : inF ? 'var(--accent)' : inT ? 'var(--pink)' : 'var(--surface-3)';
+        svg('circle', { cx: POS[i].x, cy: POS[i].y, r: i === s || i === t ? 12 : inF || inT ? 8 : 5.5, fill, stroke: 'var(--surface)', 'stroke-width': 1.5 }, bs);
+        svg('text', { x: POS[i].x, y: POS[i].y + 20, 'text-anchor': 'middle', class: 'lbl2', text: nm }, bs);
+      });
+    } else {
+      NAMES.forEach((nm, i) => {
+        svg('circle', { cx: POS[i].x, cy: POS[i].y, r: 6.5, fill: 'var(--surface-3)', stroke: 'var(--surface)', 'stroke-width': 1.5 }, bs);
+        svg('text', { x: POS[i].x, y: POS[i].y + 19, 'text-anchor': 'middle', class: 'lbl2', text: nm }, bs);
+      });
+    }
+  }
+  function shortestPath(s, t) {
+    const prev = new Map([[s, null]]);
+    let frontier = [s];
+    while (frontier.length) {
+      const next = [];
+      for (const u of frontier) for (const v of ADJ[u]) if (!prev.has(v)) { prev.set(v, u); if (v === t) { const path = [t]; let c = t; while (prev.get(c) != null) { c = prev.get(c); path.unshift(c); } return path; } next.push(v); }
+      frontier = next;
+    }
+    return null;
+  }
+  function visits(s, t) {
+    // one-directional: nodes touched until t found
+    let seen = new Set([s]), frontier = [s], one = 0, found = false;
+    while (frontier.length && !found) {
+      const next = [];
+      for (const u of frontier) for (const v of ADJ[u]) { one++; if (v === t) { found = true; } if (!seen.has(v)) { seen.add(v); next.push(v); } }
+      frontier = next;
+    }
+    // bidirectional: alternate expansion until the frontiers intersect
+    let fs = new Set([s]), ts = new Set([t]), ff = [s], tf = [t], bi = 0, met = false;
+    while ((ff.length || tf.length) && !met) {
+      const expand = (frontier, seenSet, otherSet) => {
+        const next = [];
+        for (const u of frontier) for (const v of ADJ[u]) { bi++; if (otherSet.has(v)) met = true; if (!seenSet.has(v)) { seenSet.add(v); next.push(v); } }
+        return next;
+      };
+      ff = expand(ff, fs, ts);
+      if (!met) tf = expand(tf, ts, fs);
+    }
+    return { one, bi, fromSet: fs, toSet: ts };
+  }
+  $('#bRun').onclick = () => {
+    let s = Math.floor(Math.random() * N), t = Math.floor(Math.random() * N);
+    while (t === s || ADJ[s].has(t)) t = Math.floor(Math.random() * N);
+    const path = shortestPath(s, t) || [s, t];
+    const v = visits(s, t);
+    const pathEdges = path.slice(1).map((x, i) => [path[i], x]);
+    bState = { pathEdges, fromSet: v.fromSet, toSet: v.toSet, s, t };
+    drawBi();
+    $('#bPath').textContent = path.map(i => NAMES[i]).join(' → ');
+    $('#bOne').textContent = v.one;
+    $('#bBi').textContent = v.bi;
+    $('#bSave').textContent = v.one ? Math.round((1 - v.bi / v.one) * 100) + '% fewer' : '–';
+  };
+  $('#bReset').onclick = () => { bState = null; drawBi(); ['bPath', 'bOne', 'bBi', 'bSave'].forEach(id => $('#' + id).textContent = '–'); };
+  drawBi();
+
+  /* ================= TAO labels ================= */
+  $('#tStep').addEventListener('step', e => {
+    const i = e.detail.index;
+    $('#tL1').textContent = i < 1 ? '–' : i === 1 ? 'MISS' : i >= 3 ? 'invalidated' : 'HIT ✓';
+    $('#tL2').textContent = i < 2 ? '–' : i === 2 ? 'MISS → db' : 'write-through';
+    $('#tDb').textContent = i < 2 ? 'source of truth' : i < 3 ? 'range scan: 312 edges' : 'edge + counter written';
+    $('#t-db').classList.toggle('ok', i >= 3);
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Distributed Key-Value Store</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('sd-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .step-banner { display:flex; gap:10px; align-items:center; margin:60px 0 -40px; }
+  .step-banner span { font-family:var(--mono); font-size:12px; font-weight:800; color:#fff; background:linear-gradient(90deg,var(--pink),var(--accent)); padding:4px 10px; border-radius:8px; }
+  .req-list { display:grid; gap:8px; }
+  .req { display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); font-size:14.5px; }
+  .req .chk { flex:none; width:20px; height:20px; border-radius:6px; background:var(--green); color:#fff; display:grid; place-items:center; font-size:12px; font-weight:800; }
+  .nodes5 { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-top:12px; }
+  .nd { border:2px solid var(--border-strong); border-radius:12px; padding:10px; background:var(--surface); text-align:center; cursor:pointer; transition:.25s; user-select:none; }
+  .nd:hover { border-color:var(--accent); }
+  .nd.dead { border-color:var(--red); background:var(--red-soft); opacity:.7; }
+  .nd.used { box-shadow:0 0 0 3px var(--accent-soft); }
+  .nd .nm { font-family:var(--mono); font-weight:800; font-size:13px; }
+  .nd .val { margin-top:6px; font-family:var(--mono); font-size:12px; padding:4px; border-radius:6px; background:var(--surface-2); }
+  .nd .val.fresh { background:var(--green-soft); color:var(--green); }
+  .nd .val.stale { background:var(--amber-soft); color:var(--amber); }
+  .nd .hint { font-size:10.5px; color:var(--pink); font-family:var(--mono); margin-top:4px; }
+  .verdict { margin-top:12px; padding:12px 14px; border-radius:12px; font-weight:700; font-size:13.5px; }
+  .verdict.ok { background:var(--green-soft); color:var(--green); }
+  .verdict.bad { background:var(--red-soft); color:var(--red); }
+  .verdict.idle { background:var(--surface-2); color:var(--muted); }
+  .vc { font-family:var(--mono); font-size:12px; }
+  .sib { border:1.5px solid var(--amber); background:var(--amber-soft); border-radius:10px; padding:8px 10px; margin-top:6px; font-family:var(--mono); font-size:12px; }
+</style>
+</head>
+<body data-chapter="39">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 39</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Design a <span class="grad">Distributed Key-Value Store</span></h1>
+    <p class="lead">This is the capstone of the distributed-systems chapters: build Amazon's Dynamo (the ancestor of DynamoDB, Cassandra, Riak and ScyllaDB). Two operations — <code>get(key)</code> and <code>put(key, value)</code> — but the requirement that makes it hard: <b>writes must always succeed</b>, even during failures and network partitions, on a cluster of thousands of commodity machines where something is always broken.</p>
+    <ul class="objectives">
+      <li>Partition data with consistent hashing and virtual nodes</li>
+      <li>Replicate to a preference list across failure domains</li>
+      <li>Tune consistency with N, R and W quorums</li>
+      <li>Stay writeable during failures with sloppy quorums and hinted handoff</li>
+      <li>Detect concurrent writes with vector clocks and resolve siblings</li>
+      <li>Repair divergence with read repair, Merkle trees and gossip</li>
+    </ul>
+  </section>
+
+  <div class="step-banner"><span>STEP 1 / 6</span></div>
+  <h2>Requirements</h2>
+  <div class="split">
+    <div><h4 class="mt0">🛠️ Functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span><code>get(key)</code> → value (or conflicting versions)</span></div>
+      <div class="req"><span class="chk">✓</span><span><code>put(key, context, value)</code> — values are opaque blobs (~1 KB)</span></div>
+      <div class="req"><span class="chk">✓</span><span>No cross-key transactions, joins or SQL</span></div>
+      <div class="req"><span class="chk">✓</span><span>Add/remove nodes without downtime</span></div>
+    </div></div>
+    <div><h4 class="mt0">📏 Non-functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span><b>Always writeable</b> (“add to cart” must never fail) → AP in CAP terms</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>p99 &lt; 10 ms</b> under an SLA, not just averages</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Incrementally scalable</b> — add one node at a time</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Symmetric & decentralized:</b> every node is equal, no master</span></div>
+      <div class="req"><span class="chk">✓</span><span>Tunable consistency per operation</span></div>
+    </div></div>
+  </div>
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">The requirement that drives everything</div><p>“Always writeable” is the decision that produces the whole design. Because you can't block writes during a partition (CAP, Chapter 13), you must accept conflicting versions — which forces vector clocks, siblings, read repair and anti-entropy. If instead the requirement were “never return stale data”, you'd build a leader-based, consensus-backed system (Raft, Chapter 13) and accept unavailability. Same problem, opposite architecture.</p></div></div>
+
+  <div class="step-banner"><span>STEP 2 / 6</span></div>
+  <h2>Estimate the scale</h2>
+  <div class="stats">
+    <div class="stat"><div class="k">Keys</div><div class="v">100B</div></div>
+    <div class="stat"><div class="k">Avg value</div><div class="v">~1 KB</div></div>
+    <div class="stat warn"><div class="k">Logical data</div><div class="v">100 TB <small>→ 300 TB at N=3</small></div></div>
+    <div class="stat acc"><div class="k">Ops / second</div><div class="v">1M <small>80% reads</small></div></div>
+    <div class="stat"><div class="k">Nodes (2 TB usable each)</div><div class="v">~200</div></div>
+    <div class="stat bad"><div class="k">Nodes failing per week</div><div class="v">several</div></div>
+  </div>
+  <p style="margin-top:16px">At a few hundred machines, hardware failure is routine, not exceptional. The system must treat node loss as a normal event handled automatically — no pager, no manual failover.</p>
+
+  <div class="step-banner"><span>STEP 3 / 6</span></div>
+  <h2>Partitioning: consistent hashing with virtual nodes</h2>
+  <p>Keys are hashed onto a ring; each key belongs to the first node clockwise. <b>Virtual nodes</b> (each physical machine owns many small ranges) even out the distribution and spread the work of a failure across the whole cluster instead of dumping it on one neighbour.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">The ring</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="ringV" checked style="accent-color:var(--accent)"> Virtual nodes (8 per physical node)</label>
+        <button class="btn sm" id="ringAdd">➕ Add node</button>
+        <button class="btn sm" id="ringRemove">➖ Remove node</button>
+        <button class="btn sm" id="ringReset">↺ Reset</button>
+      </div>
+      <div class="split" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-top:10px">
+        <svg id="ringSvg" class="diagram" viewBox="0 0 380 380"></svg>
+        <div>
+          <div class="controls" style="margin-top:0"><input class="inp" id="ringKey" value="cart:u42" aria-label="Key" style="min-width:150px"><button class="btn sm primary" id="ringLookup">🔍 Locate key</button></div>
+          <div class="verdict idle" id="ringOut">Enter a key to see which nodes store it.</div>
+          <div class="stats" style="grid-template-columns:1fr 1fr">
+            <div class="stat"><div class="k">Physical nodes</div><div class="v" id="ringN">–</div></div>
+            <div class="stat acc"><div class="k">Load imbalance</div><div class="v" id="ringBal">–</div></div>
+            <div class="stat warn"><div class="k">Keys moved on last change</div><div class="v" id="ringMoved">–</div></div>
+            <div class="stat"><div class="k">Ideal share</div><div class="v" id="ringIdeal">–</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="panel-foot">🧪 Turn virtual nodes <b>off</b> and add/remove nodes: load imbalance jumps (some node owns twice its share) and one unlucky neighbour absorbs everything a failed node held. With vnodes on, both are smoothed — and the rebuild after a failure is parallelized across many nodes.</div>
+  </div>
+
+  <h2>Replication & the preference list</h2>
+  <p>Each key is stored on the next <b>N distinct physical nodes</b> clockwise (skipping vnodes of the same machine) — its <b>preference list</b>. The list is extended to prefer distinct racks and availability zones, so one rack losing power doesn't take all replicas of a key. Any node can act as <b>coordinator</b> for a request: clients (or a smart client library) know the ring from gossip and usually talk to a node in the preference list directly.</p>
+
+  <div class="step-banner"><span>STEP 4 / 6</span></div>
+  <h2>Deep dive: quorums (N, R, W)</h2>
+  <p>Per operation you choose how many replicas must respond: <b>W</b> acknowledgements for a write, <b>R</b> responses for a read, out of <b>N</b> replicas. If <b>R + W &gt; N</b>, the read set and write set must overlap in at least one replica, so a read sees the latest acknowledged write. If not, reads can be stale — which may be perfectly fine.</p>
+
+  <div class="panel" id="qPanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Quorum lab — N = 5 replicas of key “cart:u42”</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="range-row"><label>W (write acks)</label><input type="range" id="qW" min="1" max="5" value="3"><output id="qWO">3</output></div>
+      <div class="range-row"><label>R (read responses)</label><input type="range" id="qR" min="1" max="5" value="3"><output id="qRO">3</output></div>
+      <div class="verdict idle" id="qRule"></div>
+      <div class="controls">
+        <button class="btn sm primary" id="qWrite">✍️ put(cart:u42, v+1)</button>
+        <button class="btn sm" id="qRead">📖 get(cart:u42)</button>
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="qRepair" checked style="accent-color:var(--accent)"> Read repair</label>
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="qHint" checked style="accent-color:var(--accent)"> Sloppy quorum + hinted handoff</label>
+        <button class="btn sm" id="qReset">↺ Reset</button>
+      </div>
+      <div class="nodes5" id="qNodes"></div>
+      <div class="verdict idle" id="qOut">Click nodes to kill/revive them, then write and read.</div>
+      <div class="stats">
+        <div class="stat acc"><div class="k">Write latency (slowest ack)</div><div class="v" id="qWl">–</div></div>
+        <div class="stat"><div class="k">Read latency</div><div class="v" id="qRl">–</div></div>
+        <div class="stat good"><div class="k">Writes accepted</div><div class="v" id="qOk">0</div></div>
+        <div class="stat bad"><div class="k">Stale reads</div><div class="v" id="qStale">0</div></div>
+      </div>
+    </div>
+    <div class="panel-foot">🧪 Try <b>W=1, R=1</b> (fastest, weakest): kill nodes and watch stale reads appear. <b>W=3, R=3</b> guarantees overlap. <b>W=5</b> makes writes fail as soon as one node dies — unless sloppy quorum is on, which stores a <b>hint</b> on a healthy substitute node and replays it when the owner returns.</div>
+  </div>
+
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">⚡</div><h4>W=1, R=1</h4><p>Lowest latency and highest availability; reads may be stale. Good for caches, counters, presence.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">⚖️</div><h4>W=2, R=2 (N=3)</h4><p>The common default: R+W &gt; N with only one extra replica to wait for. Tolerates one node down on either path.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🧱</div><h4>W=N, R=1</h4><p>Fast reads from any replica, expensive and fragile writes. Good for write-rarely, read-constantly config data.</p></div>
+  </div>
+
+  <h2>Deep dive: staying writeable</h2>
+  <div class="grid c2">
+    <div class="card feature reveal"><div class="f-ico">🧭</div><h4>Sloppy quorum</h4><p>If a node in the preference list is unreachable, the write goes to the <b>next healthy node on the ring</b> instead — so W acks are still achievable during failures. It's “sloppy” because the write isn't on its permanent home yet.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">📨</div><h4>Hinted handoff</h4><p>The substitute stores the data with a <b>hint</b>: “this belongs to node C”. When gossip reports C healthy again, the hint is delivered and the local copy deleted. Hints expire after a while — if a node is gone for hours, anti-entropy takes over.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🩹</div><h4>Read repair</h4><p>If a read sees replicas with different versions, the coordinator returns the newest (or siblings) to the client <b>and writes the reconciled value back</b> to the stale replicas — repair paid for by read traffic on hot keys.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🌳</div><h4>Anti-entropy</h4><p>Cold keys are never read, so they'd stay divergent forever. Replicas periodically exchange <b>Merkle trees</b> (Chapter 20) of their key ranges and sync only the differing parts.</p></div>
+  </div>
+
+  <div class="step-banner"><span>STEP 5 / 6</span></div>
+  <h2>Deep dive: conflicting writes & vector clocks</h2>
+  <p>With no leader, two clients can update the same key concurrently — during a partition, or simply by reaching different coordinators. Which wins? A wall-clock timestamp (last-write-wins) is simple but <b>silently loses data</b> when clocks disagree. Dynamo instead attaches a <b>vector clock</b>: a per-node counter map that reveals whether one version <i>descends from</i> the other or whether they're truly concurrent.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A shopping cart during a partition</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <button class="btn sm" id="vcA">🛒 Client A (via node Sx): add 🎧 headphones</button>
+        <button class="btn sm" id="vcB">🛒 Client B (via node Sy): add 🖱️ mouse</button>
+        <button class="btn sm primary" id="vcRead">📖 get(cart:u42)</button>
+        <button class="btn sm" id="vcResolve">🤝 Client merges siblings & writes back</button>
+        <button class="btn sm" id="vcReset">↺ Reset</button>
+      </div>
+      <div class="split" style="margin-top:12px">
+        <div class="card" style="margin:0"><h4 class="mt0">Versions stored for cart:u42</h4><div id="vcList" class="vc"></div></div>
+        <div class="card" style="margin:0"><h4 class="mt0">What the client sees</h4><div id="vcOut" class="vc"></div></div>
+      </div>
+      <div class="log" id="vcLog" style="margin-top:12px;height:120px"></div>
+    </div>
+    <div class="panel-foot">📖 Reading <code>[Sx:1]</code> and <code>[Sy:1]</code>: neither clock dominates the other, so they're <b>concurrent siblings</b>. The store can't merge opaque blobs, so it returns both and lets the application decide — for a cart, <b>union</b> the items (the famous “resurrected item” quirk: a deleted item can come back, which Amazon considered better than losing an added one).</div>
+  </div>
+
+  <div class="callout warn"><div class="ico">⏱️</div><div class="body"><div class="title">Why not last-write-wins?</div><p>LWW discards one of two concurrent writes based on timestamps from machines whose clocks differ by milliseconds to seconds (Chapter 13). Cassandra defaults to LWW per <b>column</b>, which is fine for “set status = X” and terrible for “append to a list”. Prefer CRDTs (Chapter 22) or application-level merges when concurrent updates are expected.</p></div></div>
+
+  <h2>Inside a single node</h2>
+  <div class="grid c4">
+    <div class="card feature reveal"><div class="f-ico">📝</div><h4>Commit log</h4><p>Every write is appended to a WAL on disk before acknowledgement, for crash durability.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧠</div><h4>Memtable</h4><p>Writes also go into a sorted in-memory structure — which is why writes are so fast (no random disk I/O).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">💾</div><h4>SSTables + compaction</h4><p>Memtables flush to immutable sorted files; background compaction merges them and drops obsolete versions (Chapter 7's LSM tree).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🎯</div><h4>Bloom filters</h4><p>Per SSTable, so a lookup skips files that definitely don't contain the key (Chapter 20).</p></div>
+  </div>
+  <div class="callout tip"><div class="ico">🪦</div><div class="body"><div class="title">Deletes need tombstones</div><p>You can't just remove a key: a replica that was offline would “resurrect” it during the next repair. Deletes write a <b>tombstone</b> marker that replicates like any value and is purged only after a grace period (<code>gc_grace_seconds</code>) longer than your repair interval. Too many tombstones make reads slow — a classic Cassandra operational trap with queue-like workloads.</p></div></div>
+
+  <div class="step-banner"><span>STEP 6 / 6</span></div>
+  <h2>Wrap-up: operations & gotchas</h2>
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">🌡️</div><h4>Hot keys & partitions</h4><p>One celebrity key can overwhelm its N replicas. Mitigate by adding a shard suffix to spread the key, caching it in front, or per-key rate limiting. Monitor per-partition traffic, not just cluster averages.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🌍</div><h4>Multi-datacenter</h4><p>Extend the preference list across DCs and replicate asynchronously between them; use <code>LOCAL_QUORUM</code> so a read or write doesn't wait for a cross-ocean round trip (Chapter 22).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">➕</div><h4>Bootstrapping a node</h4><p>A new node claims ranges and streams data from current owners, throttled so it doesn't starve live traffic. Gossip spreads the new ring; clients update their routing tables.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🔎</div><h4>Secondary indexes</h4><p>Local indexes (per partition) are cheap but require scatter-gather reads; global indexes are another table that must be kept consistent asynchronously. This is why access patterns must be known up front.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">📊</div><h4>Measure p99, not averages</h4><p>Dynamo's SLA was expressed at the 99.9th percentile. Coordinators can hedge slow replicas with extra requests, and speculative retries trade a little load for much better tails (Chapter 4).</p></div>
+    <div class="card feature reveal"><div class="f-ico">🧯</div><h4>Backpressure</h4><p>Reject or shed load when queues grow rather than accepting everything and timing out — an overloaded node that stays silent is worse than one that says no (Chapter 16).</p></div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="t">
+      <thead><tr><th>Design choice</th><th>Technique</th><th>Chapter</th></tr></thead>
+      <tbody>
+        <tr><td>Partitioning</td><td>Consistent hashing with virtual nodes</td><td>8</td></tr>
+        <tr><td>High availability for writes</td><td>Replication to N nodes, sloppy quorum + hinted handoff</td><td>8, 12</td></tr>
+        <tr><td>Tunable consistency</td><td>N / R / W quorums</td><td>8, 12</td></tr>
+        <tr><td>Conflict detection</td><td>Vector clocks, siblings, application merge or CRDTs</td><td>12, 20</td></tr>
+        <tr><td>Divergence repair</td><td>Read repair + Merkle-tree anti-entropy</td><td>18</td></tr>
+        <tr><td>Membership & failure detection</td><td>Gossip + phi accrual / SWIM</td><td>18</td></tr>
+        <tr><td>Local storage</td><td>WAL + memtable + SSTables + Bloom filters</td><td>7, 18</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Assuming R + W > N gives you linearizability.</b> It gives overlap, not a total order — concurrent writes still need reconciliation.</li>
+      <li><b>Using last-write-wins on data where concurrent updates are normal.</b> Wall clocks disagree; you'll lose writes silently.</li>
+      <li><b>Deleting data without tombstones.</b> An offline replica will resurrect it during the next repair.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Reason:</b> Your store has N=3, W=2, R=2. One node is down for an hour. What is the user experience?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Writes still succeed — two healthy replicas satisfy W=2 — and with sloppy quorum a substitute node holds hinted data for the absent one. Reads still succeed and remain fresh, because any two live replicas overlap with the write set. When the node returns, hinted handoff delivers what it missed and read repair or anti-entropy fixes the rest. The user notices nothing; the operator sees hint counts and repair activity.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Design:</b> How would you add a secondary index (“find users by email”) to a Dynamo-style store?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Either a local index per partition — cheap to write, but every query is a scatter-gather across all partitions — or a global index stored as a separate table keyed by email, maintained asynchronously. The global index is fast to read but eventually consistent and needs careful handling of updates (delete the old entry, insert the new) and of concurrent writes to the same email. That asymmetry is exactly why these stores insist you know your access patterns up front.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>“Always writeable” forces an AP design: accept conflicts and reconcile, rather than blocking writes.</li>
+      <li>Consistent hashing with virtual nodes spreads data and rebalances only ~1/N of keys when membership changes.</li>
+      <li>Each key lives on a preference list of N distinct nodes spanning racks and zones; any node can coordinate.</li>
+      <li>R + W &gt; N gives overlap and fresh reads; smaller values trade consistency for latency and availability.</li>
+      <li>Sloppy quorums plus hinted handoff keep writes succeeding during failures.</li>
+      <li>Vector clocks distinguish causal updates from concurrent siblings; LWW silently loses data.</li>
+      <li>Read repair fixes hot data; Merkle-tree anti-entropy fixes cold data; gossip spreads membership.</li>
+      <li>Nodes are LSM-tree stores; deletes need tombstones with a grace period.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+    <div class="quiz" data-answer="2">
+      <p class="q">With N=3, W=1, R=1, a client writes and immediately reads from another coordinator. What can happen?</p>
+      <div class="opts"><button class="opt">The read blocks until all replicas agree</button><button class="opt">The write is rejected</button><button class="opt">The read may return the old value, because R + W ≤ N gives no guaranteed overlap</button><button class="opt">A vector clock conflict is guaranteed</button></div>
+      <div class="explain">Only one replica acknowledged the write; a read of one replica may hit a different one that hasn't received it yet.</div>
+    </div>
+    <div class="quiz" data-answer="0">
+      <p class="q">A node in the preference list is down and W=3 with N=3. How does the write still succeed?</p>
+      <div class="opts"><button class="opt">Sloppy quorum: a healthy substitute node accepts it with a hint and later hands it off</button><button class="opt">The write is queued on the client forever</button><button class="opt">N is temporarily reduced to 2</button><button class="opt">The coordinator elects a new leader</button></div>
+      <div class="explain">Hinted handoff preserves availability, then restores the data to its rightful owner when it returns.</div>
+    </div>
+    <div class="quiz" data-answer="3">
+      <p class="q">A get returns two versions with vector clocks [Sx:1] and [Sy:1]. What does that mean?</p>
+      <div class="opts"><button class="opt">One node's clock is wrong</button><button class="opt">The newer timestamp wins</button><button class="opt">The data is corrupted</button><button class="opt">The writes were concurrent — neither descends from the other — so the client must reconcile them</button></div>
+      <div class="explain">Neither clock dominates, so both are valid siblings. Carts merge by union; other domains need their own merge rule.</div>
+    </div>
+    <div class="quiz" data-answer="1">
+      <p class="q">Why are virtual nodes used instead of one ring position per machine?</p>
+      <div class="opts"><button class="opt">To reduce the number of replicas</button><button class="opt">To even out load and spread a failed node's data and rebuild work across many nodes</button><button class="opt">To make hashing faster</button><button class="opt">To support secondary indexes</button></div>
+      <div class="explain">With a single token per machine, ranges are uneven and a failure dumps everything on one successor.</div>
+    </div>
+    <div class="quiz" data-answer="2">
+      <p class="q">Why must deletes create tombstones rather than removing the key?</p>
+      <div class="opts"><button class="opt">To save disk space</button><button class="opt">To keep vector clocks short</button><button class="opt">So replicas that missed the delete don't resurrect the key during repair</button><button class="opt">Because SSTables are mutable</button></div>
+      <div class="explain">Absence can't be replicated. A tombstone is a value meaning “deleted”, kept until every replica has surely seen it.</div>
+    </div>
+  </div>
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, svg } = SD;
+  const hash = s => { let h = 0x811c9dc5; for (const c of s) { h ^= c.charCodeAt(0); h = Math.imul(h, 0x01000193); } h ^= h >>> 13; return (h >>> 0) / 4294967296; };
+
+  /* ================= Ring ================= */
+  const NAMES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+  const COLORS = ['var(--accent)', 'var(--accent-2)', 'var(--green)', 'var(--amber)', 'var(--pink)', 'var(--red)', 'var(--text-2)', 'var(--muted)'];
+  const SAMPLE = Array.from({ length: 600 }, (_, i) => 'key:' + i);
+  let phys = 4, lastOwners = null;
+  const ring = $('#ringSvg');
+  function tokens() {
+    const v = $('#ringV').checked ? 8 : 1, out = [];
+    for (let i = 0; i < phys; i++) for (let j = 0; j < v; j++) out.push({ n: i, p: hash(NAMES[i] + '#' + j) });
+    return out.sort((a, b) => a.p - b.p);
+  }
+  function ownerOf(tk, k, count = 1) {
+    const p = hash(k), out = [];
+    let idx = tk.findIndex(t => t.p >= p); if (idx < 0) idx = 0;
+    for (let i = 0; out.length < count && i < tk.length; i++) { const t = tk[(idx + i) % tk.length]; if (!out.includes(t.n)) out.push(t.n); }
+    return out;
+  }
+  function drawRing(msg) {
+    const tk = tokens();
+    ring.innerHTML = '';
+    const cx = 190, cy = 190, r = 140;
+    svg('circle', { cx, cy, r, fill: 'none', stroke: 'var(--border-strong)', 'stroke-width': 14 }, ring);
+    // arcs per token range
+    tk.forEach((t, i) => {
+      const start = i === 0 ? tk[tk.length - 1].p - 1 : tk[i - 1].p, end = t.p;
+      const a0 = (start * 2 - .5) * Math.PI, a1 = (end * 2 - .5) * Math.PI;
+      const large = (end - start) > .5 ? 1 : 0;
+      const x0 = cx + Math.cos(a0) * r, y0 = cy + Math.sin(a0) * r, x1 = cx + Math.cos(a1) * r, y1 = cy + Math.sin(a1) * r;
+      svg('path', { d: `M${x0},${y0} A${r},${r} 0 ${large} 1 ${x1},${y1}`, fill: 'none', stroke: COLORS[t.n], 'stroke-width': 14, opacity: .85 }, ring);
+      const am = (t.p * 2 - .5) * Math.PI;
+      svg('circle', { cx: cx + Math.cos(am) * r, cy: cy + Math.sin(am) * r, r: 4, fill: 'var(--surface)', stroke: COLORS[t.n], 'stroke-width': 2 }, ring);
+    });
+    for (let i = 0; i < phys; i++) {
+      const a = (i / phys * 2 - .5) * Math.PI;
+      svg('text', { x: cx + Math.cos(a) * (r + 34), y: cy + Math.sin(a) * (r + 34), 'text-anchor': 'middle', 'dominant-baseline': 'middle', style: `font-weight:800;fill:${COLORS[i]}`, text: 'Node ' + NAMES[i] }, ring);
+    }
+    svg('text', { x: cx, y: cy - 8, 'text-anchor': 'middle', style: 'font-size:13px;font-weight:700', text: `${tk.length} tokens` }, ring);
+    svg('text', { x: cx, y: cy + 12, 'text-anchor': 'middle', class: 'lbl', text: $('#ringV').checked ? '8 vnodes × node' : '1 token × node' }, ring);
+    // balance
+    const counts = new Array(phys).fill(0);
+    const owners = {};
+    SAMPLE.forEach(k => { const o = ownerOf(tk, k)[0]; counts[o]++; owners[k] = o; });
+    const ideal = SAMPLE.length / phys;
+    const imb = Math.max(...counts) / ideal;
+    $('#ringN').textContent = phys;
+    $('#ringBal').textContent = '+' + Math.round((imb - 1) * 100) + '% on busiest';
+    $('#ringBal').parentElement.className = 'stat ' + (imb > 1.4 ? 'bad' : imb > 1.2 ? 'warn' : 'good');
+    $('#ringIdeal').textContent = Math.round(100 / phys) + '% each';
+    if (lastOwners) {
+      const moved = SAMPLE.filter(k => lastOwners[k] !== undefined && lastOwners[k] !== owners[k]).length;
+      $('#ringMoved').textContent = Math.round(moved / SAMPLE.length * 100) + '%';
+    } else $('#ringMoved').textContent = '–';
+    lastOwners = owners;
+    if (msg) { const o = $('#ringOut'); o.className = 'verdict idle'; o.innerHTML = msg; }
+  }
+  function lookup() {
+    const tk = tokens(), k = $('#ringKey').value || 'cart:u42';
+    const pref = ownerOf(tk, k, 3);
+    const o = $('#ringOut'); o.className = 'verdict ok';
+    o.innerHTML = `<code>${k}</code> → hash ${hash(k).toFixed(4)} → preference list: <b>${pref.map(i => NAMES[i]).join(' → ')}</b> (N=3: first is the coordinator's home, the rest are replicas)`;
+  }
+  $('#ringV').addEventListener('change', () => { lastOwners = null; drawRing(); });
+  $('#ringAdd').onclick = () => { if (phys < 8) { phys++; drawRing(`➕ Node ${NAMES[phys - 1]} joined — it streams its new ranges from the current owners.`); } };
+  $('#ringRemove').onclick = () => { if (phys > 2) { phys--; drawRing(`➖ Node ${NAMES[phys]} left — its ranges were absorbed by the ${$('#ringV').checked ? 'whole cluster' : 'next node clockwise'}.`); } };
+  $('#ringReset').onclick = () => { phys = 4; lastOwners = null; drawRing(); };
+  $('#ringLookup').onclick = lookup;
+  $('#ringKey').addEventListener('input', lookup);
+  drawRing(); lookup();
+
+  /* ================= Quorum lab ================= */
+  const QN = ['S1', 'S2', 'S3', 'S4', 'S5'];
+  let Q;
+  function qReset() { Q = { v: QN.map(() => 1), dead: QN.map(() => false), hints: QN.map(() => null), cur: 1, ok: 0, stale: 0 }; qRender('Click nodes to kill/revive them, then write and read.', 'idle'); }
+  function qRender(msg, cls) {
+    $('#qNodes').innerHTML = QN.map((n, i) => `<div class="nd ${Q.dead[i] ? 'dead' : ''} ${Q.used && Q.used.includes(i) ? 'used' : ''}" data-i="${i}"><div class="nm">${n}</div><div class="val ${Q.v[i] === Q.cur ? 'fresh' : 'stale'}">v${Q.v[i]}</div>${Q.hints[i] ? `<div class="hint">hint → ${QN[Q.hints[i].for]} v${Q.hints[i].v}</div>` : ''}${Q.dead[i] ? '<div class="hint" style="color:var(--red)">DOWN</div>' : ''}</div>`).join('');
+    $$('#qNodes .nd').forEach(el => el.onclick = () => {
+      const i = +el.dataset.i;
+      Q.dead[i] = !Q.dead[i];
+      if (!Q.dead[i]) {
+        // revived: replay hints held for it
+        const h = Q.hints.map((x, j) => [x, j]).filter(([x]) => x && x.for === i);
+        h.forEach(([x, j]) => { Q.v[i] = Math.max(Q.v[i], x.v); Q.hints[j] = null; });
+        qRender(h.length ? `♻️ ${QN[i]} is back — ${h.length} hinted write(s) handed off to it, now at v${Q.v[i]}.` : `♻️ ${QN[i]} is back online (it may be stale until repaired).`, 'ok');
+      } else qRender(`💥 ${QN[i]} is down.`, 'bad');
+    });
+    if (msg) { const o = $('#qOut'); o.className = 'verdict ' + (cls || 'idle'); o.innerHTML = msg; }
+    const W = +$('#qW').value, R = +$('#qR').value;
+    $('#qWO').textContent = W; $('#qRO').textContent = R;
+    const rule = $('#qRule');
+    rule.className = 'verdict ' + (R + W > 5 ? 'ok' : 'bad');
+    rule.innerHTML = `R + W = ${R} + ${W} = ${R + W} ${R + W > 5 ? '&gt; N = 5 → read and write sets overlap → reads see the latest acknowledged write' : '≤ N = 5 → no guaranteed overlap → reads can be stale'}`;
+    $('#qOk').textContent = Q.ok; $('#qStale').textContent = Q.stale;
+  }
+  const lat = () => Math.round(SD.rand(2, 9));
+  $('#qWrite').onclick = () => {
+    const W = +$('#qW').value;
+    // the coordinator sends to all replicas but only waits for the W fastest to answer
+    const live = QN.map((_, i) => i).filter(i => !Q.dead[i]).sort(() => Math.random() - .5);
+    const target = Q.cur + 1;
+    const used = [], lats = [];
+    live.slice(0, W).forEach(i => { Q.v[i] = target; used.push(i); lats.push(lat()); });
+    let hinted = 0;
+    if (used.length < W && $('#qHint').checked) {
+      // sloppy quorum: store hints on healthy nodes for the dead ones
+      const dead = QN.map((_, i) => i).filter(i => Q.dead[i]);
+      for (const d of dead) {
+        const host = live.find(i => !Q.hints[i]);
+        if (host == null || used.length >= W) break;
+        Q.hints[host] = { for: d, v: target }; used.push(host); hinted++; lats.push(lat());
+      }
+    }
+    Q.used = used;
+    if (used.length >= W) {
+      Q.cur = target; Q.ok++;
+      qRender(`✅ put succeeded with ${used.length} acks (W=${W})${hinted ? ` — ${hinted} via <b>sloppy quorum + hinted handoff</b>` : ''}. New version v${target}.`, 'ok');
+      $('#qWl').textContent = Math.max(...lats) + ' ms';
+    } else {
+      qRender(`❌ put FAILED: only ${used.length} of W=${W} replicas available. ${$('#qHint').checked ? 'Even with sloppy quorum there were not enough healthy nodes.' : 'Enable sloppy quorum to keep writes succeeding.'}`, 'bad');
+      $('#qWl').textContent = 'timeout';
+    }
+  };
+  $('#qRead').onclick = () => {
+    const R = +$('#qR').value;
+    const live = QN.map((_, i) => i).filter(i => !Q.dead[i]);
+    const picked = live.sort(() => Math.random() - .5).slice(0, R);
+    Q.used = picked;
+    if (picked.length < R) { qRender(`❌ get FAILED: only ${picked.length} of R=${R} replicas responded.`, 'bad'); $('#qRl').textContent = 'timeout'; return; }
+    const best = Math.max(...picked.map(i => Q.v[i]));
+    const stale = best < Q.cur;
+    if (stale) Q.stale++;
+    let repaired = 0;
+    if ($('#qRepair').checked) picked.forEach(i => { if (Q.v[i] < best) { Q.v[i] = best; repaired++; } });
+    $('#qRl').textContent = Math.max(...picked.map(() => lat())) + ' ms';
+    qRender(`${stale ? '⚠️' : '✅'} get read ${picked.map(i => QN[i] + '=v' + Q.v[i]).join(', ')} → returned <b>v${best}</b>${stale ? ` — <b>STALE</b> (latest acknowledged is v${Q.cur})` : ' — fresh'}${repaired ? ` · read repair updated ${repaired} replica(s)` : ''}`, stale ? 'bad' : 'ok');
+  };
+  ['#qW', '#qR'].forEach(s => $(s).addEventListener('input', () => qRender()));
+  $('#qReset').onclick = qReset;
+  qReset();
+
+  /* ================= Vector clocks ================= */
+  let V;
+  function vcReset() { V = { versions: [{ items: ['📕 book'], vc: { Sx: 1 }, from: 'initial write' }], log: [] }; $('#vcLog').innerHTML = ''; vcRender('Cart starts with one item, written via node Sx.'); }
+  const vcStr = vc => '[' + Object.entries(vc).map(([k, v]) => `${k}:${v}`).join(', ') + ']';
+  const dominates = (a, b) => Object.keys({ ...a, ...b }).every(k => (a[k] || 0) >= (b[k] || 0)) && Object.keys({ ...a, ...b }).some(k => (a[k] || 0) > (b[k] || 0));
+  function addWrite(node, item) {
+    // client writes based on the versions it last read: here, extend every current version it descends from
+    const base = V.versions.length === 1 ? V.versions[0] : null;
+    if (base) {
+      const vc = { ...base.vc }; vc[node] = (vc[node] || 0) + 1;
+      V.versions = [{ items: [...base.items, item], vc, from: `client via ${node}` }];
+    } else {
+      // partitioned: each client writes on top of the original version it read
+      const orig = V.versions.find(x => x.from === 'initial write') || V.versions[0];
+      const vc = { ...orig.vc }; vc[node] = (vc[node] || 0) + 1;
+      V.versions.push({ items: [...orig.items, item], vc, from: `client via ${node}` });
+    }
+    // drop versions dominated by others
+    V.versions = V.versions.filter(v => !V.versions.some(o => o !== v && dominates(o.vc, v.vc)));
+    SD.log($('#vcLog'), `✍️ put via ${node}: ${item} → ${vcStr(V.versions[V.versions.length - 1].vc)}`, 'ok');
+  }
+  function vcRender(msg) {
+    $('#vcList').innerHTML = V.versions.map(v => `<div class="sib" style="${V.versions.length === 1 ? 'border-color:var(--green);background:var(--green-soft)' : ''}">${vcStr(v.vc)} → ${v.items.join(' + ')}<br><span class="muted">${v.from}</span></div>`).join('');
+    $('#vcOut').innerHTML = msg || (V.versions.length === 1
+      ? `✅ one version — the store returns <b>${V.versions[0].items.join(' + ')}</b> with context ${vcStr(V.versions[0].vc)}`
+      : `⚠️ <b>${V.versions.length} siblings</b> returned — neither vector clock dominates, so the store cannot decide. The client must merge them.`);
+  }
+  $('#vcA').onclick = () => { addWrite('Sx', '🎧 headphones'); vcRender(); };
+  $('#vcB').onclick = () => { addWrite('Sy', '🖱️ mouse'); vcRender(); };
+  $('#vcRead').onclick = () => { vcRender(); SD.log($('#vcLog'), V.versions.length > 1 ? `📖 get → ${V.versions.length} siblings: ${V.versions.map(v => vcStr(v.vc)).join(' vs ')}` : `📖 get → single version ${vcStr(V.versions[0].vc)}`, V.versions.length > 1 ? 'warn' : 'acc'); };
+  $('#vcResolve').onclick = () => {
+    if (V.versions.length === 1) { SD.log($('#vcLog'), 'Nothing to merge — only one version.', ''); return; }
+    const items = [...new Set(V.versions.flatMap(v => v.items))];
+    const vc = {}; V.versions.forEach(v => Object.entries(v.vc).forEach(([k, n]) => vc[k] = Math.max(vc[k] || 0, n)));
+    vc.Sx = (vc.Sx || 0) + 1;
+    V.versions = [{ items, vc, from: 'client merge (union) written back' }];
+    SD.log($('#vcLog'), `🤝 client unions the carts and writes back with the merged clock ${vcStr(vc)} — siblings collapse into one version`, 'ok');
+    vcRender();
+  };
+  $('#vcReset').onclick = vcReset;
+  vcReset();
+})();
+</script>
+</body>
+</html>

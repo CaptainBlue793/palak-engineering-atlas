@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Replication & Sharding</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('sd-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  #repSvg .dead rect { stroke: var(--red); fill: var(--red-soft); stroke-dasharray: 6 4; }
+  #repSvg .leader rect { stroke: var(--accent); stroke-width: 2.5; }
+  .log-cells text { font-family: var(--mono); font-size: 10.5px; font-weight: 700; }
+  .ring-wrap { display:grid; grid-template-columns: 1.1fr .9fr; gap:18px; align-items:start; }
+  @media (max-width:760px){ .ring-wrap{ grid-template-columns:1fr; } }
+  .node-bars .row { display:grid; grid-template-columns: 70px 1fr 44px; gap:8px; align-items:center; font-family:var(--mono); font-size:12.5px; margin:5px 0; }
+  .node-bars .tr { height:12px; background:var(--surface-3); border-radius:4px; overflow:hidden; }
+  .node-bars .tr i { display:block; height:100%; transition: width .4s; }
+  .shard-bars { display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; align-items:end; height:180px; padding:10px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); }
+  .shard-bars .sb { display:flex; flex-direction:column; align-items:center; justify-content:flex-end; height:100%; gap:4px; font-family:var(--mono); font-size:12px; }
+  .shard-bars .sb i { width:70%; border-radius:6px 6px 0 0; transition: height .5s cubic-bezier(.2,.8,.2,1), background .3s; display:block; }
+  .quorum-nodes text { font-family: var(--mono); font-weight: 800; }
+</style>
+</head>
+<body data-chapter="8">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 8</span><span class="pill cyan">Intermediate</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Replication & <span class="grad">Sharding</span></h1>
+    <p class="lead">One database server eventually isn't enough — it can't survive failure, can't serve every read, can't hold every byte. The two answers are <b>replication</b> (copies of the same data) and <b>sharding</b> (splitting data across machines). Most big systems use both.</p>
+    <ul class="objectives">
+      <li>Explain leader–follower replication & failover</li>
+      <li>Trade off sync vs async replication</li>
+      <li>Handle replication-lag anomalies</li>
+      <li>Use quorums (W + R &gt; N) in leaderless systems</li>
+      <li>Compare range, hash & directory sharding</li>
+      <li>Master consistent hashing</li>
+    </ul>
+  </section>
+
+  <div class="split">
+    <div class="card"><h4 class="mt0">🧬 Replication</h4><p class="small mb0">Keep <b>the same data</b> on multiple machines. Gives <b>high availability</b> (survive a node dying), <b>read scaling</b> (spread reads) and <b>lower latency</b> (a copy near users).</p></div>
+    <div class="card"><h4 class="mt0">🧩 Sharding (partitioning)</h4><p class="small mb0">Split <b>different data</b> across machines. Gives <b>write scaling</b> and <b>storage scaling</b> beyond one machine. Each shard is usually replicated too.</p></div>
+  </div>
+
+  <h2>Leader–follower replication</h2>
+  <p>The most common setup (PostgreSQL, MySQL, MongoDB, Redis). One node is the <strong>leader</strong> (primary): all writes go to it. It streams its change log to <strong>followers</strong> (replicas), which apply changes in the same order and can serve reads.</p>
+
+  <div class="panel" id="repPanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Replication lab</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="flex" style="justify-content:space-between">
+        <div class="seg" id="repMode"><button data-v="async" class="active">Asynchronous</button><button data-v="semi">Semi-sync (1 ack)</button><button data-v="sync">Synchronous (all acks)</button></div>
+        <button class="btn sm ghost" id="repReset">↺ Reset</button>
+      </div>
+      <div class="range-row" style="margin-top:10px"><label>Replication lag</label><input type="range" id="lagR" min="100" max="4000" step="100" value="1800"><output id="lagO"></output></div>
+      <div class="controls">
+        <button class="btn primary sm" id="repWrite">✍️ Write x = next</button>
+        <button class="btn sm" id="repRead">📖 Read from a follower</button>
+        <button class="btn sm" id="repKill" style="border-color:var(--red);color:var(--red)">💥 Kill the leader</button>
+      </div>
+      <div class="svg-scroll"><svg id="repSvg" class="diagram" viewBox="0 0 860 340" style="margin-top:8px"></svg></div>
+      <div class="stats">
+        <div class="stat acc"><div class="k">Last write latency</div><div class="v" id="repLat">–</div></div>
+        <div class="stat warn"><div class="k">Stale reads</div><div class="v" id="repStale">0</div></div>
+        <div class="stat bad"><div class="k">Writes lost in failover</div><div class="v" id="repLost">0</div></div>
+      </div>
+      <div class="log" id="repLog" style="height:120px;margin-top:12px"></div>
+    </div>
+    <div class="panel-foot">🧪 <b>Async:</b> write a few values quickly, read from a follower (stale!), then kill the leader before replication finishes — acknowledged writes vanish. <b>Sync:</b> repeat and compare write latency and data loss.</div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="t">
+      <thead><tr><th>Mode</th><th>Write latency</th><th>Durability on leader crash</th><th>Availability</th></tr></thead>
+      <tbody>
+        <tr><td><b>Asynchronous</b></td><td class="yes">Fast</td><td class="no">Recent writes can be lost</td><td class="yes">Writes continue if followers are down</td></tr>
+        <tr><td><b>Semi-synchronous</b></td><td class="meh">Medium</td><td class="yes">At least 2 copies of each write</td><td class="meh">Needs 1 follower up</td></tr>
+        <tr><td><b>Synchronous (all)</b></td><td class="no">Slowest follower sets the pace</td><td class="yes">No loss</td><td class="no">Any follower down blocks writes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Replication lag problems</h2>
+  <p>With async replication, followers are <strong>eventually consistent</strong> — usually milliseconds behind, but under load it can be seconds or minutes. That creates user-visible weirdness:</p>
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">🪞</div><h4>Read-your-writes</h4><p>You post a comment, refresh, and it's gone — your read hit a lagging replica. <b>Fix:</b> read your own recent data from the leader (e.g. for 60s after a write), or track the log position you've seen.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">⏪</div><h4>Monotonic reads</h4><p>You see a new comment, refresh, and it disappears — the second read hit a <i>more</i> lagged replica. <b>Fix:</b> pin each user to one replica (e.g. hash of user ID).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🔀</div><h4>Consistent prefix</h4><p>You see an answer before the question it replies to, because partitions replicate at different speeds. <b>Fix:</b> write causally related data to the same partition.</p></div>
+  </div>
+
+  <h2>Multi-leader & leaderless replication</h2>
+  <div class="tabs">
+    <div class="tab-list"><button>👑👑 Multi-leader</button><button>🕸️ Leaderless (quorums)</button></div>
+    <div class="tab-panel">
+      <p>Several nodes accept writes — typically <b>one leader per data center</b> — and replicate to each other. Writes stay fast and local even if the inter-region link is slow or down. Also how offline-first apps and collaborative editors work (each device is a “leader”).</p>
+      <div class="callout warn"><div class="ico">⚔️</div><div class="body"><div class="title">The catch: write conflicts</div><p>Two regions edit the same record at the same time. Resolution options: <b>last-write-wins</b> by timestamp (simple, silently loses data), merging values, <b>CRDTs</b> (data types designed to merge automatically), or asking the user.</p></div></div>
+    </div>
+    <div class="tab-panel">
+      <p>No leader at all. The client (or a coordinator) sends each write to <b>all N replicas</b> and waits for <b>W</b> to confirm; reads query <b>R</b> replicas and take the newest version. Used by Cassandra, DynamoDB-style systems and Riak. If <b>W + R &gt; N</b>, every read set overlaps every write set, so reads see the latest write.</p>
+      <div class="panel" style="margin:12px 0 0">
+        <div class="panel-body">
+          <div class="split">
+            <div>
+              <div class="range-row"><label>N replicas</label><input type="range" id="qN" min="1" max="7" value="3"><output id="qNO"></output></div>
+              <div class="range-row"><label>W write acks</label><input type="range" id="qW" min="1" max="3" value="2"><output id="qWO"></output></div>
+              <div class="range-row"><label>R read replicas</label><input type="range" id="qR" min="1" max="3" value="2"><output id="qRO"></output></div>
+              <div class="verdict" id="qVerdict" style="margin-top:12px;padding:12px 14px;border-radius:12px;font-weight:600"></div>
+              <div class="controls"><button class="btn primary sm" id="qOnce">▶ One write + read</button><button class="btn sm" id="qMany">🎲 Run 1,000 trials</button></div>
+              <div class="stats"><div class="stat bad"><div class="k">Stale reads</div><div class="v" id="qStale">–</div></div><div class="stat"><div class="k">Tolerates down (writes)</div><div class="v" id="qTolW">–</div></div></div>
+            </div>
+            <svg id="qSvg" class="diagram quorum-nodes" viewBox="0 0 320 300"></svg>
+          </div>
+          <div class="legend"><span><i style="background:var(--green)"></i>has new value v2</span><span><i style="background:var(--surface-3)"></i>still has old v1</span><span><i style="border:2px solid var(--accent)"></i>queried by the read</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h2>Sharding: splitting the data</h2>
+  <p>When writes or data volume exceed one machine, you <strong>partition</strong> rows across shards using a <strong>shard key</strong>. The strategy for mapping key → shard decides how evenly load spreads and how painful growth will be.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Shard 1,000 users by last name</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="flex" style="justify-content:space-between"><div class="seg" id="shSeg"><button data-v="range" class="active">Range (A–F, G–L…)</button><button data-v="hash">Hash (hash % 4)</button><button data-v="dir">Directory (lookup table)</button></div><button class="btn sm primary" id="shAdd">➕ Add 1,000 more users</button></div>
+      <p class="small" id="shDesc" style="margin:12px 0"></p>
+      <div class="shard-bars" id="shBars"></div>
+      <div class="stats"><div class="stat"><div class="k">Largest / smallest</div><div class="v" id="shSkew">–</div></div><div class="stat"><div class="k">Range query “names M–N”</div><div class="v" id="shRange" style="font-size:15px">–</div></div></div>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="t">
+      <thead><tr><th>Strategy</th><th>Pros</th><th>Cons</th><th>Used by</th></tr></thead>
+      <tbody>
+        <tr><td><b>Range</b></td><td>Efficient range scans; easy to reason about</td><td>Hot spots (skewed keys, or time-based keys where all new writes hit the last shard)</td><td>HBase, Bigtable, Spanner</td></tr>
+        <tr><td><b>Hash</b></td><td>Even distribution</td><td>Range queries hit every shard; naive <code>% N</code> reshuffles almost everything when N changes</td><td>Cassandra, DynamoDB (via consistent hashing)</td></tr>
+        <tr><td><b>Directory</b></td><td>Full control; move tenants individually</td><td>The lookup service is a critical dependency and potential bottleneck</td><td>Multi-tenant SaaS, Vitess</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Consistent hashing</h2>
+  <p>With <code>shard = hash(key) % N</code>, going from 4 to 5 servers changes the result for <strong>~80% of keys</strong> — a massive, simultaneous data migration (or cache wipe). <strong>Consistent hashing</strong> fixes this: servers and keys are placed on the same circular hash space, and each key belongs to the <strong>next server clockwise</strong>. Adding a server only steals keys from its neighbour — about <strong>1/N</strong> of keys move.</p>
+
+  <div class="panel" id="ringPanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">The hash ring</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="ring-wrap">
+        <svg id="ringSvg" class="diagram" viewBox="0 0 420 420"></svg>
+        <div>
+          <div class="controls" style="margin-top:0">
+            <button class="btn primary sm" id="ringAdd">➕ Add server</button>
+            <button class="btn sm" id="ringRemove">➖ Remove server</button>
+          </div>
+          <div class="range-row" style="margin-top:12px"><label style="min-width:110px">Virtual nodes</label><input type="range" id="vnR" min="1" max="50" value="1"><output id="vnO"></output></div>
+          <div class="range-row"><label style="min-width:110px">Keys</label><input type="range" id="keysR" min="50" max="400" step="50" value="150"><output id="keysO"></output></div>
+          <div class="stats">
+            <div class="stat good"><div class="k">Moved (consistent)</div><div class="v" id="movC">–</div></div>
+            <div class="stat bad"><div class="k">Would move (hash % N)</div><div class="v" id="movM">–</div></div>
+          </div>
+          <div class="muted small" style="font-weight:700;margin:14px 0 4px">KEYS PER SERVER</div>
+          <div class="node-bars" id="ringBars"></div>
+          <div class="stat" style="margin-top:8px"><div class="k">Imbalance (max ÷ ideal)</div><div class="v" id="ringImb">–</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel-foot">🧪 With 1 virtual node per server, arcs are random sizes and load is lumpy. Slide virtual nodes to 50 — each server appears 50 times around the ring, averaging out the arcs. Then add/remove a server and compare keys moved vs <code>% N</code>.</div>
+  </div>
+
+  <div class="callout tip"><div class="ico">🌀</div><div class="body"><p>Consistent hashing is everywhere: DynamoDB & Cassandra partitioning, Memcached client libraries, CDN request routing, load balancers with affinity (Chapter 5), and Discord's message routing.</p></div></div>
+
+  <h2>The hard parts of sharding</h2>
+  <div class="grid c2">
+    <div class="card feature reveal"><div class="f-ico">🔥</div><h4>Hot partitions</h4><p>A celebrity's user ID or a viral hashtag overloads one shard even with perfect hashing. Mitigate by adding a random suffix to hot keys (<code>post_9#0..#9</code>) and scatter-gathering on read.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🔗</div><h4>Cross-shard queries</h4><p>Joins and transactions across shards are slow or unsupported. Choose a shard key so most queries touch one shard (e.g. shard by <code>tenant_id</code> so each customer's data is colocated).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">🚚</div><h4>Rebalancing</h4><p>Moving data between shards while serving traffic is delicate: copy, catch up via change log, switch routing, delete. Pre-splitting into many logical partitions (e.g. 1,024) mapped onto fewer machines makes it easier.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🆔</div><h4>Global uniqueness</h4><p>Auto-increment IDs no longer work across shards. Use UUIDs, or Snowflake-style IDs (timestamp + machine ID + sequence) — see the URL shortener case study.</p></div>
+  </div>
+
+  <div class="callout interview">
+    <div class="ico">🎤</div>
+    <div class="body"><div class="title">Choosing a shard key — say this in interviews</div><p>A good shard key has <b>high cardinality</b> (many distinct values), <b>even access frequency</b> (no hot values), and <b>matches the dominant query</b> so most requests hit a single shard. <code>user_id</code> for a user-centric app is the classic choice; <code>created_at</code> alone is a classic mistake (all writes hit the newest shard).</p></div>
+  </div>
+
+  <h2>Resharding without downtime</h2>
+  <p>Sooner or later the shard count is wrong: shards get too big, one tenant outgrows its shard, or you simply need more machines. You can't take a global lock on a live system, so resharding is a <b>migration protocol</b> that runs for days while traffic keeps flowing. The same playbook works for moving to a different database entirely.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Live migration: split shard 3 into 3a and 3b</span><span class="p-tag">Step-through</span></div>
+    <div class="panel-body svg-scroll">
+      <svg id="rsSvg" class="diagram" viewBox="0 0 860 260">
+        <path id="rs-e1" class="edge dimmable" d="M150,120 L230,120"/>
+        <path id="rs-e2" class="edge dimmable" d="M390,90 L470,60"/>
+        <path id="rs-e3" class="edge dash dimmable" d="M390,140 L470,180"/>
+        <path id="rs-e4" class="edge dash dimmable" d="M600,90 L600,150"/>
+        <g id="rs-app" class="node dimmable" transform="translate(10,80)"><rect width="140" height="80" rx="12"/><text x="70" y="30">🧩 App</text><text x="70" y="54" class="lbl mono" id="rsApp">reads+writes</text></g>
+        <g id="rs-route" class="node dimmable" transform="translate(230,70)"><rect width="160" height="100" rx="12"/><text x="80" y="30">🧭 Shard router</text><text x="80" y="54" class="lbl mono" id="rsRoute">3 → old</text><text x="80" y="74" class="lbl">config / lookup table</text></g>
+        <g id="rs-old" class="node dimmable" transform="translate(470,20)"><rect width="260" height="80" rx="12"/><text x="130" y="28">🗄️ shard 3 (old)</text><text x="130" y="54" class="lbl mono" id="rsOld">100% of keys</text></g>
+        <g id="rs-new" class="node dimmable" transform="translate(470,150)"><rect width="260" height="90" rx="12"/><text x="130" y="28">🗄️ shard 3a + 3b (new)</text><text x="130" y="54" class="lbl mono" id="rsNew">empty</text><text x="130" y="74" class="lbl mono" id="rsNew2"></text></g>
+      </svg>
+    </div>
+    <div class="stepper" id="rsStep" data-diagram="rsSvg">
+      <ol class="steps">
+        <li data-title="Add a routing layer you can change" data-on="rs-app rs-route rs-e1" data-packet="rs-app>rs-route">If the app computes <code>shard = hash(key) % N</code> in code, you're stuck. Route through a <b>lookup table or config service</b> (Vitess, a shard map in etcd) so ownership can change at runtime, per key range, without a deploy.</li>
+        <li data-title="Create the new shards and dual-write" data-on="rs-route rs-old rs-new rs-e2 rs-e3" data-packet="rs-route>rs-old,rs-route>rs-new" data-color="var(--amber)">Writes for the affected range go to <b>both</b> old and new (or the new shard follows the old one via replication/CDC — Chapter 17). Reads still come from the old shard. Everything is reversible at this point.</li>
+        <li data-title="Backfill history" data-on="rs-old rs-new rs-e4" data-packet="rs-old>rs-new" data-color="var(--accent-2)">A throttled background job copies existing rows in batches, tracking a cursor and pausing when replication lag or CPU rises. This is the slow part — days for terabytes — and it must be resumable.</li>
+        <li data-title="Verify continuously" data-on="rs-old rs-new">A comparison job samples (and eventually sweeps) rows on both sides, comparing checksums. Any mismatch is a bug in the dual-write path — find it <b>before</b> cutover, not after.</li>
+        <li data-title="Shift reads gradually" data-on="rs-route rs-new rs-e3" data-packet="rs-route>rs-new" data-color="var(--green)">Move 1% → 10% → 50% → 100% of reads to the new shards, comparing results and latency. Any problem: flip back instantly, because the old shard is still being written.</li>
+        <li data-title="Cut over writes, then clean up" data-on="rs-route rs-new" data-color="var(--green)">Flip writes to the new shards (a brief per-key freeze — usually milliseconds — guarantees ordering), keep dual-writing in reverse for a safety window, then stop, drop the old range and reclaim the space.</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">🔥</div><h4>The hot shard</h4><p>One celebrity, one huge tenant or one popular key can saturate a shard while others idle. Fixes: <b>split that key</b> with a suffix (<code>post:42#0…#9</code>) and merge on read, cache it in front, give the tenant a dedicated shard, or rate-limit per key.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧮</div><h4>Pre-split into many shards</h4><p>Create, say, 1,024 <b>logical</b> shards on day one and map many of them onto each physical machine. Growth then means <i>moving</i> logical shards, never rehashing keys. This is how Vitess, Citus and most large fleets avoid painful resplits.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🧭</div><h4>Cross-shard queries</h4><p>Anything that needs data from all shards (reports, global search, joins) becomes scatter-gather — slow and fragile. Serve those from a <b>derived store</b> instead: a search index or warehouse fed by CDC (Chapters 10, 16, 17).</p></div>
+  </div>
+  <div class="callout warn"><div class="ico">🧊</div><div class="body"><div class="title">Choose the shard key like it's permanent</div><p>Because it nearly is. A good key spreads load evenly, keeps data that's read together on one shard, and avoids monotonic values (timestamps or auto-increment IDs put every new write on the last shard). Getting it wrong means the migration above — plan for it once, then live with it.</p></div></div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Sharding too early.</b> It's a one-way door that breaks joins, transactions and operations. Exhaust vertical scaling, read replicas and caching first.</li>
+      <li><b>Choosing a monotonic shard key.</b> Timestamps or auto-increment IDs put every new write on the last shard — an instant hot spot.</li>
+      <li><b>Forgetting replication lag in the product.</b> “Post then refresh shows nothing” is a design bug, not a database quirk; route read-your-writes to the primary or track the log position.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Design:</b> Pick a shard key for a multi-tenant SaaS where 1% of tenants hold 60% of the data.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div><code>tenant_id</code> keeps each tenant's data together so queries and transactions stay single-shard — but the giant tenants break balance. So: pre-split into many logical shards mapped onto physical nodes, give the largest tenants dedicated shards, and for the very biggest, sub-shard by <code>(tenant_id, bucket)</code> where bucket is derived from a secondary key. Say explicitly that you'd monitor per-shard traffic, because the imbalance will move over time.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Operate:</b> You must double the shard count with no downtime. Walk me through it.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Route through a shard map rather than <code>hash % N</code> in code. Then: create the new shards, dual-write the affected key ranges (or replicate via CDC), backfill history in throttled batches with a resumable cursor, run a continuous checksum comparison, shift reads gradually (1% → 100%) while writes still go to both, and finally cut over writes with a brief per-key freeze. Keep the old data until verification passes, then drop it.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Replication = copies for availability and read scaling; sharding = splits for write and storage scaling.</li>
+      <li>Async replication is fast but can lose acknowledged writes on failover; sync is safe but slow and fragile.</li>
+      <li>Replica lag breaks read-your-writes and monotonic reads — route reads carefully.</li>
+      <li>Leaderless systems use quorums; W + R &gt; N guarantees overlap between reads and writes.</li>
+      <li>Range sharding enables range scans but risks hot spots; hash sharding spreads load evenly.</li>
+      <li>Consistent hashing moves only ~1/N of keys when servers change; virtual nodes even out load.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+    <div class="quiz" data-answer="2">
+      <p class="q">A user updates their profile, refreshes, and sees the old version. Reads go to async replicas. Best targeted fix?</p>
+      <div class="opts"><button class="opt">Make all replication synchronous</button><button class="opt">Add more replicas</button><button class="opt">Read that user's own profile from the leader for a short time after they write</button><button class="opt">Increase the cache TTL</button></div>
+      <div class="explain">Read-your-writes consistency only needs to apply to the writer's own data, so route just those reads to the leader.</div>
+    </div>
+    <div class="quiz" data-answer="1">
+      <p class="q">N = 5 replicas. Which configuration guarantees reads see the latest write?</p>
+      <div class="opts"><button class="opt">W = 2, R = 2</button><button class="opt">W = 3, R = 3</button><button class="opt">W = 1, R = 3</button><button class="opt">W = 2, R = 1</button></div>
+      <div class="explain">Need W + R &gt; N: 3 + 3 = 6 &gt; 5. The others sum to 5 or less, so read and write sets can miss each other.</div>
+    </div>
+    <div class="quiz" data-answer="0">
+      <p class="q">You shard an events table by <code>created_at</code> ranges. What happens?</p>
+      <div class="opts"><button class="opt">All new writes hit the newest shard, creating a hot spot</button><button class="opt">Load is perfectly even</button><button class="opt">Range queries become impossible</button><button class="opt">Consistent hashing kicks in automatically</button></div>
+      <div class="explain">Time is monotonic, so “now” always falls in the last range. Prefix with a hashed key (e.g. device_id) to spread writes.</div>
+    </div>
+    <div class="quiz" data-answer="3">
+      <p class="q">Your cache cluster uses <code>hash(key) % N</code>. You add one server to 9. Roughly what fraction of cache lookups now miss?</p>
+      <div class="opts"><button class="opt">~10%</button><button class="opt">~1%</button><button class="opt">0%</button><button class="opt">~90%</button></div>
+      <div class="explain">Changing N from 9 to 10 changes the modulo result for about 9/10 of keys. With consistent hashing, only ~1/10 move.</div>
+    </div>
+    <div class="quiz" data-answer="1">
+      <p class="q">What problem do virtual nodes solve in consistent hashing?</p>
+      <div class="opts"><button class="opt">They encrypt keys</button><button class="opt">Uneven arc sizes → uneven load; many virtual points per server even it out</button><button class="opt">They make range queries possible</button><button class="opt">They remove the need for replication</button></div>
+      <div class="explain">A few random points give lumpy arcs. Hundreds of points per server average out, and weights can give bigger servers more points.</div>
+    </div>
+  </div>
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, svg, sleep, rand } = SD;
+
+  /* ================= Replication lab ================= */
+  const R = $('#repSvg'), repLog = $('#repLog');
+  const POS = [ [250, 120, 180, 100], [580, 10, 250, 96], [580, 122, 250, 96], [580, 234, 250, 96] ];
+  let nodes, nextVal, stale, lost, leaderIdx, busyFailover;
+  function resetRep() {
+    nodes = POS.map((p, i) => ({ i, name: i ? `Replica ${i}` : 'Node 0', log: [], dead: false, pos: p, lagMul: [0, 1, 1.35, 1.8][i] }));
+    nodes[0].name = 'Node 0'; nodes[1].name = 'Node 1'; nodes[2].name = 'Node 2'; nodes[3].name = 'Node 3';
+    leaderIdx = 0; nextVal = 1; stale = 0; lost = 0; busyFailover = false;
+    $('#repStale').textContent = 0; $('#repLost').textContent = 0; $('#repLat').textContent = '–';
+    repLog.innerHTML = ''; SD.log(repLog, 'Cluster ready. Node 0 is the leader.', 'acc');
+    drawRep();
+  }
+  const center = n => [n.pos[0] + n.pos[2] / 2, n.pos[1] + n.pos[3] / 2];
+  function drawRep() {
+    R.innerHTML = '';
+    const L = nodes[leaderIdx];
+    const cg = svg('g', { class: 'node', id: 'rep-client' }, R);
+    svg('rect', { x: 20, y: 130, width: 120, height: 80, rx: 12 }, cg);
+    svg('text', { x: 80, y: 162, text: '📱 Client' }, cg);
+    svg('text', { x: 80, y: 186, class: 'lbl', text: 'writes → leader' }, cg);
+    const [lx, ly] = center(L);
+    svg('line', { x1: 140, y1: 170, x2: L.pos[0], y2: ly, class: 'edge' }, R);
+    nodes.forEach(n => { if (n !== L) { const [x, y] = center(n); svg('line', { x1: L.pos[0] + L.pos[2], y1: ly, x2: n.pos[0], y2: y, class: 'edge dash' }, R); } });
+    nodes.forEach(n => {
+      const [x, y, w, h] = n.pos;
+      const isL = n === L;
+      const g = svg('g', { class: 'node' + (n.dead ? ' dead' : '') + (isL ? ' leader' : '') }, R);
+      n.g = g;
+      svg('rect', { x, y, width: w, height: h, rx: 12 }, g);
+      svg('text', { x: x + 14, y: y + 22, text: `${isL ? '👑' : '📄'} ${n.name}`, style: 'text-anchor:start;font-size:13.5px' }, g);
+      svg('text', { x: x + w - 12, y: y + 22, class: 'lbl', text: n.dead ? '💀 DOWN' : isL ? 'LEADER' : 'follower', style: `text-anchor:end;font-weight:700;fill:${n.dead ? 'var(--red)' : isL ? 'var(--accent)' : 'var(--muted)'}` }, g);
+      const val = n.log.length ? n.log[n.log.length - 1] : '∅';
+      svg('text', { x: x + 14, y: y + 50, text: `x = ${val}`, class: 'mono', style: 'text-anchor:start;font-size:16px;font-weight:800' }, g);
+      const cells = svg('g', { class: 'log-cells' }, g);
+      const last = n.log.slice(-8);
+      last.forEach((v, k) => {
+        const cx = x + 14 + k * 27;
+        svg('rect', { x: cx, y: y + h - 30, width: 23, height: 20, rx: 4, fill: 'var(--accent-soft)', stroke: 'var(--accent)', 'stroke-width': 1 }, cells);
+        svg('text', { x: cx + 11.5, y: y + h - 19, text: v, style: 'text-anchor:middle;dominant-baseline:middle;fill:var(--accent)' }, cells);
+      });
+    });
+  }
+  const lag = () => +$('#lagR').value;
+  $('#lagR').addEventListener('input', () => $('#lagO').textContent = (lag() / 1000).toFixed(1) + ' s');
+  $('#lagO').textContent = (lag() / 1000).toFixed(1) + ' s';
+  $('#repMode').addEventListener('segchange', resetRep);
+  $('#repReset').onclick = resetRep;
+  function replicate(from, to, v) {
+    return new Promise(async res => {
+      await sleep(Math.max(0, lag() * to.lagMul - 500));
+      if (from.dead) return res(false);
+      const [fx, fy] = center(from), [tx, ty] = center(to);
+      await SD.packet(R, from.pos[0] + from.pos[2], fy, to.pos[0], ty, { dur: 500, r: 5, label: 'x=' + v, color: 'var(--accent-2)' });
+      if (to.dead || from.dead) return res(false);
+      to.log.push(v); drawRep(); res(true);
+    });
+  }
+  $('#repWrite').onclick = async () => {
+    const L = nodes[leaderIdx];
+    if (L.dead || busyFailover) { SD.toast('No leader available right now!'); return; }
+    const v = nextVal++, t0 = performance.now();
+    const [lx, ly] = center(L);
+    await SD.packet(R, 140, 170, L.pos[0], ly, { dur: 400, r: 6, label: 'x=' + v });
+    if (L.dead) return;
+    L.log.push(v); drawRep();
+    const mode = $('#repMode').dataset.value;
+    const followers = nodes.filter(n => n !== L && !n.dead);
+    const reps = followers.map(f => replicate(L, f, v));
+    if (mode === 'sync') await Promise.all(reps);
+    else if (mode === 'semi') await Promise.race(reps.length ? reps : [Promise.resolve()]);
+    const ms = performance.now() - t0 - 400;
+    await SD.packet(R, L.pos[0], ly, 140, 170, { dur: 350, r: 5, color: 'var(--green)', label: 'OK' });
+    $('#repLat').textContent = Math.max(3, Math.round(ms)) + ' ms';
+    SD.log(repLog, `✍️ x=${v} acknowledged after ${Math.max(3, Math.round(ms))}ms (${mode === 'async' ? 'no follower acks awaited' : mode === 'semi' ? '1 follower ack' : 'all followers acked'})`, 'ok');
+  };
+  $('#repRead').onclick = async () => {
+    const L = nodes[leaderIdx];
+    const fs = nodes.filter(n => n !== L && !n.dead);
+    if (!fs.length) return;
+    const f = fs[Math.floor(Math.random() * fs.length)];
+    const [fx, fy] = center(f);
+    await SD.packet(R, 140, 170, f.pos[0], fy, { dur: 500, r: 5, color: 'var(--amber)', label: 'read' });
+    const val = f.log.length ? f.log[f.log.length - 1] : '∅';
+    const latest = L.log.length ? L.log[L.log.length - 1] : '∅';
+    await SD.packet(R, f.pos[0], fy, 140, 170, { dur: 450, r: 5, color: val === latest ? 'var(--green)' : 'var(--red)', label: 'x=' + val });
+    if (val !== latest) { stale++; $('#repStale').textContent = stale; SD.log(repLog, `📖 ${f.name} returned x=${val}, but the leader has x=${latest} → STALE READ`, 'warn'); }
+    else SD.log(repLog, `📖 ${f.name} returned x=${val} (up to date)`, 'ok');
+  };
+  $('#repKill').onclick = async () => {
+    const L = nodes[leaderIdx];
+    if (L.dead || busyFailover) return;
+    L.dead = true; busyFailover = true; drawRep();
+    SD.log(repLog, `💥 ${L.name} (leader) crashed! Followers stop receiving heartbeats…`, 'bad');
+    await sleep(1500);
+    const cands = nodes.filter(n => !n.dead);
+    if (!cands.length) { SD.log(repLog, 'No nodes left.', 'bad'); return; }
+    const best = cands.reduce((a, b) => b.log.length > a.log.length ? b : a);
+    const lostVals = L.log.filter(v => !best.log.includes(v));
+    leaderIdx = best.i;
+    [best.pos, L.pos] = [L.pos, best.pos];
+    cands.forEach(n => { if (n !== best) n.log = best.log.slice(); }); // followers resync to new leader
+    lost += lostVals.length; $('#repLost').textContent = lost;
+    SD.log(repLog, `🗳️ Election: ${best.name} has the most complete log → promoted to leader.`, 'acc');
+    if (lostVals.length) SD.log(repLog, `☠️ Writes x=${lostVals.join(', x=')} were acknowledged to the client but never replicated — LOST.`, 'bad');
+    else SD.log(repLog, '✅ No acknowledged writes were lost.', 'ok');
+    busyFailover = false; drawRep();
+  };
+  resetRep();
+
+  /* ================= Quorum ================= */
+  const qSvg = $('#qSvg');
+  let qState = null;
+  function qSync() {
+    const N = +$('#qN').value;
+    ['qW', 'qR'].forEach(id => { const el = $('#' + id); el.max = N; if (+el.value > N) el.value = N; });
+    const W = +$('#qW').value, Rr = +$('#qR').value;
+    $('#qNO').textContent = N; $('#qWO').textContent = W; $('#qRO').textContent = Rr;
+    const ok = W + Rr > N;
+    const v = $('#qVerdict');
+    v.style.background = ok ? 'var(--green-soft)' : 'var(--red-soft)'; v.style.color = ok ? 'var(--green)' : 'var(--red)';
+    v.textContent = ok ? `W + R = ${W + Rr} > ${N} ✓ read and write sets always overlap — no stale reads` : `W + R = ${W + Rr} ≤ ${N} ✕ a read can miss every node that got the write`;
+    $('#qTolW').textContent = `${N - W} node${N - W === 1 ? '' : 's'}`;
+    $('#qStale').textContent = '–';
+    qState = null; qDraw();
+  }
+  function qDraw(written = [], read = []) {
+    qSvg.innerHTML = '';
+    const N = +$('#qN').value, cx = 160, cy = 150, rad = N === 1 ? 0 : 105;
+    svg('text', { x: cx, y: cy + 4, text: 'coordinator', class: 'lbl', 'text-anchor': 'middle' }, qSvg);
+    for (let i = 0; i < N; i++) {
+      const a = -Math.PI / 2 + i / N * Math.PI * 2, x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      const has = written.includes(i), rd = read.includes(i);
+      svg('line', { x1: cx, y1: cy, x2: x, y2: y, class: 'edge', opacity: .4 }, qSvg);
+      svg('circle', { cx: x, cy: y, r: 30, fill: has ? 'var(--green)' : 'var(--surface-3)', stroke: rd ? 'var(--accent)' : 'var(--border-strong)', 'stroke-width': rd ? 5 : 1.5 }, qSvg);
+      svg('text', { x, y: y + 1, text: has ? 'v2' : 'v1', 'text-anchor': 'middle', 'dominant-baseline': 'middle', style: `fill:${has ? '#fff' : 'var(--text)'}` }, qSvg);
+    }
+  }
+  const pickK = (n, k) => { const a = [...Array(n).keys()]; for (let i = n - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a.slice(0, k); };
+  ['qN', 'qW', 'qR'].forEach(id => $('#' + id).addEventListener('input', qSync));
+  $('#qOnce').onclick = async () => {
+    const N = +$('#qN').value, W = +$('#qW').value, Rr = +$('#qR').value;
+    const w = pickK(N, W); qDraw(w, []); await sleep(700);
+    const r = pickK(N, Rr); qDraw(w, r);
+    const fresh = r.some(i => w.includes(i));
+    SD.toast(fresh ? '✓ Read found v2 (latest)' : '✕ Stale read: every queried node had v1');
+  };
+  $('#qMany').onclick = () => {
+    const N = +$('#qN').value, W = +$('#qW').value, Rr = +$('#qR').value; let st = 0;
+    for (let t = 0; t < 1000; t++) { const w = pickK(N, W), r = pickK(N, Rr); if (!r.some(i => w.includes(i))) st++; }
+    $('#qStale').textContent = (st / 10).toFixed(1) + '%';
+  };
+  qSync();
+
+  /* ================= Sharding strategies ================= */
+  const FREQ = { A:3.5,B:9,C:8,D:5,E:2,F:3.5,G:5,H:7,I:.5,J:2,K:3,L:5,M:9,N:2,O:1.5,P:5,Q:.3,R:5.5,S:10,T:3.5,U:.5,V:1.5,W:6,X:.1,Y:.8,Z:.5 };
+  const LET = Object.keys(FREQ), TOT = Object.values(FREQ).reduce((a, b) => a + b, 0);
+  const SYL = ['son','ton','ley','er','man','ford','well','ski','ez','an','ing','ly'];
+  const randName = () => { let r = Math.random() * TOT, L = 'A'; for (const k of LET) { r -= FREQ[k]; if (r <= 0) { L = k; break; } } return L + 'abcdefghijklmnoprstuvw'[Math.floor(Math.random() * 22)] + SYL[Math.floor(Math.random() * SYL.length)] + Math.floor(Math.random() * 1000); };
+  const fnv = s => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); } return h >>> 0; };
+  let users = [];
+  const rangeShard = n => { const c = n[0]; return c <= 'F' ? 0 : c <= 'L' ? 1 : c <= 'R' ? 2 : 3; };
+  // directory: greedy balance letters by expected frequency
+  const DIR = {}; (() => { const load = [0, 0, 0, 0]; LET.slice().sort((a, b) => FREQ[b] - FREQ[a]).forEach(L => { const i = load.indexOf(Math.min(...load)); DIR[L] = i; load[i] += FREQ[L]; }); })();
+  const shardOf = (n, s) => s === 'range' ? rangeShard(n) : s === 'hash' ? fnv(n) % 4 : DIR[n[0]];
+  const SH_DESC = {
+    range: '<b>Range:</b> Shard 0 = A–F, 1 = G–L, 2 = M–R, 3 = S–Z. Real surnames are skewed (lots of S, M, B, C; few Q, X, Z), so shards fill unevenly.',
+    hash: '<b>Hash:</b> <code>fnv(name) % 4</code>. Hashing scrambles the alphabet, so shards are nearly equal — but neighbouring names now live on different shards.',
+    dir: '<b>Directory:</b> a lookup table assigns each first letter to a shard, chosen to balance load: ' + [0,1,2,3].map(i => `S${i}=${LET.filter(l => DIR[l] === i).join('')}`).join(' · '),
+  };
+  function shRender() {
+    const s = $('#shSeg').dataset.value || 'range';
+    $('#shDesc').innerHTML = SH_DESC[s];
+    const counts = [0, 0, 0, 0]; users.forEach(u => counts[shardOf(u, s)]++);
+    const max = Math.max(...counts), min = Math.min(...counts);
+    const top = Math.max(max, users.length / 2);
+    $('#shBars').innerHTML = counts.map((c, i) => `<div class="sb"><b>${c}</b><i style="height:${c / top * 130}px;background:${c === max && max > min * 1.4 ? 'var(--red)' : 'linear-gradient(var(--accent),var(--accent-2))'}"></i><span>Shard ${i}</span></div>`).join('');
+    $('#shSkew').textContent = (max / Math.max(1, min)).toFixed(2) + '×';
+    const rangeShards = new Set(users.filter(u => u[0] === 'M' || u[0] === 'N').map(u => shardOf(u, s)));
+    $('#shRange').textContent = s === 'hash' ? `scatter to ${rangeShards.size} shards` : `${rangeShards.size} shard${rangeShards.size === 1 ? '' : 's'}`;
+  }
+  $('#shSeg').addEventListener('segchange', shRender);
+  $('#shAdd').onclick = () => { for (let i = 0; i < 1000; i++) users.push(randName()); shRender(); };
+  for (let i = 0; i < 1000; i++) users.push(randName());
+  shRender();
+
+  /* ================= Consistent hashing ring ================= */
+  const ring = $('#ringSvg'), CX = 210, CY = 210, RAD = 160;
+  const COLORS = ['#8b7dff', '#22d3ee', '#f472b6', '#fbbf24', '#34d399', '#fb923c', '#60a5fa', '#e879f9'];
+  const NAMES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+  let servers = ['A', 'B', 'C'], prevOwner = null, prevServers = null, lastMoved = null;
+  const H32 = 4294967296;
+  const ang = h => h / H32 * Math.PI * 2 - Math.PI / 2;
+  const pt = (h, r) => [CX + r * Math.cos(ang(h)), CY + r * Math.sin(ang(h))];
+  function points() {
+    const vn = +$('#vnR').value, arr = [];
+    servers.forEach(s => { for (let v = 0; v < vn; v++) arr.push({ s, h: fnv(`${s}#vn${v}`) }); });
+    return arr.sort((a, b) => a.h - b.h);
+  }
+  const keyList = () => [...Array(+$('#keysR').value)].map((_, i) => ({ k: 'key' + i, h: fnv('user:' + i * 7919) }));
+  function ownerOf(h, pts) { for (const p of pts) if (p.h >= h) return p.s; return pts[0].s; }
+  function ringRender(changed) {
+    const pts = points(), keys = keyList();
+    const owner = {}; keys.forEach(k => owner[k.k] = ownerOf(k.h, pts));
+    ring.innerHTML = '';
+    svg('circle', { cx: CX, cy: CY, r: RAD, fill: 'none', stroke: 'var(--border-strong)', 'stroke-width': 2 }, ring);
+    // ownership arcs
+    pts.forEach((p, i) => {
+      const prev = pts[(i - 1 + pts.length) % pts.length];
+      let a0 = prev.h, a1 = p.h; if (pts.length === 1) { a0 = p.h + 1; }
+      const [x0, y0] = pt(a0, RAD), [x1, y1] = pt(a1, RAD);
+      let span = (a1 - a0 + H32) % H32; if (pts.length === 1) span = H32 - 1;
+      const large = span > H32 / 2 ? 1 : 0;
+      svg('path', { d: `M${x0},${y0} A${RAD},${RAD} 0 ${large} 1 ${x1},${y1}`, fill: 'none', stroke: COLORS[NAMES.indexOf(p.s)], 'stroke-width': 10, opacity: .55 }, ring);
+    });
+    // keys
+    let moved = 0;
+    keys.forEach(k => {
+      const [x, y] = pt(k.h, RAD - 22);
+      const mv = changed && prevOwner && prevOwner[k.k] !== owner[k.k];
+      if (mv) moved++;
+      const c = svg('circle', { cx: x, cy: y, r: mv ? 6 : 3.2, fill: COLORS[NAMES.indexOf(owner[k.k])], stroke: mv ? 'var(--text)' : 'none', 'stroke-width': 1.5 }, ring);
+      if (mv) setTimeout(() => { c.setAttribute('r', 3.6); }, 1400);
+    });
+    // server points
+    const vn = +$('#vnR').value;
+    pts.forEach(p => {
+      const [x, y] = pt(p.h, RAD);
+      svg('circle', { cx: x, cy: y, r: vn > 10 ? 4 : 11, fill: COLORS[NAMES.indexOf(p.s)], stroke: 'var(--surface)', 'stroke-width': 2 }, ring);
+      if (vn <= 10) svg('text', { x, y: y + 1, text: p.s, style: 'font-size:11px;font-weight:800;fill:#fff;text-anchor:middle;dominant-baseline:middle' }, ring);
+    });
+    svg('text', { x: CX, y: CY - 8, text: '🌀 hash ring', 'text-anchor': 'middle', style: 'font-weight:700' }, ring);
+    svg('text', { x: CX, y: CY + 14, class: 'lbl', 'text-anchor': 'middle', text: `${servers.length} servers · ${keys.length} keys` }, ring);
+    svg('text', { x: CX, y: CY + 32, class: 'lbl', 'text-anchor': 'middle', text: 'key → next server clockwise ↻' }, ring);
+    // stats
+    if (changed && prevServers) {
+      const modMoved = keys.filter(k => prevServers[k.h % prevServers.length] !== servers[k.h % servers.length]).length;
+      $('#movC').textContent = `${moved} (${Math.round(moved / keys.length * 100)}%)`;
+      $('#movM').textContent = `${modMoved} (${Math.round(modMoved / keys.length * 100)}%)`;
+    }
+    const counts = {}; servers.forEach(s => counts[s] = 0); keys.forEach(k => counts[owner[k.k]]++);
+    const ideal = keys.length / servers.length, mx = Math.max(...Object.values(counts));
+    $('#ringBars').innerHTML = servers.map(s => `<div class="row"><span>Server ${s}</span><div class="tr"><i style="width:${counts[s] / mx * 100}%;background:${COLORS[NAMES.indexOf(s)]}"></i></div><span>${counts[s]}</span></div>`).join('');
+    $('#ringImb').textContent = (mx / ideal).toFixed(2) + '×';
+    $('#ringImb').style.color = mx / ideal > 1.5 ? 'var(--red)' : mx / ideal > 1.2 ? 'var(--amber)' : 'var(--green)';
+    prevOwner = owner; prevServers = servers.slice();
+  }
+  $('#ringAdd').onclick = () => { if (servers.length >= 8) return SD.toast('Max 8 servers in this demo'); const n = NAMES.find(x => !servers.includes(x)); servers.push(n); ringRender(true); SD.toast(`Added server ${n}`); };
+  $('#ringRemove').onclick = () => { if (servers.length <= 1) return; const n = servers.splice(Math.floor(Math.random() * servers.length), 1)[0]; ringRender(true); SD.toast(`Removed server ${n} — its keys moved to neighbours`); };
+  $('#vnR').addEventListener('input', () => { $('#vnO').textContent = $('#vnR').value + ' / server'; prevOwner = null; ringRender(false); $('#movC').textContent = '–'; $('#movM').textContent = '–'; });
+  $('#keysR').addEventListener('input', () => { $('#keysO').textContent = $('#keysR').value; prevOwner = null; ringRender(false); });
+  $('#vnO').textContent = '1 / server'; $('#keysO').textContent = $('#keysR').value;
+  ringRender(false);
+})();
+</script>
+<script>
+(function(){
+  const { $ } = SD;
+  $('#rsStep').addEventListener('step', e => {
+    const i = e.detail.index;
+    $('#rsApp').textContent = i < 0 ? 'reads+writes' : i < 4 ? 'reads: old' : i < 5 ? 'reads: mixed' : 'reads+writes: new';
+    $('#rsRoute').textContent = i < 1 ? '3 → old' : i < 4 ? '3 → old (+dual write)' : i < 5 ? '3 → 10% new' : '3a/3b → new ✓';
+    $('#rsOld').textContent = i < 5 ? '100% of keys' : 'read-only → dropped';
+    $('#rsNew').textContent = i < 1 ? 'empty' : i < 2 ? 'new writes only' : i < 3 ? 'backfilling…' : 'complete copy ✓';
+    $('#rsNew2').textContent = i === 3 ? 'checksums match ✓' : '';
+    $('#rs-new').classList.toggle('ok', i >= 3);
+    $('#rs-old').classList.toggle('warn', i >= 5);
+  });
+})();
+</script>
+</body>
+</html>

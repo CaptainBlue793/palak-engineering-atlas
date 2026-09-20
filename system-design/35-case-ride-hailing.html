@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Ride Hailing</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('sd-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .step-banner { display:flex; gap:10px; align-items:center; margin:60px 0 -40px; }
+  .step-banner span { font-family:var(--mono); font-size:12px; font-weight:800; color:#fff; background:linear-gradient(90deg,var(--pink),var(--accent)); padding:4px 10px; border-radius:8px; }
+  .req-list { display:grid; gap:8px; }
+  .req { display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); font-size:14.5px; }
+  .req .chk { flex:none; width:20px; height:20px; border-radius:6px; background:var(--green); color:#fff; display:grid; place-items:center; font-size:12px; font-weight:800; }
+  #map { background:var(--surface-2); border-radius:14px; cursor:crosshair; }
+  .fsm { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:10px; }
+  .fsm .s { font-family:var(--mono); font-size:12px; font-weight:700; padding:6px 10px; border-radius:9px; background:var(--surface-2); border:1.5px solid var(--border-strong); }
+  .fsm .s.on { border-color:var(--accent); background:var(--accent-soft); color:var(--accent); }
+  .fsm .ar { color:var(--muted); }
+</style>
+</head>
+<body data-chapter="35">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 35</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Design <span class="grad">Ride Hailing</span></h1>
+    <p class="lead">Uber, Lyft, Grab, Bolt: press a button and a stranger's car arrives in four minutes. Under the hood this is a real-time matching market — millions of vehicles streaming their location every few seconds, riders appearing anywhere, and a matching engine that must pair them in seconds without ever assigning the same driver twice.</p>
+    <ul class="objectives">
+      <li>Ingest a firehose of location updates without melting a database</li>
+      <li>Index moving objects geospatially and search nearby</li>
+      <li>Compare greedy and batched matching strategies</li>
+      <li>Guarantee a driver is assigned to exactly one trip</li>
+      <li>Model the trip lifecycle as a state machine with events</li>
+      <li>Compute surge pricing and ETAs</li>
+    </ul>
+  </section>
+
+  <div class="step-banner"><span>STEP 1 / 6</span></div>
+  <h2>Requirements</h2>
+  <div class="split">
+    <div><h4 class="mt0">🛠️ Functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span>Drivers go online and stream their location</span></div>
+      <div class="req"><span class="chk">✓</span><span>Riders request a ride from A to B and see nearby cars, price and ETA</span></div>
+      <div class="req"><span class="chk">✓</span><span>System matches rider ↔ driver; either side can cancel</span></div>
+      <div class="req"><span class="chk">✓</span><span>Live tracking during pickup and trip; fare charged at the end</span></div>
+      <div class="req"><span class="chk">✓</span><span>Out of scope here: payments internals (Chapter 37), pooling, food delivery</span></div>
+    </div></div>
+    <div><h4 class="mt0">📏 Non-functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span><b>Match within a few seconds</b>; location freshness ~5 s</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>A driver is never assigned two trips</b> — this one needs strong consistency</span></div>
+      <div class="req"><span class="chk">✓</span><span>Survive flaky mobile networks and tunnels</span></div>
+      <div class="req"><span class="chk">✓</span><span>Highly available per city; a failure in one city must not affect others</span></div>
+    </div></div>
+  </div>
+
+  <div class="step-banner"><span>STEP 2 / 6</span></div>
+  <h2>Estimate the scale</h2>
+  <div class="stats">
+    <div class="stat"><div class="k">Online drivers at peak</div><div class="v">1M</div></div>
+    <div class="stat bad"><div class="k">Location updates</div><div class="v">250K/s <small>every 4 s</small></div></div>
+    <div class="stat"><div class="k">Per update</div><div class="v">~100 B <small>→ 25 MB/s</small></div></div>
+    <div class="stat acc"><div class="k">Ride requests peak</div><div class="v">~5K/s</div></div>
+    <div class="stat warn"><div class="k">If every ping were a DB write</div><div class="v">21B rows/day</div></div>
+    <div class="stat good"><div class="k">Live state in memory</div><div class="v">~100 MB <small>1M × ~100 B</small></div></div>
+  </div>
+  <p style="margin-top:16px">The key insight: <b>current driver locations are tiny and disposable</b>. A million drivers' latest positions fit in memory on a single machine — replicated and sharded for availability, not capacity. Writing every ping to a durable database would be 250K writes/second of data nobody queries. Keep the hot state in memory, and stream the history to analytics storage asynchronously.</p>
+
+  <div class="step-banner"><span>STEP 3 / 6</span></div>
+  <h2>High-level design</h2>
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">From driver ping to matched trip</span><span class="p-tag">Step-through</span></div>
+    <div class="panel-body svg-scroll">
+      <svg id="rSvg" class="diagram" viewBox="0 0 900 380">
+        <path id="r-e1" class="edge dimmable" d="M130,60 L200,60"/>
+        <path id="r-e2" class="edge dimmable" d="M340,60 L410,60"/>
+        <path id="r-e3" class="edge dash dimmable" d="M340,90 L410,190"/>
+        <path id="r-e4" class="edge dimmable" d="M130,300 L200,300"/>
+        <path id="r-e5" class="edge dimmable" d="M340,300 L560,300"/>
+        <path id="r-e6" class="edge dimmable" d="M550,120 L550,270"/>
+        <path id="r-e7" class="edge dimmable" d="M700,290 L760,220"/>
+        <path id="r-e8" class="edge dimmable" d="M700,310 L760,340"/>
+        <path id="r-e9" class="edge dash dimmable" d="M620,270 L620,130"/>
+        <g id="r-d" class="node dimmable" transform="translate(10,30)"><rect width="120" height="60" rx="12"/><text x="60" y="26">🚗 Driver app</text><text x="60" y="44" class="lbl">GPS every 4 s</text></g>
+        <g id="r-gw" class="node dimmable" transform="translate(200,30)"><rect width="140" height="60" rx="12"/><text x="70" y="26">📡 Location gw</text><text x="70" y="44" class="lbl">WebSocket</text></g>
+        <g id="r-geo" class="node dimmable" transform="translate(410,20)"><rect width="140" height="90" rx="12"/><text x="70" y="26">🗺️ Geo index</text><text x="70" y="48" class="lbl">in-memory, sharded</text><text x="70" y="68" class="lbl mono" id="rGeo">by cell</text></g>
+        <g id="r-k" class="node dimmable" transform="translate(410,160)"><rect width="140" height="60" rx="12"/><text x="70" y="26">📬 Kafka</text><text x="70" y="44" class="lbl">trajectories</text></g>
+        <g id="r-r" class="node dimmable" transform="translate(10,270)"><rect width="120" height="60" rx="12"/><text x="60" y="26">🧍 Rider app</text><text x="60" y="44" class="lbl">request ride</text></g>
+        <g id="r-api" class="node dimmable" transform="translate(200,270)"><rect width="140" height="60" rx="12"/><text x="70" y="26">🚪 Trip API</text><text x="70" y="44" class="lbl">quote · request</text></g>
+        <g id="r-m" class="node dimmable" transform="translate(560,270)"><rect width="140" height="80" rx="12"/><text x="70" y="26">🎯 Matcher</text><text x="70" y="48" class="lbl mono" id="rM">idle</text></g>
+        <g id="r-eta" class="node dimmable" transform="translate(560,90)"><rect width="140" height="60" rx="12"/><text x="70" y="24">🛣️ ETA / routing</text><text x="70" y="42" class="lbl">road graph</text></g>
+        <g id="r-trip" class="node dimmable" transform="translate(760,180)"><rect width="130" height="70" rx="12"/><text x="65" y="26">🗄️ Trip store</text><text x="65" y="46" class="lbl mono" id="rTrip">–</text></g>
+        <g id="r-push" class="node dimmable" transform="translate(760,310)"><rect width="130" height="60" rx="12"/><text x="65" y="24">🔔 Push</text><text x="65" y="42" class="lbl">offer to driver</text></g>
+      </svg>
+    </div>
+    <div class="stepper" id="rStep" data-diagram="rSvg">
+      <ol class="steps">
+        <li data-title="Drivers stream location" data-on="r-d r-gw r-geo r-e1 r-e2" data-packet="r-d>r-gw,r-gw>r-geo">Each driver app holds a <b>WebSocket</b> to a gateway and sends <code>{driver_id, lat, lng, heading, status}</code> every ~4 s (less often when stationary, batched when the network is bad). The gateway updates the in-memory geo index: “driver 812 is now in cell 9q8yy”.</li>
+        <li data-title="History goes to the stream, not the DB" data-on="r-gw r-k r-e3" data-packet="r-gw>r-k" data-color="var(--accent-2)">The same ping is published to Kafka for analytics, ETA model training, driver pay auditing and incident reconstruction — none of which are on the critical path.</li>
+        <li data-title="Rider requests a ride" data-on="r-r r-api r-e4" data-packet="r-r>r-api">The Trip API creates a trip in <code>REQUESTED</code> state (idempotency key from the client prevents duplicate requests on retry) and asks the matcher for a driver.</li>
+        <li data-title="Find candidates nearby" data-on="r-api r-m r-geo r-e5 r-e9" data-packet="r-m>r-geo,r-geo>r-m" data-color="var(--amber)">The matcher queries the geo index for available drivers in the rider's cell <b>and its neighbours</b> (Chapter 10), expanding the radius if too few are found.</li>
+        <li data-title="Rank by real ETA, not straight-line distance" data-on="r-m r-eta r-e6" data-packet="r-m>r-eta,r-eta>r-m" data-color="var(--amber)">A driver 200 m away across a river may be 10 minutes out. The routing service scores candidates by <b>road-network ETA with live traffic</b>, plus driver rating, vehicle type and acceptance history.</li>
+        <li data-title="Offer, with exclusivity" data-on="r-m r-trip r-push r-e7 r-e8" data-packet="r-m>r-trip,r-m>r-push" data-color="var(--green)">The best driver is <b>atomically reserved</b> (compare-and-set on driver status: <code>AVAILABLE → OFFERED</code>) so no other match can grab them, and a push offer with a 15-second timeout goes out. On decline or timeout, the reservation is released and the next candidate is offered.</li>
+        <li data-title="Accepted → live trip" data-on="r-trip r-r r-d" data-packet="r-trip>r-r" data-color="var(--green)">The trip moves to <code>ACCEPTED</code>; both apps subscribe to live updates; the driver's location is now streamed to the rider until drop-off, when fare calculation and payment kick off (Chapter 37).</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="step-banner"><span>STEP 4 / 6</span></div>
+  <h2>Deep dive: matching</h2>
+  <p>Greedy matching answers each request instantly with the nearest car. <b>Batched</b> matching waits a couple of seconds, collects several riders and drivers, and solves the assignment globally — which produces shorter pickups overall because it can avoid “nearest-first” mistakes. Uber found batching reduces both wait times and driver idle miles.</p>
+
+  <div class="panel" id="mapPanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Dispatch lab — click the map to hail a ride</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <div class="seg" id="mMode"><button data-v="greedy" class="active">⚡ Greedy (match instantly)</button><button data-v="batch">🧮 Batch every 2 s</button></div>
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="mSurge" style="accent-color:var(--accent)"> Show surge heatmap</label>
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="mCells" checked style="accent-color:var(--accent)"> Show geo cells searched</label>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="mRider">🧍 Add a rider</button>
+        <button class="btn sm" id="mRush">🎉 Concert lets out (12 riders in one area)</button>
+        <button class="btn sm" id="mDrivers">🚗 +10 drivers</button>
+        <button class="btn sm" id="mReset">↺ Reset</button>
+      </div>
+      <div class="split" style="grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr);margin-top:10px">
+        <svg id="map" viewBox="0 0 400 400"></svg>
+        <div>
+          <div class="stats" style="margin-top:0;grid-template-columns:1fr 1fr">
+            <div class="stat acc"><div class="k">Avg pickup ETA</div><div class="v" id="mEta">–</div></div>
+            <div class="stat"><div class="k">Matched</div><div class="v" id="mMatched">0</div></div>
+            <div class="stat warn"><div class="k">Waiting riders</div><div class="v" id="mWait">0</div></div>
+            <div class="stat good"><div class="k">Available drivers</div><div class="v" id="mAvail">–</div></div>
+            <div class="stat"><div class="k">Driver utilization</div><div class="v" id="mUtil">–</div></div>
+            <div class="stat bad"><div class="k">Peak surge</div><div class="v" id="mSurge2">1.0×</div></div>
+          </div>
+          <div class="legend" style="margin-top:10px"><span><i style="background:var(--green)"></i>available</span><span><i style="background:var(--amber)"></i>en route to pickup</span><span><i style="background:var(--accent)"></i>on trip</span><span><i style="background:var(--pink)"></i>waiting rider</span></div>
+          <div class="log" id="mLog" style="margin-top:10px;height:130px"></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel-foot">🧪 Trigger the concert rush in both modes. Greedy assigns each rider to whoever is nearest at that instant — sometimes stealing a car that was much closer to the next rider. Batching considers the whole set and lowers the <b>average</b> pickup time. Turn on the heatmap to see surge rise where demand outruns supply.</div>
+  </div>
+
+  <h2>Deep dive: never double-assign a driver</h2>
+  <p>Most of this system is happily eventually consistent — a location a second out of date is fine. But <b>driver assignment is a uniqueness constraint</b>, and two riders getting the same car is a serious failure. Options, in increasing order of coordination:</p>
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">🔄</div><h4>Conditional update (best)</h4><p>Reserve with a compare-and-set: <code>UPDATE drivers SET status='OFFERED', trip_id=:t WHERE id=:d AND status='AVAILABLE'</code>. Zero rows updated = someone else got there first. One atomic operation, no locks held across network calls.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🔐</div><h4>Lease + fencing</h4><p>If the reservation spans multiple services, take a short <b>lease</b> with a fencing token (Chapter 17) so a paused matcher can't resurrect a stale assignment.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🧵</div><h4>Single-writer per region</h4><p>Route all matching for a city (or geo cell) through one matcher instance/partition — like a Kafka partition consumer. Serializing decisions per region removes races entirely and keeps latency low.</p></div>
+  </div>
+
+  <h2>Deep dive: the trip state machine</h2>
+  <p>Every trip is a small, strictly ordered state machine. Transitions are driven by events from two phones on unreliable networks, so every transition must be <b>idempotent and validated</b> — “already in this state” returns success, and illegal transitions are rejected.</p>
+  <div class="panel">
+    <div class="panel-body">
+      <div class="fsm" id="fsm"></div>
+      <div class="controls">
+        <button class="btn sm primary" id="fsNext">▶ Next event</button>
+        <button class="btn sm" id="fsCancel">✖️ Rider cancels</button>
+        <button class="btn sm" id="fsDup">🔁 Replay the last event (duplicate)</button>
+        <button class="btn sm" id="fsReset">↺ Reset</button>
+      </div>
+      <div class="log" id="fsLog" style="margin-top:10px;height:120px"></div>
+    </div>
+    <div class="panel-foot">Each transition writes to the trip store <b>and</b> an outbox (Chapter 17) so downstream services — pricing, payments, notifications, analytics — react reliably without the matcher calling them synchronously.</div>
+  </div>
+
+  <div class="step-banner"><span>STEP 5 / 6</span></div>
+  <h2>Deep dive: surge pricing & ETAs</h2>
+  <div class="grid c2">
+    <div class="card feature reveal"><div class="f-ico">📈</div><h4>Surge</h4><p>Divide the city into hexagons (<b>H3</b>, Chapter 10). A streaming job computes open requests vs available drivers per hex in a short window (Chapter 18). When demand outruns supply, a multiplier rises — dampening demand and pulling drivers toward the area. Smooth it across neighbouring hexes and over time so prices don't flicker, and cap it during emergencies.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🛣️</div><h4>ETA & routing</h4><p>A road graph with live traffic-weighted edges. Precomputation (contraction hierarchies) answers shortest paths in microseconds; ML models correct raw route times using historical pickup data. ETAs are needed for ranking candidates, showing arrival times and pricing — so this service is queried far more than it is updated.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">📍</div><h4>Map matching</h4><p>Raw GPS is noisy (urban canyons, tunnels). Snap points to the road network with a hidden Markov model so the rider sees a car on the road, and distance-based fares are computed from matched paths, not GPS jitter.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">📶</div><h4>Flaky networks</h4><p>Phones buffer location updates offline and send them in batches with original timestamps. Apps must tolerate duplicate and out-of-order events; critical actions (accept, start trip, end trip) carry idempotency keys and are retried until acknowledged.</p></div>
+  </div>
+
+  <div class="step-banner"><span>STEP 6 / 6</span></div>
+  <h2>Wrap-up: scaling and isolation</h2>
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">🏙️</div><h4>Shard by city</h4><p>Rides are inherently local: a rider in Berlin never matches a driver in Cairo. Run an independent stack (matcher, geo index, trip store) per city or metro — a natural <b>cell architecture</b> (Chapter 22) that bounds blast radius and lets you deploy city by city.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧠</div><h4>Hot-partition care</h4><p>Airports and stadiums concentrate demand in one cell. Use finer cells where density is high (quadtree-style), and shard matchers by cell rather than only by city.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🛟</div><h4>Degrade gracefully</h4><p>If the ETA service is down, fall back to straight-line distance. If surge computation fails, default to 1.0×. If the geo index shard is lost, rebuild it in seconds from the next round of driver pings — it's disposable state.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Writing every GPS ping to the primary database.</b> It's disposable state — keep current locations in memory and stream history elsewhere.</li>
+      <li><b>Matching on straight-line distance.</b> A driver across a river is not nearby; rank by routing ETA.</li>
+      <li><b>Assigning drivers without an atomic reservation.</b> Two matchers will pick the same car within milliseconds of each other.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Design:</b> How do you find “available drivers near me” in 20 ms, for a city with 100K drivers?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Keep live positions in an in-memory geospatial index sharded by city, keyed by geohash/H3 cell. A query reads the rider's cell plus neighbours (expanding if too few candidates), which is a handful of hash lookups. Filter by status and vehicle type in memory, then rank the top candidates by routing ETA — the expensive call — rather than scoring everyone. The index is rebuilt from the next round of pings if a shard dies, so it needs no durability.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Reason:</b> Where in this system do you actually need strong consistency, and where not?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Driver assignment needs it — a seat-like uniqueness constraint where double-assignment is a real-world failure — so use a conditional update, a lease with fencing, or a single writer per region. Almost everything else is fine eventually consistent: locations are stale by design, surge multipliers are approximations, trip history and analytics can lag. Being explicit about that boundary is what keeps the hot path fast.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Keep live driver locations in memory (sharded, replicated) and stream history to Kafka instead of writing every ping to a database.</li>
+      <li>Index moving objects with geohash/H3 cells and search the rider's cell plus neighbours, expanding as needed.</li>
+      <li>Rank candidates by road-network ETA, not straight-line distance.</li>
+      <li>Batch matching over a short window beats greedy matching on average pickup time.</li>
+      <li>Driver assignment needs strong consistency: use conditional updates, leases with fencing, or a single writer per region.</li>
+      <li>Model trips as validated, idempotent state machines and publish transitions via an outbox.</li>
+      <li>Shard by city for isolation; handle hot cells with finer partitioning; degrade gracefully when subsystems fail.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+    <div class="quiz" data-answer="1">
+      <p class="q">Why not store every driver location update in the primary database?</p>
+      <div class="opts"><button class="opt">Databases can't store coordinates</button><button class="opt">250K writes/s of data that's obsolete in 4 seconds would dominate the database for no benefit; current state belongs in memory</button><button class="opt">It would violate GDPR</button><button class="opt">Kafka can't handle it</button></div>
+      <div class="explain">Only the latest position matters for matching, and it's small. History goes to a stream for asynchronous consumers.</div>
+    </div>
+    <div class="quiz" data-answer="2">
+      <p class="q">Two matcher instances pick the same driver for different riders at the same moment. Best prevention?</p>
+      <div class="opts"><button class="opt">Retry one of the requests later</button><button class="opt">Use eventual consistency and fix it afterwards</button><button class="opt">Atomic compare-and-set on the driver's status (or a single writer per region)</button><button class="opt">Increase the offer timeout</button></div>
+      <div class="explain">A conditional update makes exactly one matcher win; the loser moves to its next candidate immediately.</div>
+    </div>
+    <div class="quiz" data-answer="0">
+      <p class="q">Why rank nearby drivers by routing ETA instead of straight-line distance?</p>
+      <div class="opts"><button class="opt">Physical proximity can mean a long drive — rivers, one-way streets, highways and traffic</button><button class="opt">Straight-line distance is expensive to compute</button><button class="opt">Drivers prefer longer trips</button><button class="opt">Geohash cells don't store coordinates</button></div>
+      <div class="explain">The rider experiences arrival time, not distance. Geo search narrows candidates; ETA ranks them.</div>
+    </div>
+    <div class="quiz" data-answer="3">
+      <p class="q">A driver's phone loses signal in a tunnel and later sends 8 buffered location updates at once, out of order. What should the system do?</p>
+      <div class="opts"><button class="opt">Reject them all</button><button class="opt">Overwrite current state with the last message received</button><button class="opt">Disconnect the driver</button><button class="opt">Use the event timestamps: keep the newest for live state, and accept the rest for the trajectory stream</button></div>
+      <div class="explain">Event-time handling (Chapter 18) keeps live state correct while preserving history for analytics and fares.</div>
+    </div>
+    <div class="quiz" data-answer="1">
+      <p class="q">Why shard the whole stack by city?</p>
+      <div class="opts"><button class="opt">Cities have different languages</button><button class="opt">Matching is inherently local, so each city can run as an isolated cell — limiting blast radius and avoiding cross-shard queries</button><button class="opt">To reduce storage costs</button><button class="opt">Because geohashes only work per city</button></div>
+      <div class="explain">Locality of the workload maps perfectly onto cell-based isolation and independent scaling per market.</div>
+    </div>
+  </div>
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, svg } = SD;
+
+  /* ================= Step labels ================= */
+  $('#rStep').addEventListener('step', e => {
+    const i = e.detail.index;
+    $('#rGeo').textContent = i < 1 ? 'by cell' : 'cell 9q8yy: 41 cars';
+    $('#rM').textContent = i < 3 ? 'idle' : i < 4 ? 'searching cells' : i < 5 ? 'scoring by ETA' : i < 6 ? 'offer → driver 812' : 'matched ✓';
+    $('#rTrip').textContent = i < 2 ? '–' : i < 5 ? 'REQUESTED' : i < 6 ? 'OFFERED' : 'ACCEPTED ✓';
+    $('#r-trip').classList.toggle('ok', i >= 6);
+  });
+
+  /* ================= Dispatch lab ================= */
+  const map = $('#map'), N = 400, CELL = 50, GRID = N / CELL;
+  let W, visible = false, tick = 0;
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  function mkDriver() { return { x: rnd(10, 390), y: rnd(10, 390), vx: rnd(-1, 1), vy: rnd(-1, 1), st: 'free' }; }
+  function reset() {
+    W = { drivers: Array.from({ length: 24 }, mkDriver), riders: [], batch: [], matched: 0, etaSum: 0, lastCells: null, surgePeak: 1, id: 1 };
+    $('#mLog').innerHTML = '';
+    draw();
+  }
+  const cellOf = p => [Math.floor(p.x / CELL), Math.floor(p.y / CELL)];
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const etaOf = d => d / 40 * 3 + 1; // ~3 min per 40px + 1 min pickup overhead
+  function candidates(rider) {
+    const [cx, cy] = cellOf(rider), cells = [];
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) { const x = cx + dx, y = cy + dy; if (x >= 0 && y >= 0 && x < GRID && y < GRID) cells.push([x, y]); }
+    W.lastCells = cells;
+    let cands = W.drivers.filter(d => d.st === 'free' && cells.some(([x, y]) => { const [dx2, dy2] = cellOf(d); return dx2 === x && dy2 === y; }));
+    if (!cands.length) cands = W.drivers.filter(d => d.st === 'free'); // expand radius
+    return cands;
+  }
+  function assign(rider, driver) {
+    // atomic reservation: only one rider can take a free driver
+    if (driver.st !== 'free') return false;
+    driver.st = 'pickup'; driver.target = rider; rider.driver = driver;
+    const eta = etaOf(dist(driver, rider));
+    W.matched++; W.etaSum += eta;
+    SD.log($('#mLog'), `✓ rider ${rider.id} matched — ETA ${eta.toFixed(1)} min`, 'ok');
+    return true;
+  }
+  function greedy(rider) {
+    const c = candidates(rider).sort((a, b) => dist(a, rider) - dist(b, rider));
+    if (!c.length) return false;
+    return assign(rider, c[0]);
+  }
+  function batchMatch() {
+    const waiting = W.riders.filter(r => !r.driver);
+    if (!waiting.length) return;
+    const free = W.drivers.filter(d => d.st === 'free');
+    if (!free.length) return;
+    // global greedy over all (rider, driver) pairs sorted by distance — approximates the optimal assignment
+    const pairs = [];
+    waiting.forEach(r => free.forEach(d => pairs.push([dist(d, r), r, d])));
+    pairs.sort((a, b) => a[0] - b[0]);
+    const usedR = new Set(), usedD = new Set();
+    pairs.forEach(([, r, d]) => { if (usedR.has(r) || usedD.has(d)) return; if (assign(r, d)) { usedR.add(r); usedD.add(d); } });
+    SD.log($('#mLog'), `🧮 batch solved ${usedR.size} assignments over ${waiting.length} riders × ${free.length} drivers`, 'acc');
+  }
+  function addRider(x, y) {
+    const r = { x: x ?? rnd(10, 390), y: y ?? rnd(10, 390), id: W.id++, at: tick };
+    W.riders.push(r);
+    if ($('#mMode').dataset.value === 'greedy') { if (!greedy(r)) SD.log($('#mLog'), `⏳ rider ${r.id} waiting — no free driver nearby`, 'warn'); }
+    draw();
+  }
+  function surge() {
+    const cells = {};
+    W.riders.filter(r => !r.driver).forEach(r => { const k = cellOf(r).join(','); cells[k] = cells[k] || { d: 0, s: 0 }; cells[k].d++; });
+    W.drivers.filter(d => d.st === 'free').forEach(d => { const k = cellOf(d).join(','); cells[k] = cells[k] || { d: 0, s: 0 }; cells[k].s++; });
+    const out = {};
+    let peak = 1;
+    Object.entries(cells).forEach(([k, v]) => { const m = Math.min(3, 1 + Math.max(0, v.d - v.s) * 0.35); out[k] = m; peak = Math.max(peak, m); });
+    W.surgePeak = peak;
+    return out;
+  }
+  function step() {
+    tick++;
+    W.drivers.forEach(d => {
+      if (d.st === 'free') {
+        d.x += d.vx; d.y += d.vy;
+        if (d.x < 5 || d.x > 395) d.vx *= -1; if (d.y < 5 || d.y > 395) d.vy *= -1;
+        if (Math.random() < .02) { d.vx = rnd(-1, 1); d.vy = rnd(-1, 1); }
+      } else if (d.target) {
+        const t = d.target, dx = t.x - d.x, dy = t.y - d.y, dd = Math.hypot(dx, dy);
+        if (dd < 3) {
+          if (d.st === 'pickup') { d.st = 'trip'; W.riders = W.riders.filter(r => r !== t); d.target = { x: rnd(10, 390), y: rnd(10, 390) }; }
+          else { d.st = 'free'; d.target = null; d.vx = rnd(-1, 1); d.vy = rnd(-1, 1); }
+        } else { d.x += dx / dd * 2.2; d.y += dy / dd * 2.2; }
+      }
+    });
+    if ($('#mMode').dataset.value === 'batch' && tick % 20 === 0) batchMatch();
+    if (tick % 45 === 0) addRider();
+  }
+  function draw() {
+    map.innerHTML = '';
+    const sg = $('#mSurge').checked ? surge() : null;
+    for (let x = 0; x < GRID; x++) for (let y = 0; y < GRID; y++) {
+      const m = sg ? (sg[[x, y].join(',')] || 1) : 1;
+      const searched = $('#mCells').checked && W.lastCells && W.lastCells.some(([a, b]) => a === x && b === y);
+      svg('rect', { x: x * CELL, y: y * CELL, width: CELL, height: CELL, fill: m > 1 ? `rgba(220,38,38,${(m - 1) / 2 * .55})` : searched ? 'var(--accent-soft)' : 'transparent', stroke: 'var(--border)', 'stroke-width': .8 }, map);
+      if (sg && m > 1.05) svg('text', { x: x * CELL + CELL / 2, y: y * CELL + CELL / 2, 'text-anchor': 'middle', 'dominant-baseline': 'middle', style: 'font-size:11px;font-weight:800;fill:var(--red)', text: m.toFixed(1) + '×' }, map);
+    }
+    W.riders.forEach(r => { if (!r.driver) svg('text', { x: r.x, y: r.y, 'text-anchor': 'middle', 'dominant-baseline': 'middle', style: 'font-size:15px', text: '🧍' }, map); });
+    W.drivers.forEach(d => {
+      const col = d.st === 'free' ? 'var(--green)' : d.st === 'pickup' ? 'var(--amber)' : 'var(--accent)';
+      if (d.st === 'pickup' && d.target) svg('line', { x1: d.x, y1: d.y, x2: d.target.x, y2: d.target.y, stroke: 'var(--amber)', 'stroke-width': 1, 'stroke-dasharray': '3 3', opacity: .7 }, map);
+      svg('circle', { cx: d.x, cy: d.y, r: 6, fill: col }, map);
+      svg('text', { x: d.x, y: d.y + .5, 'text-anchor': 'middle', 'dominant-baseline': 'middle', style: 'font-size:8px', text: '🚗' }, map);
+    });
+    const waiting = W.riders.filter(r => !r.driver).length, free = W.drivers.filter(d => d.st === 'free').length;
+    $('#mEta').textContent = W.matched ? (W.etaSum / W.matched).toFixed(1) + ' min' : '–';
+    $('#mMatched').textContent = W.matched;
+    $('#mWait').textContent = waiting;
+    $('#mAvail').textContent = `${free} / ${W.drivers.length}`;
+    $('#mUtil').textContent = Math.round((1 - free / W.drivers.length) * 100) + '%';
+    $('#mSurge2').textContent = W.surgePeak.toFixed(1) + '×';
+  }
+  setInterval(() => { if (visible) { step(); draw(); } }, 80);
+  SD.whenVisible($('#mapPanel'), () => visible = true, () => visible = false);
+  map.addEventListener('click', e => { const r = map.getBoundingClientRect(); addRider((e.clientX - r.left) / r.width * 400, (e.clientY - r.top) / r.height * 400); });
+  $('#mRider').onclick = () => addRider();
+  $('#mRush').onclick = () => { const cx = rnd(60, 340), cy = rnd(60, 340); for (let i = 0; i < 12; i++) addRider(SD.clamp(cx + rnd(-35, 35), 5, 395), SD.clamp(cy + rnd(-35, 35), 5, 395)); SD.log($('#mLog'), '🎉 12 ride requests in one area', 'warn'); };
+  $('#mDrivers').onclick = () => { for (let i = 0; i < 10; i++) W.drivers.push(mkDriver()); draw(); };
+  $('#mReset').onclick = reset;
+  $('#mMode').addEventListener('segchange', reset);
+  reset();
+
+  /* ================= Trip state machine ================= */
+  const STATES = ['REQUESTED', 'OFFERED', 'ACCEPTED', 'ARRIVED', 'IN_PROGRESS', 'COMPLETED'];
+  const EVENTS = [['matcher offers driver', 'OFFERED'], ['driver accepts', 'ACCEPTED'], ['driver arrives at pickup', 'ARRIVED'], ['rider on board — trip starts', 'IN_PROGRESS'], ['drop-off — fare computed', 'COMPLETED']];
+  let si = 0, lastEvt = null;
+  function fsRender() {
+    $('#fsm').innerHTML = STATES.map((s, i) => `<span class="s ${i === si ? 'on' : ''}">${s}</span>`).join('<span class="ar">→</span>') + '<span class="ar">·</span><span class="s" id="fsCancelled">CANCELLED</span>';
+  }
+  $('#fsNext').onclick = () => {
+    if (si >= STATES.length - 1) { SD.log($('#fsLog'), '✓ Trip already COMPLETED — terminal state', 'ok'); return; }
+    const [name, to] = EVENTS[si];
+    lastEvt = { name, to, from: STATES[si] };
+    si++; fsRender();
+    SD.log($('#fsLog'), `→ ${name}: ${lastEvt.from} → ${to} · outbox event written`, 'ok');
+  };
+  $('#fsDup').onclick = () => {
+    if (!lastEvt) { SD.log($('#fsLog'), 'No event yet', ''); return; }
+    SD.log($('#fsLog'), `🔁 duplicate “${lastEvt.name}” received — current state is already ${STATES[si]} → 200 OK, no state change, no duplicate outbox event`, 'acc');
+  };
+  $('#fsCancel').onclick = () => {
+    if (si >= 4) { SD.log($('#fsLog'), '✕ Cancel rejected: trip already in progress — illegal transition (rider must use “end trip early”)', 'bad'); return; }
+    SD.log($('#fsLog'), `✖️ CANCELLED from ${STATES[si]} · driver released back to AVAILABLE, cancellation fee evaluated`, 'warn');
+    si = 0; fsRender(); $('#fsCancelled').classList.add('on');
+    setTimeout(() => $('#fsCancelled') && $('#fsCancelled').classList.remove('on'), 1500);
+  };
+  $('#fsReset').onclick = () => { si = 0; lastEvt = null; fsRender(); $('#fsLog').innerHTML = ''; };
+  fsRender();
+})();
+</script>
+</body>
+</html>

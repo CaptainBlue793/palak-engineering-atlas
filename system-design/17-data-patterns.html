@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IDs, Outbox, CDC & Locks</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('sd-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .bits { display:grid; grid-template-columns:repeat(64,1fr); gap:1px; margin:12px 0 6px; }
+  .bits i { height:26px; border-radius:2px; font-style:normal; font-family:var(--mono); font-size:8px; display:grid; place-items:center; color:#fff; }
+  .bits .s { background:var(--muted); } .bits .t { background:var(--accent); } .bits .d { background:var(--pink); } .bits .w { background:var(--amber); } .bits .q { background:var(--green); }
+  @media (max-width:700px){ .bits i { font-size:0; height:20px; } }
+  .idlist { font-family:var(--mono); font-size:12.5px; }
+  .idlist div { padding:4px 8px; border-radius:6px; animation:fadeUp .25s; display:flex; justify-content:space-between; gap:10px; }
+  .idlist div:nth-child(odd) { background:var(--surface-2); }
+  .store-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; margin-top:14px; }
+  .store { border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px; min-height:150px; }
+  .store h5 { margin:0 0 8px; font-size:12.5px; display:flex; justify-content:space-between; align-items:center; }
+  .store.down { border-color:var(--red); background:var(--red-soft); }
+  .rowi { font-family:var(--mono); font-size:11.5px; padding:4px 7px; border-radius:6px; background:var(--surface); border:1px solid var(--border); margin-bottom:5px; animation:fadeUp .25s; }
+  .rowi.pending { border-color:var(--amber); color:var(--amber); }
+  .rowi.sent { opacity:.55; }
+  .rowi.dup { border-color:var(--pink); color:var(--pink); }
+  .rowi.lost { border-color:var(--red); color:var(--red); }
+  .ev-list { display:grid; gap:6px; max-height:260px; overflow:auto; }
+  .ev { display:grid; grid-template-columns:34px 1fr auto; gap:8px; font-family:var(--mono); font-size:12px; padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface); }
+  .ev.future { opacity:.3; }
+  .ev.snap { border-color:var(--accent-2); background:var(--accent-2-soft); }
+  .ev .n { color:var(--muted); }
+  .ev .amt.pos { color:var(--green); } .ev .amt.neg { color:var(--red); }
+</style>
+</head>
+<body data-chapter="17">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 17</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
+    <h1>IDs, Outbox, CDC & <span class="grad">Distributed Locks</span></h1>
+    <p class="lead">Once data lives in more than one place — a database <i>and</i> a queue, a cache, a search index, another service — a handful of small-looking problems become the source of most production bugs. How do you name things uniquely without coordination? How do you update two systems without losing one of the writes? How do you make sure only one worker does a job? This chapter is the toolkit.</p>
+    <ul class="objectives">
+      <li>Generate unique, sortable IDs across many machines (Snowflake, UUIDv7)</li>
+      <li>Understand why dual writes lose data — and fix it with the transactional outbox</li>
+      <li>Use change data capture to feed caches, search and analytics</li>
+      <li>Build idempotent consumers with an inbox/dedupe table</li>
+      <li>Model state as events with event sourcing and CQRS</li>
+      <li>Use leases and fencing tokens so distributed locks are actually safe</li>
+    </ul>
+  </section>
+
+  <h2>Generating unique IDs at scale</h2>
+  <p>A single database hands out <code>1, 2, 3…</code> with an auto-increment column. Shard that database, or create records in 40 services, and auto-increment breaks: two shards both produce ID 1001. You need IDs that are <b>unique without coordination</b>, and ideally <b>roughly time-sortable</b> (so B-tree inserts stay appended at the end and “newest first” is a cheap sort).</p>
+
+  <div class="table-wrap">
+    <table class="t">
+      <thead><tr><th>Approach</th><th>Size</th><th>Sortable by time</th><th>Coordination</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td><b>Auto-increment</b></td><td>64-bit</td><td class="yes">Yes</td><td class="no">Single DB</td><td>Doesn't shard; leaks business volume (order #1043 → you have ~1,000 orders)</td></tr>
+        <tr><td><b>Per-shard ranges / step</b></td><td>64-bit</td><td class="meh">Per shard</td><td class="meh">Config</td><td>Shard 1 uses odd, shard 2 even — adding shards is painful</td></tr>
+        <tr><td><b>Ticket server / range allocation</b></td><td>64-bit</td><td class="meh">Roughly</td><td class="meh">Central, batched</td><td>Services lease blocks of 1,000 IDs; the allocator must be highly available (Flickr, Tinder)</td></tr>
+        <tr><td><b>UUIDv4</b></td><td>128-bit</td><td class="no">No — random</td><td class="yes">None</td><td>Random inserts fragment B-tree indexes and hurt cache locality</td></tr>
+        <tr><td><b>UUIDv7 / ULID</b></td><td>128-bit</td><td class="yes">Yes (ms)</td><td class="yes">None</td><td>Larger than 64-bit; a great modern default</td></tr>
+        <tr><td><b>Snowflake</b></td><td>64-bit</td><td class="yes">Yes (ms)</td><td class="meh">Worker IDs assigned</td><td>Clock going backwards; worker ID collisions</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel" id="sfPanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Snowflake ID generator — 64 bits, no coordination</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="bits" id="sfBits"></div>
+      <div class="legend"><span><i style="background:var(--muted)"></i>1 sign bit</span><span><i style="background:var(--accent)"></i>41 bits · ms since epoch (~69 years)</span><span><i style="background:var(--pink)"></i>5 bits · datacenter</span><span><i style="background:var(--amber)"></i>5 bits · worker</span><span><i style="background:var(--green)"></i>12 bits · sequence (4,096 / ms)</span></div>
+      <div class="controls">
+        <label class="small">Datacenter <select class="inp" id="sfDc"><option value="1">1 · us-east</option><option value="2">2 · eu-west</option><option value="3">3 · ap-south</option></select></label>
+        <label class="small">Worker <select class="inp" id="sfW"><option>7</option><option>12</option><option>31</option></select></label>
+        <button class="btn sm primary" id="sfOne">➕ Generate 1</button>
+        <button class="btn sm" id="sfBurst">💥 Burst 5 in the same ms</button>
+        <button class="btn sm" id="sfClock">⏪ Clock jumps back 2 s</button>
+      </div>
+      <div class="split" style="margin-top:12px">
+        <div><div class="small" style="font-weight:700;margin-bottom:6px">Generated IDs (newest first)</div><div class="idlist" id="sfList"></div></div>
+        <div>
+          <div class="stats" style="margin-top:0;grid-template-columns:1fr 1fr">
+            <div class="stat acc"><div class="k">Timestamp</div><div class="v" id="sfT" style="font-size:14px">–</div></div>
+            <div class="stat"><div class="k">DC · worker</div><div class="v" id="sfDW">–</div></div>
+            <div class="stat good"><div class="k">Sequence</div><div class="v" id="sfSeq">–</div></div>
+            <div class="stat"><div class="k">Sorted = creation order?</div><div class="v" id="sfSorted">–</div></div>
+          </div>
+          <p class="small muted" style="margin-top:10px" id="sfNote">Each worker can mint 4,096 IDs per millisecond — ~4 million per second — with zero network calls.</p>
+        </div>
+      </div>
+    </div>
+    <div class="panel-foot">🧪 Hit <b>Clock jumps back</b>: NTP corrections can move a server's clock backwards. A naive generator would reuse old timestamps and risk duplicates, so real implementations <b>refuse to issue IDs</b> (or wait) until the clock catches up.</div>
+  </div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview answer template</div><p>“I'd use <b>Snowflake-style 64-bit IDs</b>: time-ordered, so they index well and double as a creation timestamp; generated locally, so there's no bottleneck. Worker IDs are assigned from ZooKeeper/etcd or the pod ordinal. If 128 bits are fine, <b>UUIDv7</b> needs no worker assignment at all.” Also: don't expose sequential IDs publicly if they leak business metrics or invite enumeration.</p></div></div>
+
+  <h2>The dual-write problem</h2>
+  <p>A very common piece of code: save an order to the database, then publish <code>OrderPlaced</code> to Kafka so email, analytics and shipping can react. It looks innocent. It's broken.</p>
+<pre class="code"><span class="k">def</span> <span class="f">place_order</span>(order):
+    db.<span class="f">insert</span>(order)                 <span class="c"># ✓ committed</span>
+    <span class="c"># 💥 process crashes / deploy kills pod / network blips here</span>
+    kafka.<span class="f">publish</span>(<span class="s">"OrderPlaced"</span>, order)  <span class="c"># never happens → no email, no shipping</span></pre>
+  <p>Flip the order and it's broken the other way: the event is published, then the DB insert fails, and shipping sends a package for an order that doesn't exist. You can't wrap a Postgres commit and a Kafka publish in one ACID transaction, and 2PC across them is slow and poorly supported (Chapter 13). The fix is to <b>write only once</b>.</p>
+
+  <div class="panel" id="dwPanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Dual write vs transactional outbox — inject failures</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="seg" id="dwMode"><button data-v="dual" class="active">❌ Dual write</button><button data-v="outbox">✅ Transactional outbox</button></div>
+      <div class="controls">
+        <button class="btn sm primary" id="dwOk">🛒 Place order</button>
+        <button class="btn sm" id="dwCrash">💥 Place order, crash after DB commit</button>
+        <button class="btn sm" id="dwKafka">🔌 Toggle Kafka outage</button>
+        <button class="btn sm" id="dwRelayCrash">🔁 Relay crashes after publish</button>
+        <button class="btn sm" id="dwReset">↺ Reset</button>
+      </div>
+      <div class="store-grid">
+        <div class="store"><h5>🗄️ orders table</h5><div id="dwOrders"></div></div>
+        <div class="store" id="dwOutboxBox"><h5>📤 outbox table <span class="badge" id="dwOutboxTag">same transaction</span></h5><div id="dwOutbox"></div></div>
+        <div class="store" id="dwKafkaBox"><h5>📬 Kafka topic <span class="badge" id="dwKafkaTag">up</span></h5><div id="dwTopic"></div></div>
+        <div class="store"><h5>✉️ email service <span class="badge">dedupes by event_id</span></h5><div id="dwEmail"></div></div>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="k">Orders</div><div class="v" id="dwN">0</div></div>
+        <div class="stat good"><div class="k">Emails sent</div><div class="v" id="dwSent">0</div></div>
+        <div class="stat bad"><div class="k">Lost forever</div><div class="v" id="dwLost">0</div></div>
+        <div class="stat warn"><div class="k">Duplicates ignored</div><div class="v" id="dwDup">0</div></div>
+      </div>
+    </div>
+    <div class="panel-foot">🧪 In dual-write mode, crash after commit or take Kafka down — events vanish. Switch to outbox and repeat: events wait in the outbox and are delivered once Kafka recovers. The relay gives <b>at-least-once</b> delivery, so consumers must be idempotent.</div>
+  </div>
+
+  <h2>The transactional outbox</h2>
+  <p>Write the business row <b>and</b> the event into the <b>same database, in the same local transaction</b>. Either both commit or neither does. A separate <b>relay</b> process then reads the outbox and publishes to the broker, retrying until it succeeds.</p>
+<pre class="code"><span class="k">BEGIN</span>;
+  <span class="k">INSERT INTO</span> orders (id, user_id, total, status) <span class="k">VALUES</span> (<span class="g">7321</span>, <span class="g">42</span>, <span class="g">89.00</span>, <span class="s">'PLACED'</span>);
+  <span class="k">INSERT INTO</span> outbox (event_id, aggregate_id, type, payload, created_at)
+       <span class="k">VALUES</span> (<span class="s">'evt_01J…'</span>, <span class="g">7321</span>, <span class="s">'OrderPlaced'</span>, <span class="s">'{"total":89.00,…}'</span>, now());
+<span class="k">COMMIT</span>;   <span class="c">-- atomic: the order and its event exist together, or not at all</span></pre>
+
+  <div class="grid c2">
+    <div class="card"><h4 class="mt0">🔁 Relay option A: polling publisher</h4><p class="small mb0">A worker runs <code>SELECT … FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED</code>, publishes, marks rows sent, and deletes old rows. Simple; adds polling latency and DB load.</p></div>
+    <div class="card"><h4 class="mt0">📜 Relay option B: log tailing (CDC)</h4><p class="small mb0">Debezium reads new outbox rows straight from the database's <b>write-ahead log</b> and publishes them. No polling, low latency, preserves commit order. Rows can be deleted immediately after insert — the log already captured them.</p></div>
+  </div>
+
+  <h2>Change data capture (CDC)</h2>
+  <p>Every serious database already keeps an ordered log of every change for replication: Postgres's WAL, MySQL's binlog, MongoDB's oplog. <strong>CDC</strong> tools subscribe to that log like a replica would and turn each committed insert/update/delete into an event. Your application doesn't need to publish anything at all.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One write, many derived systems</span><span class="p-tag">Step-through</span></div>
+    <div class="panel-body svg-scroll">
+      <svg id="cdcSvg" class="diagram" viewBox="0 0 880 320">
+        <path id="c-e1" class="edge dimmable" d="M140,160 L200,160"/>
+        <path id="c-e2" class="edge dimmable" d="M340,160 L400,160"/>
+        <path id="c-e3" class="edge dimmable" d="M540,160 L600,160"/>
+        <path id="c-e4" class="edge dimmable" d="M720,150 L760,50"/>
+        <path id="c-e5" class="edge dimmable" d="M720,160 L760,130"/>
+        <path id="c-e6" class="edge dimmable" d="M720,170 L760,210"/>
+        <path id="c-e7" class="edge dimmable" d="M720,180 L760,285"/>
+        <g id="c-app" class="node dimmable" transform="translate(10,120)"><rect width="130" height="80" rx="12"/><text x="65" y="30">🧩 App</text><text x="65" y="54" class="lbl">UPDATE product</text></g>
+        <g id="c-db" class="node dimmable" transform="translate(200,110)"><rect width="140" height="100" rx="12"/><text x="70" y="30">🗄️ Postgres</text><text x="70" y="56" class="lbl mono" id="cWal">WAL: …</text></g>
+        <g id="c-dbz" class="node dimmable" transform="translate(400,110)"><rect width="140" height="100" rx="12"/><text x="70" y="30">🔌 Debezium</text><text x="70" y="54" class="lbl">logical replication</text><text x="70" y="72" class="lbl">slot</text></g>
+        <g id="c-k" class="node dimmable" transform="translate(600,110)"><rect width="120" height="100" rx="12"/><text x="60" y="30">📬 Kafka</text><text x="60" y="54" class="lbl mono">products.cdc</text></g>
+        <g id="c-cache" class="node dimmable" transform="translate(760,20)"><rect width="110" height="56" rx="10"/><text x="55" y="28" style="font-size:13px">⚡ Cache</text></g>
+        <g id="c-search" class="node dimmable" transform="translate(760,100)"><rect width="110" height="56" rx="10"/><text x="55" y="28" style="font-size:13px">🔎 Search</text></g>
+        <g id="c-dw" class="node dimmable" transform="translate(760,180)"><rect width="110" height="56" rx="10"/><text x="55" y="28" style="font-size:13px">🏛️ Warehouse</text></g>
+        <g id="c-svc" class="node dimmable" transform="translate(760,258)"><rect width="110" height="56" rx="10"/><text x="55" y="28" style="font-size:13px">🧩 Other svc</text></g>
+      </svg>
+    </div>
+    <div class="stepper" id="cdcStep" data-diagram="cdcSvg">
+      <ol class="steps">
+        <li data-title="The app only writes to its database" data-on="c-app c-db c-e1" data-packet="c-app>c-db"><code>UPDATE products SET price = 79 WHERE id = 5</code>. No Kafka client, no cache-invalidation code, no search sync code in the request path.</li>
+        <li data-title="The change lands in the WAL" data-on="c-db">On commit, Postgres appends the change to its write-ahead log with a monotonically increasing <b>LSN</b> (log sequence number). Committed changes appear in commit order.</li>
+        <li data-title="CDC reads the log like a replica" data-on="c-db c-dbz c-e2" data-packet="c-db>c-dbz" data-color="var(--accent-2)">Debezium holds a <b>replication slot</b> and decodes the change into <code>{op: "u", before: {price: 99}, after: {price: 79}, lsn: …}</code>. It checkpoints its LSN, so after a restart it resumes exactly where it left off.</li>
+        <li data-title="Publish to a partitioned topic" data-on="c-dbz c-k c-e3" data-packet="c-dbz>c-k" data-color="var(--accent-2)">Events are keyed by primary key, so all changes to product 5 land in the same partition — <b>per-row ordering is preserved</b> (Chapter 14).</li>
+        <li data-title="Every derived store follows along" data-on="c-k c-cache c-search c-dw c-svc c-e4 c-e5 c-e6 c-e7" data-packet="c-k>c-cache,c-k>c-search,c-k>c-dw,c-k>c-svc" data-color="var(--green)">Consumers invalidate the cache, re-index the product, append to the warehouse, and update other services' local copies — each at its own pace. Add a new consumer next year and replay from the beginning to backfill.</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="callout warn"><div class="ico">⚠️</div><div class="body"><div class="title">CDC gotchas</div><p><b>Schema changes</b> flow downstream — use a schema registry and compatible evolution. Raw table CDC <b>couples consumers to your internal schema</b>; publishing curated domain events through an outbox table avoids that. And an abandoned replication slot makes Postgres <b>retain WAL forever</b> until the disk fills — monitor slot lag.</p></div></div>
+
+  <h2>Idempotent consumers</h2>
+  <p>Outbox relays, CDC connectors and Kafka consumers all deliver <b>at least once</b>. After a crash or rebalance, the same event will arrive again. Exactly-once <i>effects</i> come from making the consumer idempotent (Chapter 3's idempotency, applied to events).</p>
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">📥</div><h4>Inbox / dedupe table</h4><p>In the same transaction as the side effect: <code>INSERT INTO processed_events(event_id)</code>. A unique-key violation means “already handled — skip”.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧮</div><h4>Naturally idempotent writes</h4><p>Prefer <code>SET status = 'SHIPPED'</code> or upserts over <code>balance = balance + 10</code>. Applying “set” twice is harmless.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🔢</div><h4>Version checks</h4><p>Carry a version or LSN in each event and ignore anything older than what you've stored — handles duplicates <i>and</i> out-of-order delivery.</p></div>
+  </div>
+
+  <h2>Event sourcing</h2>
+  <p>Most systems store <b>current state</b> and overwrite it: <code>balance = 70</code>. <strong>Event sourcing</strong> stores the <b>sequence of facts</b> that happened — <code>Opened, Deposited 100, Withdrew 30</code> — as the source of truth. Current state is derived by replaying events. It's how ledgers, version control and databases' own logs work.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A bank account as an event stream — time-travel through it</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <button class="btn sm" data-ev="dep:100">💵 Deposit $100</button>
+        <button class="btn sm" data-ev="dep:25">💵 Deposit $25</button>
+        <button class="btn sm" data-ev="wd:30">🏧 Withdraw $30</button>
+        <button class="btn sm" data-ev="wd:500">🏧 Withdraw $500</button>
+        <button class="btn sm" id="esSnap">📸 Snapshot</button>
+        <button class="btn sm" id="esReset">↺ Reset</button>
+      </div>
+      <div class="range-row"><label>Replay up to event</label><input type="range" id="esAt" min="0" max="1" value="1"><output id="esAtO"></output></div>
+      <div class="split" style="margin-top:10px">
+        <div><div class="small" style="font-weight:700;margin-bottom:6px">📜 Append-only event store</div><div class="ev-list" id="esList"></div></div>
+        <div>
+          <div class="stats" style="margin-top:0;grid-template-columns:1fr 1fr">
+            <div class="stat acc"><div class="k">Balance at this point</div><div class="v" id="esBal">$0</div></div>
+            <div class="stat"><div class="k">Events replayed</div><div class="v" id="esReplayed">0</div></div>
+            <div class="stat good"><div class="k">Total deposited</div><div class="v" id="esDep">$0</div></div>
+            <div class="stat warn"><div class="k">Rejected commands</div><div class="v" id="esRej">0</div></div>
+          </div>
+          <div class="log" id="esLog" style="margin-top:10px;height:120px"></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel-foot">🧪 Withdraw $500 on an empty account: the <b>command</b> is validated against current state and rejected, so no event is written — events are facts, and facts can't be invalid. Take a snapshot, and later replays start from it instead of event #1.</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h5>Why teams choose it</h5><ul><li>Complete audit trail by construction — required in finance and healthcare</li><li>Time travel: reconstruct state at any moment to debug</li><li>Build brand-new read models later by replaying history</li><li>Events feed other services naturally</li></ul></div>
+    <div class="cons"><h5>What it costs</h5><ul><li>Replays get slow → need snapshots</li><li>Event schemas are forever → versioning and upcasting</li><li>Deleting personal data (GDPR) is hard in an immutable log → crypto-shredding</li><li>Querying current state requires projections → CQRS, eventual consistency</li></ul></div>
+  </div>
+
+  <h2>CQRS: separate models for writes and reads</h2>
+  <p><strong>Command Query Responsibility Segregation</strong> splits the model that handles <b>commands</b> (validate, enforce invariants, write) from one or more models optimized for <b>queries</b>. The write side is normalized and transactional; read sides are denormalized views built from change events — a search index, a Redis leaderboard, a pre-joined “order summary” table.</p>
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">CQRS with projections</span><span class="p-tag">Step-through</span></div>
+    <div class="panel-body svg-scroll">
+      <svg id="cqSvg" class="diagram" viewBox="0 0 860 260">
+        <path id="q-e1" class="edge dimmable" d="M130,70 L220,70"/>
+        <path id="q-e2" class="edge dimmable" d="M380,70 L460,70"/>
+        <path id="q-e3" class="edge dimmable" d="M600,70 L660,50"/>
+        <path id="q-e4" class="edge dimmable" d="M600,80 L660,130"/>
+        <path id="q-e5" class="edge dimmable" d="M130,200 L660,200"/>
+        <g id="q-c" class="node dimmable" transform="translate(10,30)"><rect width="120" height="200" rx="14"/><text x="60" y="40">🧑 Client</text><text x="60" y="70" class="lbl">commands ↗</text><text x="60" y="170" class="lbl">queries ↘</text></g>
+        <g id="q-w" class="node dimmable" transform="translate(220,30)"><rect width="160" height="80" rx="12"/><text x="80" y="30">✍️ Write model</text><text x="80" y="54" class="lbl">validates invariants</text></g>
+        <g id="q-ev" class="node dimmable" transform="translate(460,30)"><rect width="140" height="80" rx="12"/><text x="70" y="30">📜 Events</text><text x="70" y="54" class="lbl">log / outbox</text></g>
+        <g id="q-r1" class="node dimmable" transform="translate(660,20)"><rect width="190" height="60" rx="12"/><text x="95" y="24">📋 Order summary view</text><text x="95" y="44" class="lbl">SQL, denormalized</text></g>
+        <g id="q-r2" class="node dimmable" transform="translate(660,100)"><rect width="190" height="60" rx="12"/><text x="95" y="24">🔎 Search projection</text><text x="95" y="44" class="lbl">Elasticsearch</text></g>
+        <g id="q-rd" class="node dimmable" transform="translate(660,175)"><rect width="190" height="50" rx="12"/><text x="95" y="26">📖 Query API reads views</text></g>
+      </svg>
+    </div>
+    <div class="stepper" data-diagram="cqSvg">
+      <ol class="steps">
+        <li data-title="Command in" data-on="q-c q-w q-e1" data-packet="q-c>q-w"><code>PlaceOrder</code> goes to the write model, which checks stock, credit limits and other invariants in one transaction.</li>
+        <li data-title="Facts out" data-on="q-w q-ev q-e2" data-packet="q-w>q-ev" data-color="var(--accent-2)">On success it emits <code>OrderPlaced</code> (event-sourced, or via the outbox).</li>
+        <li data-title="Projections update asynchronously" data-on="q-ev q-r1 q-r2 q-e3 q-e4" data-packet="q-ev>q-r1,q-ev>q-r2" data-color="var(--green)">Projectors consume events and update each read model, shaped exactly for its screens. Reads and writes scale independently.</li>
+        <li data-title="Queries hit the views" data-on="q-c q-rd q-r1 q-e5" data-packet="q-c>q-rd" data-color="var(--green)">Queries never touch the write model. The trade-off: views lag by milliseconds to seconds. Handle “I just placed an order but don't see it” with read-your-writes tricks: return the new state in the command response, or have the UI wait for the projection to reach the command's version.</li>
+      </ol>
+    </div>
+  </div>
+  <div class="callout warn"><div class="ico">🧯</div><div class="body"><p><b>Don't reach for event sourcing + CQRS by default.</b> They shine in domains with rich business rules, audit needs and many read shapes. For a CRUD settings page, they add a lot of machinery for nothing. CQRS <i>without</i> event sourcing (a DB plus CDC-fed read views) is a much lighter, very common middle ground.</p></div></div>
+
+  <h2>Distributed locks, leases & fencing tokens</h2>
+  <p>Sometimes exactly one worker must do something: run the nightly billing job, process a given file, act as leader. A <b>distributed lock</b> is usually a <b>lease</b>: a lock with a timeout, so a crashed holder doesn't block everyone forever. The classic Redis version:</p>
+<pre class="code"><span class="k">SET</span> lock:billing <span class="s">worker-7:uuid</span> <span class="k">NX PX</span> <span class="g">30000</span>   <span class="c"># acquire only if absent, auto-expire in 30s</span>
+<span class="c"># … do work …</span>
+<span class="c"># release only if we still own it (atomic check-and-delete via Lua)</span>
+<span class="k">if</span> redis.<span class="f">call</span>(<span class="s">"GET"</span>, KEYS[1]) == ARGV[1] <span class="k">then return</span> redis.<span class="f">call</span>(<span class="s">"DEL"</span>, KEYS[1]) <span class="k">end</span></pre>
+  <p>But timeouts create a nasty failure mode. A process can <b>pause</b> for longer than the lease — stop-the-world garbage collection, VM migration, a page fault on a swapped-out process — then wake up <b>still believing it holds the lock</b>.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">The zombie lock holder — and how fencing tokens stop it</span><span class="p-tag">Step-through</span></div>
+    <div class="panel-body svg-scroll">
+      <svg id="fenSvg" class="diagram" viewBox="0 0 860 300">
+        <path id="f-e1" class="edge dimmable" d="M200,70 L330,120"/>
+        <path id="f-e2" class="edge dimmable" d="M200,230 L330,180"/>
+        <path id="f-e3" class="edge dimmable" d="M200,80 L630,120"/>
+        <path id="f-e4" class="edge dimmable" d="M200,220 L630,180"/>
+        <g id="f-a" class="node dimmable" transform="translate(20,30)"><rect width="180" height="80" rx="12"/><text x="90" y="30">⚙️ Worker A</text><text x="90" y="56" class="lbl mono" id="fA">–</text></g>
+        <g id="f-b" class="node dimmable" transform="translate(20,190)"><rect width="180" height="80" rx="12"/><text x="90" y="30">⚙️ Worker B</text><text x="90" y="56" class="lbl mono" id="fB">–</text></g>
+        <g id="f-l" class="node dimmable" transform="translate(330,100)"><rect width="200" height="100" rx="12"/><text x="100" y="30">🔒 Lock service</text><text x="100" y="54" class="lbl">(etcd / ZooKeeper)</text><text x="100" y="78" class="lbl mono" id="fL">free</text></g>
+        <g id="f-s" class="node dimmable" transform="translate(630,90)"><rect width="210" height="120" rx="12"/><text x="105" y="30">🗄️ Storage</text><text x="105" y="58" class="lbl mono" id="fS">file.v = ∅</text><text x="105" y="82" class="lbl mono" id="fS2">max token seen: –</text></g>
+      </svg>
+    </div>
+    <div class="stepper" id="fenStep" data-diagram="fenSvg">
+      <ol class="steps">
+        <li data-title="A acquires the lease — token 33" data-on="f-a f-l f-e1" data-packet="f-a>f-l,f-l>f-a">The lock service grants a 10-second lease and returns a <b>fencing token</b>: a number that increases every time the lock is granted (etcd's revision, ZooKeeper's zxid).</li>
+        <li data-title="A freezes" data-on="f-a">A long GC pause stops Worker A for 15 seconds. It can't renew the lease, and it has no idea time is passing.</li>
+        <li data-title="Lease expires — B gets token 34" data-on="f-b f-l f-e2" data-packet="f-b>f-l,f-l>f-b" data-color="var(--accent-2)">After 10 s the lease expires. Worker B acquires the lock legitimately with token <b>34</b>.</li>
+        <li data-title="B writes with token 34" data-on="f-b f-s f-e4" data-packet="f-b>f-s" data-color="var(--green)">B writes to storage, passing its token. Storage records “highest token seen = 34”.</li>
+        <li data-title="Zombie A wakes up and writes" data-on="f-a f-s f-e3" data-packet="f-a>f-s" data-color="var(--red)">A resumes mid-task, still thinking it holds the lock, and writes with token <b>33</b>. <b>Without fencing</b>, this silently overwrites B's work — two “exclusive” holders, corrupted data.</li>
+        <li data-title="Storage rejects the stale token" data-on="f-s f-a">With fencing, storage checks <code>33 &lt; 34</code> and rejects the write. Safety no longer depends on clocks or pauses. The protected resource itself must enforce this — e.g. <code>UPDATE … WHERE fencing_token &lt; :token</code>.</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="grid c2">
+    <div class="card"><h4 class="mt0">⚡ Locks for efficiency</h4><p class="small mb0">If two workers occasionally doing the same job is merely wasteful (sending a duplicate cache-warming request), a single Redis <code>SET NX PX</code> lock is fine.</p></div>
+    <div class="card"><h4 class="mt0">🛡️ Locks for correctness</h4><p class="small mb0">If double execution corrupts data or double-charges money, use a consensus-backed store (<b>etcd, ZooKeeper, Consul</b>) and <b>fencing tokens</b>. Better still, avoid the lock entirely with database constraints, conditional writes (compare-and-set) or idempotency keys.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Dual writes.</b> Writing to the database and then publishing to a broker will eventually lose events. Use the outbox.</li>
+      <li><b>Assuming a lock makes you safe.</b> A process can pause past its lease; without a fencing token the “exclusive” holder can still write.</li>
+      <li><b>Event sourcing everything.</b> It's powerful for audit-heavy domains and heavy machinery for a settings page.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Design:</b> Keep a search index in sync with Postgres, with no lost updates and no dual writes.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Two good options. CDC: Debezium reads the WAL and publishes row changes to Kafka; the indexer consumes and upserts. Or the outbox: the application writes a curated domain event in the same transaction as the row change, and a relay publishes it. CDC is less code but couples consumers to your table schema; the outbox gives you a stable contract. Either way the indexer must be idempotent and handle out-of-order events with a version check, and a full rebuild from the database must always be possible.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Reason:</b> Two workers both think they hold the lock for a job. How does your storage layer protect itself?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The lock service hands out a monotonically increasing fencing token with each grant. Every write to the protected resource carries the token, and the resource rejects any write whose token is lower than the highest it has seen — <code>UPDATE … WHERE fencing_token &lt; :token</code>. That makes safety independent of clocks, GC pauses and lease timeouts, which can never be made reliable on their own.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Snowflake IDs and UUIDv7 are unique without coordination and time-sortable, which keeps indexes healthy.</li>
+      <li>Writing to a database and a broker separately (dual write) will eventually lose or invent events.</li>
+      <li>The transactional outbox writes the event in the same local transaction; a relay publishes it at least once.</li>
+      <li>CDC turns the database log into an event stream to feed caches, search, warehouses and other services.</li>
+      <li>At-least-once delivery requires idempotent consumers: dedupe tables, upserts or version checks.</li>
+      <li>Event sourcing stores facts and derives state; CQRS separates write invariants from read-optimized views.</li>
+      <li>Distributed locks are leases that can expire under a paused holder — use fencing tokens for correctness.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+    <div class="quiz" data-answer="1">
+      <p class="q">Why are random UUIDv4 primary keys often slower to insert than Snowflake or UUIDv7 IDs?</p>
+      <div class="opts"><button class="opt">UUIDs can't be indexed</button><button class="opt">Random keys insert all over the B-tree, causing page splits and poor cache locality</button><button class="opt">UUIDs require a network call to generate</button><button class="opt">They are always duplicated</button></div>
+      <div class="explain">Time-ordered IDs append near the right edge of the index, keeping hot pages in memory and splits rare.</div>
+    </div>
+    <div class="quiz" data-answer="3">
+      <p class="q">A service commits an order to Postgres and then publishes to Kafka. Sometimes customers never get confirmation emails. Best fix?</p>
+      <div class="opts"><button class="opt">Publish to Kafka first</button><button class="opt">Retry the publish three times</button><button class="opt">Use two-phase commit between Postgres and Kafka</button><button class="opt">Write the event to an outbox table in the same transaction and relay it asynchronously</button></div>
+      <div class="explain">The outbox makes the state change and the event atomic. Retries can't help if the process crashes between the two writes.</div>
+    </div>
+    <div class="quiz" data-answer="0">
+      <p class="q">An outbox relay publishes an event, then crashes before marking it sent. What happens, and what must consumers do?</p>
+      <div class="opts"><button class="opt">The event is published again; consumers must be idempotent</button><button class="opt">The event is lost; consumers must poll the DB</button><button class="opt">Kafka rejects the duplicate automatically</button><button class="opt">The database transaction rolls back</button></div>
+      <div class="explain">Outbox relays provide at-least-once delivery. Dedupe by event ID (inbox table) or make handlers naturally idempotent.</div>
+    </div>
+    <div class="quiz" data-answer="2">
+      <p class="q">In an event-sourced system, how do you get current state quickly once an account has 2 million events?</p>
+      <div class="opts"><button class="opt">Delete old events</button><button class="opt">Replay all events on every request</button><button class="opt">Periodically store snapshots and replay only events after the latest snapshot</button><button class="opt">Switch to UUIDv7</button></div>
+      <div class="explain">Snapshots cap replay cost while keeping the full history for audits and new projections.</div>
+    </div>
+    <div class="quiz" data-answer="1">
+      <p class="q">A worker holding a Redis lock pauses for 40 s (lease 30 s). Another worker takes the lock. What prevents the first worker's late write from corrupting data?</p>
+      <div class="opts"><button class="opt">A longer TTL</button><button class="opt">A monotonically increasing fencing token checked by the storage layer</button><button class="opt">Using NTP on all servers</button><button class="opt">Releasing the lock with DEL</button></div>
+      <div class="explain">Any TTL can be exceeded by a pause. Fencing tokens let the resource reject writes from holders whose lease was superseded.</div>
+    </div>
+  </div>
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, sleep } = SD;
+
+  /* ================= Snowflake ================= */
+  const EPOCH = 1577836800000n; // 2020-01-01
+  let lastTs = -1n, seq = 0n, skew = 0, ids = [];
+  function drawBits(id) {
+    const bin = id.toString(2).padStart(64, '0');
+    $('#sfBits').innerHTML = [...bin].map((b, i) => `<i class="${i === 0 ? 's' : i <= 41 ? 't' : i <= 46 ? 'd' : i <= 51 ? 'w' : 'q'}">${b}</i>`).join('');
+  }
+  function gen() {
+    const now = BigInt(Date.now() + skew);
+    const dc = BigInt($('#sfDc').value), w = BigInt($('#sfW').value);
+    if (now < lastTs) {
+      $('#sfNote').innerHTML = `<b style="color:var(--red)">✕ Clock moved backwards by ${lastTs - now} ms — refusing to generate IDs</b> until the clock passes the last issued timestamp. Issuing now could duplicate an existing ID.`;
+      SD.toast('Clock went backwards — generation paused');
+      return null;
+    }
+    if (now === lastTs) { seq = (seq + 1n) & 4095n; } else { seq = 0n; }
+    lastTs = now;
+    const id = ((now - EPOCH) << 22n) | (dc << 17n) | (w << 12n) | seq;
+    ids.unshift({ id, dc, w, seq, ts: now });
+    ids = ids.slice(0, 8);
+    drawBits(id);
+    $('#sfT').textContent = new Date(Number(now)).toISOString().slice(11, 23);
+    $('#sfDW').textContent = `${dc} · ${w}`;
+    $('#sfSeq').textContent = seq.toString();
+    $('#sfList').innerHTML = ids.map(x => `<div><span>${x.id}</span><span class="muted">dc${x.dc} w${x.w} #${x.seq}</span></div>`).join('');
+    const sorted = ids.every((x, i) => i === 0 || ids[i - 1].id > x.id);
+    $('#sfSorted').textContent = sorted ? '✓ yes' : '✕ no';
+    $('#sfSorted').parentElement.className = 'stat ' + (sorted ? 'good' : 'bad');
+    return id;
+  }
+  $('#sfOne').onclick = () => { if (gen()) $('#sfNote').textContent = 'Each worker can mint 4,096 IDs per millisecond — ~4 million per second — with zero network calls.'; };
+  $('#sfBurst').onclick = () => {
+    // simulate same millisecond by freezing time for the burst
+    const real = Date.now; const t = real();
+    Date.now = () => t;
+    try { for (let i = 0; i < 5; i++) gen(); } finally { Date.now = real; }
+    $('#sfNote').innerHTML = 'Same timestamp, same worker → the <b>12-bit sequence</b> increments (0, 1, 2…) to keep IDs unique. If it overflows past 4,095 within one ms, the generator waits for the next millisecond.';
+  };
+  $('#sfClock').onclick = async () => {
+    skew = -2000; gen();
+    await sleep(2200); skew = 0;
+    if ($('#sfNote').textContent.includes('refusing')) $('#sfNote').innerHTML += ' <b style="color:var(--green)">…Clock caught up — generation resumed.</b>';
+  };
+  gen();
+
+  /* ================= Dual write vs outbox ================= */
+  let st;
+  function dwReset() { st = { n: 0, orders: [], outbox: [], topic: [], emails: [], seen: new Set(), lost: 0, dup: 0, kafkaUp: true, relayCrashNext: false }; dwRender(); }
+  const outboxMode = () => $('#dwMode').dataset.value === 'outbox';
+  function dwRender() {
+    $('#dwOrders').innerHTML = st.orders.map(o => `<div class="rowi ${o.lost ? 'lost' : ''}">#${o.id} PLACED${o.lost ? ' · no event!' : ''}</div>`).join('') || '<div class="small muted">empty</div>';
+    $('#dwOutboxBox').style.opacity = outboxMode() ? 1 : .35;
+    $('#dwOutboxTag').textContent = outboxMode() ? 'same transaction' : 'not used';
+    $('#dwOutbox').innerHTML = st.outbox.map(r => `<div class="rowi ${r.sent ? 'sent' : 'pending'}">evt_${r.id} ${r.sent ? '✓ sent' : '⏳ pending'}</div>`).join('') || '<div class="small muted">empty</div>';
+    $('#dwKafkaBox').classList.toggle('down', !st.kafkaUp);
+    $('#dwKafkaTag').textContent = st.kafkaUp ? 'up' : 'DOWN';
+    $('#dwTopic').innerHTML = st.topic.map(e => `<div class="rowi ${e.dup ? 'dup' : ''}">OrderPlaced evt_${e.id}${e.dup ? ' (again)' : ''}</div>`).join('') || '<div class="small muted">empty</div>';
+    $('#dwEmail').innerHTML = st.emails.map(e => `<div class="rowi ${e.dup ? 'dup' : ''}">${e.dup ? `evt_${e.id} duplicate → skipped` : `📧 sent for #${e.id}`}</div>`).join('') || '<div class="small muted">empty</div>';
+    $('#dwN').textContent = st.orders.length;
+    $('#dwSent').textContent = st.emails.filter(e => !e.dup).length;
+    $('#dwLost').textContent = st.lost;
+    $('#dwDup').textContent = st.dup;
+  }
+  function deliver(id, dup) {
+    st.topic.push({ id, dup });
+    if (st.seen.has(id)) { st.dup++; st.emails.push({ id, dup: true }); }
+    else { st.seen.add(id); st.emails.push({ id, dup: false }); }
+  }
+  function place(crash) {
+    const id = 7300 + (++st.n);
+    if (outboxMode()) {
+      st.orders.push({ id }); st.outbox.push({ id, sent: false });
+      if (crash) SD.toast('💥 Crashed after commit — but the event is safely in the outbox');
+    } else {
+      const o = { id }; st.orders.push(o);
+      if (crash) { o.lost = true; st.lost++; SD.toast('💥 Crashed between DB commit and publish'); }
+      else if (!st.kafkaUp) { o.lost = true; st.lost++; SD.toast('Kafka unreachable — publish failed after the order committed'); }
+      else deliver(id, false);
+    }
+    dwRender();
+  }
+  function relayTick() {
+    if (!outboxMode() || !st.kafkaUp) return;
+    const r = st.outbox.find(x => !x.sent);
+    if (!r) return;
+    deliver(r.id, false);
+    if (st.relayCrashNext) {
+      st.relayCrashNext = false;
+      SD.toast('🔁 Relay crashed before marking the row sent — it will publish again');
+      setTimeout(() => { if (!outboxMode()) return; deliver(r.id, true); r.sent = true; dwRender(); }, 900);
+    } else r.sent = true;
+    dwRender();
+  }
+  setInterval(() => { try { relayTick(); } catch (e) {} }, 900);
+  $('#dwOk').onclick = () => place(false);
+  $('#dwCrash').onclick = () => place(true);
+  $('#dwKafka').onclick = () => { st.kafkaUp = !st.kafkaUp; dwRender(); };
+  $('#dwRelayCrash').onclick = () => {
+    if (!outboxMode()) { SD.toast('Switch to outbox mode — dual write has no relay'); return; }
+    st.relayCrashNext = true; place(false);
+  };
+  $('#dwReset').onclick = dwReset;
+  $('#dwMode').addEventListener('segchange', dwReset);
+  dwReset();
+
+  /* ================= CDC labels ================= */
+  $('#cdcStep').addEventListener('step', e => { $('#cWal').textContent = e.detail.index >= 1 ? 'LSN 0/16B3748 ✓' : 'WAL: …'; });
+
+  /* ================= Event sourcing ================= */
+  let events = [], rejected = 0;
+  const esLog = $('#esLog');
+  function fold(upTo) {
+    // find latest snapshot at or before upTo
+    let start = 0, bal = 0, dep = 0, replayed = 0;
+    for (let i = upTo - 1; i >= 0; i--) if (events[i].type === 'Snapshot') { start = i + 1; bal = events[i].bal; dep = events[i].dep; break; }
+    for (let i = start; i < upTo; i++) {
+      const e = events[i];
+      if (e.type === 'Deposited') { bal += e.amt; dep += e.amt; replayed++; }
+      if (e.type === 'Withdrew') { bal -= e.amt; replayed++; }
+    }
+    return { bal, dep, replayed, fromSnap: start > 0 };
+  }
+  function esRender(keepAt) {
+    const slider = $('#esAt');
+    slider.max = Math.max(1, events.length);
+    if (!keepAt) slider.value = events.length;
+    const at = Math.min(+slider.value, events.length);
+    $('#esAtO').textContent = events.length ? `#${at} of ${events.length}` : 'no events';
+    $('#esList').innerHTML = events.map((e, i) => e.type === 'Snapshot'
+      ? `<div class="ev snap ${i >= at ? 'future' : ''}"><span class="n">#${i + 1}</span><span>📸 Snapshot {balance: ${e.bal}}</span><span></span></div>`
+      : `<div class="ev ${i >= at ? 'future' : ''}"><span class="n">#${i + 1}</span><span>${e.type}</span><span class="amt ${e.type === 'Deposited' ? 'pos' : 'neg'}">${e.type === 'Deposited' ? '+' : '−'}$${e.amt}</span></div>`).join('') || '<div class="small muted">No events yet — the account doesn\'t exist until something happens.</div>';
+    const f = fold(at);
+    $('#esBal').textContent = '$' + f.bal;
+    $('#esReplayed').textContent = f.replayed + (f.fromSnap ? ' +snap' : '');
+    $('#esDep').textContent = '$' + f.dep;
+    $('#esRej').textContent = rejected;
+  }
+  $$('[data-ev]').forEach(b => b.onclick = () => {
+    const [kind, v] = b.dataset.ev.split(':'); const amt = +v;
+    const cur = fold(events.length).bal;
+    if (kind === 'wd' && amt > cur) { rejected++; SD.log(esLog, `✕ Command Withdraw($${amt}) rejected: balance $${cur}. No event written.`, 'bad'); esRender(); return; }
+    events.push({ type: kind === 'dep' ? 'Deposited' : 'Withdrew', amt, at: Date.now() });
+    SD.log(esLog, `✓ Appended ${kind === 'dep' ? 'Deposited' : 'Withdrew'}(${amt}) at version ${events.length}`, 'ok');
+    esRender();
+  });
+  $('#esSnap').onclick = () => { const f = fold(events.length); events.push({ type: 'Snapshot', bal: f.bal, dep: f.dep }); SD.log(esLog, `📸 Snapshot stored at version ${events.length}: balance $${f.bal}`, 'acc'); esRender(); };
+  $('#esReset').onclick = () => { events = []; rejected = 0; esLog.innerHTML = ''; esRender(); };
+  $('#esAt').addEventListener('input', () => esRender(true));
+  esRender();
+
+  /* ================= Fencing labels ================= */
+  $('#fenStep').addEventListener('step', e => {
+    const i = e.detail.index;
+    $('#fA').textContent = i < 0 ? '–' : i === 0 ? 'holds lock · token 33' : i < 4 ? '⏸ GC pause… (thinks: 33)' : i === 4 ? 'writes with token 33' : '✕ rejected — stale';
+    $('#fB').textContent = i < 2 ? '–' : i === 2 ? 'holds lock · token 34' : 'wrote with token 34';
+    $('#fL').textContent = i < 0 ? 'free' : i < 2 ? 'lease: A (token 33)' : 'lease: B (token 34)';
+    $('#fS').textContent = i < 3 ? 'file.v = ∅' : i === 4 ? 'file.v = A\'s data 💥 (no fencing)' : 'file.v = B\'s data';
+    $('#fS2').textContent = i < 3 ? 'max token seen: –' : i === 5 ? 'reject 33 < 34 ✓' : 'max token seen: 34';
+    $('#f-a').classList.toggle('warn', i >= 1 && i <= 3);
+    $('#f-a').classList.toggle('bad', i >= 5);
+    $('#f-s').classList.toggle('bad', i === 4);
+    $('#f-s').classList.toggle('ok', i === 5);
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Ticket Booking</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('sd-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .step-banner { display:flex; gap:10px; align-items:center; margin:60px 0 -40px; }
+  .step-banner span { font-family:var(--mono); font-size:12px; font-weight:800; color:#fff; background:linear-gradient(90deg,var(--pink),var(--accent)); padding:4px 10px; border-radius:8px; }
+  .req-list { display:grid; gap:8px; }
+  .req { display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); font-size:14.5px; }
+  .req .chk { flex:none; width:20px; height:20px; border-radius:6px; background:var(--green); color:#fff; display:grid; place-items:center; font-size:12px; font-weight:800; }
+  .seats { display:grid; grid-template-columns:repeat(20,1fr); gap:3px; margin-top:12px; }
+  .seat { aspect-ratio:1; border-radius:3px; background:var(--surface-3); transition:background .2s; }
+  .seat.held { background:var(--amber); }
+  .seat.sold { background:var(--green); }
+  .seat.double { background:var(--red); animation:shake .4s; }
+  .qroom { position:relative; height:44px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; margin-top:10px; }
+  .qroom i { position:absolute; top:0; bottom:0; left:0; background:linear-gradient(90deg,var(--accent-2),var(--accent)); transition:width .3s; }
+  .qroom span { position:absolute; inset:0; display:grid; place-items:center; font-family:var(--mono); font-weight:800; font-size:13px; }
+  .verdict { margin-top:12px; padding:12px 14px; border-radius:12px; font-weight:700; font-size:13.5px; }
+  .verdict.ok { background:var(--green-soft); color:var(--green); }
+  .verdict.bad { background:var(--red-soft); color:var(--red); }
+  .verdict.idle { background:var(--surface-2); color:var(--muted); }
+</style>
+</head>
+<body data-chapter="36">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 36</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Design <span class="grad">Ticket Booking</span></h1>
+    <p class="lead">Ticketmaster, airline seats, cinema bookings, restaurant tables, conference passes. This system is unusual in this course: it is <b>tiny in data, enormous in contention</b>. Fifty thousand seats, half a million people, and one instant when they all press “buy”. Sell a seat twice and you have an angry customer at a turnstile; sell it zero times and you lost money.</p>
+    <ul class="objectives">
+      <li>Model seats, holds and orders</li>
+      <li>Guarantee no double-booking under extreme concurrency</li>
+      <li>Expire holds correctly without a nightly cleanup job</li>
+      <li>Absorb flash-sale load with a virtual waiting room</li>
+      <li>Keep browsing available while booking is saturated</li>
+      <li>Handle payment failures, bots and fairness</li>
+    </ul>
+  </section>
+
+  <div class="step-banner"><span>STEP 1 / 6</span></div>
+  <h2>Requirements</h2>
+  <div class="split">
+    <div><h4 class="mt0">🛠️ Functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span>Browse events and see a live seat map with availability</span></div>
+      <div class="req"><span class="chk">✓</span><span>Select seats and <b>hold</b> them for ~10 minutes during checkout</span></div>
+      <div class="req"><span class="chk">✓</span><span>Pay; on success the seats become an order with tickets</span></div>
+      <div class="req"><span class="chk">✓</span><span>Support both reserved seating and general admission (a counter)</span></div>
+      <div class="req"><span class="chk">✓</span><span>Waiting room for high-demand on-sales; presale codes</span></div>
+    </div></div>
+    <div><h4 class="mt0">📏 Non-functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span><b>Never double-sell a seat</b> — correctness beats availability here</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Flash sale:</b> 500K users arriving within seconds for 50K seats</span></div>
+      <div class="req"><span class="chk">✓</span><span>Browsing stays up even when booking is at capacity</span></div>
+      <div class="req"><span class="chk">✓</span><span>Fair and bot-resistant access</span></div>
+      <div class="req"><span class="chk">✓</span><span>Seat map freshness within a second or two is fine</span></div>
+    </div></div>
+  </div>
+
+  <div class="step-banner"><span>STEP 2 / 6</span></div>
+  <h2>Estimate the scale</h2>
+  <div class="stats">
+    <div class="stat"><div class="k">Seats for a hot event</div><div class="v">50K</div></div>
+    <div class="stat bad"><div class="k">Users at on-sale</div><div class="v">500K <small>in ~30 s</small></div></div>
+    <div class="stat warn"><div class="k">Seat-map reads</div><div class="v">~2M/s <small>cacheable</small></div></div>
+    <div class="stat acc"><div class="k">Hold attempts</div><div class="v">~50K/s <small>contended writes</small></div></div>
+    <div class="stat good"><div class="k">Successful bookings</div><div class="v">≤ 50K total</div></div>
+    <div class="stat"><div class="k">Data size</div><div class="v">tiny <small>~10 MB per event</small></div></div>
+  </div>
+  <p style="margin-top:16px">The asymmetry is the whole design. <b>Reads are massive but cacheable</b>; <b>writes are small but must be perfectly serialized per seat</b>; and 90% of the arriving traffic is destined to fail because there simply aren't enough seats. A good design rejects that excess load <b>early and politely</b>, instead of letting it reach the database.</p>
+
+  <div class="step-banner"><span>STEP 3 / 6</span></div>
+  <h2>Data model</h2>
+  <div class="split">
+<pre class="code" style="margin:0">seats(event_id, seat_id <span class="k">PK</span>,
+      section, row, number, price_cents,
+      status <span class="k">ENUM</span>(<span class="s">'free'</span>,<span class="s">'held'</span>,<span class="s">'sold'</span>),
+      hold_id, hold_expires_at, version)
+
+holds(hold_id <span class="k">PK</span>, user_id, event_id,
+      seat_ids[], expires_at, state)
+
+orders(order_id <span class="k">PK</span>, user_id, event_id,
+       seat_ids[], amount_cents, state,
+       idempotency_key <span class="k">UNIQUE</span>)
+
+ga_inventory(event_id, tier <span class="k">PK</span>,
+       total, sold)      <span class="c">-- general admission: a counter</span></pre>
+    <div>
+      <p class="small">Everything for one event lives on <b>one shard</b>, keyed by <code>event_id</code>. Events are independent, so this partitions perfectly — and it means a booking transaction never spans shards (Chapter 8).</p>
+      <p class="small">Seat status is <b>derived from holds</b>, so the only durable truth is: a seat is sold, or it has an unexpired hold, or it's free. Storing <code>hold_expires_at</code> on the seat row lets a single conditional UPDATE both take a hold and reclaim an expired one.</p>
+      <div class="callout tip" style="margin:10px 0 0"><div class="ico">🎯</div><div class="body"><p class="small">General admission is much easier: it's a <b>counter</b>, not a set of unique items. <code>UPDATE ga SET sold = sold + 2 WHERE sold + 2 &lt;= total</code> — one row, one atomic check. Reserved seating is harder precisely because each seat is a distinct, non-substitutable item.</p></div></div>
+    </div>
+  </div>
+
+  <div class="step-banner"><span>STEP 4 / 6</span></div>
+  <h2>The core problem: two people, one seat</h2>
+  <p>Ten thousand people click seat H-14 in the same second. Exactly one must win. The naive implementation — read the seat, see it's free, then write — is a textbook race condition, and at this concurrency it fires constantly.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Booking lab — 400 seats, adjustable rush</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="seg" id="bkMode">
+        <button data-v="naive" class="active">❌ Read-then-write</button>
+        <button data-v="cas">✅ Conditional UPDATE (compare-and-set)</button>
+        <button data-v="lock">🔒 SELECT … FOR UPDATE</button>
+        <button data-v="queue">📨 Per-event queue (single writer)</button>
+      </div>
+      <p class="small" id="bkDesc" style="margin:10px 0 0"></p>
+      <div class="range-row"><label>Concurrent buyers per wave</label><input type="range" id="bkConc" min="10" max="400" step="10" value="200"><output id="bkConcO">200</output></div>
+      <div class="controls">
+        <button class="btn sm primary" id="bkRun">🎟️ Open the sale</button>
+        <button class="btn sm" id="bkReset">↺ Reset</button>
+      </div>
+      <div class="seats" id="bkSeats"></div>
+      <div class="legend"><span><i style="background:var(--surface-3)"></i>free</span><span><i style="background:var(--amber)"></i>held</span><span><i style="background:var(--green)"></i>sold</span><span><i style="background:var(--red)"></i>sold twice 💥</span></div>
+      <div class="stats">
+        <div class="stat good"><div class="k">Seats sold</div><div class="v" id="bkSold">0</div></div>
+        <div class="stat bad"><div class="k">Double-booked</div><div class="v" id="bkDouble">0</div></div>
+        <div class="stat"><div class="k">Failed attempts (retried)</div><div class="v" id="bkFail">0</div></div>
+        <div class="stat warn"><div class="k">p99 latency</div><div class="v" id="bkLat">–</div></div>
+      </div>
+      <div class="verdict idle" id="bkOut">Pick a strategy and open the sale.</div>
+    </div>
+    <div class="panel-foot">🧪 Read-then-write double-sells immediately. The conditional UPDATE is correct <b>and</b> fast — the database's row lock does the work, and losers get zero rows updated and simply pick another seat. Explicit <code>FOR UPDATE</code> locks are also correct but hold locks longer, so latency climbs with concurrency. A per-event queue serializes everything: bulletproof, but throughput is capped by one writer.</div>
+  </div>
+
+<pre class="code"><span class="c">-- The whole correctness story in one statement: take the seat only if it is still takeable</span>
+<span class="k">UPDATE</span> seats
+   <span class="k">SET</span> status = <span class="s">'held'</span>, hold_id = :hold, hold_expires_at = now() + <span class="k">interval</span> <span class="s">'10 minutes'</span>,
+       version = version + <span class="g">1</span>
+ <span class="k">WHERE</span> seat_id = :seat
+   <span class="k">AND</span> (status = <span class="s">'free'</span>                                   <span class="c">-- free…</span>
+        <span class="k">OR</span> (status = <span class="s">'held'</span> <span class="k">AND</span> hold_expires_at &lt; now()));  <span class="c">-- …or an expired hold (lazy reclaim)</span>
+<span class="c">-- 1 row updated → you got it.  0 rows → someone else did; pick another seat.</span></pre>
+
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">⏳</div><h4>Expiring holds lazily</h4><p>Don't rely on a sweeper job to free seats — the condition above reclaims an expired hold <b>at the moment someone needs it</b>. Run a background sweeper too, but only so the seat map <i>looks</i> right; correctness never depends on it.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧊</div><h4>Hold, then charge</h4><p>Never charge before the seat is secured, and never confirm the order before the charge settles. The hold gives you a bounded window in which to run the payment saga (Chapter 37) with compensations if it fails.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🔁</div><h4>Idempotency everywhere</h4><p>Users double-click and mobile networks retry. Hold requests carry a hold ID, orders carry an idempotency key, and re-submitting either returns the original result instead of taking a second seat.</p></div>
+  </div>
+
+  <h2>Absorbing the rush: the virtual waiting room</h2>
+  <p>500,000 people, 50,000 seats. Letting everyone into the booking flow guarantees a meltdown and a terrible experience. Instead, admit users at the rate the system can actually serve, and tell everyone else exactly where they stand.</p>
+
+  <div class="panel" id="qPanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Waiting room — 50,000 seats, huge demand</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <div class="seg" id="qMode"><button data-v="none">🚪 No waiting room</button><button data-v="fifo" class="active">🎫 FIFO queue</button><button data-v="lottery">🎲 Lottery (random draw)</button></div>
+        <button class="btn sm primary" id="qGo">🔔 On-sale!</button>
+        <button class="btn sm" id="qBots">🤖 Add 200K bot requests</button>
+        <button class="btn sm" id="qReset">↺ Reset</button>
+      </div>
+      <div class="qroom" id="qBar"><i style="width:0"></i><span id="qBarTxt">idle</span></div>
+      <div class="stats">
+        <div class="stat acc"><div class="k">In queue</div><div class="v" id="qLen">0</div></div>
+        <div class="stat"><div class="k">Admitted / s</div><div class="v" id="qRate">–</div></div>
+        <div class="stat good"><div class="k">Tickets sold</div><div class="v" id="qSold">0</div></div>
+        <div class="stat bad"><div class="k">Errors served</div><div class="v" id="qErr">0</div></div>
+        <div class="stat warn"><div class="k">Est. wait for newcomers</div><div class="v" id="qWait">–</div></div>
+        <div class="stat"><div class="k">Booking tier load</div><div class="v" id="qLoad">–</div></div>
+      </div>
+      <div class="log" id="qLog" style="margin-top:10px;height:120px"></div>
+    </div>
+    <div class="panel-foot">🧪 Without a waiting room the booking tier saturates and <b>everyone</b> gets errors — including the people who would have bought tickets. FIFO is predictable but rewards whoever had the fastest connection at t=0 (and bots). A lottery over everyone who joined in the first N minutes is fairer and removes the incentive to hammer the site.</div>
+  </div>
+
+  <div class="step-banner"><span>STEP 5 / 6</span></div>
+  <h2>End-to-end architecture</h2>
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">From “on sale” to a ticket in a wallet</span><span class="p-tag">Step-through</span></div>
+    <div class="panel-body svg-scroll">
+      <svg id="tSvg" class="diagram" viewBox="0 0 900 380">
+        <path id="k-e1" class="edge dimmable" d="M130,70 L200,70"/>
+        <path id="k-e2" class="edge dimmable" d="M340,70 L410,70"/>
+        <path id="k-e3" class="edge dimmable" d="M480,110 L480,170"/>
+        <path id="k-e4" class="edge dimmable" d="M560,200 L640,200"/>
+        <path id="k-e5" class="edge dimmable" d="M720,240 L720,300"/>
+        <path id="k-e6" class="edge dimmable" d="M640,330 L500,330"/>
+        <path id="k-e7" class="edge dash dimmable" d="M410,200 L340,200"/>
+        <path id="k-e8" class="edge dash dimmable" d="M270,240 L270,110"/>
+        <g id="k-u" class="node dimmable" transform="translate(10,40)"><rect width="120" height="60" rx="12"/><text x="60" y="26">🧍 Fan</text><text x="60" y="44" class="lbl mono" id="kU">waiting</text></g>
+        <g id="k-wr" class="node dimmable" transform="translate(200,40)"><rect width="140" height="60" rx="12"/><text x="70" y="26">🎫 Waiting room</text><text x="70" y="44" class="lbl">edge, static</text></g>
+        <g id="k-api" class="node dimmable" transform="translate(410,40)"><rect width="140" height="70" rx="12"/><text x="70" y="26">🚪 Booking API</text><text x="70" y="46" class="lbl">admission token</text></g>
+        <g id="k-inv" class="node dimmable" transform="translate(410,170)"><rect width="150" height="70" rx="12"/><text x="75" y="26">🪑 Inventory svc</text><text x="75" y="48" class="lbl mono" id="kInv">seat H-14: free</text></g>
+        <g id="k-pay" class="node dimmable" transform="translate(640,170)"><rect width="160" height="70" rx="12"/><text x="80" y="26">💳 Payments</text><text x="80" y="48" class="lbl mono" id="kPay">–</text></g>
+        <g id="k-out" class="node dimmable" transform="translate(640,300)"><rect width="160" height="60" rx="12"/><text x="80" y="24">📤 Outbox → Kafka</text><text x="80" y="44" class="lbl">order events</text></g>
+        <g id="k-post" class="node dimmable" transform="translate(340,300)"><rect width="160" height="60" rx="12"/><text x="80" y="24">✉️ Tickets & email</text><text x="80" y="44" class="lbl">async delivery</text></g>
+        <g id="k-map" class="node dimmable" transform="translate(190,190)"><rect width="150" height="70" rx="12"/><text x="75" y="26">🗺️ Seat map cache</text><text x="75" y="48" class="lbl">CDN + deltas</text></g>
+      </svg>
+    </div>
+    <div class="stepper" id="kStep" data-diagram="tSvg">
+      <ol class="steps">
+        <li data-title="Everyone lands on static pages" data-on="k-u k-wr k-e1" data-packet="k-u>k-wr">The event page, images and seat-map skeleton are static files on a CDN. Half a million people can load them without touching your servers at all (Chapter 6).</li>
+        <li data-title="Waiting room issues an admission token" data-on="k-wr k-api k-e2" data-packet="k-wr>k-api" data-color="var(--amber)">The queue itself lives at the edge: a signed token with a position and an admit time. The booking tier only accepts requests carrying a valid token, so it can never be flooded.</li>
+        <li data-title="Seat map from cache, updates by delta" data-on="k-map k-u k-e8" data-packet="k-map>k-u" data-color="var(--accent-2)">The full map is cached; changes stream as small deltas over WebSocket (“H-14 now held”). Slight staleness is fine — the authoritative check happens on the hold attempt.</li>
+        <li data-title="Hold with a conditional write" data-on="k-api k-inv k-e3" data-packet="k-api>k-inv" data-color="var(--accent)">One atomic UPDATE per seat takes the hold for 10 minutes. Losers get a friendly “those seats just went — here are the closest available” rather than an error.</li>
+        <li data-title="Pay inside the hold window" data-on="k-inv k-pay k-e4" data-packet="k-inv>k-pay" data-color="var(--green)">The payment runs with an idempotency key (Chapter 37). Succeed → seats become <code>sold</code> in the same transaction that records the order. Fail or time out → the hold expires and the seats return to the pool automatically.</li>
+        <li data-title="Everything else is asynchronous" data-on="k-pay k-out k-post k-e5 k-e6" data-packet="k-pay>k-out,k-out>k-post" data-color="var(--pink)">Ticket generation, wallet passes, confirmation email and analytics are driven from order events (Chapter 17's outbox), so a slow email provider can never block a sale.</li>
+        <li data-title="Degrade, don't die" data-on="k-wr k-map k-api" data-color="var(--amber)">Under stress: widen the admission interval, serve the seat map from cache only, disable seat-by-seat selection in favour of “best available”, and keep browsing read-only but alive.</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="step-banner"><span>STEP 6 / 6</span></div>
+  <h2>Deep dives</h2>
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">🤖</div><h4>Bots</h4><p>Scalpers automate everything. Defences: account age and verification, presale codes, device fingerprinting, per-account and per-payment-instrument limits, CAPTCHA/attestation at queue entry, and honeypot endpoints. Purely technical measures never fully win — pair them with policy (ticket transfer rules, identity at entry).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">⚖️</div><h4>Fairness</h4><p>FIFO rewards fast networks and bots; a <b>randomized draw</b> among everyone who joined within a window is fairer and reduces the stampede. Publish the rules — perceived unfairness is a bigger reputational problem than latency.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">💥</div><h4>Payment succeeded, hold expired</h4><p>The nightmare interleaving. Prevent it by validating the hold inside the same transaction that confirms the order, and by keeping the payment window shorter than the hold. If it still happens: refund automatically, or upgrade the customer to an equivalent seat — and alert.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🛫</div><h4>Deliberate overselling</h4><p>Airlines oversell because no-shows are predictable and empty seats are pure loss. That's a <b>business</b> decision layered on the same inventory system: sell up to <code>capacity × (1 + expected_no_show)</code>, with a compensation budget. Never accidental overselling — this kind is modelled, monitored and priced.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">🗺️</div><h4>Rendering 50,000 seats</h4><p>Don't send 50K DOM nodes. Pre-render the venue as vector tiles or a canvas, ship availability as a compact bitmap (one bit per seat ≈ 6 KB), and patch it with deltas. Zoom levels load section summaries first — the same tiling idea as maps.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🔍</div><h4>Observability that matters</h4><p>Track hold success rate, time-to-first-hold, queue wait vs actual, conversion from admitted to sold, double-book count (must be 0), and payment failure rate. A sudden drop in hold success usually means bots or a stuck sweeper, not load.</p></div>
+  </div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">What this problem is really testing</div><p>Whether you reach for a distributed lock when a <b>single conditional UPDATE</b> would do. The database already serializes writes to a row; use that. Bring in queues or locks only where you need cross-row invariants (“these 4 seats together, or none”) — and even then, one transaction on one shard usually beats a distributed protocol.</p></div></div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Reaching for a distributed lock.</b> A single conditional UPDATE is simpler, faster and safer than any lock service here.</li>
+      <li><b>Letting everyone into the booking flow at once.</b> Without admission control, the people who would have bought tickets get errors too.</li>
+      <li><b>Charging before securing the seat.</b> Take the hold first; the payment happens inside that window.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Design:</b> Four friends want four seats together, or none at all. How?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>One transaction on the event's shard updating all four seat rows conditionally; if fewer than four rows are updated, roll back and return the next-best contiguous block. Because everything for an event lives on one shard, this stays a single-shard transaction rather than a distributed one. For best-available requests, compute candidate blocks from a cached seat map first, then attempt them in order — read from cache, verify with the write.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Operate:</b> The on-sale starts and your booking tier is at 100% CPU with a growing queue. What do you do, in order?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Widen the waiting-room admission interval first — that's the one lever that reduces load without harming anyone already inside. Then shed non-essential work: disable seat-by-seat selection in favour of best-available, serve the seat map from cache only, and defer analytics. Communicate the queue position honestly. Scaling out helps only if the database isn't the bottleneck; if it is, admission control is the fix, not more app servers.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Ticketing is a contention problem, not a data-volume problem: tiny data, extreme write conflicts on individual rows.</li>
+      <li>A conditional UPDATE (compare-and-set) prevents double-booking simply and fast — no distributed locks needed.</li>
+      <li>Holds bound the checkout window; reclaim expired holds lazily in the same conditional write.</li>
+      <li>Shard by event so every booking transaction stays on one shard.</li>
+      <li>A virtual waiting room admits users at the rate the system can serve, protecting everyone's experience.</li>
+      <li>Serve seat maps from cache with delta updates; the authoritative check happens at hold time.</li>
+      <li>Do payment inside the hold window with idempotency keys, and drive tickets/emails asynchronously.</li>
+      <li>Fairness, bot mitigation and clear communication matter as much as the technical design.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+    <div class="quiz" data-answer="1">
+      <p class="q">10,000 requests try to hold seat H-14 simultaneously. Which approach is both correct and fastest?</p>
+      <div class="opts"><button class="opt">Read the seat, check it's free, then write</button><button class="opt">A single conditional UPDATE that only succeeds if the seat is free or its hold has expired</button><button class="opt">A distributed lock in Redis per seat</button><button class="opt">Optimistic UI with reconciliation later</button></div>
+      <div class="explain">The database serializes writes to that row; exactly one UPDATE affects a row and the rest see 0 rows changed. No extra infrastructure, no lock to leak.</div>
+    </div>
+    <div class="quiz" data-answer="2">
+      <p class="q">Why reclaim expired holds inside the hold query instead of relying on a cleanup job?</p>
+      <div class="opts"><button class="opt">Cleanup jobs are expensive</button><button class="opt">Because holds never really expire</button><button class="opt">So correctness doesn't depend on a background process running on time — the seat is freed exactly when someone needs it</button><button class="opt">To avoid using SQL</button></div>
+      <div class="explain">If a sweeper is delayed or dead, lazy reclamation still frees seats. The sweeper only keeps the displayed map tidy.</div>
+    </div>
+    <div class="quiz" data-answer="0">
+      <p class="q">What does a virtual waiting room actually buy you?</p>
+      <div class="opts"><button class="opt">Admission control: the booking tier only ever sees traffic it can serve, so nobody gets errors and users get honest wait estimates</button><button class="opt">More tickets to sell</button><button class="opt">Faster database writes</button><button class="opt">Protection against refunds</button></div>
+      <div class="explain">It converts an overload (everyone fails) into a queue (most people wait, then succeed or learn it's sold out).</div>
+    </div>
+    <div class="quiz" data-answer="3">
+      <p class="q">A payment succeeds but the seat hold expired 3 seconds earlier and someone else took the seat. How do you prevent this?</p>
+      <div class="opts"><button class="opt">Make holds permanent</button><button class="opt">Charge before holding</button><button class="opt">Use a longer HTTP timeout</button><button class="opt">Validate and consume the hold in the same transaction that confirms the order, and keep the payment window shorter than the hold</button></div>
+      <div class="explain">The seat must be re-checked atomically at confirmation. If it still slips through, auto-refund or reseat, and alert — never silently double-sell.</div>
+    </div>
+    <div class="quiz" data-answer="1">
+      <p class="q">How should the seat map for a 50,000-seat stadium be delivered?</p>
+      <div class="opts"><button class="opt">One database query per seat on page load</button><button class="opt">Cached static geometry plus a compact availability bitmap, updated by deltas over a WebSocket</button><button class="opt">A full refresh every second</button><button class="opt">Server-rendered HTML with 50,000 elements</button></div>
+      <div class="explain">Geometry never changes and availability is one bit per seat; deltas keep it fresh for a few hundred bytes per update.</div>
+    </div>
+  </div>
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, sleep } = SD;
+
+  /* ================= Booking lab ================= */
+  const SEATS = 400;
+  const DESC = {
+    naive: '<b>Read-then-write:</b> <code>SELECT status … ; if free → UPDATE</code>. Two requests can both read “free” before either writes. Classic lost update.',
+    cas: '<b>Conditional UPDATE:</b> one statement that only changes the row if it is still free (or the hold expired). The row lock inside the database does all the work.',
+    lock: '<b>SELECT … FOR UPDATE:</b> lock the row, check it, write, commit. Correct, but the lock is held across the round trip, so waiting time grows with concurrency.',
+    queue: '<b>Per-event queue:</b> all booking commands go to a single writer (one partition, one consumer). Impossible to race, but throughput is capped by that one worker.',
+  };
+  let B;
+  function bkReset() {
+    B = { seats: new Array(SEATS).fill(0), sold: 0, dbl: 0, fail: 0, lat: [], running: false };
+    $('#bkDesc').innerHTML = DESC[$('#bkMode').dataset.value];
+    bkRender('Pick a strategy and open the sale.', 'idle');
+  }
+  function bkRender(msg, cls) {
+    $('#bkSeats').innerHTML = B.seats.map(s => `<div class="seat ${s === 1 ? 'held' : s === 2 ? 'sold' : s === 3 ? 'double' : ''}"></div>`).join('');
+    $('#bkSold').textContent = B.sold;
+    $('#bkDouble').textContent = B.dbl;
+    $('#bkDouble').parentElement.className = 'stat ' + (B.dbl ? 'bad' : 'good');
+    $('#bkFail').textContent = B.fail;
+    const s = B.lat.slice().sort((a, b) => a - b);
+    $('#bkLat').textContent = s.length ? s[Math.floor(s.length * .99) - 1 < 0 ? 0 : Math.floor(s.length * .99) - 1] + ' ms' : '–';
+    if (msg) { const o = $('#bkOut'); o.className = 'verdict ' + (cls || 'idle'); o.innerHTML = msg; }
+  }
+  $('#bkMode').addEventListener('segchange', bkReset);
+  $('#bkConc').addEventListener('input', () => $('#bkConcO').textContent = $('#bkConc').value);
+  $('#bkRun').onclick = async () => {
+    if (B.running) return;
+    bkReset(); B.running = true;
+    const mode = $('#bkMode').dataset.value, conc = +$('#bkConc').value;
+    const waves = 6;
+    for (let w = 0; w < waves && B.running; w++) {
+      // each buyer picks a random seat, favouring the best (low-index) seats — that's where contention is
+      const picks = Array.from({ length: conc }, () => Math.floor(Math.pow(Math.random(), 2.2) * SEATS));
+      const claimed = new Map();
+      picks.forEach(p => claimed.set(p, (claimed.get(p) || 0) + 1));
+      claimed.forEach((n, seat) => {
+        const base = mode === 'lock' ? 6 + conc * 0.06 : mode === 'queue' ? 10 + conc * 0.09 : 5;
+        for (let i = 0; i < n; i++) B.lat.push(Math.round(base + Math.random() * base * 0.7));
+        if (B.seats[seat] >= 2) { B.fail += n; return; }          // already sold
+        if (mode === 'naive' && n > 1) {                            // lost update: everyone read "free"
+          B.seats[seat] = 3; B.dbl += n - 1; B.sold++;
+        } else {
+          B.seats[seat] = 2; B.sold++; B.fail += n - 1;             // one winner, the rest retry elsewhere
+        }
+      });
+      bkRender();
+      await sleep(320);
+    }
+    B.running = false;
+    const msg = B.dbl
+      ? `💥 <b>${B.dbl} seats sold to more than one person.</b> Every one of those is a customer turned away at the gate. The read and the write were separate steps, so two requests both saw “free”.`
+      : `✅ <b>No double-bookings.</b> ${B.sold} seats sold, ${B.fail} attempts lost the race and were redirected to other seats. ${$('#bkMode').dataset.value === 'queue' ? 'Throughput is limited by the single writer — fine for one event, but it is your ceiling.' : $('#bkMode').dataset.value === 'lock' ? 'Correct, but note how p99 latency grows as concurrency rises — locks are held across the transaction.' : 'And it stayed fast: the conditional UPDATE is a single round trip with no held locks.'}`;
+    bkRender(msg, B.dbl ? 'bad' : 'ok');
+  };
+  $('#bkReset').onclick = () => { B.running = false; bkReset(); };
+  bkReset();
+
+  /* ================= Waiting room ================= */
+  const TOTAL_SEATS = 50000, CAPACITY = 900;   // bookings the tier can serve per tick
+  let Q, qTimer = null;
+  function qReset() {
+    clearInterval(qTimer); qTimer = null;
+    Q = { queue: 0, arrived: 0, sold: 0, err: 0, t: 0, admitted: 0, rateHist: [] };
+    $('#qLog').innerHTML = '';
+    qRender();
+  }
+  function qRender() {
+    const mode = $('#qMode').dataset.value;
+    const pct = Math.min(100, Q.sold / TOTAL_SEATS * 100);
+    $('#qBar').querySelector('i').style.width = pct + '%';
+    $('#qBarTxt').textContent = Q.sold >= TOTAL_SEATS ? 'SOLD OUT' : `${SD.fmt(Q.sold)} / ${SD.fmt(TOTAL_SEATS)} sold`;
+    $('#qLen').textContent = SD.fmt(Q.queue);
+    $('#qRate').textContent = Q.rateHist.length ? SD.fmt(Q.rateHist[Q.rateHist.length - 1] * 2) : '–';
+    $('#qSold').textContent = SD.fmt(Q.sold);
+    $('#qErr').textContent = SD.fmt(Q.err);
+    $('#qErr').parentElement.className = 'stat ' + (Q.err > 1000 ? 'bad' : 'good');
+    const wait = mode === 'none' ? 0 : Q.queue / (CAPACITY * 2);
+    $('#qWait').textContent = mode === 'none' ? 'n/a' : wait > 60 ? (wait / 60).toFixed(1) + ' min' : Math.round(wait) + ' s';
+    const load = mode === 'none' ? (Q.lastArrivals || 0) / CAPACITY : Math.min(1, (Q.admitted || 0) / CAPACITY);
+    $('#qLoad').textContent = Math.round(Math.min(load, 9.99) * 100) + '%';
+    $('#qLoad').parentElement.className = 'stat ' + (load > 1.05 ? 'bad' : 'good');
+  }
+  function qTick() {
+    Q.t++;
+    const mode = $('#qMode').dataset.value;
+    // arrivals: huge burst at the start, decaying
+    const arrivals = Math.round(60000 * Math.exp(-Q.t / 6)) + (Q.t < 40 ? 800 : 0);
+    Q.arrived += arrivals; Q.lastArrivals = arrivals;
+    if (Q.sold >= TOTAL_SEATS) {
+      if (mode !== 'none' && Q.queue > 0) { SD.log($('#qLog'), `🏁 Sold out — remaining ${SD.fmt(Q.queue)} in queue told honestly, not shown an error page`, 'acc'); Q.queue = 0; }
+      clearInterval(qTimer); qTimer = null; qRender(); return;
+    }
+    if (mode === 'none') {
+      // everyone hits the booking tier directly
+      const served = Math.min(arrivals, CAPACITY);
+      const overflow = arrivals - served;
+      Q.err += overflow;
+      const sold = Math.min(Math.round(served * 0.55), TOTAL_SEATS - Q.sold);
+      Q.sold += sold;
+      Q.admitted = served;
+      if (overflow > 0 && Q.t % 3 === 1) SD.log($('#qLog'), `💥 ${SD.fmt(overflow)} requests over capacity → 503s (people who would have bought tickets are failing too)`, 'bad');
+    } else {
+      Q.queue += arrivals;
+      const admit = Math.min(Q.queue, CAPACITY);
+      Q.queue -= admit;
+      Q.admitted = admit;
+      const sold = Math.min(Math.round(admit * 0.72), TOTAL_SEATS - Q.sold);
+      Q.sold += sold;
+      if (Q.t % 4 === 1) SD.log($('#qLog'), `🎫 admitted ${SD.fmt(admit)} (${mode === 'fifo' ? 'in join order' : 'random draw'}), ${SD.fmt(sold)} bought · ${SD.fmt(Q.queue)} still waiting`, 'ok');
+    }
+    Q.rateHist.push(Q.admitted);
+    qRender();
+  }
+  $('#qGo').onclick = () => { qReset(); qTimer = setInterval(qTick, 500); SD.log($('#qLog'), `🔔 On sale: ${SD.fmt(TOTAL_SEATS)} seats, booking tier serves ${SD.fmt(CAPACITY * 2)}/s`, 'acc'); };
+  $('#qBots').onclick = () => { Q.queue += 200000; Q.arrived += 200000; SD.log($('#qLog'), '🤖 200K automated requests joined — without per-account limits and attestation they take real fans\' places', 'warn'); qRender(); };
+  $('#qReset').onclick = qReset;
+  $('#qMode').addEventListener('segchange', qReset);
+  qReset();
+
+  /* ================= Step labels ================= */
+  $('#kStep').addEventListener('step', e => {
+    const i = e.detail.index;
+    $('#kU').textContent = i < 1 ? 'waiting' : i < 3 ? 'admitted ✓' : i < 4 ? 'choosing seats' : i < 5 ? 'paying' : 'has tickets 🎟️';
+    $('#kInv').textContent = i < 3 ? 'seat H-14: free' : i < 4 ? 'H-14: HELD (10 min)' : 'H-14: SOLD ✓';
+    $('#kPay').textContent = i < 4 ? '–' : i === 4 ? 'authorizing…' : 'captured ✓';
+    $('#k-inv').classList.toggle('ok', i >= 4);
+    $('#k-pay').classList.toggle('ok', i >= 5);
+  });
+})();
+</script>
+</body>
+</html>

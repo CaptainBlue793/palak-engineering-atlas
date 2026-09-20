@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Job Scheduler</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('sd-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .step-banner { display:flex; gap:10px; align-items:center; margin:60px 0 -40px; }
+  .step-banner span { font-family:var(--mono); font-size:12px; font-weight:800; color:#fff; background:linear-gradient(90deg,var(--pink),var(--accent)); padding:4px 10px; border-radius:8px; }
+  .req-list { display:grid; gap:8px; }
+  .req { display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); font-size:14.5px; }
+  .req .chk { flex:none; width:20px; height:20px; border-radius:6px; background:var(--green); color:#fff; display:grid; place-items:center; font-size:12px; font-weight:800; }
+  .verdict { margin-top:12px; padding:12px 14px; border-radius:12px; font-weight:700; font-size:13.5px; }
+  .verdict.ok { background:var(--green-soft); color:var(--green); }
+  .verdict.bad { background:var(--red-soft); color:var(--red); }
+  .verdict.idle { background:var(--surface-2); color:var(--muted); }
+  .runs { display:grid; gap:5px; font-family:var(--mono); font-size:12px; max-height:170px; overflow:auto; }
+  .runs div { padding:5px 9px; border-radius:7px; background:var(--surface-2); border:1px solid var(--border); animation:fadeUp .25s; }
+  .runs div.dup { border-color:var(--red); color:var(--red); background:var(--red-soft); }
+  .runs div.blocked { border-color:var(--green); color:var(--green); background:var(--green-soft); }
+</style>
+</head>
+<body data-chapter="38">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 38</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Design a <span class="grad">Job Scheduler</span></h1>
+    <p class="lead">“Send this reminder in 3 days.” “Run this report every weekday at 07:00.” “Retry this payout in 15 minutes.” “Run this 12-step onboarding workflow, which takes a week and must survive deploys.” Every platform eventually needs one of these — and gets it subtly wrong: jobs that fire twice, jobs that never fire, and a midnight stampede that takes out the database.</p>
+    <ul class="objectives">
+      <li>Find due jobs efficiently at 100M+ schedules</li>
+      <li>Compare polling, time buckets and timing wheels</li>
+      <li>Survive the cron alignment stampede</li>
+      <li>Trigger exactly once despite crashes</li>
+      <li>Run retries, priorities and per-tenant fairness</li>
+      <li>Support long-running durable workflows</li>
+    </ul>
+  </section>
+
+  <div class="step-banner"><span>STEP 1 / 6</span></div>
+  <h2>Requirements</h2>
+  <div class="split">
+    <div><h4 class="mt0">🛠️ Functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span>One-off jobs (“at 14:05 on 12 Nov”) and recurring schedules (cron expressions, timezone-aware)</span></div>
+      <div class="req"><span class="chk">✓</span><span>Execute a task: call a service, run a container, send a message</span></div>
+      <div class="req"><span class="chk">✓</span><span>Retries with backoff, timeouts, cancellation, manual re-run</span></div>
+      <div class="req"><span class="chk">✓</span><span>Multi-step workflows with waits, branches and compensations</span></div>
+      <div class="req"><span class="chk">✓</span><span>Status, history and alerting per job</span></div>
+    </div></div>
+    <div><h4 class="mt0">📏 Non-functional</h4><div class="req-list">
+      <div class="req"><span class="chk">✓</span><span><b>Fire within ~1 s</b> of the due time, at any scale</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Never lose a job</b>; never silently skip one</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>At-least-once execution with idempotent handlers</b> — and at-most-once <i>triggering</i> per scheduled instant</span></div>
+      <div class="req"><span class="chk">✓</span><span>Multi-tenant: one noisy tenant can't starve others</span></div>
+      <div class="req"><span class="chk">✓</span><span>Survive worker crashes, deploys and region failover</span></div>
+    </div></div>
+  </div>
+
+  <div class="step-banner"><span>STEP 2 / 6</span></div>
+  <h2>Estimate the scale</h2>
+  <div class="stats">
+    <div class="stat"><div class="k">Active schedules</div><div class="v">100M</div></div>
+    <div class="stat acc"><div class="k">Average fire rate</div><div class="v">~12K/s</div></div>
+    <div class="stat bad"><div class="k">Midnight UTC spike</div><div class="v">~20M <small>in one second</small></div></div>
+    <div class="stat"><div class="k">Row size</div><div class="v">~300 B <small>→ ~30 GB</small></div></div>
+    <div class="stat warn"><div class="k">Run history / day</div><div class="v">~1B rows</div></div>
+    <div class="stat good"><div class="k">Precision needed</div><div class="v">±1 s</div></div>
+  </div>
+  <p style="margin-top:16px">The averages are unremarkable; the <b>distribution</b> is brutal. Humans write <code>0 0 * * *</code>, so a huge fraction of all schedules are due at exactly midnight, on the hour, or on the minute. A scheduler that can handle 12K/s on average will still fall over at 00:00:00 unless it deliberately spreads that load.</p>
+
+  <div class="step-banner"><span>STEP 3 / 6</span></div>
+  <h2>How do you find the jobs that are due?</h2>
+  <p>Everything else is ordinary service design; this is the part with real choices.</p>
+  <div class="table-wrap">
+    <table class="t">
+      <thead><tr><th>Approach</th><th>How</th><th>Precision</th><th>Scales to</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><b>Database polling</b></td><td><code>SELECT … WHERE next_run_at &lt;= now() ORDER BY next_run_at LIMIT 500 FOR UPDATE SKIP LOCKED</code> every second</td><td class="yes">~1 s</td><td class="meh">~10M schedules</td><td>Simplest, transactional, easy to reason about. Index on <code>next_run_at</code> is everything.</td></tr>
+        <tr><td><b>Time-bucketed queues</b></td><td>Redis sorted set (or a partition) per minute; workers pop the current bucket</td><td class="yes">~1 s</td><td class="yes">Hundreds of millions</td><td>Spreads load across buckets and shards; needs durable backing store.</td></tr>
+        <tr><td><b>Hierarchical timing wheel</b></td><td>In-memory circular buffer of slots; O(1) insert and tick</td><td class="yes">ms</td><td class="yes">Millions in memory</td><td>What Kafka, Netty and OS kernels use for timers. Needs a durable log to recover after a crash.</td></tr>
+        <tr><td><b>Broker delay features</b></td><td>SQS delay/visibility timeout, RabbitMQ delayed exchange, Kafka + tumbling “due” topics</td><td class="meh">Seconds</td><td class="meh">Bounded delay (e.g. 15 min)</td><td>Zero infrastructure for short delays; awkward for “in 6 months” and for cancellation.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout tip"><div class="ico">🏗️</div><div class="body"><div class="title">The pragmatic combination</div><p>Durable schedules in a database (source of truth, sharded by tenant), a <b>rolling window</b> of the next few minutes loaded into an in-memory timing wheel per shard for precision, and a queue for handing work to executors. The database survives restarts; the wheel provides millisecond firing; the queue decouples firing from execution.</p></div></div>
+
+  <div class="panel" id="wheelPanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Timing wheel — 60 slots, one tick per second</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <button class="btn sm primary" id="whAdd">➕ Schedule a job (random delay)</button>
+        <button class="btn sm" id="whBurst">💥 Schedule 200 jobs at the top of the minute</button>
+        <button class="btn sm" id="whPlay">⏸ Pause</button>
+      </div>
+      <div class="split" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-top:10px">
+        <svg id="whSvg" viewBox="0 0 320 320" style="background:var(--surface-2);border-radius:14px"></svg>
+        <div>
+          <div class="stats" style="margin-top:0;grid-template-columns:1fr 1fr">
+            <div class="stat acc"><div class="k">Current slot</div><div class="v" id="whSlot">0</div></div>
+            <div class="stat"><div class="k">Jobs in wheel</div><div class="v" id="whJobs">0</div></div>
+            <div class="stat good"><div class="k">Fired</div><div class="v" id="whFired">0</div></div>
+            <div class="stat warn"><div class="k">Fired this tick</div><div class="v" id="whNow">0</div></div>
+          </div>
+          <p class="small muted" style="margin-top:10px">Insert is O(1): compute <code>slot = (now + delay) % 60</code> and append. Each tick fires one slot's list — no scanning, no sorting, no database query. Delays longer than one revolution go into a coarser wheel (minutes → hours → days), which is why it's called <b>hierarchical</b>.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="step-banner"><span>STEP 4 / 6</span></div>
+  <h2>The midnight stampede</h2>
+  <p>Twenty million jobs all due at <code>00:00:00</code>. Your executors can run maybe 20,000 per second. What happens next is a design decision, not an accident.</p>
+
+  <div class="panel" id="spikePanel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Cron alignment: 2M jobs due at midnight, capacity 20K/s</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <div class="seg" id="spMode"><button data-v="naive" class="active">⏰ Fire them all at 00:00</button><button data-v="jitter">🎲 Deterministic jitter (spread over 5 min)</button><button data-v="lanes">🚦 Jitter + priority lanes</button></div>
+      </div>
+      <div class="svg-scroll" style="margin-top:10px"><svg id="spSvg" class="diagram" viewBox="0 0 860 240"></svg></div>
+      <div class="legend"><span><i style="background:var(--accent-2)"></i>jobs becoming due</span><span><i style="background:var(--green)"></i>executed</span><span><i style="background:var(--red)"></i>backlog (late jobs)</span><span><i style="background:var(--amber)"></i>high-priority lane</span></div>
+      <div class="stats">
+        <div class="stat bad"><div class="k">Max backlog</div><div class="v" id="spBack">–</div></div>
+        <div class="stat warn"><div class="k">Worst lateness</div><div class="v" id="spLate">–</div></div>
+        <div class="stat good"><div class="k">Urgent jobs on time</div><div class="v" id="spUrgent">–</div></div>
+        <div class="stat acc"><div class="k">Peak DB read load</div><div class="v" id="spLoad">–</div></div>
+      </div>
+      <div class="verdict idle" id="spOut"></div>
+    </div>
+    <div class="panel-foot">🧪 <b>Deterministic jitter</b> is the trick: derive an offset from a hash of the job ID (<code>hash(job_id) % 300s</code>) so “daily at midnight” actually means “somewhere in the next five minutes, but the <i>same</i> second every day”. Users get consistency, you get a flat load curve. Keep a separate lane for jobs whose timing genuinely matters.</div>
+  </div>
+
+  <div class="step-banner"><span>STEP 5 / 6</span></div>
+  <h2>Firing exactly once</h2>
+  <p>A worker picks up a job, starts running it, and its process dies. Did the job run? Another worker must decide — and “run it again” is only safe if the effect is idempotent. Two mechanisms do the heavy lifting.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Crash a worker mid-job and see what happens</span><span class="p-tag">Simulator</span></div>
+    <div class="panel-body">
+      <div class="controls" style="margin-top:0">
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="exKey" style="accent-color:var(--accent)"> Unique run key <code>(job_id, scheduled_for)</code></label>
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="exLease" style="accent-color:var(--accent)"> Lease + fencing token</label>
+        <label class="flex small" style="gap:6px"><input type="checkbox" id="exIdem" style="accent-color:var(--accent)"> Idempotent handler (dedupe on effect)</label>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="exRun">▶ Fire the 09:00 payout job</button>
+        <button class="btn sm" id="exCrash">💥 Fire it, then crash the worker mid-run</button>
+        <button class="btn sm" id="exSlow">🐢 Worker pauses 40 s (lease expires) then resumes</button>
+        <button class="btn sm" id="exReset">↺ Reset</button>
+      </div>
+      <div class="runs" id="exRuns" style="margin-top:12px"></div>
+      <div class="stats">
+        <div class="stat good"><div class="k">Payouts intended</div><div class="v" id="exWant">0</div></div>
+        <div class="stat bad"><div class="k">Payouts actually sent</div><div class="v" id="exSent">0</div></div>
+        <div class="stat"><div class="k">Duplicate attempts blocked</div><div class="v" id="exBlocked">0</div></div>
+      </div>
+      <div class="verdict idle" id="exOut">Turn the safeguards on one at a time and repeat the crash scenario.</div>
+    </div>
+    <div class="panel-foot">🔑 The honest summary: <b>exactly-once triggering</b> is achievable (a unique key on <code>(job_id, scheduled_for)</code> means only one run row can exist), but <b>exactly-once side effects</b> are not — the worker can always die after calling the payment API and before recording that it did. That's why the handler must be idempotent (Chapter 17) and why leases need fencing tokens.</div>
+  </div>
+
+  <h2>Execution: fairness, retries and poison jobs</h2>
+  <div class="grid c3">
+    <div class="card feature reveal"><div class="f-ico">⚖️</div><h4>Per-tenant fairness</h4><p>One customer scheduling 5 million jobs must not delay everyone else. Use per-tenant queues with weighted round-robin (or a concurrency cap per tenant), not a single global FIFO.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🔁</div><h4>Retries</h4><p>Exponential backoff with jitter, a maximum attempt count, and a <b>deadline</b> after which a late job is pointless (a “happy birthday” email three days late is worse than none). Failed jobs land in a dead-letter view with the error and a re-run button.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">☠️</div><h4>Poison jobs</h4><p>A job that crashes its worker every time will take down your fleet one worker at a time. Track consecutive failures per job, quarantine after N, and run untrusted workloads in isolated sandboxes with CPU/memory limits.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🕰️</div><h4>Timezones & DST</h4><p>“Every day at 09:00 Europe/Berlin” is not a fixed UTC offset. Store the timezone with the schedule and compute the next occurrence with a real calendar library. And decide policy for the DST gap: 02:30 happens twice in autumn and not at all in spring.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">⏭️</div><h4>Catch-up policy</h4><p>The scheduler was down for 3 hours. Should a 5-minute job now run 36 times? Per schedule, choose: <b>run all</b> (backfill), <b>run once</b> (collapse), or <b>skip</b> (only run the next occurrence). Getting this wrong is how outages become billing incidents.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🚫</div><h4>Cancellation</h4><p>Cancel must be idempotent and race-free: mark the run cancelled with a conditional update, and have workers check the flag at safe checkpoints. A job already in flight may need a compensating action rather than a hard kill.</p></div>
+  </div>
+
+  <div class="step-banner"><span>STEP 6 / 6</span></div>
+  <h2>Long-running workflows: durable execution</h2>
+  <p>“Send a welcome email, wait 3 days, if they haven't activated send a reminder, after 7 days notify sales.” That's a week-long function with sleeps in the middle — and it must survive deploys, crashes and restarts. Durable execution engines (Temporal, AWS Step Functions, Cadence) solve this by <b>event-sourcing the workflow itself</b>.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">How a workflow survives a crash on day 4</span><span class="p-tag">Step-through</span></div>
+    <div class="panel-body svg-scroll">
+      <svg id="wSvg" class="diagram" viewBox="0 0 880 320">
+        <path id="w-e1" class="edge dimmable" d="M150,80 L230,80"/>
+        <path id="w-e2" class="edge dimmable" d="M390,80 L470,80"/>
+        <path id="w-e3" class="edge dimmable" d="M540,120 L540,190"/>
+        <path id="w-e4" class="edge dimmable" d="M470,220 L390,220"/>
+        <path id="w-e5" class="edge dash dimmable" d="M230,190 L230,120"/>
+        <path id="w-e6" class="edge dimmable" d="M620,80 L700,80"/>
+        <g id="w-c" class="node dimmable" transform="translate(20,50)"><rect width="130" height="60" rx="12"/><text x="65" y="26">🧑 Trigger</text><text x="65" y="44" class="lbl">user signs up</text></g>
+        <g id="w-wf" class="node dimmable" transform="translate(230,40)"><rect width="160" height="80" rx="12"/><text x="80" y="28">⚙️ Workflow worker</text><text x="80" y="50" class="lbl mono" id="wState">replaying…</text></g>
+        <g id="w-hist" class="node dimmable" transform="translate(230,190)"><rect width="160" height="80" rx="12"/><text x="80" y="26">📜 Event history</text><text x="80" y="48" class="lbl mono" id="wHist">3 events</text></g>
+        <g id="w-eng" class="node dimmable" transform="translate(470,40)"><rect width="150" height="80" rx="12"/><text x="75" y="28">🧠 Engine</text><text x="75" y="50" class="lbl">timers & dispatch</text></g>
+        <g id="w-act" class="node dimmable" transform="translate(700,40)"><rect width="160" height="80" rx="12"/><text x="80" y="28">📨 Activities</text><text x="80" y="50" class="lbl mono" id="wAct">send_email()</text></g>
+        <g id="w-timer" class="node dimmable" transform="translate(470,190)"><rect width="150" height="70" rx="12"/><text x="75" y="26">⏲️ Durable timer</text><text x="75" y="48" class="lbl mono" id="wTimer">wake in 3 days</text></g>
+      </svg>
+    </div>
+    <div class="stepper" id="wStep" data-diagram="wSvg">
+      <ol class="steps">
+        <li data-title="Workflow code is just code" data-on="w-c w-wf w-e1" data-packet="w-c>w-wf">You write <code>await sendEmail(); await sleep('3 days'); if (!activated) await sendReminder();</code>. The engine makes those awaits durable — the process does not sit there for three days.</li>
+        <li data-title="Every step is recorded" data-on="w-wf w-hist w-e5" data-packet="w-wf>w-hist" data-color="var(--accent-2)">Each decision and result is appended to an <b>event history</b>: <code>ActivityScheduled(send_email)</code>, <code>ActivityCompleted</code>, <code>TimerStarted(3d)</code>. This is event sourcing (Chapter 17) applied to control flow.</li>
+        <li data-title="Activities do the side effects" data-on="w-wf w-eng w-act w-e2 w-e6" data-packet="w-eng>w-act" data-color="var(--green)">Anything non-deterministic — an API call, a database write, reading the clock — happens in an <b>activity</b> with its own retries and timeout. The workflow function itself must be deterministic, because it will be re-executed.</li>
+        <li data-title="Sleeping costs nothing" data-on="w-eng w-timer w-e3" data-packet="w-eng>w-timer" data-color="var(--amber)">A three-day sleep becomes a <b>durable timer</b> in the engine (backed by exactly the scheduler machinery from earlier in this chapter). No worker, no memory, no connection is held.</li>
+        <li data-title="Crash on day 4" data-on="w-wf" data-color="var(--red)">The worker dies, or you deploy new code, or the whole cluster restarts. Nothing is lost, because no state lives in the process.</li>
+        <li data-title="Replay reconstructs the state" data-on="w-hist w-wf w-e5 w-e4" data-packet="w-hist>w-wf" data-color="var(--green)">A new worker re-runs the workflow function from the top, feeding it the recorded history: the first <code>sendEmail()</code> returns its <b>recorded</b> result instead of sending again, and execution resumes exactly where it stopped. Determinism is what makes this safe — which is why you never call <code>Math.random()</code> or <code>now()</code> directly in workflow code.</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="callout warn"><div class="ico">🧭</div><div class="body"><div class="title">When not to build this</div><p>If your needs are “a handful of cron jobs”, use Kubernetes CronJobs or your cloud's scheduler and move on. Build (or adopt) a real scheduler when you need per-tenant schedules created at runtime, millions of timers, visibility into every run, or long-lived workflows. And prefer adopting Temporal/Step Functions over writing a durable-execution engine yourself — replay determinism is a deep rabbit hole.</p></div></div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Ignoring cron alignment.</b> Everyone writes <code>0 0 * * *</code>; without jitter you build a self-inflicted thundering herd.</li>
+      <li><b>Promising exactly-once execution.</b> You can guarantee at-most-once <i>triggering</i>; effects need idempotent handlers.</li>
+      <li><b>Storing schedules in UTC only.</b> “09:00 local” shifts with daylight saving — store the timezone and compute occurrences with a calendar library.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Design:</b> Support both “every 5 minutes” and “in exactly 30 days” for 100M schedules.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Durable schedules in a sharded table indexed by <code>next_run_at</code>, with only a rolling window (the next few minutes) loaded into an in-memory hierarchical timing wheel per shard for millisecond precision. Long delays simply sit in the database until their window arrives. Firing enqueues a run row with a unique <code>(job_id, scheduled_for)</code> key, then hands the work to executors via a queue. Recurring schedules compute the next occurrence after each run, in the schedule's timezone.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Operate:</b> The scheduler was down for two hours. What happens to everything that should have fired?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It depends on a per-schedule catch-up policy, which must be an explicit setting: <b>run all</b> (backfill reports), <b>collapse to one</b> (a sync job only needs to run once), or <b>skip</b> (a “good morning” push is pointless now). Without that policy you either flood downstream systems with 24 duplicate runs or silently lose work. On recovery, also rate-limit the catch-up so it doesn't become its own incident.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Durable schedules in a sharded database, a rolling in-memory timing wheel for precision, and a queue for execution.</li>
+      <li>Cron alignment creates enormous spikes — spread them with deterministic per-job jitter and keep a lane for truly time-critical jobs.</li>
+      <li>A unique key on (job_id, scheduled_for) gives at-most-once triggering; leases with fencing tokens stop zombie workers.</li>
+      <li>Exactly-once side effects are impossible — make handlers idempotent instead.</li>
+      <li>Give each tenant its own queue and concurrency budget; quarantine poison jobs.</li>
+      <li>Store timezones with schedules, and choose an explicit catch-up policy for downtime.</li>
+      <li>Long-running workflows become durable by event-sourcing their history and replaying deterministically.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+    <div class="quiz" data-answer="2">
+      <p class="q">Two million jobs are scheduled for “daily at midnight”. What's the best mitigation?</p>
+      <div class="opts"><button class="opt">Add more executors for one minute a day</button><button class="opt">Run them all a second early</button><button class="opt">Derive a deterministic offset from the job ID so each job fires at a stable, spread-out time within a window</button><button class="opt">Reject cron expressions ending in :00</button></div>
+      <div class="explain">Hash-based jitter flattens the spike while keeping each job's firing time consistent day to day — much cheaper than provisioning for the spike.</div>
+    </div>
+    <div class="quiz" data-answer="0">
+      <p class="q">A worker fetches a job, calls the payment API, and crashes before recording success. What should the system guarantee?</p>
+      <div class="opts"><button class="opt">At-least-once execution with an idempotent handler, so the retry doesn't pay twice</button><button class="opt">Exactly-once side effects, via two-phase commit with the payment provider</button><button class="opt">At-most-once execution — skip the job</button><button class="opt">Nothing; crashes are rare</button></div>
+      <div class="explain">You can't atomically couple an external call with your own state. Idempotency keys make the inevitable retry safe (Chapter 37).</div>
+    </div>
+    <div class="quiz" data-answer="1">
+      <p class="q">Why do timing wheels beat “ORDER BY next_run_at LIMIT 500” for millisecond precision at scale?</p>
+      <div class="opts"><button class="opt">They persist jobs more safely</button><button class="opt">Insert and tick are O(1) in memory — no repeated sorted scans of a huge index</button><button class="opt">They support cron syntax natively</button><button class="opt">They avoid needing retries</button></div>
+      <div class="explain">A wheel trades durability (it's in memory, rebuilt from the store) for constant-time scheduling — so real systems use both.</div>
+    </div>
+    <div class="quiz" data-answer="3">
+      <p class="q">The scheduler was down for 3 hours. A job scheduled every 5 minutes is now 36 runs behind. What's the right behaviour?</p>
+      <div class="opts"><button class="opt">Always run all 36</button><button class="opt">Always skip to the next occurrence</button><button class="opt">Ask the user at runtime</button><button class="opt">Follow a per-schedule catch-up policy: backfill all, collapse to one, or skip</button></div>
+      <div class="explain">A report might need backfilling; a "send reminder" job must not fire 36 times. Make it an explicit, per-schedule setting.</div>
+    </div>
+    <div class="quiz" data-answer="2">
+      <p class="q">Why must durable-workflow code be deterministic?</p>
+      <div class="opts"><button class="opt">To make it run faster</button><button class="opt">So it can be compiled ahead of time</button><button class="opt">Because recovery replays the function against its recorded history — non-deterministic code would take different branches and corrupt the state</button><button class="opt">Because activities can't be retried</button></div>
+      <div class="explain">Replay reconstructs state by re-executing the code; randomness, clocks and I/O must live in activities whose results are recorded.</div>
+    </div>
+  </div>
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, svg, sleep } = SD;
+
+  /* ================= Timing wheel ================= */
+  const SLOTS = 60, ws = $('#whSvg');
+  let W = { cur: 0, slots: Array.from({ length: SLOTS }, () => 0), fired: 0, last: 0, playing: true };
+  function whDraw() {
+    ws.innerHTML = '';
+    const cx = 160, cy = 160, r = 120;
+    svg('circle', { cx, cy, r, fill: 'none', stroke: 'var(--border-strong)', 'stroke-width': 26, opacity: .35 }, ws);
+    for (let i = 0; i < SLOTS; i++) {
+      const a = (i / SLOTS) * Math.PI * 2 - Math.PI / 2;
+      const n = W.slots[i];
+      const isCur = i === W.cur;
+      const rad = r + (isCur ? 0 : 0);
+      const x = cx + Math.cos(a) * rad, y = cy + Math.sin(a) * rad;
+      svg('circle', { cx: x, cy: y, r: isCur ? 9 : Math.min(10, 3 + Math.sqrt(n) * 1.6), fill: isCur ? 'var(--pink)' : n ? 'var(--accent)' : 'var(--surface-3)', opacity: isCur ? 1 : n ? .9 : .6 }, ws);
+      if (n > 0 && !isCur) svg('text', { x, y: y + 3, 'text-anchor': 'middle', style: 'font-size:8px;font-weight:800;fill:#fff', text: n > 99 ? '99+' : n }, ws);
+    }
+    const a = (W.cur / SLOTS) * Math.PI * 2 - Math.PI / 2;
+    svg('line', { x1: cx, y1: cy, x2: cx + Math.cos(a) * (r - 18), y2: cy + Math.sin(a) * (r - 18), stroke: 'var(--pink)', 'stroke-width': 3 }, ws);
+    svg('text', { x: cx, y: cy - 6, 'text-anchor': 'middle', style: 'font-size:26px;font-weight:800;font-family:var(--mono)', text: W.cur }, ws);
+    svg('text', { x: cx, y: cy + 14, 'text-anchor': 'middle', class: 'lbl', text: 'slot' }, ws);
+    $('#whSlot').textContent = W.cur;
+    $('#whJobs').textContent = W.slots.reduce((a2, b) => a2 + b, 0);
+    $('#whFired').textContent = W.fired;
+    $('#whNow').textContent = W.last;
+  }
+  let whVisible = false;
+  setInterval(() => {
+    if (!whVisible || !W.playing) return;
+    W.cur = (W.cur + 1) % SLOTS;
+    W.last = W.slots[W.cur];
+    W.fired += W.last;
+    W.slots[W.cur] = 0;
+    whDraw();
+  }, 700);
+  SD.whenVisible($('#wheelPanel'), () => whVisible = true, () => whVisible = false);
+  $('#whAdd').onclick = () => { const d = SD.randInt(1, 45); W.slots[(W.cur + d) % SLOTS]++; whDraw(); };
+  $('#whBurst').onclick = () => { W.slots[(W.cur + 12) % SLOTS] += 200; whDraw(); SD.toast('200 jobs landed in one slot — this is the alignment problem'); };
+  $('#whPlay').onclick = () => { W.playing = !W.playing; $('#whPlay').textContent = W.playing ? '⏸ Pause' : '▶ Play'; };
+  whDraw();
+
+  /* ================= Midnight spike ================= */
+  const sp = $('#spSvg'), CAP = 20000, TOTAL = 2e6, MINUTES = 12;
+  function simulate(mode) {
+    const perSec = [];
+    const secs = MINUTES * 60;
+    for (let t = 0; t < secs; t++) perSec.push(0);
+    if (mode === 'naive') perSec[10] = TOTAL;
+    else {
+      // deterministic jitter over 300 s starting at t=10
+      for (let i = 0; i < 300; i++) perSec[10 + i] = Math.round(TOTAL / 300);
+    }
+    let backlog = 0, maxBack = 0, worstLate = 0, urgentOnTime = 100;
+    const exec = [], back = [];
+    for (let t = 0; t < secs; t++) {
+      backlog += perSec[t];
+      const cap = CAP;
+      const done = Math.min(backlog, cap);
+      backlog -= done;
+      exec.push(done); back.push(backlog);
+      maxBack = Math.max(maxBack, backlog);
+      if (backlog > 0) worstLate = t;
+    }
+    // lateness = when the backlog clears, minus when it started
+    const clearAt = back.findIndex((b, i) => i > 10 && b === 0);
+    worstLate = clearAt > 0 ? clearAt - 10 : secs;
+    if (mode === 'lanes') urgentOnTime = 100; else if (mode === 'naive') urgentOnTime = Math.round(CAP / TOTAL * 100); else urgentOnTime = 62;
+    return { perSec, exec, back, maxBack, worstLate, urgentOnTime };
+  }
+  function drawSpike() {
+    const mode = $('#spMode').dataset.value;
+    const r = simulate(mode);
+    sp.innerHTML = '';
+    const secs = MINUTES * 60, X = t => 40 + t / secs * 790;
+    const maxY = Math.max(...r.perSec, CAP * 2);
+    const Y = v => 210 - Math.log10(1 + v) / Math.log10(1 + maxY) * 180;
+    svg('line', { x1: 40, y1: 210, x2: 830, y2: 210, stroke: 'var(--border-strong)' }, sp);
+    [0, 2, 4, 6, 8, 10, 12].forEach(m => svg('text', { x: X(m * 60), y: 228, 'text-anchor': 'middle', class: 'lbl', style: 'font-size:10px', text: m ? '+' + m + 'm' : '00:00' }, sp));
+    svg('line', { x1: 40, y1: Y(CAP), x2: 830, y2: Y(CAP), stroke: 'var(--green)', 'stroke-dasharray': '4 4' }, sp);
+    svg('text', { x: 44, y: Y(CAP) - 5, class: 'lbl', style: 'fill:var(--green)', text: 'executor capacity 20K/s' }, sp);
+    const path = (arr, col, w) => { let d = ''; arr.forEach((v, i) => { d += `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`; }); svg('path', { d, fill: 'none', stroke: col, 'stroke-width': w }, sp); };
+    path(r.back, 'var(--red)', 2.2);
+    path(r.perSec, 'var(--accent-2)', 2);
+    path(r.exec, 'var(--green)', 1.6);
+    if (mode === 'lanes') { svg('line', { x1: X(10), y1: 30, x2: X(10), y2: 210, stroke: 'var(--amber)', 'stroke-width': 2 }, sp); svg('text', { x: X(10) + 6, y: 44, class: 'lbl', style: 'fill:var(--amber);font-weight:700', text: 'urgent lane fires immediately' }, sp); }
+    $('#spBack').textContent = SD.fmt(r.maxBack);
+    $('#spLate').textContent = r.worstLate > 120 ? (r.worstLate / 60).toFixed(1) + ' min' : r.worstLate + ' s';
+    $('#spUrgent').textContent = r.urgentOnTime + '%';
+    $('#spLoad').textContent = mode === 'naive' ? SD.fmt(TOTAL) + ' rows/s' : SD.fmt(Math.round(TOTAL / 300)) + ' rows/s';
+    const o = $('#spOut');
+    if (mode === 'naive') { o.className = 'verdict bad'; o.innerHTML = `💥 2M jobs due in one second against 20K/s capacity: a backlog of ${SD.fmt(r.maxBack)} builds instantly and takes <b>${(r.worstLate / 60).toFixed(1)} minutes</b> to clear. Every job is late, including the ones that actually mattered — and the database is being hammered for due rows the whole time.`; }
+    else if (mode === 'jitter') { o.className = 'verdict ok'; o.innerHTML = `✅ Spreading the same 2M jobs over 5 minutes keeps arrivals (${SD.fmt(Math.round(TOTAL / 300))}/s) below capacity: no backlog, flat database load, and each job still fires at the same second every day.`; }
+    else { o.className = 'verdict ok'; o.innerHTML = `✅ Best of both: bulk jobs are jittered across 5 minutes, while a small <b>urgent lane</b> (SLA-critical jobs) is served first with reserved capacity — so time-sensitive work is never stuck behind two million reports.`; }
+  }
+  $('#spMode').addEventListener('segchange', drawSpike);
+  drawSpike();
+
+  /* ================= Exactly-once ================= */
+  let E;
+  function exReset() { E = { runs: [], want: 0, sent: 0, blocked: 0 }; exRender('Turn the safeguards on one at a time and repeat the crash scenario.', 'idle'); }
+  function exRender(msg, cls) {
+    $('#exRuns').innerHTML = E.runs.length ? E.runs.map(r => `<div class="${r.cls}">${r.t}</div>`).join('') : '<div class="muted">no runs yet</div>';
+    $('#exWant').textContent = E.want;
+    $('#exSent').textContent = E.sent;
+    $('#exSent').parentElement.className = 'stat ' + (E.sent > E.want ? 'bad' : 'good');
+    $('#exBlocked').textContent = E.blocked;
+    if (msg) { const o = $('#exOut'); o.className = 'verdict ' + (cls || 'idle'); o.innerHTML = msg; }
+  }
+  const log = (t, cls) => E.runs.push({ t, cls: cls || '' });
+  function attempt(label, secondAttempt) {
+    const key = $('#exKey').checked, lease = $('#exLease').checked, idem = $('#exIdem').checked;
+    if (secondAttempt && key) { E.blocked++; log(`${label} → INSERT run(job_42, 09:00) violates unique key → skipped ✓`, 'blocked'); return false; }
+    if (secondAttempt && !key) log(`${label} → new run row created (no unique key!)`, 'dup');
+    else log(`${label} → run row created`);
+    // the side effect
+    if (secondAttempt && idem) { E.blocked++; log(`   payout API: idempotency key seen → returns the original payout ✓`, 'blocked'); return false; }
+    E.sent++;
+    log(`   payout API: $2,400 sent${secondAttempt ? '  ← DUPLICATE PAYMENT 💸' : ''}`, secondAttempt ? 'dup' : '');
+    return true;
+  }
+  $('#exRun').onclick = () => { E.want++; attempt('worker-1 leases job'); exRender('Single clean run — nothing interesting yet. Try crashing a worker.', 'idle'); };
+  $('#exCrash').onclick = () => {
+    E.want++;
+    attempt('worker-1 leases job');
+    log('💥 worker-1 dies after calling the payout API, before marking the run complete', 'dup');
+    const dup = attempt('worker-2 takes over after the lease expires', true);
+    const key = $('#exKey').checked, idem = $('#exIdem').checked;
+    exRender(dup
+      ? '❌ <b>The customer was paid twice.</b> Without a unique run key the retry created a second run, and without an idempotent handler the payout API happily sent the money again.'
+      : key && idem ? '✅ Both layers held: the unique run key stopped a second run row, and the idempotent payout API would have caught it anyway. This is the belt-and-braces setup you want for money.'
+      : key ? '✅ The unique key on (job_id, scheduled_for) blocked the duplicate <i>trigger</i>. Note this only works because the trigger is recorded in your database — the effect itself still needs idempotency if the crash happens later.'
+      : '✅ The idempotent handler saved you: a second run happened, but the payout API recognised the key and returned the original payment instead of sending a new one.',
+      dup ? 'bad' : 'ok');
+  };
+  $('#exSlow').onclick = () => {
+    E.want++;
+    const lease = $('#exLease').checked;
+    attempt('worker-1 leases job (lease 30 s)');
+    log('🐢 worker-1 pauses for 40 s — its lease expires while it still believes it holds the job', 'dup');
+    const dup = attempt('worker-2 acquires the expired lease', true);
+    log(lease ? '   worker-1 wakes and writes with token 7 → rejected, current token is 8 ✓' : '   worker-1 wakes and writes anyway — two workers "own" the same job 💥', lease ? 'blocked' : 'dup');
+    if (lease) E.blocked++;
+    exRender(lease
+      ? '✅ <b>Fencing tokens</b> made the zombie harmless: storage rejects any write carrying an older token (Chapter 17). Leases alone would not have — a paused process can always wake up after its lease expires.'
+      : '⚠️ Two workers now believe they own the job. With money involved this is how double payouts happen; a lease without a fencing token is only a hint, not a guarantee.',
+      lease ? 'ok' : 'bad');
+  };
+  $('#exReset').onclick = exReset;
+  exReset();
+
+  /* ================= Workflow labels ================= */
+  $('#wStep').addEventListener('step', e => {
+    const i = e.detail.index;
+    $('#wState').textContent = i < 0 ? 'replaying…' : i < 4 ? 'running' : i === 4 ? '💥 crashed' : 'resumed ✓';
+    $('#wHist').textContent = i < 1 ? '3 events' : i < 3 ? '5 events' : i < 5 ? '7 events (timer)' : '7 events → replay';
+    $('#wAct').textContent = i < 2 ? 'send_email()' : i < 5 ? 'completed ✓' : 'returns recorded result';
+    $('#wTimer').textContent = i < 3 ? 'wake in 3 days' : i < 5 ? 'armed · day 4' : 'fired ✓';
+    $('#w-wf').classList.toggle('bad', i === 4);
+    $('#w-wf').classList.toggle('ok', i >= 5);
+  });
+})();
+</script>
+</body>
+</html>
