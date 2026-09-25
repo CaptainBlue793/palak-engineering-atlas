@@ -33,16 +33,29 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 40</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
     <h1>Design an <span class="grad">Ad Click Aggregator</span></h1>
-    <p class="lead">Advertisers spend real money based on these numbers, so this system has an unusual combination of demands: ingest a million events per second, show counts that are <b>fresh within a minute</b>, and produce billing numbers that are <b>exactly right</b> even after machines crash, events arrive late, and bots try to inflate the totals. It's the practical showcase for everything in the streaming chapter.</p>
+    <p class="lead">Advertisers pay real money based on these numbers, so this system has an unusual mix of demands. It must take in a million events per second. It must show counts that are <b>less than a minute old</b>. And its billing numbers must be <b>exactly right</b> — even after machines crash, events arrive late, and bots try to inflate the totals. It's the practical showcase for everything in the streaming chapter.</p>
     <ul class="objectives">
-      <li>Ingest ad clicks at a million events per second</li>
-      <li>Aggregate with windows, watermarks and late data</li>
-      <li>Avoid hot partitions caused by viral ads</li>
-      <li>Get exactly-once counts despite crashes and retries</li>
-      <li>Serve dashboard queries from rollups in milliseconds</li>
-      <li>Reconcile streaming results with a batch recompute for billing</li>
+      <li>Take in ad clicks at a million events per second</li>
+      <li>Add them up using time windows, watermarks and rules for late data</li>
+      <li>Avoid overloading one partition when an ad goes viral</li>
+      <li>Count each click exactly once, despite crashes and retries</li>
+      <li>Answer dashboard queries in milliseconds from pre-computed totals (rollups)</li>
+      <li>Check the live stream's numbers against a nightly recount, and bill from the recount</li>
     </ul>
   </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Back-of-envelope math</b> — events per day to events per second, bytes to TB (<a href="p8-estimation-design-questions.html">P8: Estimation &amp; Reading a Design Question</a>, <a href="04-scalability.html">Chapter 4</a>).</li>
+        <li><b>Kafka partitions, consumer groups and delivery guarantees</b> (<a href="14-message-queues.html">Chapter 14</a>).</li>
+        <li><b>Event time, windows, watermarks, columnar storage, lambda vs kappa</b> (<a href="18-stream-batch.html">Chapter 18</a>).</li>
+        <li><b>Object storage for cheap raw data</b> (<a href="09-object-storage.html">Chapter 9</a>).</li>
+        <li><b>HyperLogLog sketches</b> for counting unique users (<a href="20-probabilistic.html">Chapter 20</a>).</li>
+      </ul>
+    </div>
+  </div>
 
   <div class="step-banner"><span>STEP 1 / 6</span></div>
   <h2>Requirements</h2>
@@ -50,17 +63,18 @@
     <div><h4 class="mt0">🛠️ Functional</h4><div class="req-list">
       <div class="req"><span class="chk">✓</span><span>Record every ad <b>impression and click</b> with attributes (ad, campaign, country, device)</span></div>
       <div class="req"><span class="chk">✓</span><span>Advertiser dashboard: clicks over time, filtered and grouped, for any range up to a year</span></div>
-      <div class="req"><span class="chk">✓</span><span>Billing-grade totals per campaign per day</span></div>
-      <div class="req"><span class="chk">✓</span><span>Filter invalid/bot traffic; support reprocessing after logic changes</span></div>
+      <div class="req"><span class="chk">✓</span><span>Totals per campaign per day that are accurate enough to bill from</span></div>
+      <div class="req"><span class="chk">✓</span><span>Filter out fake and bot traffic; allow recounting old data after the rules change</span></div>
     </div></div>
     <div><h4 class="mt0">📏 Non-functional</h4><div class="req-list">
-      <div class="req"><span class="chk">✓</span><span><b>Scale:</b> 10B events/day, peak ~1M/s</span></div>
-      <div class="req"><span class="chk">✓</span><span><b>Freshness:</b> dashboards within ~1 minute</span></div>
-      <div class="req"><span class="chk">✓</span><span><b>Exactly-once for billing</b>; approximate is fine for live dashboards</span></div>
-      <div class="req"><span class="chk">✓</span><span>Queries p99 &lt; 1 s over months of data</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Scale:</b> 10B events/day, peaking around 1M/s</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Freshness:</b> dashboards no more than ~1 minute behind</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Billing counts each click exactly once</b>; live dashboards can be approximate</span></div>
+      <div class="req"><span class="chk">✓</span><span>99% of queries under 1 second, even across months of data</span></div>
       <div class="req"><span class="chk">✓</span><span>The click redirect itself must be instant — users must never wait for analytics</span></div>
     </div></div>
   </div>
+  <p style="margin-top:16px"><b>Why two accuracy levels?</b> "Exactly right, within a minute, at a million events a second" is very hard to deliver in one path. So the requirements split the job: dashboards need to be <i>fresh</i> and can be off by a fraction of a percent for a few hours; invoices need to be <i>exact</i> and can wait until tomorrow. Spotting that split is the key move in this design — it lets the fast path be simple and the slow path be thorough.</p>
 
   <div class="step-banner"><span>STEP 2 / 6</span></div>
   <h2>Estimate the scale</h2>
@@ -72,7 +86,14 @@
     <div class="stat good"><div class="k">Aggregated rows/day</div><div class="v">~200M <small>ad × minute × dims</small></div></div>
     <div class="stat"><div class="k">Dashboard QPS</div><div class="v">~5K</div></div>
   </div>
-  <p style="margin-top:16px">The raw stream is huge but the <b>aggregates are small</b> — that asymmetry is the whole design. Keep raw events cheaply in object storage for reprocessing and audits, and serve every query from pre-aggregated rollups.</p>
+  <p style="margin-top:16px">The raw stream is huge, but the <b>totals are small</b>. That gap is the whole design. Keep raw events cheaply in object storage (like S3) so you can recount and audit them later. Answer every dashboard query from the small, pre-computed totals instead.</p>
+  <p><b>The arithmetic:</b></p>
+  <ul>
+    <li><b>Average rate:</b> 10B ÷ 86,400 s ≈ 115K events/s. Traffic follows daytime in big markets and spikes during major events, so peak is planned at ~1M/s — about 9× average.</li>
+    <li><b>Raw volume:</b> 10B × 100 bytes = 1 TB/day. Stored as compressed columnar files (Parquet), repetitive fields like country and device shrink a lot, so ~4× compression gives ~250 GB/day, or ~90 TB/year.</li>
+    <li><b>Aggregated rows:</b> a rollup row exists only for a <code>(minute, ad, country, device)</code> combination that actually had clicks. If ~140K such combinations are active in a typical minute, that is 140K × 1,440 minutes ≈ 200M rows/day. So 10B events become 200M minute rows (50× smaller), and hour rows are smaller again.</li>
+    <li><b>Kafka partitions:</b> with 64 partitions, peak load per partition is 1M ÷ 64 ≈ 16K events/s, about 1.6 MB/s — easy for one consumer. Partition count sets the maximum number of consumers that can work in parallel, so you size it for peak with room to grow.</li>
+  </ul>
 
   <div class="step-banner"><span>STEP 3 / 6</span></div>
   <h2>High-level design</h2>
@@ -102,22 +123,26 @@
     </div>
     <div class="stepper" id="aStep" data-diagram="aSvg">
       <ol class="steps">
-        <li data-title="The click path must be instant" data-on="a-u a-rd a-e1" data-packet="a-u>a-rd">The ad links to <code>/click?ad=…&amp;sig=…</code>. The redirect service validates a signature (so clicks can't be forged), assigns a <b>click_id</b>, writes the event to a local buffer and returns a <code>302</code> to the advertiser's page within milliseconds. Nothing downstream is on the user's critical path.</li>
-        <li data-title="Buffer into Kafka" data-on="a-rd a-k a-e2" data-packet="a-rd>a-k" data-color="var(--accent-2)">Events are batched into Kafka, partitioned to spread load and preserve per-key ordering. Kafka absorbs the 1M/s spikes and lets several independent consumers read the same stream (Chapter 14).</li>
-        <li data-title="Stream aggregation" data-on="a-k a-f a-e3" data-packet="a-k>a-f" data-color="var(--amber)">Flink keys by <code>(ad_id, country, device)</code>, drops duplicates by <code>click_id</code>, filters known bots, and counts into <b>1-minute tumbling windows</b> with a watermark allowing ~2 minutes of lateness (Chapter 18).</li>
-        <li data-title="Write rollups" data-on="a-f a-olap a-e4" data-packet="a-f>a-olap" data-color="var(--green)">Completed windows are <b>upserted</b> into an OLAP store keyed by <code>(minute, ad_id, dims)</code>. Upserts make the write idempotent: reprocessing the same window overwrites rather than double-counts.</li>
-        <li data-title="Dashboards query rollups" data-on="a-adv a-dash a-olap a-e5 a-e9" data-packet="a-adv>a-dash,a-dash>a-olap" data-color="var(--green)">“Clicks per hour for campaign 42 in Germany, last 30 days” reads a few thousand pre-aggregated rows instead of scanning billions of events.</li>
-        <li data-title="Keep the raw truth" data-on="a-k a-lake a-e6 a-e7" data-packet="a-k>a-lake" data-color="var(--pink)">A second consumer archives raw events to the data lake as Parquet, partitioned by hour (Chapter 9). This is the source of truth for audits, backfills and any change to counting logic.</li>
-        <li data-title="Batch recompute for billing" data-on="a-lake a-batch a-olap a-e8" data-packet="a-lake>a-batch" data-color="var(--pink)">Overnight, a batch job recomputes yesterday from raw data with the full fraud model, and reconciles against the streaming numbers. Small drift is expected and corrected; large drift pages someone. Advertisers are billed from the batch result.</li>
+        <li data-title="The click path must be instant" data-on="a-u a-rd a-e1" data-packet="a-u>a-rd">The ad links to <code>/click?ad=…&amp;sig=…</code>. The redirect service checks a signature so clicks can't be faked, gives the click a <b>click_id</b>, writes the event to a local buffer, and sends the user on to the advertiser's page with a <code>302</code> redirect — all within milliseconds. Nothing further down the pipeline makes the user wait.</li>
+        <li data-title="Buffer into Kafka" data-on="a-rd a-k a-e2" data-packet="a-rd>a-k" data-color="var(--accent-2)">Events are sent to Kafka in batches, split across partitions to spread the load while keeping events with the same key in order. Kafka soaks up the 1M/s spikes, and several independent consumers can read the same stream (Chapter 14).</li>
+        <li data-title="Stream aggregation" data-on="a-k a-f a-e3" data-packet="a-k>a-f" data-color="var(--amber)">Flink groups events by <code>(ad_id, country, device)</code>, drops duplicates using <code>click_id</code>, filters out known bots, and counts them into <b>1-minute windows</b> that don't overlap (tumbling windows). A watermark lets events arrive up to ~2 minutes late and still be counted in their own minute (Chapter 18).</li>
+        <li data-title="Write rollups" data-on="a-f a-olap a-e4" data-packet="a-f>a-olap" data-color="var(--green)">When a window closes, its total is <b>upserted</b> — inserted, or overwritten if it's already there — into an analytics (OLAP) store keyed by <code>(minute, ad_id, dims)</code>. Upserting makes the write safe to repeat: recounting the same window overwrites the old total instead of adding to it.</li>
+        <li data-title="Dashboards query rollups" data-on="a-adv a-dash a-olap a-e5 a-e9" data-packet="a-adv>a-dash,a-dash>a-olap" data-color="var(--green)">“Clicks per hour for campaign 42 in Germany, last 30 days” reads a few thousand pre-computed rows, instead of scanning billions of events.</li>
+        <li data-title="Keep the raw truth" data-on="a-k a-lake a-e6 a-e7" data-packet="a-k>a-lake" data-color="var(--pink)">A second consumer saves the raw events to the data lake as Parquet files, grouped by hour (Chapter 9). This is the source of truth for audits, filling gaps, and any change to how you count.</li>
+        <li data-title="Batch recompute for billing" data-on="a-lake a-batch a-olap a-e8" data-packet="a-lake>a-batch" data-color="var(--pink)">Overnight, a batch job recounts yesterday from the raw data, using the full fraud model, and compares the result with the streaming numbers. A small difference is expected and corrected. A large one pages someone. Advertisers are billed from the batch result.</li>
       </ol>
     </div>
   </div>
 
-  <div class="callout tip"><div class="ico">λ</div><div class="body"><div class="title">This is a lambda architecture — on purpose</div><p>Streaming gives <b>freshness</b> (dashboards in seconds) and batch gives <b>correctness</b> (complete, late-inclusive, re-runnable). Money justifies running both. If you only needed dashboards, a single streaming path (kappa) would be simpler — and if you only needed invoices, a nightly batch job alone would do.</p></div></div>
+  <div class="callout tip"><div class="ico">λ</div><div class="body"><div class="title">This is a lambda architecture — on purpose</div><p>A lambda architecture runs two paths over the same data. Streaming gives <b>freshness</b>: dashboards update within seconds. Batch gives <b>correctness</b>: it sees every event, including late ones, and can be re-run at any time. Running both costs more, but with money on the line it's worth it. If you only needed dashboards, one streaming path (the kappa architecture) would be simpler. If you only needed invoices, a nightly batch job alone would do.</p></div></div>
+
+  <h3>Event time, watermarks and the one-minute promise</h3>
+  <p>Each click carries the time it <i>happened</i> (event time). It reaches Flink a little later (processing time), and not always in order. The window for 12:00–12:01 must contain clicks that <i>happened</i> in that minute, whenever they arrive. A <b>watermark</b> is Flink's running estimate of "I have probably seen everything up to time T" — here, the latest event time seen minus 2 minutes.</p>
+  <p>A trace: a click at 12:00:59 arrives at 12:01:40. The 12:00 window is still open (the watermark is only around 11:59:40), so the click is counted in the right minute. How does that square with dashboards being only ~1 minute behind? The usual answer is to <b>emit early and correct later</b>: the window publishes a running total every few seconds while it is open, then a final total when the watermark passes. Because each publish is an upsert of the whole window total, the dashboard's number simply gets replaced with a slightly more accurate one — nothing is added twice.</p>
 
   <div class="step-banner"><span>STEP 4 / 6</span></div>
   <h2>Deep dive: hot partitions</h2>
-  <p>Partitioning by <code>ad_id</code> keeps each ad's events in order on one partition — until a Super Bowl ad becomes 40% of all traffic. That partition's consumer can't keep up, its lag grows, and dashboards for <b>every</b> ad on that partition fall behind.</p>
+  <p>Splitting the stream by <code>ad_id</code> puts all of one ad's events on one partition, in order. That works — until a Super Bowl ad becomes 40% of all traffic. The one consumer reading that partition can't keep up, it falls further and further behind, and dashboards for <b>every</b> ad on that partition go stale with it.</p>
 
   <div class="panel" id="hpPanel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">8 Kafka partitions, one consumer each</span><span class="p-tag">Simulator</span></div>
@@ -136,11 +161,13 @@
         <div class="stat good"><div class="k">Processed / s</div><div class="v" id="hpDone">–</div></div>
       </div>
     </div>
-    <div class="panel-foot">🧪 Go viral with <b>key = ad_id</b>: one partition's lag explodes while seven consumers idle. Switch to a <b>salted key</b>: the viral ad spreads over all partitions, each producing a partial count that the aggregator sums by <code>ad_id</code>. The cost is that per-ad ordering is lost — fine for counting, not for event sequences that must stay ordered.</div>
+    <div class="panel-foot">🧪 Go viral with <b>key = ad_id</b>: one partition falls far behind while seven consumers sit idle. Now switch to a <b>salted key</b> — the ad id plus a small random number, like “ad_99:3”. The viral ad now spreads across all partitions. Each one produces a partial count, and the aggregator adds those up by <code>ad_id</code>. The cost is that the ad's events are no longer in order. That's fine for counting, but not for events that must stay in sequence.</div>
   </div>
+  <p><b>Merging the partial counts is a second, tiny step.</b> Stage 1 counts per <code>(ad_99:3, 12:00)</code> on each partition. Stage 2 is keyed by the plain <code>ad_99</code> and adds up at most 8 partial totals per minute — 8 small numbers, no matter how many millions of clicks the ad got. Most systems salt only keys detected as hot (the top few ads by rate), so the 99.9% of normal ads skip the extra step.</p>
+  <p><b>Why not simply add more partitions?</b> Kafka sends every event with the same key to the same partition, whatever the partition count. With key = <code>ad_99</code>, going from 8 to 800 partitions still puts all of that ad's traffic on exactly one of them.</p>
 
   <h2>Deep dive: counting exactly once</h2>
-  <p>Three independent things can inflate or lose counts: the client retrying, the consumer reprocessing after a crash, and bots. Each needs its own defence.</p>
+  <p>Three separate things can push counts up or down: the client retrying, a consumer reprocessing events after a crash, and bots. Each needs its own defence.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Counting under failure</span><span class="p-tag">Simulator</span></div>
@@ -165,12 +192,16 @@
       </div>
       <div class="log" id="exLog" style="margin-top:10px;height:130px"></div>
     </div>
-    <div class="panel-foot">🧪 Run everything with all three defences off, then turn them on one at a time. Note that <b>dedupe</b> fixes client retries, <b>idempotent upserts</b> fix consumer replays (an increment would double-count; writing the window's total is naturally repeatable), and only <b>filtering</b> fixes bots — no amount of exactly-once machinery makes fraudulent clicks disappear.</div>
+    <div class="panel-foot">🧪 Run everything with all three defences off, then turn them on one at a time. <b>Deduplication</b> fixes client retries. <b>Idempotent upserts</b> fix consumer replays: adding 1 each time would double-count, but writing the window's total again is harmless. And only <b>filtering</b> fixes bots — no amount of exactly-once machinery makes fake clicks disappear.</div>
   </div>
+  <p><b>Why replays happen at all.</b> Flink regularly takes a <b>checkpoint</b>: it saves its counting state together with the Kafka offsets (positions in each partition) it has read up to. After a crash it restores the last checkpoint and re-reads everything after those offsets. So every event since the last checkpoint — perhaps 30 seconds' worth — is processed a second time. Inside Flink that is fine, because the restored state is from before those events. The danger is outside Flink: anything already written to the database from those 30 seconds gets written again. An upsert of the window total makes that second write harmless; <code>count = count + 1</code> does not.</p>
+  <p><b>Sizing the dedupe state.</b> Remembering every click_id for 24 hours means holding up to 10B IDs. At ~16 bytes each that is ~160 GB — too big for memory on one machine, but fine when split across 64 Flink tasks (~2.5 GB each) in an on-disk state store such as RocksDB. You might ask: why not a Bloom filter, which is far smaller? Because a Bloom filter sometimes says "seen it" for an ID it has never seen. Here that would silently drop a real, billable click. For billing, a small exact store beats a tiny approximate one.</p>
 
   <div class="step-banner"><span>STEP 5 / 6</span></div>
   <h2>Deep dive: serving queries fast</h2>
-  <p>Advertisers slice by campaign, country, device and time, over ranges from “last hour” to “this year”. Scanning raw events per query is impossible; the answer is a <b>hierarchy of rollups</b> plus a columnar store.</p>
+  <p>Advertisers break the numbers down by campaign, country, device and time, over ranges from “last hour” to “this year”. Scanning raw events for each query is impossible. The answer is a <b>ladder of rollups</b> — totals per minute, per hour and per day — stored in a columnar database, which only reads the columns a query needs.</p>
+  <p>A sized example: "clicks per hour for campaign 42 over the last 30 days". From raw events, that means filtering through 30 × 10B = 300B events. From the hourly rollup, it is 30 × 24 = 720 rows per country/device combination — a few thousand rows in total, which a columnar store answers in milliseconds. The rule of thumb: pick the coarsest rollup that still gives the granularity asked for (per-hour charts read the hour table, even for a range of one day).</p>
+  <p><b>Why sums roll up but uniques don't.</b> Clicks in an hour = the sum of clicks in its 60 minutes, exactly. But if user U clicks in minute 1 and again in minute 2, U is one of the uniques in both minutes; adding the minute counts counts U twice. The fix is to store something that can be <i>merged</i> rather than added — a HyperLogLog sketch per minute (a few KB), which estimates unique counts to within about 1–2%.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Which table answers this query?</span><span class="p-tag">Simulator</span></div>
@@ -187,44 +218,44 @@
         <div class="stat good"><div class="k">Estimated latency</div><div class="v" id="qLat">–</div></div>
       </div>
     </div>
-    <div class="panel-foot">Rollups are built by chaining stream jobs (minute → hour → day) or by the OLAP engine itself (Druid/ClickHouse materialized views). Unique-user metrics use <b>HyperLogLog sketches</b> (Chapter 20), which merge across rollup levels — plain counts of distinct users cannot.</div>
+    <div class="panel-foot">Rollups are built by chaining stream jobs (minute → hour → day), or by the analytics engine itself (Druid or ClickHouse materialized views). “Unique users” needs special handling: use <b>HyperLogLog sketches</b> (Chapter 20), small summaries that can be merged from minutes into hours. Plain counts of distinct users can't be added up that way, because the same user appears in several minutes.</div>
   </div>
 
   <div class="step-banner"><span>STEP 6 / 6</span></div>
   <h2>Wrap-up</h2>
   <div class="grid c3">
-    <div class="card feature reveal"><div class="f-ico">🤖</div><h4>Invalid traffic</h4><p>Real-time heuristics (rate per IP/device, impossible timings, known bot ASNs) plus offline ML review. Billing waits for the hold-back window so refunds for invalid clicks are computed before invoicing.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🔁</div><h4>Reprocessing</h4><p>Because raw events live in the lake and rollups are idempotent upserts, you can replay a month through fixed logic and overwrite the affected windows — no manual patching of counters.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">⏱️</div><h4>Late events</h4><p>Mobile SDKs upload offline clicks hours later. Allow lateness for a bounded window, route the rest to a side output, and let the nightly batch job fold them into the final numbers.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🌍</div><h4>Multi-region</h4><p>Aggregate locally in each region and merge partial counts centrally — counting is associative, so partial sums merge cleanly (and HLL sketches merge too).</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">💾</div><h4>Retention & cost</h4><p>Raw events for 30–90 days in hot storage then archive; minute rollups for 3 months; hour for a year; day forever. Storage cost is dominated by raw data, query cost by granularity.</p></div>
-    <div class="card feature reveal"><div class="f-ico">🔭</div><h4>Monitoring the pipeline</h4><p>Consumer lag per partition, watermark delay, dropped-late-event count, streaming-vs-batch drift, and rollup freshness — these are the SLIs that tell you the numbers can be trusted.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🤖</div><h4>Invalid traffic</h4><p>Use quick rules in real time: too many clicks per IP or device, timings no human could produce, networks known for bots. Then review more carefully offline with ML. Billing waits for a hold-back period, so credits for invalid clicks are worked out before the invoice goes out.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🔁</div><h4>Reprocessing</h4><p>Raw events live in the lake, and rollups are written with upserts that are safe to repeat. So you can replay a whole month through corrected logic and simply overwrite the affected windows. No hand-patching of counters.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">⏱️</div><h4>Late events</h4><p>Phone apps upload clicks made offline hours later. Accept late events for a set period, send anything later than that to a side output, and let the nightly batch job fold them into the final numbers.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🌍</div><h4>Multi-region</h4><p>Count locally in each region, then add the partial counts together centrally. Addition doesn't care about grouping or order, so partial sums combine cleanly. HLL sketches merge the same way.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">💾</div><h4>Retention & cost</h4><p>Keep raw events in fast storage for 30–90 days, then archive them. Keep minute rollups for 3 months, hour rollups for a year, and day rollups forever. Storage cost comes mostly from raw data; query cost comes from how fine-grained the rollup is.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🔭</div><h4>Monitoring the pipeline</h4><p>Watch how far behind each partition's consumer is, how delayed the watermark is, how many late events were dropped, how far streaming and batch numbers differ, and how fresh the rollups are. These are the signals that tell you the numbers can be trusted.</p></div>
   </div>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
-      <li><b>Doing analytics work in the redirect.</b> The user's click must be a fast 302; everything else is asynchronous.</li>
-      <li><b>Incrementing counters on reprocessing.</b> Upsert the window total instead, so replays are idempotent.</li>
-      <li><b>Deleting raw events.</b> Without them you can't backfill, re-run corrected logic, or defend an invoice.</li>
+      <li><b>Doing analytics work inside the redirect.</b> The user's click must be a fast 302. Everything else happens afterwards, in the background.</li>
+      <li><b>Adding to counters when reprocessing.</b> Write the window's total instead, so replays don't double-count.</li>
+      <li><b>Deleting raw events.</b> Without them you can't fill gaps, re-run corrected logic, or defend an invoice.</li>
     </ul></div></div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Design:</b> Advertisers dispute a bill. What lets you answer them?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Raw events in the lake, partitioned by hour, with a click ID per event and the signature that proved the click was legitimate. The nightly batch job recomputes the invoice from that raw data with the current fraud model, and its output — not the streaming dashboard — is what's billed. You can show the drift between streaming and batch, the number of events filtered as invalid, and replay any window to demonstrate the number.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The raw events in the lake, grouped by hour, each with a click ID and the signature that proved the click was genuine. The nightly batch job recounts the invoice from that raw data using the current fraud model, and its output — not the streaming dashboard — is what the advertiser is billed for. You can show how far streaming and batch differed, how many events were filtered out as invalid, and replay any window to prove the number.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Scale:</b> One advertiser's campaign is 60% of all traffic. What do you change?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Salt the partition key (<code>ad_id:0–N</code>) so that campaign's events spread across partitions, and sum the partial counts by <code>ad_id</code> downstream — counting is associative, so partial aggregates merge cleanly. Ordering within the ad is lost, which is fine for counting. Also check the serving store: the same hot key can become a hot row there, so pre-aggregate before writing and consider a separate partition for the whale.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Salt the partition key (<code>ad_id:0–N</code>) so that campaign's events spread across partitions, then add the partial counts back together by <code>ad_id</code>. Addition doesn't care about grouping, so partial totals merge cleanly. You lose ordering within that ad, which doesn't matter for counting. Also check the store the dashboards read: the same hot key can become one hot row there, so aggregate before writing, and consider giving the huge advertiser its own partition.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Keep the user-facing click redirect instant; everything analytical happens asynchronously behind Kafka.</li>
-      <li>Aggregate in event-time windows with watermarks; expect and handle late events.</li>
-      <li>Hot keys create hot partitions — salt the key and merge partial counts.</li>
-      <li>Exactly-once counting needs dedupe by event ID plus idempotent upserts of window totals.</li>
-      <li>Bot filtering is a separate problem from exactly-once processing.</li>
-      <li>Serve dashboards from a hierarchy of rollups in a columnar OLAP store; use HLL sketches for uniques.</li>
-      <li>Archive raw events so any logic change can be replayed; bill from a nightly batch recompute reconciled against the stream.</li>
+      <li>Keep the user's click redirect instant. All the analytics happens later, behind Kafka.</li>
+      <li>Count events into windows based on when they happened, using watermarks. Expect late events and have a plan for them.</li>
+      <li>A very popular key overloads one partition. Salt the key and add the partial counts back together.</li>
+      <li>Counting exactly once needs two things: dropping duplicate event IDs, and writing window totals with upserts that are safe to repeat.</li>
+      <li>Filtering bots is a separate problem from exactly-once processing.</li>
+      <li>Serve dashboards from a ladder of rollups in a columnar analytics store. Use HLL sketches for unique-user counts.</li>
+      <li>Archive raw events so any change in logic can be replayed. Bill from a nightly recount that is checked against the streaming numbers.</li>
     </ul>
   </div>
 
@@ -234,27 +265,27 @@
     <div class="quiz" data-answer="1">
       <p class="q">A single ad generates 60% of all clicks. Events are keyed by ad_id. What happens and what's the fix?</p>
       <div class="opts"><button class="opt">Kafka rebalances automatically; nothing to do</button><button class="opt">One partition's consumer falls behind; salt the key (ad_id:0–N) and sum partial counts</button><button class="opt">Add more partitions with the same key</button><button class="opt">Switch to at-most-once delivery</button></div>
-      <div class="explain">All events with the same key land on one partition. Salting spreads them; counting is associative so partials merge.</div>
+      <div class="explain">All events with the same key go to one partition. Salting spreads them out, and the partial counts can simply be added back together.</div>
     </div>
     <div class="quiz" data-answer="2">
       <p class="q">A consumer crashes and reprocesses the last minute of events. Why does writing the window total (upsert) beat incrementing a counter?</p>
       <div class="opts"><button class="opt">Upserts are faster</button><button class="opt">Increments are not supported in OLAP stores</button><button class="opt">Re-writing the same window total is idempotent, while replayed increments double-count</button><button class="opt">It avoids the need for watermarks</button></div>
-      <div class="explain">Idempotent writes make reprocessing safe — the cornerstone of exactly-once <i>effects</i>.</div>
+      <div class="explain">Writes that can be repeated safely make reprocessing safe. That's the foundation of getting exactly-once <i>results</i>.</div>
     </div>
     <div class="quiz" data-answer="0">
       <p class="q">Why keep raw events in a data lake when rollups answer every dashboard query?</p>
       <div class="opts"><button class="opt">To reprocess after logic or fraud-model changes, to backfill, and for audits and billing disputes</button><button class="opt">Because Kafka deletes data after 7 days and cannot be configured</button><button class="opt">To make queries faster</button><button class="opt">It isn't needed</button></div>
-      <div class="explain">Aggregates are lossy. Raw data is the only way to answer a question you didn't anticipate — or to prove the invoice.</div>
+      <div class="explain">Totals throw away detail. Raw data is the only way to answer a question you didn't plan for — or to prove an invoice is right.</div>
     </div>
     <div class="quiz" data-answer="3">
       <p class="q">A mobile SDK uploads clicks that happened 3 hours ago, past the 2-minute allowed lateness. What should happen?</p>
       <div class="opts"><button class="opt">Count them in the current minute</button><button class="opt">Drop them silently</button><button class="opt">Extend the watermark delay to 3 hours</button><button class="opt">Route them to a side output and let the nightly batch job include them in the final numbers</button></div>
-      <div class="explain">Counting them "now" corrupts the timeline, and a 3-hour watermark would make every dashboard 3 hours stale. Batch fixes the record.</div>
+      <div class="explain">Counting them in the current minute would put clicks in the wrong hour, and waiting 3 hours would make every dashboard 3 hours behind. The nightly batch job corrects the record instead.</div>
     </div>
     <div class="quiz" data-answer="1">
       <p class="q">Why can't you sum “unique users per hour” from 60 per-minute unique-user counts?</p>
       <div class="opts"><button class="opt">Because minutes and hours use different time zones</button><button class="opt">The same user can appear in several minutes, so counts of distinct values aren't additive — use mergeable HLL sketches</button><button class="opt">Because the OLAP store doesn't support SUM</button><button class="opt">You can, it's exact</button></div>
-      <div class="explain">Distinct counts aren't additive. Storing HyperLogLog sketches per minute lets you merge them into any larger window.</div>
+      <div class="explain">You can't add up counts of distinct things. Storing a HyperLogLog sketch per minute lets you merge them into any larger window.</div>
     </div>
   </div>
 </main>

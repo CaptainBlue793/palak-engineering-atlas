@@ -51,21 +51,35 @@
 <main class="content">
 
   <section class="hero">
-    <div class="eyebrow"><span class="pill accent">Chapter 28</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study · Finale</span><span class="pill">⏱ 45 min</span></div>
+    <div class="eyebrow"><span class="pill accent">Chapter 28</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
     <h1>Design a <span class="grad">Chat System</span></h1>
-    <p class="lead">WhatsApp, Messenger, Slack, Discord. Real-time messaging combines nearly everything in this course: persistent connections, stateful servers, message queues, ordering, durable storage, delivery guarantees and presence. Let's build it.</p>
+    <p class="lead">WhatsApp, Messenger, Slack, Discord. Real-time chat uses nearly everything in this course: connections that stay open, servers that remember who is connected, message queues, ordering, safe storage, delivery guarantees and presence (who's online). Let's build it.</p>
     <ul class="objectives">
-      <li>Choose the right real-time protocol</li>
-      <li>Route messages between stateful gateway servers</li>
+      <li>Choose the right protocol for real-time messages</li>
+      <li>Route messages between gateway servers that each hold live connections</li>
       <li>Implement sent / delivered / read receipts</li>
-      <li>Handle offline users with push & sync</li>
-      <li>Guarantee per-conversation ordering</li>
-      <li>Design presence at scale</li>
+      <li>Handle offline users with push notifications and sync</li>
+      <li>Keep messages in the right order within each conversation</li>
+      <li>Design presence (online / last seen) at scale</li>
     </ul>
   </section>
 
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>TCP connections and HTTP</b> — what it means for a connection to stay open (<a href="p4-networking-basics.html">P4: Networking Basics</a>, <a href="02-networking.html">Chapter 2</a>).</li>
+        <li><b>WebSockets vs polling vs SSE</b> (<a href="03-apis.html">Chapter 3: APIs &amp; Communication</a>).</li>
+        <li><b>Partition keys and wide-column stores</b> like Cassandra (<a href="07-databases.html">Chapter 7</a>, <a href="08-replication-sharding.html">Chapter 8</a>).</li>
+        <li><b>Why clocks can't be trusted for ordering</b> (<a href="13-distributed-theory.html">Chapter 13</a>).</li>
+        <li><b>Idempotency, retries with backoff and jitter</b> (<a href="14-message-queues.html">Chapter 14</a>, <a href="16-reliability.html">Chapter 16</a>).</li>
+      </ul>
+    </div>
+  </div>
+
   <div class="step-banner"><span>STEP 1 / 6</span></div>
   <h2>Requirements</h2>
+  <p>Notice how different these are from the news feed. There, a few seconds of delay and the odd missing post were fine. Here, the user is watching the screen waiting for a reply, and a lost message is a real failure — someone missed “the meeting moved”. So chat trades some of the feed's freedom for stronger promises: <b>low latency</b>, <b>no loss</b> and <b>a fixed order</b>. Each of those promises will cost us something specific below.</p>
   <div class="split">
     <div><h4 class="mt0">🛠️ Functional</h4><div class="req-list">
       <div class="req"><span class="chk">✓</span><span>1:1 chats and group chats (up to 500 members)</span></div>
@@ -75,10 +89,10 @@
       <div class="req"><span class="chk">✓</span><span>Multiple devices per user stay in sync</span></div>
     </div></div>
     <div><h4 class="mt0">📏 Non-functional</h4><div class="req-list">
-      <div class="req"><span class="chk">✓</span><span><b>Real-time:</b> delivery &lt; 200ms when both online</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Real-time:</b> delivered in under 200ms when both people are online</span></div>
       <div class="req"><span class="chk">✓</span><span><b>Never lose a message</b> once the sender sees ✓</span></div>
       <div class="req"><span class="chk">✓</span><span><b>Ordered</b> within each conversation</span></div>
-      <div class="req"><span class="chk">✓</span><span><b>Massive concurrency:</b> ~100M simultaneous connections</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Huge scale:</b> ~100M connections open at the same time</span></div>
     </div></div>
   </div>
 
@@ -92,20 +106,30 @@
     <div class="stat warn"><div class="k">Concurrent connections</div><div class="v">~100M</div></div>
     <div class="stat good"><div class="k">Gateway servers</div><div class="v">~1,000 <small>@100K conns</small></div></div>
   </div>
-  <p style="margin-top:16px">Writes and reads are roughly balanced (every message is written once and delivered ~once), unlike the feed. The unusual cost is <strong>holding 100 million open connections</strong>.</p>
+  <p style="margin-top:16px">Unlike the news feed, writes and reads are roughly balanced: each message is written once and delivered about once. The unusual cost is <strong>keeping 100 million connections open</strong>.</p>
+  <p>The working behind the tiles: 500M users × 40 messages = 20B messages/day. Divide by 86,400 s ≈ 230K messages/s, and a 3× evening peak gives ~700K/s. At ~100 bytes per message (text plus IDs and timestamps), 20B × 100 B = 2 TB/day, or about 730 TB a year before copies — so old messages will need cheaper storage. If about one user in five is connected at any moment, that's 100M open connections; at ~100K per gateway server you need ~1,000 gateways.</p>
+  <p>Why ~100K connections per server and not more? An idle open connection costs little CPU but some memory — tens of kilobytes for buffers and TLS state. 100K × ~20 KB ≈ 2 GB, which is comfortable. Well-tuned servers can hold millions, but keeping each one smaller limits the damage when one dies: 100K users reconnecting is a spike; 2M is a storm.</p>
 
   <div class="step-banner"><span>STEP 3 / 6</span></div>
   <h2>Connections: why WebSockets</h2>
-  <p>Recall Chapter 3: the server must push messages the instant they arrive, and clients send frequently too. Polling wastes battery and adds latency; SSE is one-way. <strong>WebSockets</strong> give a persistent, full-duplex, low-overhead channel. (Mobile apps often use MQTT or a custom protocol over TCP for the same reasons.)</p>
+  <p>Recall Chapter 3. The server must push each message the moment it arrives, and clients send often too. Let's check the options:</p>
+  <ul>
+    <li><b>Polling</b> (asking “anything new?” over and over) drains the battery and adds delay.</li>
+    <li><b>SSE</b> (Server-Sent Events) only works one way, server to client.</li>
+    <li><strong>WebSockets</strong> keep one connection open, let both sides talk at any time (<b>full-duplex</b>), and add little overhead per message.</li>
+  </ul>
+  <p>Mobile apps often use MQTT or their own protocol over TCP, for the same reasons.</p>
+  <p>A quick comparison with numbers. Suppose 100M phones poll every 5 seconds: that's 20M requests per second, almost all answering “nothing new”, and each message waits up to 5 seconds. With WebSockets, the same phones send only a small heartbeat now and then, and a message arrives in the time it takes to cross the network — tens of milliseconds. The price is that each server now <i>remembers</i> its connections, which the next cards deal with.</p>
   <div class="grid c3">
-    <div class="card feature reveal"><div class="f-ico">🔌</div><h4>Chat gateways are stateful</h4><p>Each gateway holds ~100K live sockets in memory. Alice's messages must reach the <i>specific</i> gateway holding Bob's socket.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">📍</div><h4>Session registry</h4><p>On connect, record <code>bob → gateway-17, device-2</code> in Redis (with TTL refreshed by heartbeats). Lookups route each message.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🧠</div><h4>Keep gateways thin</h4><p>Gateways only manage connections. Business logic lives in stateless chat services, so gateways can be drained and redeployed safely.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🔌</div><h4>Chat gateways are stateful</h4><p>A <b>gateway</b> is a server that holds users' open connections. Each one keeps ~100K live sockets in memory. So Alice's message must reach the <i>exact</i> gateway holding Bob's socket.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">📍</div><h4>Session registry</h4><p>When a user connects, save <code>bob → gateway-17, device-2</code> in Redis. The entry has a TTL (expiry time) that each heartbeat renews. To route a message, look up the recipient here.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🧠</div><h4>Keep gateways thin</h4><p>Gateways only manage connections. The real app logic lives in separate chat services that keep no state. That way, gateways can be emptied and redeployed safely.</p></div>
   </div>
+  <p>Why must the registry entry have a TTL? Phones vanish without saying goodbye — the battery dies or the train enters a tunnel. Without an expiry, the registry would keep saying “Bob is on gateway-17” long after that connection died, and messages would be sent into nothing. With a TTL of, say, 30 seconds that each heartbeat renews, a dead connection clears itself within half a minute, and the message falls back to “store and push”.</p>
 
   <div class="step-banner"><span>STEP 4 / 6</span></div>
   <h2>Message flow — try it live</h2>
-  <p>Two users on <strong>different gateway servers</strong>. Send messages both ways, take Bob offline, close/open the chat, and watch the ticks change. Everything in the middle is what really happens.</p>
+  <p>Here are two users on <strong>different gateway servers</strong>. Send messages both ways, take Bob offline, close and open the chat, and watch the ticks change. The middle shows what really happens behind the scenes.</p>
 
   <div class="panel" id="chatPanel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Chat lab</span><span class="p-tag">Simulator</span><button class="btn sm ghost" id="chatReset" style="margin-left:auto">↺ Reset</button></div>
@@ -141,19 +165,28 @@
         </div>
       </div>
     </div>
-    <div class="panel-foot">✓ <b>sent</b> = persisted on the server · ✓✓ <b>delivered</b> = reached a recipient device · <span style="color:#38bdf8;font-weight:800">✓✓</span> <b>read</b> = recipient opened the chat. 🧪 Uncheck Bob's “online”, send 2 messages (push notification!), then bring Bob back online to see sync.</div>
+    <div class="panel-foot">✓ <b>sent</b> = saved on the server · ✓✓ <b>delivered</b> = reached one of the recipient's devices · <span style="color:#38bdf8;font-weight:800">✓✓</span> <b>read</b> = the recipient opened the chat. 🧪 Uncheck Bob's “online” and send 2 messages (you'll see a push notification). Then bring Bob back online to watch him sync.</div>
   </div>
 
   <div class="timeline">
-    <div class="ti" data-n="1"><h4>Client sends over WebSocket with a client message ID</h4><p>The client-generated ID makes retries idempotent: if the connection drops before the ack, resending won't duplicate.</p></div>
-    <div class="ti" data-n="2"><h4>Chat service assigns a sequence number & persists</h4><p>Per-conversation monotonically increasing <code>seq</code>. Write to the messages DB (replicated). Only <b>then</b> ack the sender → ✓. Durability before acknowledgement.</p></div>
-    <div class="ti" data-n="3"><h4>Route via the session registry</h4><p>Look up all of the recipient's connected devices. For each, forward to the owning gateway (via internal pub/sub channel per gateway, or direct RPC).</p></div>
-    <div class="ti" data-n="4"><h4>Deliver or push</h4><p>Online: push down the socket; the device acks → ✓✓. Offline: send a push notification; the message waits in the DB.</p></div>
-    <div class="ti" data-n="5"><h4>Sync on reconnect</h4><p>Each device remembers the last <code>seq</code> it has per conversation, and asks “give me everything after seq 41”. Works identically for new devices and flaky networks.</p></div>
+    <div class="ti" data-n="1"><h4>Client sends over WebSocket with a client message ID</h4><p>The client creates the ID itself. That makes retries <b>idempotent</b> (safe to repeat): if the connection drops before the server confirms, resending won't create a duplicate.</p></div>
+    <div class="ti" data-n="2"><h4>Chat service assigns a sequence number & persists</h4><p>Each conversation has its own <code>seq</code> counter that only goes up. Write the message to the messages DB (which keeps copies). Only <b>then</b> confirm to the sender → ✓. Save first, confirm second.</p></div>
+    <div class="ti" data-n="3"><h4>Route via the session registry</h4><p>Look up all of the recipient's connected devices. Forward the message to the gateway holding each one. This can go through an internal pub/sub channel per gateway, or a direct call (RPC).</p></div>
+    <div class="ti" data-n="4"><h4>Deliver or push</h4><p>Online: send it down the socket, and the device confirms → ✓✓. Offline: send a push notification, and the message waits in the DB.</p></div>
+    <div class="ti" data-n="5"><h4>Sync on reconnect</h4><p>Each device remembers the last <code>seq</code> it has in each conversation. It asks: “give me everything after seq 41”. This works the same way for brand-new devices and for shaky networks.</p></div>
   </div>
+  <p>Why this exact order? Each step closes a gap the previous one left open:</p>
+  <ul>
+    <li><b>Save before ✓.</b> If the server said ✓ and then crashed before saving, the sender would believe a message was sent that no longer exists. Saving first means ✓ is a real promise.</li>
+    <li><b>Client message ID.</b> Suppose the message is saved but the ✓ is lost on a bad network. The phone resends. The server sees the same client ID already stored and just repeats the ✓ instead of saving a second copy.</li>
+    <li><b>Deliver after saving.</b> Even if the recipient's gateway crashes mid-delivery, the message is safe in the database, and the sync step picks it up on reconnect. Live delivery is a speed-up; the database is the source of truth.</li>
+  </ul>
+  <p>A tiny trace: Alice sends message with client ID <code>a-77</code>. The server stores it as seq 42 and replies ✓. Bob's phone is offline, so a push goes out. Two hours later Bob opens the app; his phone last saw seq 41, so it asks for “after 41”, gets seq 42, and confirms → Alice sees ✓✓.</p>
 
   <h2>Ordering messages correctly</h2>
-  <p>Phone clocks are wrong all the time. If you sort by the <strong>client's timestamp</strong>, replies can appear before the questions they answer. Instead the server assigns an increasing <strong>sequence number per conversation</strong> (or a Snowflake ID from a single sequencer per conversation).</p>
+  <p>Phone clocks are often wrong. If you sort by the <strong>client's timestamp</strong>, a reply can appear before the question it answers. Instead, the server gives each message the next <strong>sequence number for that conversation</strong>. (Another option: a Snowflake ID from one ID generator per conversation.) Think of the ticket machine at a deli counter: the order comes from the machine, not from anyone's watch.</p>
+  <p>How do you give out sequence numbers when many servers handle one conversation? The simplest way is to make one place own each conversation's counter — for example an atomic <code>INCR</code> on a Redis key <code>seq:grp_lunch</code>, or a conditional write in the database. Since a single chat rarely gets more than a few messages per second, one counter per conversation is never a bottleneck, and different conversations don't share counters at all. Notice what we are <i>not</i> promising: there's no global order across different chats, and nobody needs one.</p>
+  <p>One edge case: two people send at the same instant. Both messages get numbers, one is 7 and the other 8. Which is first is decided by who reached the counter first — a fair tie-break, and crucially the <i>same</i> order for every member.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Group chat “Lunch 🍴” — Bob's phone clock is 2 min slow, Chen's is 30s fast</span><div class="seg" id="ordSeg" style="margin-left:auto"><button data-v="client" class="active">Sort by client timestamp</button><button data-v="seq">Sort by server seq</button></div></div>
@@ -163,14 +196,15 @@
         <div><p class="small" id="ordNote"></p>
           <div class="table-wrap"><table class="t"><thead><tr><th colspan="3">messages (wide-column)</th></tr><tr><th>conversation_id</th><th>seq ↓</th><th>payload</th></tr></thead>
           <tbody><tr><td rowspan="3" class="mono small">grp_lunch</td><td class="mono">6</td><td class="small">Meet at 12:30</td></tr><tr><td class="mono">5</td><td class="small">Perfect</td></tr><tr><td class="mono">…</td><td class="small">…</td></tr></tbody></table></div>
-          <p class="small muted">Partition key <code>conversation_id</code> keeps a chat on one partition; clustering by <code>seq</code> makes “latest 50” and “after seq N” single range reads. Huge chats bucket by time (Discord: <code>(channel_id, bucket)</code>).</p>
+          <p class="small muted">Using <code>conversation_id</code> as the partition key keeps a whole chat on one partition. Sorting rows by <code>seq</code> on disk turns “latest 50” and “after seq N” into one range read each. Very large chats are also split into time buckets (Discord uses <code>(channel_id, bucket)</code>).</p>
         </div>
       </div>
     </div>
   </div>
 
   <h2>Presence: who's online?</h2>
-  <p>Presence seems small but it's one of the highest-traffic parts of a chat system: every app open, close and network blip changes it, and each change could notify hundreds of friends.</p>
+  <p>Presence looks like a small feature. In fact it's one of the busiest parts of a chat system. Every app open, app close and network blip changes it, and each change could notify hundreds of friends.</p>
+  <p>Some rough numbers show why. Heartbeats alone: 100M connected devices, each sending one every 5 seconds, is 20M heartbeats per second — about 100 times the message rate. And if each status change were sent to all of a user's ~200 contacts, a few hundred million status changes a day would turn into tens of billions of updates. That's why presence is built to be cheap and to be the first thing dropped under load.</p>
 
   <div class="panel" id="presPanel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Heartbeat-based presence</span><span class="p-tag">Simulator</span></div>
@@ -188,53 +222,63 @@
   </div>
 
   <div class="grid c2">
-    <div class="card"><h4 class="mt0">⚙️ How it works</h4><p class="small mb0">Clients heartbeat every ~5s over the socket; the presence service stores <code>last_heartbeat</code> in Redis with a TTL. No heartbeat for ~30s → offline, “last seen” = last heartbeat. A graceful close marks offline immediately. The timeout avoids flapping when a train goes through a tunnel.</p></div>
-    <div class="card"><h4 class="mt0">📉 Keeping it cheap</h4><p class="small mb0">Don't broadcast every change to every friend. Only publish presence to users <b>currently viewing</b> that contact (subscribe on screen open), batch updates, and for large groups show just a member count — or skip presence entirely, like Slack's big channels.</p></div>
+    <div class="card"><h4 class="mt0">⚙️ How it works</h4><p class="small mb0">Every ~5s, each client sends a <b>heartbeat</b> (a tiny “I'm still here” message) over the socket. The presence service stores <code>last_heartbeat</code> in Redis with a TTL. No heartbeat for ~30s → offline, and “last seen” = the last heartbeat. Closing the app normally marks you offline at once. The 30s wait stops your status from <b>flapping</b> (flipping on and off) while your train passes through a tunnel.</p></div>
+    <div class="card"><h4 class="mt0">📉 Keeping it cheap</h4><p class="small mb0">Don't send every change to every friend. Instead:</p><ul class="small mb0"><li>Only send presence to users <b>looking at</b> that contact right now (they subscribe when they open the screen).</li><li>Group updates into batches.</li><li>For large groups, show just a member count, or skip presence entirely, like Slack's big channels.</li></ul></div>
   </div>
 
   <div class="step-banner"><span>STEP 5 / 6</span></div>
   <h2>Group chats</h2>
   <div class="split">
-    <div class="card"><h4 class="mt0">👨‍👩‍👧 Small groups (≤ ~500)</h4><p class="small mb0"><b>Fan-out on write:</b> store the message once in the group's conversation, then deliver to each member's connected devices (via the registry) and push to offline ones. Like the feed chapter's push model — member counts are bounded, so it's affordable.</p></div>
-    <div class="card"><h4 class="mt0">📣 Huge channels (100K+)</h4><p class="small mb0"><b>Fan-out on read:</b> don't push to everyone. Clients viewing the channel subscribe to it; others see an unread badge computed lazily from the latest <code>seq</code> vs their last-read <code>seq</code>. Exactly the celebrity trade-off from Chapter 27.</p></div>
+    <div class="card"><h4 class="mt0">👨‍👩‍👧 Small groups (≤ ~500)</h4><p class="small mb0"><b>Fan-out on write:</b> store the message once in the group's conversation. Then deliver it to each member's connected devices (found through the registry), and send push notifications to offline ones. It's like the push model from the feed chapter. Groups have a size limit, so the cost stays affordable.</p></div>
+    <div class="card"><h4 class="mt0">📣 Huge channels (100K+)</h4><p class="small mb0"><b>Fan-out on read:</b> don't push to everyone. Clients looking at the channel subscribe to it. Everyone else sees an unread badge, worked out only when needed by comparing the latest <code>seq</code> with their last-read <code>seq</code>. It's exactly the celebrity trade-off from Chapter 27.</p></div>
   </div>
+  <p>Worked example for a 500-member group. One message becomes up to 500 deliveries. If 5,000 such groups each send one message a second, that's 2.5M deliveries per second — heavy but fine, since each is a small socket write. A 200,000-member channel would turn one message into 200,000 deliveries, and a busy channel sends several a second. That is why the design switches to pull above a size limit: members who have the channel open get the message live, and everyone else just sees a number next to it.</p>
 
   <div class="step-banner"><span>STEP 6 / 6</span></div>
   <h2>Deep dives & failure handling</h2>
+  <p>Chat's promises — no loss, fast, ordered — are easy when nothing breaks. These cards cover what happens when something does, and a few features that change the design.</p>
   <div class="grid c2">
-    <div class="card feature reveal"><div class="f-ico">🌊</div><h4>Reconnect storms</h4><p>A gateway dies → 100K clients reconnect at once. Use exponential backoff with <b>jitter</b> on the client (Chapter 16), and spread reconnections across gateways with the load balancer (least connections).</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🚚</div><h4>Deploying gateways</h4><p>Stateful servers can't just be killed. Stop routing new connections, tell clients to reconnect elsewhere gradually, then drain — a rolling deploy can take hours.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🔐</div><h4>End-to-end encryption</h4><p>With the Signal protocol, only devices hold keys; servers store and route ciphertext. Multi-device means encrypting per device, and servers can't search or moderate content.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">🖼️</div><h4>Media</h4><p>Upload images/video directly to object storage with a pre-signed URL; the message carries only a reference and thumbnail. Serve via CDN.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🛡️</div><h4>Spam & abuse</h4><p>Rate limit messages per user and per new conversation (Chapter 15), detect bulk senders asynchronously from the message stream, and allow reporting/blocking.</p></div>
-    <div class="card feature reveal"><div class="f-ico">🗄️</div><h4>Storage tiers</h4><p>Recent messages in a fast wide-column store (Cassandra/ScyllaDB/HBase); older ones compacted to cheaper storage. WhatsApp historically deleted messages from servers after delivery.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🌊</div><h4>Reconnect storms</h4><p>When a gateway dies, its 100K clients all reconnect at once. On the client, wait longer after each failed try (<b>exponential backoff</b>) and add a random delay (<b>jitter</b>) so clients don't all retry together (Chapter 16). The load balancer spreads the reconnections across gateways, picking the one with the fewest connections.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🚚</div><h4>Deploying gateways</h4><p>You can't just kill a server that holds live connections. First stop sending it new connections. Then slowly ask its clients to reconnect elsewhere, until it's empty. A rolling deploy across all gateways can take hours.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🔐</div><h4>End-to-end encryption</h4><p>With the Signal protocol, only the devices hold the keys. Servers only store and pass along scrambled text (<b>ciphertext</b>). Multiple devices means encrypting once per device. And servers can't search or moderate the content.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">🖼️</div><h4>Media</h4><p>Upload images and video straight to object storage with a pre-signed URL (a temporary upload link). The message carries only a reference and a thumbnail. Serve the files through a CDN.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🛡️</div><h4>Spam & abuse</h4><p>Rate limit messages per user and per new conversation (Chapter 15). Spot bulk senders in the background by watching the message stream. Let users report and block.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🗄️</div><h4>Storage tiers</h4><p>Keep recent messages in a fast wide-column store (Cassandra/ScyllaDB/HBase). Pack older ones into cheaper storage. WhatsApp used to delete messages from its servers once they were delivered.</p></div>
   </div>
 
-  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">The whole course in one design</div><p>Notice how this chapter reused everything: WebSockets (Ch 3), load balancing stateful connections (Ch 5), caching the registry (Ch 6), wide-column storage (Ch 7), partitioning by conversation (Ch 8), ordering and consistency (Ch 9), async delivery & idempotency (Ch 10), rate limiting (Ch 11), and backoff/heartbeats (Ch 12). That's system design: <b>combining well-understood building blocks with clear trade-offs.</b></p></div></div>
+  <h3>More edge cases to mention</h3>
+  <ul>
+    <li><b>The session registry is wrong.</b> Bob moved to another gateway a moment ago, but the registry still says the old one. The old gateway finds no socket and reports failure; the chat service treats Bob as offline for this message and sends a push. When Bob's phone syncs, it gets the message anyway. No loss, only a slightly slower delivery.</li>
+    <li><b>The message store is slow or a partition is down.</b> The server can't save, so it must not send ✓. The client keeps the message in an outbox with a clock icon and retries with backoff. Because of the client message ID, a retry that succeeds twice still stores one copy.</li>
+    <li><b>A device is offline for months.</b> Syncing “everything after seq N” could mean thousands of messages. Send them in pages, newest conversations first, so the app is usable quickly.</li>
+    <li><b>Group membership changes.</b> Someone is removed at seq 120. They must not receive seq 121 onward. Check membership when the message is fanned out, not only when the group was created.</li>
+  </ul>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">The whole course in one design</div><p>Notice how this chapter reused everything: WebSockets (Ch 3), load balancing stateful connections (Ch 5), caching the registry (Ch 6), wide-column storage (Ch 7), partitioning by conversation (Ch 8), ordering and consistency (Ch 13), async delivery & idempotency (Ch 14), rate limiting (Ch 15), and backoff/heartbeats (Ch 16). That's what system design is: <b>combining well-understood building blocks with clear trade-offs.</b></p></div></div>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
-      <li><b>Using timestamps for message order.</b> Device clocks disagree; use a per-conversation sequence assigned by the server.</li>
-      <li><b>Treating presence like messages.</b> Presence is high-volume, low-value and ephemeral — throttle it and drop it under load.</li>
+      <li><b>Using timestamps for message order.</b> Device clocks disagree. Use a sequence number per conversation, assigned by the server.</li>
+      <li><b>Treating presence like messages.</b> Presence changes are many, each one matters little, and they go stale fast. Limit them, and drop them when the system is busy.</li>
       <li><b>Ignoring the reconnect storm.</b> When a gateway dies, 100K clients reconnect at once unless they back off with jitter.</li>
     </ul></div></div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Design:</b> A user has three devices. How do they all stay in sync, including after being offline for a week?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Each conversation has a monotonically increasing sequence number assigned server-side. Every device stores the highest sequence it has applied per conversation, and on reconnect asks for everything after it — a cursor sync that's idempotent and works no matter how long it was away. Read state (“last read seq”) is per device-user and synced the same way, so unread badges converge. Push notifications are just a hint to come and sync.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The server gives each conversation a sequence number that only goes up. Every device stores the highest number it has seen in each conversation. On reconnect, it asks for everything after that number. This “cursor sync” is safe to repeat, and works no matter how long the device was away. Read state (“last read seq”) is synced the same way, so unread badges end up matching on all devices. Push notifications are just a nudge to come and sync.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Scale:</b> How do you find which server holds a given user's WebSocket connection?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Keep a session registry: user → gateway instance, in Redis with a TTL refreshed by heartbeat. To deliver a message, look up the recipient's gateways and forward to them — or publish to a pub/sub channel per user and let gateways subscribe for their connected users, which avoids a lookup per message. Either way, handle the race where the user reconnects elsewhere mid-delivery by making delivery idempotent and letting the client re-sync by sequence.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Keep a session registry: user → gateway, stored in Redis with a TTL that each heartbeat renews. To deliver a message, look up the recipient's gateways and forward it to them. Another option: publish to a pub/sub channel per user, and let each gateway subscribe for the users connected to it. That avoids a lookup per message. Either way, the user might reconnect to a different gateway in the middle of a delivery. Handle that by making delivery safe to repeat, and letting the client re-sync by sequence number.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Use persistent full-duplex connections; keep gateways thin and track sessions in a registry.</li>
-      <li>Persist before acknowledging; client message IDs make resends idempotent.</li>
-      <li>Receipts are just acks flowing back: sent (server stored), delivered (device got it), read (user opened).</li>
-      <li>Offline users get push notifications and sync by last-seen sequence number on reconnect.</li>
-      <li>Order by server-assigned per-conversation sequence, never by device clocks.</li>
-      <li>Presence uses heartbeats + timeouts and should only be published to interested viewers.</li>
+      <li>Use connections that stay open and carry traffic both ways. Keep gateways simple and track who's connected where in a registry.</li>
+      <li>Save the message before confirming it. Client message IDs make resends safe.</li>
+      <li>Receipts are just confirmations flowing back: sent (server stored it), delivered (device got it), read (user opened it).</li>
+      <li>Offline users get push notifications. When they reconnect, they sync everything after the last sequence number they have.</li>
+      <li>Order messages by a per-conversation sequence number from the server, never by device clocks.</li>
+      <li>Presence uses heartbeats plus timeouts. Only send it to people who are looking.</li>
     </ul>
   </div>
 
@@ -244,34 +288,34 @@
     <div class="quiz" data-answer="2">
       <p class="q">Alice is connected to gateway 3 and Bob to gateway 41. How does Alice's message reach Bob?</p>
       <div class="opts"><button class="opt">Gateway 3 broadcasts it to all 1,000 gateways</button><button class="opt">Bob polls every gateway</button><button class="opt">The chat service looks up Bob's gateway in a session registry and forwards it there</button><button class="opt">DNS routes it</button></div>
-      <div class="explain">A registry (e.g. Redis) maps user/device → gateway, so messages are routed precisely instead of broadcast.</div>
+      <div class="explain">A registry (e.g. Redis) maps each user/device to its gateway. So messages go straight to the right place instead of being sent everywhere.</div>
     </div>
     <div class="quiz" data-answer="0">
       <p class="q">When should the server send the “sent ✓” acknowledgement to the sender?</p>
       <div class="opts"><button class="opt">After the message is durably stored</button><button class="opt">As soon as the gateway receives it</button><button class="opt">After the recipient reads it</button><button class="opt">Never — the client assumes success</button></div>
-      <div class="explain">Acking before persistence could lose a message the sender believes was sent — violating the “never lose” requirement.</div>
+      <div class="explain">If you confirm before saving, a crash could lose a message the sender thinks was sent. That breaks the “never lose a message” requirement.</div>
     </div>
     <div class="quiz" data-answer="3">
       <p class="q">Messages in a group appear out of order for some users. What's the most robust fix?</p>
       <div class="opts"><button class="opt">Sync all phone clocks with NTP</button><button class="opt">Sort by arrival time on each client</button><button class="opt">Use last-write-wins</button><button class="opt">Assign a server-side monotonically increasing sequence per conversation and sort by it</button></div>
-      <div class="explain">Device clocks can't be trusted (Chapter 13). A per-conversation sequencer gives everyone the same total order.</div>
+      <div class="explain">Device clocks can't be trusted (Chapter 13). One sequence counter per conversation gives everyone exactly the same order.</div>
     </div>
     <div class="quiz" data-answer="1">
       <p class="q">Bob's phone was offline for 3 hours. On reconnect, how does it get the messages it missed?</p>
       <div class="opts"><button class="opt">The server replays every message ever sent</button><button class="opt">It requests messages with seq greater than the last seq it stored for each conversation</button><button class="opt">Push notifications contain the full history</button><button class="opt">It can't; they're lost</button></div>
-      <div class="explain">Cursor-style sync by sequence number is simple, idempotent and works across multiple devices.</div>
+      <div class="explain">Syncing “everything after sequence N” is simple, safe to repeat, and works across multiple devices.</div>
     </div>
     <div class="quiz" data-answer="2">
       <p class="q">A gateway holding 100K connections crashes. What prevents the reconnect wave from knocking over other gateways?</p>
       <div class="opts"><button class="opt">Sticky sessions</button><button class="opt">Longer heartbeat intervals</button><button class="opt">Client reconnection with exponential backoff and random jitter</button><button class="opt">Switching to HTTP polling</button></div>
-      <div class="explain">Jitter spreads 100K simultaneous reconnects over time — the thundering herd fix from Chapter 16.</div>
+      <div class="explain">Jitter spreads 100K reconnects out over time instead of all at once. It's the “thundering herd” fix from Chapter 16.</div>
     </div>
   </div>
 
   <section class="finale reveal">
     <span class="trophy">🎯</span>
-    <h2>Three case studies down, ten to go</h2>
-    <p style="max-width:600px;margin:0 auto 18px">URL shortener, news feed and chat cover the classic trio. The remaining case studies push into new territory: fan-out with providers you don't control, crawling the web, video pipelines, file sync, geospatial matching, money, a Dynamo-style store, streaming analytics and GPU serving. Next up: <b>notifications at scale</b>.</p>
+    <h2>Three case studies down, fourteen to go</h2>
+    <p style="max-width:600px;margin:0 auto 18px">URL shortener, news feed and chat are the classic trio. The remaining fourteen go into new territory: sending through providers you don't control, crawling the web, autocomplete, video pipelines, file sync, collaborative editing, matching by location, ticketing under a rush, money, job scheduling, a Dynamo-style store, streaming analytics, metrics and monitoring, and GPU serving for an LLM. Next up: <b>notifications at scale</b>.</p>
     <div class="flex" style="justify-content:center"><button class="btn primary" id="celebrate">🎉 Celebrate progress</button><a class="btn" href="29-case-notifications.html">Next: Notification System →</a></div>
   </section>
 </main>
@@ -379,7 +423,7 @@
   $$('.ph-foot input').forEach(i => i.addEventListener('keydown', e => { if (e.key === 'Enter') send(i.closest('.phone').id === 'ph-alice' ? 'alice' : 'bob'); }));
   $$('[data-online]').forEach(c => c.onchange = () => {
     const u = c.dataset.online; U[u].online = c.checked; render();
-    if (c.checked) reconnect(u); else log(`📴 ${U[u].name} went offline — socket closed, registry entry removed`, 'warn');
+    if (c.checked) reconnect(u); else log(`📴 ${U[u].name} went offline — connection closed, registry entry removed`, 'warn');
   });
   $$('[data-open]').forEach(c => c.onchange = () => { const u = c.dataset.open; U[u].open = c.checked; if (c.checked && U[u].online) readReceipts(u); });
   $('#chatReset').onclick = () => { msgs = []; seq = 1; stored = 0; U.alice.lastSeq = U.bob.lastSeq = 0; clog.innerHTML = ''; render(); };
@@ -399,8 +443,8 @@
     const arr = [...MSGS].sort((a, b) => byClient ? a.client.localeCompare(b.client) : a.seq - b.seq);
     $('#ordList').innerHTML = arr.map(m => `<div class="bub ${m.me ? 'me' : 'them'}"><b style="font-size:11px">${m.me ? '' : m.who}</b> ${m.text}<span class="meta">${byClient ? 'client ts ' + m.client : 'seq #' + m.seq}</span></div>`).join('');
     $('#ordNote').innerHTML = byClient
-      ? '😵 <b>Nonsense:</b> Bob\'s “Yes! Where?” and “Perfect” appear before Alice even asked, and Chen jumps ahead of the plan. Device clocks drift, get set manually, or change time zones.'
-      : '✅ <b>Correct:</b> the chat service stamps each message with the next sequence number for this conversation as it arrives. Every member sees the same order.';
+      ? '😵 <b>Nonsense:</b> Bob\'s “Yes! Where?” and “Perfect” appear before Alice even asked, and Chen jumps ahead of the plan. Device clocks drift, get set by hand, or change time zones.'
+      : '✅ <b>Correct:</b> as each message arrives, the chat service stamps it with the next sequence number for this conversation. Every member sees the same order.';
   }
   $('#ordSeg').addEventListener('segchange', ordRender); ordRender();
 
@@ -415,7 +459,7 @@
     const seenOnline = pState === 'online' || (pState === 'lost' && since < TIMEOUT);
     $('#pDot').style.background = seenOnline ? 'var(--green)' : 'var(--border-strong)';
     $('#pView').textContent = seenOnline ? 'Bob · online' : `Bob · last seen ${fmtT(new Date(lastHb))}`;
-    $('#pWhy').textContent = pState === 'online' ? 'Heartbeats arriving; Redis key refreshed.' : pState === 'closed' ? 'Graceful disconnect → marked offline immediately.' : since < TIMEOUT ? `No heartbeat for ${(since / 1000).toFixed(1)}s… waiting for timeout (${TIMEOUT / 1000}s here, ~30s in production) to avoid flapping.` : 'Heartbeat TTL expired → marked offline. Last seen = last heartbeat.';
+    $('#pWhy').textContent = pState === 'online' ? 'Heartbeats arriving, so the Redis key keeps getting renewed.' : pState === 'closed' ? 'App closed normally → marked offline right away.' : since < TIMEOUT ? `No heartbeat for ${(since / 1000).toFixed(1)}s… waiting for the timeout (${TIMEOUT / 1000}s here, ~30s in real systems) so the status doesn't flip on and off.` : 'Heartbeat expired → marked offline. Last seen = last heartbeat.';
     $('#pHb').innerHTML = hbs.slice(-26).map(h => `<i style="background:${h ? 'var(--green)' : 'var(--surface-3)'}"></i>`).join('');
   }
   setInterval(() => { if (!pVisible) return; if (pState === 'online') { lastHb = Date.now(); hbs.push(1); } else if (pState === 'lost') hbs.push(0); pRender(); }, 1000);

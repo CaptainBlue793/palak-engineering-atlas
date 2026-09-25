@@ -46,7 +46,7 @@ for (const file of pageFiles) {
   if (!bodyOpen) fail(`${file}: no <body> tag`);
   const bodyInner = src.slice(src.indexOf(bodyOpen[0]) + bodyOpen[0].length, src.lastIndexOf('</body>'));
 
-  const chapter = (bodyOpen[1].match(/data-chapter=["']?(\d+)/i) || [])[1] || '';
+  const chapter = (bodyOpen[1].match(/data-chapter=["']?([\d.]+)/i) || [])[1] || '';
   const title = (src.match(/<title>([\s\S]*?)<\/title>/i) || [, file])[1].trim();
 
   // page-local <style> blocks (the shared stylesheet is inlined once, globally)
@@ -63,7 +63,9 @@ for (const file of pageFiles) {
   if (!sawBootstrap) fail(`${file}: theme bootstrap missing or changed — update THEME_BOOTSTRAP in build.js`);
 
   // strip <script>/<style> out of the markup we replay
-  const html = bodyInner.replace(RE_SCRIPT, '').replace(RE_STYLE, '');
+  const html = bodyInner.replace(RE_SCRIPT, '').replace(RE_STYLE, '')
+    // Rewrite before JSON serialization, where attribute quotes become escaped.
+    .split('href="../index.html"').join('href="https://captainblue793.github.io/palak-engineering-atlas/"');
 
   pages[file] = { title, chapter, styles, html, scripts };
 }
@@ -118,7 +120,8 @@ ${css}
 `;
 
 fs.mkdirSync(OUT_DIR, { recursive: true });
-fs.writeFileSync(OUT_FILE, bundle);
+// The Atlas home page is not in the bundle; send "back to Atlas" to the live site.
+fs.writeFileSync(OUT_FILE, bundle.split('"../index.html"').join('"https://captainblue793.github.io/palak-engineering-atlas/"'));
 
 const kb = (Buffer.byteLength(bundle) / 1024 / 1024).toFixed(2);
 console.log(`✓ ${pageFiles.length} pages bundled -> ${path.relative(ROOT, OUT_FILE)} (${kb} MB)`);

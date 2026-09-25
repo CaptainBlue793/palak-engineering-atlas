@@ -26,15 +26,27 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 48</span><span class="pill pink">Case Study</span><span class="pill">⏱ 50 min</span></div>
     <h1>Case Study: <span class="grad">Image Generation Service</span></h1>
-    <p class="lead">Text-to-image for three million users. Every request occupies a whole GPU for seconds at a time, so this is the one system in the course where a single user's request can meaningfully degrade everyone else's. Capacity, queueing and abuse control matter more here than model quality — and the safety problem has no equivalent in a text product.</p>
+    <p class="lead">You're running text-to-image for three million users. Every request ties up a whole GPU for several seconds. That makes this the one system in the course where a single user's request can really slow down everyone else's. Capacity, queueing and abuse control matter more here than model quality. And the safety problem is unlike anything in a text product.</p>
     <ul class="objectives">
-      <li>Design an asynchronous request path around multi-second GPU work</li>
+      <li>Design an asynchronous request path (submit now, collect the result later) around GPU work that takes seconds</li>
       <li>Trade denoising steps against quality, latency and cost</li>
-      <li>Queue fairly when one user can consume a GPU for a minute</li>
-      <li>Build a safety pipeline covering prompts, outputs and provenance</li>
+      <li>Queue fairly when one user can take up a GPU for a minute</li>
+      <li>Build safety checks that cover prompts, outputs and provenance (proof of where an image came from)</li>
       <li>Store and serve images without the storage bill overtaking the GPU bill</li>
     </ul>
   </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>How image models see pixels.</b> Convolutions, image encoders and why resolution drives cost — <a href="12-computer-vision.html">Chapter 12</a>.</li>
+        <li><b>GPU memory and throughput.</b> Why a GPU is either busy computing or waiting on memory — <a href="10-hardware.html">Chapter 10</a>.</li>
+        <li><b>Serving, batching and autoscaling.</b> The general shape of a model-serving fleet — <a href="26-inference-serving.html">Chapter 26</a>.</li>
+        <li><b>Distillation and low-precision weights.</b> How a smaller or cheaper model copies a bigger one — <a href="27-compression.html">Chapter 27</a>.</li>
+        <li><b>Rates and averages.</b> Requests per second, average vs peak, and back-of-envelope multiplication — <a href="p5-probability-stats.html">P5: Probability &amp; Statistics</a>.</li>
+      </ul></div>
+  </div>
 
   <h2>1 · Requirements</h2>
   <div class="req">
@@ -45,18 +57,29 @@
     <div><b>p95 first image</b><span>&lt; 12 s</span></div>
     <div><b>Resolution</b><span>1024² default</span></div>
   </div>
-  <p class="small muted" style="margin-top:10px"><b>In scope:</b> serving, scheduling, safety, storage, cost, abuse. <b>Out of scope:</b> training the diffusion model, the editor UI, the rights and licensing policy for training data — a real question, but a legal one.</p>
+  <p class="small muted" style="margin-top:10px"><b>In scope:</b> serving, scheduling, safety, storage, cost, abuse. <b>Out of scope:</b> training the diffusion model, the editor UI, and the rights and licensing policy for training data — a real question, but a legal one.</p>
+  <p><b>Turning the numbers into GPUs.</b> 12M images ÷ 86,400 seconds ≈ 140 images per second on average. Usage bunches into evenings and weekends, so a peak of about 3× the average gives the ~400 jobs per second in the box. Now the key step. If each job keeps a GPU busy for <i>t</i> seconds, the number of GPUs busy at any moment is simply <b>arrival rate × <i>t</i></b>. At 400 jobs/s and 8.4 GPU seconds per image, that's 400 × 8.4 ≈ 3,400 GPUs at peak. Halve the seconds per image and you halve the fleet. That one multiplication is why the rest of this chapter cares so much about GPU seconds per image.</p>
 
   <div class="callout tip">
     <div class="ico">🎯</div>
     <div class="body"><div class="title">Metrics</div>
-      <p><b>Primary:</b> images kept — downloaded, shared or saved to a project — per active user per week. Generation counts reward people regenerating because the first result was poor. <b>Quality:</b> human preference on a fixed prompt suite, prompt-adherence scores, regeneration rate as an implicit signal. <b>Guardrails:</b> p50 and p95 time to first image, queue wait at peak, GPU seconds per kept image, policy-violation rate, false-block rate. <b>Cost line:</b> GPU seconds per image is the unit that everything else converts into.</p></div>
+      <p><b>Primary:</b> images kept — downloaded, shared or saved to a project — per active user per week. Don't count generations: that rewards people regenerating because the first result was bad.</p>
+      <p><b>Quality:</b> which images people prefer on a fixed set of test prompts, scores for how well images follow the prompt, and regeneration rate as an indirect signal.</p>
+      <p><b>Guardrails:</b> p50 and p95 time to first image, queue wait at peak, GPU seconds per kept image, policy-violation rate, and false-block rate (harmless requests wrongly blocked).</p>
+      <p><b>Cost line:</b> GPU seconds per image. Every other cost comes back to this number.</p></div>
   </div>
 
   <div class="callout warn">
     <div class="ico">🧮</div>
     <div class="body"><div class="title">Why this system is not like the others</div>
-      <p>A chat token takes milliseconds and shares a GPU with fifty other conversations. A 1024² image at 30 steps occupies a substantial slice of a GPU for several seconds and cannot be interleaved nearly as finely. The consequences run through every design decision: requests must be <b>asynchronous</b> with a job id rather than a held-open connection; <b>queue depth</b>, not utilization, is the health metric; admission control has to exist on day one; and a single abusive client can consume the capacity of thousands of ordinary users without tripping any rate limit expressed in requests per second.</p></div>
+      <p>A chat token takes milliseconds, and one GPU serves fifty conversations at once. A 1024² image at 30 steps takes up a large slice of a GPU for several seconds, and can't be mixed with other work nearly as finely.</p>
+      <p>That shapes every design decision:</p>
+      <ul>
+        <li>In this design, requests are <b>asynchronous</b>: you get a job id back, instead of holding a connection open.</li>
+        <li><b>Queue depth</b> (how much work is waiting), not GPU utilization, is the health metric.</li>
+        <li>Admission control (turning work away when full) has to exist from day one.</li>
+        <li>One abusive client can use up the capacity of thousands of normal users without ever hitting a "requests per second" rate limit.</li>
+      </ul></div>
   </div>
 
   <h2>2 · The request path</h2>
@@ -85,20 +108,30 @@
     </div>
     <div class="stepper" data-diagram="imgSvg">
       <ol class="steps">
-        <li data-title="Submit, get a job id" data-on="i-cli">The API returns immediately with a job id and a queue position; the client subscribes for progress. Holding an HTTP connection open for eight seconds of GPU work wastes a connection slot, breaks through proxies, and makes retries indistinguishable from new work — so the job, not the connection, is the unit of state.</li>
-        <li data-title="Prompt safety, before the GPU" data-on="i-cli i-safe i-e1 i-mod i-block" data-packet="i-cli>i-safe" data-color="var(--amber)">Classify the prompt, match against blocklists for named real people and known abuse patterns, and reject or rewrite. This runs first for a practical reason as well as a policy one: rejecting in 20 ms costs nothing, whereas generating and then discarding an image costs eight GPU seconds you can never sell.</li>
-        <li data-title="Schedule against a fair share" data-on="i-safe i-q i-e2" data-packet="i-safe>i-q">Jobs enter priority classes — interactive paid, free tier, batch and API — each with a GPU-second budget rather than a request-per-second limit. The scheduler picks by class weight and per-user fair share, so one user submitting 500 jobs delays their own queue, not everyone else's.</li>
-        <li data-title="Denoise" data-on="i-q i-gpu i-e3" data-packet="i-q>i-gpu" data-color="var(--accent-2)">The actual work: encode the prompt, then run N denoising steps over the latent, then decode to pixels. Batching a few jobs with identical parameters improves throughput; batching jobs with different step counts or resolutions does not, so the scheduler groups compatible work.</li>
-        <li data-title="Preview early, finish later" data-on="i-gpu" data-color="var(--green)">Decode a low-resolution preview from the latent after a handful of steps and stream it. Perceived latency drops enormously — the user sees the composition forming at 1.2 s instead of a spinner until 6 s — for a few percent of extra compute.</li>
-        <li data-title="Output safety and provenance" data-on="i-gpu i-post i-e4" data-packet="i-gpu>i-post" data-color="var(--pink)">An image classifier on the result, perceptual-hash matching against known-illegal content, and an embedded provenance signal plus signed metadata. Some violations are only detectable in the output: the prompt was innocuous and the model produced something that is not.</li>
-        <li data-title="Store and deliver" data-on="i-post i-cdn i-e5 i-meta i-store" data-packet="i-post>i-cdn">Write to object storage with a lifecycle policy, serve through a CDN behind short-lived signed URLs. Record seed, model version and every parameter — regeneration, "make a variation of this", billing disputes and abuse investigations all depend on that record (Chapter 31).</li>
-        <li data-title="Return" data-on="i-cdn i-cli i-e6" data-packet="i-cdn>i-cli">The client already has the preview; the final image replaces it. Failed jobs must be visibly failed and not silently charged — a job that dies mid-denoise has consumed real GPU seconds, and deciding who pays for those is a product decision you should make before launch.</li>
+        <li data-title="Submit, get a job id" data-on="i-cli">The API replies straight away with a job id and a place in the queue. The app then listens for progress updates. Like a restaurant pager: you order, get a buzzer, and sit down instead of waiting at the counter. An eight-second HTTP request can work, but a durable job ID makes longer queues, reconnects and retries easier to manage. So the job, not the connection, is what the system tracks.</li>
+        <li data-title="Prompt safety, before the GPU" data-on="i-cli i-safe i-e1 i-mod i-block" data-packet="i-cli>i-safe" data-color="var(--amber)">Classify the prompt, check it against blocklists of named real people and known abuse patterns, then reject or rewrite it. This runs first for a practical reason as well as a policy one. Rejecting in 20 ms costs nothing. Generating an image and then throwing it away costs eight GPU seconds you can never sell.</li>
+        <li data-title="Schedule against a fair share" data-on="i-safe i-q i-e2" data-packet="i-safe>i-q">Jobs go into priority classes — paid interactive, free tier, batch and API. Each class has a budget of GPU seconds, not a requests-per-second limit. The scheduler picks jobs by class weight and each user's fair share. So one user who submits 500 jobs mostly delays their own queue, not everyone else's.</li>
+        <li data-title="Denoise" data-on="i-q i-gpu i-e3" data-packet="i-q>i-gpu" data-color="var(--accent-2)">This is the actual work. Encode the prompt. Then run N denoising steps — each one cleans up a noisy "latent" (a compressed version of the image) a little more. Finally, decode the latent into pixels. Batching a few jobs with identical settings speeds things up. Batching jobs with different step counts or sizes doesn't, so the scheduler groups similar jobs.</li>
+        <li data-title="Preview early, finish later" data-on="i-gpu" data-color="var(--green)">After a handful of steps, decode a low-resolution preview from the latent and stream it. The wait feels far shorter: the user sees the picture taking shape at 1.2 s, instead of a spinner until 6 s. It costs only a few percent of extra compute.</li>
+        <li data-title="Output safety and provenance" data-on="i-gpu i-post i-e4" data-packet="i-gpu>i-post" data-color="var(--pink)">An image classifier checks the result. Perceptual hashing (a fingerprint that still matches after small changes) compares it against known illegal content. A hidden provenance signal and signed metadata are added. Some violations only show up in the output: the prompt was harmless, but the model produced something that isn't.</li>
+        <li data-title="Store and deliver" data-on="i-post i-cdn i-e5 i-meta i-store" data-packet="i-post>i-cdn">Save to object storage with a lifecycle policy (rules for when files expire or move to cheaper storage). Serve through a CDN using signed URLs that expire quickly. Record the seed, model version and every setting. Regenerating, "make a variation of this", billing disputes and abuse investigations all depend on that record (Chapter 31).</li>
+        <li data-title="Return" data-on="i-cdn i-cli i-e6" data-packet="i-cdn>i-cli">The app already shows the preview; the final image replaces it. Failed jobs must clearly show as failed and must not be silently charged. A job that dies halfway has still used real GPU seconds. Decide who pays for those before launch — it's a product decision.</li>
       </ol>
     </div>
   </div>
 
+  <p><b>Edge cases the path must handle.</b></p>
+  <ul>
+    <li><b>The client retries.</b> Phones lose signal and apps resubmit. The submit call carries an <i>idempotency key</i> — a unique id the app generates once per request — so a retry returns the existing job id instead of starting a second, paid-for generation.</li>
+    <li><b>The user closes the app.</b> The job keeps running, and the result waits under the job id. Cancelling is a separate, explicit action that frees the GPU slot if the job hasn't started yet.</li>
+    <li><b>A GPU dies mid-job.</b> The scheduler notices the missing heartbeat (a regular "I'm alive" signal), puts the job back at the front of the queue, and makes sure the user isn't charged twice.</li>
+    <li><b>The output is blocked.</b> The user gets a clear "this result can't be shown" message rather than a silent failure, and the job still counts toward their abuse history if the prompt was the cause.</li>
+  </ul>
+
   <h2>3 · Deep dive: the step budget</h2>
-  <p>Diffusion quality is bought in denoising steps, and every step is a full pass through the network. This single number sets latency, cost and capacity simultaneously — which makes it the most consequential dial in the system.</p>
+  <p>A diffusion model starts from pure noise and removes a little of it at each step, like a photo slowly coming into focus. More steps give better quality, but every step is a full pass through the network. This one number sets latency, cost and capacity all at once. That makes it the most important dial in the system.</p>
+  <p><b>Why cost is roughly proportional to steps.</b> Each step runs the whole denoising network once over the image's latent. The prompt is encoded once and the latent decoded once, but those are small next to 30 or 50 network passes. So going from 50 to 28 steps removes 22 of 50 passes — about 44% of the work — and the GPU count falls by about the same share. Quality doesn't fall in step: the early steps set the layout and colours, and the late ones only polish fine detail, so the quality curve rises fast and then flattens.</p>
+  <p><b>Resolution is the other hidden multiplier.</b> Doubling the side length (1024² → 2048²) gives four times the pixels, and the network's cost grows at least that fast — faster in the attention layers, which compare every patch of the image with every other patch. That's why large sizes and upscales belong in a separately priced tier.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Steps, quality, latency and fleet size</span><span class="p-tag">Interactive</span></div>
@@ -118,7 +151,8 @@
   <div class="callout tip">
     <div class="ico">🧭</div>
     <div class="body"><div class="title">Tiering by step count is the practical answer</div>
-      <p>You do not have to pick one. Use a 4-step distilled model for previews, thumbnails, variations and free-tier traffic — where speed matters more than the last few percent of fidelity — and a higher-step configuration for final renders, upscales and paid requests. The model weights differ but the pipeline does not, so the scheduler simply routes by tier. The mistake is picking the high-quality configuration for everything and then discovering the fleet costs four times what the product earns.</p></div>
+      <p>You don't have to pick just one. Use a 4-step distilled model (a smaller model trained to copy the big one in fewer steps) for previews, thumbnails, variations and free-tier traffic. There, speed matters more than the last few percent of detail. Use more steps for final renders, upscales and paid requests.</p>
+      <p>The model weights differ but the pipeline is the same, so the scheduler just routes by tier. The mistake is using the high-quality setting for everything, then finding the GPUs cost four times what the product earns.</p></div>
   </div>
 
   <h2>4 · Deep dive: queueing when jobs are seconds long</h2>
@@ -126,26 +160,30 @@
     <table class="t">
       <thead><tr><th>Decision</th><th>Choice</th><th>Why</th></tr></thead>
       <tbody>
-        <tr><td>Unit of limiting</td><td>GPU seconds, not requests</td><td>A 4-image 2048² batch is ~40× a single 512² preview; a request limit prices them the same</td></tr>
-        <tr><td>Queue discipline</td><td>Weighted fair queueing per user, within priority classes</td><td>One user's burst delays their own jobs first; everyone else's wait is unchanged</td></tr>
-        <tr><td>Admission control</td><td>Reject early with an honest wait estimate</td><td>A queue that grows without bound converts a capacity problem into a timeout storm</td></tr>
-        <tr><td>Health metric</td><td>Queue wait at p95, not GPU utilization</td><td>Utilization is 100% by design; wait time is what users experience</td></tr>
-        <tr><td>Autoscaling signal</td><td>Queue depth in GPU seconds</td><td>Leads demand; utilization only tells you the fleet is already saturated</td></tr>
-        <tr><td>Preemption</td><td>Batch and API jobs yield to interactive</td><td>Interactive users are watching; batch jobs are not, and can resume from a checkpointed latent</td></tr>
+        <tr><td>What you limit</td><td>GPU seconds, not requests</td><td>A batch of four 2048² images costs ~40× a single 512² preview; a request limit treats them as equal</td></tr>
+        <tr><td>Queue order</td><td>Weighted fair queueing per user, inside priority classes</td><td>A burst from one user delays their own jobs first; everyone else's wait stays the same</td></tr>
+        <tr><td>Admission control</td><td>Reject early, with an honest wait estimate</td><td>A queue with no limit turns a capacity problem into a storm of timeouts</td></tr>
+        <tr><td>Health metric</td><td>Queue wait at p95, not GPU utilization</td><td>GPUs are meant to be 100% busy; wait time is what users actually feel</td></tr>
+        <tr><td>Autoscaling signal</td><td>Queue depth in GPU seconds</td><td>Rises before demand peaks; utilization only tells you the GPUs are already full</td></tr>
+        <tr><td>Preemption (pausing a job for a more urgent one)</td><td>Batch and API jobs give way to interactive ones</td><td>Interactive users are watching; batch jobs aren't, and can resume from a saved latent</td></tr>
       </tbody>
     </table>
   </div>
-  <p class="small muted" style="margin-top:8px">Cold starts are the other scheduling trap: loading a multi-gigabyte diffusion model takes tens of seconds, so scaling up <em>after</em> the queue builds is far too late. Keep a warm pool sized to the daily peak, and pre-warm on the schedule your traffic actually follows.</p>
+  <p class="small muted" style="margin-top:8px">Cold starts are the other scheduling trap. Loading a diffusion model of several gigabytes takes tens of seconds. So adding GPUs <em>after</em> the queue builds up is far too late. Keep a pool of warm (already loaded) GPUs sized for the daily peak, and warm up extra ones ahead of your known traffic pattern.</p>
+  <p><b>Fair queueing, with numbers.</b> Suppose 100 GPUs and 5 seconds per job. User A submits 500 jobs at once; a moment later user B submits one. With a plain first-in, first-out queue, B waits behind all of A's jobs: 500 × 5 s ÷ 100 GPUs = 25 seconds. With fair queueing per user, the scheduler takes turns between users who have work waiting, so B's job gets the next free GPU — a wait of at most about 5 seconds. A is barely slowed, because A was always going to wait for most of those 500 jobs.</p>
+  <p><b>An honest wait estimate is a division.</b> Add up the GPU seconds already queued ahead of a job and divide by the GPUs serving that class. 12,000 GPU seconds ahead ÷ 600 GPUs = about 20 seconds. If that's over the promise for the user's tier, admission control says so at submit time — and can offer the fast 4-step tier instead — rather than letting the request time out after a minute.</p>
 
   <h2>5 · Deep dive: safety and abuse</h2>
   <div class="gate">
-    <div class="r"><b>Prompt</b><span>Classifier plus blocklists for named real individuals, sexual content involving minors, and known circumvention phrasings. Cheap, fast, and the only gate that saves GPU time. Also the easiest to evade, which is why it cannot be the only one.</span></div>
-    <div class="r"><b>Image input</b><span>Image-to-image and inpainting change the threat model completely: the uploaded photo is the payload. Run face detection and consent policy on uploads, not just on prompts, and treat "edit this photo of a real person" as a distinct product decision.</span></div>
-    <div class="r"><b>Output</b><span>A classifier on the generated pixels catches what the prompt did not reveal, and perceptual hashing matches known-illegal material. Some violations only exist in the output — the prompt was benign and the model was not.</span></div>
-    <div class="r"><b>Provenance</b><span>Embedded watermark plus signed content credentials in the metadata. Metadata gets stripped by every re-upload, so the watermark is what survives; neither is proof, both are evidence.</span></div>
-    <div class="r"><b>Accounts</b><span>Abuse is concentrated: a small number of accounts generate most violations. Per-account violation tracking, graduated enforcement and a genuine appeals path catch far more than any per-request classifier.</span></div>
-    <div class="r"><b>Measurement</b><span>Track the violation rate <em>and</em> the false-block rate. A filter tuned only against violations ends up refusing "a woman in a swimming pool" and the product dies of a thousand irritations (Chapter 37).</span></div>
+    <div class="r"><b>Prompt</b><span>A classifier plus blocklists for named real people, sexual content involving minors, and known ways of sneaking past filters. Cheap, fast, and the only gate that saves GPU time. It's also the easiest to get around, which is why it can't be the only one.</span></div>
+    <div class="r"><b>Image input</b><span>Image-to-image and inpainting (editing part of an uploaded picture) change the risk completely: now the uploaded photo is the danger. Run face detection and consent rules on uploads, not just on prompts. Treat "edit this photo of a real person" as its own product decision.</span></div>
+    <div class="r"><b>Output</b><span>A classifier on the generated image catches what the prompt didn't reveal. Perceptual hashing matches known illegal material. Some violations only exist in the output — the prompt was harmless, but the result wasn't.</span></div>
+    <div class="r"><b>Provenance</b><span>A hidden watermark in the pixels, plus signed content credentials in the metadata. Some platforms strip metadata, and edits can damage a watermark. Signed credentials can verify recorded provenance when present; missing credentials alone do not establish how an image was made.</span></div>
+    <div class="r"><b>Accounts</b><span>Abuse is concentrated: a small number of accounts cause most violations. Tracking violations per account, with penalties that grow step by step and a real appeals process, catches far more than any check on single requests.</span></div>
+    <div class="r"><b>Measurement</b><span>Track the violation rate <em>and</em> the false-block rate. A filter tuned only against violations ends up refusing "a woman in a swimming pool", and the product dies of a thousand small annoyances (Chapter 37).</span></div>
   </div>
+  <p style="margin-top:12px"><b>Why the false-block rate needs its own number.</b> Define it as blocked harmless requests divided by all harmless requests. If nearly all 12M daily requests are harmless, a 1% rate means roughly 120,000 wrongful blocks. Reviewing only blocked requests instead estimates the fraction of blocks that were wrong. To estimate the false-block rate, label a representative sample of both accepted and blocked requests, accounting for how each was sampled.</p>
+  <p><b>Why several gates and not one strong one?</b> Each gate sees something the others can't. The prompt gate is cheap but can be fooled by wording. The output gate sees what was actually made, but only after paying for the GPU time. Account history sees patterns that no single request shows. Stacking them means an attacker has to beat all of them at once, and each can be tuned for what it's good at.</p>
 
   <h2>6 · Storage, and the bill that creeps up on you</h2>
   <div class="table-wrap">
@@ -155,44 +193,46 @@
         <tr><td>Images/day</td><td>12M</td><td>Plus previews and thumbnails: ~30M objects</td></tr>
         <tr><td>Bytes/day</td><td>~18 TB</td><td>~1.5 MB per 1024² PNG, less as WebP</td></tr>
         <tr><td>Naive annual storage</td><td>~6.5 PB</td><td>If everything is kept forever, at full resolution</td></tr>
-        <tr><td>With lifecycle policy</td><td>~900 TB</td><td>Unsaved generations expire after 30 days; saved images kept, cold after 90</td></tr>
-        <tr><td>Egress</td><td>~40 TB/day</td><td>CDN-cached; the long tail is small because most images are viewed once</td></tr>
-        <tr><td>Regeneration from seed</td><td>~8 GPU seconds</td><td>Cheaper than cold storage for rarely-viewed images — but only if you kept every parameter</td></tr>
+        <tr><td>With lifecycle policy</td><td>~900 TB</td><td>Unsaved images expire after 30 days; saved images are kept, and moved to cheaper "cold" storage after 90</td></tr>
+        <tr><td>Egress (data sent out)</td><td>~40 TB/day</td><td>Cached by the CDN; few old images get requested, because most are viewed only once</td></tr>
+        <tr><td>Regeneration from seed</td><td>~8 GPU seconds</td><td>Can stand in for storage for derived files and images almost nobody reopens — but only if you kept every setting</td></tr>
       </tbody>
     </table>
   </div>
-  <p class="small muted" style="margin-top:8px">The last row is the interesting one: with the seed, prompt, model version and sampler parameters recorded, an image is reproducible, so storage becomes a cache rather than a system of record. That only holds while the model version still exists — which is a real constraint on how aggressively you retire model versions.</p>
+  <p class="small muted" style="margin-top:8px">The seed, prompt, model version and sampler settings help reproduce a generation, but do not guarantee identical pixels across hardware or software changes. Record the runtime and numerical settings too, and test reproducibility before promising regeneration. Keep the original bytes when an exact image must be preserved. <a href="https://docs.pytorch.org/docs/stable/notes/randomness.html">PyTorch explains these reproducibility limits</a>. Retaining old model versions is necessary, but is only one part of the contract.</p>
+  <p><b>The storage arithmetic.</b> 12M images × 1.5 MB = 18 TB a day, and 18 TB × 365 ≈ 6.5 PB a year if nothing is ever deleted. With a 30-day expiry on unsaved images, the unsaved pool stays at about 18 TB × 30 = 540 TB. If around 5% of images are saved, that's 0.9 TB a day, or about 330 TB a year kept for good. Together that's roughly 900 TB instead of 6.5 PB — a seven-fold cut from one lifecycle rule.</p>
+  <p><b>When does regenerating beat storing?</b> Less often than it sounds. At typical cloud prices, keeping one 1.5 MB image in cold storage for a year costs a tiny fraction of a penny. Regenerating it takes about 8 GPU seconds, which at a few pounds per GPU-hour is roughly half a penny. So for a full-size image, storage is usually cheaper unless it would sit untouched for many years. Regeneration earns its keep for <i>derived</i> files — thumbnails, previews and resized copies can be rebuilt from the saved original instead of stored — and as a fallback when an image has already expired. The bigger value of the recorded settings is reproducibility: variations, disputes and investigations.</p>
 
   <h2>7 · What breaks</h2>
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Failure</th><th>Symptom</th><th>Response</th></tr></thead>
       <tbody>
-        <tr><td>Queue grows past the wait estimate</td><td>Every user sees a spinner; timeouts and retries amplify</td><td>Admission control with honest waits; shed to the fast tier before rejecting</td></tr>
-        <tr><td>One API client bursts</td><td>Interactive p95 collapses</td><td>GPU-second quotas and per-user fair queueing, not request-rate limits</td></tr>
-        <tr><td>Scale-up arrives minutes late</td><td>Cold starts during the daily peak</td><td>Scale on queue depth, keep a warm pool, pre-warm on the known traffic curve</td></tr>
-        <tr><td>Safety classifier outage</td><td>Fail open or closed?</td><td>Decided in advance: degrade to a stricter prompt policy, never disable output scanning</td></tr>
-        <tr><td>Storage growth outruns revenue</td><td>The bill doubles with flat usage</td><td>Lifecycle policies from day one; treat unsaved generations as ephemeral</td></tr>
-        <tr><td>Model version retired</td><td>Old images cannot be regenerated or varied</td><td>Pin the version in job metadata; keep retired weights available for as long as you promise reproducibility</td></tr>
+        <tr><td>Queue grows past the wait estimate</td><td>Every user sees a spinner; timeouts and retries make it worse</td><td>Admission control with honest wait times; move work to the fast tier before rejecting it</td></tr>
+        <tr><td>One API client sends a burst</td><td>p95 for interactive users collapses</td><td>GPU-second quotas and fair queueing per user, not request-rate limits</td></tr>
+        <tr><td>New GPUs arrive minutes too late</td><td>Cold starts during the daily peak</td><td>Scale on queue depth, keep a warm pool, warm up ahead of the known traffic curve</td></tr>
+        <tr><td>Safety classifier goes down</td><td>Let everything through, or block everything?</td><td>Decided in advance: switch to a stricter prompt policy, never turn off output scanning</td></tr>
+        <tr><td>Storage grows faster than revenue</td><td>The bill doubles while usage stays flat</td><td>Lifecycle policies from day one; treat unsaved images as temporary</td></tr>
+        <tr><td>Model version retired</td><td>Old images can't be regenerated or varied</td><td>Save the version in job metadata; keep old weights available for as long as you promise images can be recreated</td></tr>
       </tbody>
     </table>
   </div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Follow-up:</b> “At peak, p95 wait hits 40 seconds. You cannot get more GPUs this quarter. What do you do?”</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>I would attack demand and work per job before touching quality for everyone. First, find out where the GPU seconds are going: I would expect a small fraction of users, and the batch and API classes, to account for most of it, so enforcing GPU-second fair share redistributes wait rather than adding capacity — the median user's experience improves immediately. Second, shift default step counts down at peak only, using the distilled model for previews and free-tier requests, with the high-step path reserved for explicit final renders; that is a several-fold throughput gain for a quality difference most users will not see on a first draft. Third, deduplicate: identical prompt, seed and parameters should return the cached image rather than regenerating it. Fourth, move batch and API work to off-peak with a deadline-based scheduler, since those jobs have hours of slack and interactive jobs have seconds. And I would make the wait honest — showing a real estimate and a lower-quality instant option beats a spinner, because retries during a queue backup are what turn a slow system into a broken one.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I'd reduce demand and the work per job before lowering quality for everyone. First, find out where the GPU seconds are going. I'd expect a small share of users, plus the batch and API classes, to use most of them. Enforcing a fair share of GPU seconds spreads the wait more evenly without adding capacity, and the typical user's experience improves straight away. Second, lower the default step count at peak times only. Use the distilled model for previews and free-tier requests, and keep the high-step path for explicit final renders. That multiplies throughput several times, for a quality difference most users won't notice on a first draft. Third, remove duplicates: the same prompt, seed and settings should return the cached image instead of generating it again. Fourth, move batch and API work to quieter hours with a deadline-based scheduler — those jobs can wait hours, interactive ones only seconds. And I'd make the wait honest. A real estimate plus an instant lower-quality option beats a spinner. Retries during a queue backup are what turn a slow system into a broken one.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Follow-up:</b> “Why not rate-limit by requests per minute like a normal API?”</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Because requests are not the resource. One request can be a 512² four-step preview costing half a GPU second, or four 2048² images at 50 steps costing well over a minute — a difference of two orders of magnitude priced identically. A request limit therefore either throttles the cheap users unnecessarily or leaves the expensive path wide open, and in practice it does both. The correct unit is GPU seconds: budget them per account and per priority class, charge jobs against the budget as they run, and let the scheduler enforce fair share. It also gives you a cost model that matches the bill, so quotas, pricing and capacity planning are all denominated in the same thing.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because requests aren't the thing that runs out. One request might be a 512² four-step preview costing half a GPU second. Another might be four 2048² images at 50 steps, costing well over a minute. That's a hundred-fold difference, counted as the same. So a request limit either holds back cheap users for no reason, or leaves the expensive path wide open — and in practice it does both. The right unit is GPU seconds. Give each account and priority class a budget, charge jobs against it as they run, and let the scheduler enforce fair shares. It also gives you a cost model that matches the actual bill, so quotas, pricing and capacity planning all use the same unit.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Multi-second GPU jobs force an asynchronous design: a job id, progress streaming, and queue depth as the health metric.</li>
-      <li>The step count sets quality, latency and fleet size at once; distilled few-step models plus tiering are how the economics work.</li>
-      <li>Limit and schedule by GPU seconds, not requests — a single request can vary a hundred-fold in cost.</li>
-      <li>Safety needs gates on the prompt, on uploaded images and on the output, plus account-level enforcement and a measured false-block rate.</li>
-      <li>Recording seed and parameters makes images reproducible, which turns storage into a cache — as long as the model version survives.</li>
+      <li>GPU jobs that take seconds force an asynchronous design: a job id, streamed progress, and queue depth as the health metric.</li>
+      <li>The step count sets quality, latency and GPU count all at once. Distilled few-step models plus tiers are what make the money work.</li>
+      <li>Limit and schedule by GPU seconds, not requests — one request can cost a hundred times more than another.</li>
+      <li>Safety needs checks on the prompt, on uploaded images and on the output, plus per-account enforcement and a measured false-block rate.</li>
+      <li>Recording the seed and settings lets you recreate images, which turns storage into a cache — as long as the model version is kept.</li>
     </ul>
   </div>
 
@@ -208,7 +248,7 @@
         <button class="opt">One request can vary a hundred-fold in cost depending on resolution, steps and batch size</button>
         <button class="opt">Because diffusion models are stateless</button>
       </div>
-      <div class="explain">A 512² four-step preview and four 2048² 50-step images are both "one request". Pricing them the same either over-throttles cheap traffic or leaves the expensive path open.</div>
+      <div class="explain">A 512² four-step preview and four 2048² 50-step images are both "one request". Treating them the same either holds back cheap traffic too much or leaves the expensive path open.</div>
     </div>
 
     <div class="quiz" data-answer="0">
@@ -219,7 +259,7 @@
         <button class="opt">It changes too quickly to alert on</button>
         <button class="opt">It is unaffected by batch size</button>
       </div>
-      <div class="explain">The scheduler keeps GPUs busy whether the queue is empty or forty seconds deep. Autoscale and alert on queue depth in GPU seconds, which leads demand instead of lagging it.</div>
+      <div class="explain">The scheduler keeps GPUs busy whether the queue is empty or forty seconds deep. Autoscale and alert on queue depth in GPU seconds instead. It rises before demand peaks, rather than after.</div>
     </div>
 
     <div class="quiz" data-answer="1">
@@ -230,7 +270,7 @@
         <button class="opt">It improves image quality</button>
         <button class="opt">It is required for watermarking</button>
       </div>
-      <div class="explain">It is a capacity decision as much as a policy one. The output classifier is still needed, because a benign prompt can produce a violating image.</div>
+      <div class="explain">It saves capacity as well as enforcing policy. You still need the output classifier, because a harmless prompt can produce an image that breaks the rules.</div>
     </div>
 
     <div class="quiz" data-answer="3">
@@ -241,7 +281,7 @@
         <button class="opt">It removes the need for a queue</button>
         <button class="opt">It cuts perceived latency sharply for a few percent of extra compute</button>
       </div>
-      <div class="explain">The user sees composition forming in about a second instead of a spinner until the final image. Nothing about the final result changes; the experience changes completely.</div>
+      <div class="explain">The user sees the picture taking shape in about a second, instead of a spinner until the final image. The final result is exactly the same; the experience is completely different.</div>
     </div>
 
     <div class="quiz" data-answer="1">
@@ -252,7 +292,7 @@
         <button class="opt">Because the CDN requires it</button>
         <button class="opt">To enable watermark removal</button>
       </div>
-      <div class="explain">Regenerating from a seed can be cheaper than keeping a rarely-viewed image in cold storage — but only while the pinned model version still exists, which constrains how fast you retire versions.</div>
+      <div class="explain">With the seed and settings you can rebuild thumbnails, previews and expired images instead of storing them, and answer "what exactly was generated?" in a dispute. But that only works while the recorded model version still exists, which limits how fast you can retire versions.</div>
     </div>
   </div>
 </main>
@@ -263,13 +303,13 @@
 
   const MODES = {
     s50: { steps: 50, lat: 8.4, qual: 100, gpu: 3400, cost: 0.042,
-      note: `🚩 <b>50 steps, base sampler.</b> The reference configuration, and the one nobody should serve at scale. Eight seconds to a final image, a 3,400-GPU fleet at peak, and a cost per image that only works if users pay per generation. Useful as a quality ceiling to measure everything else against.` },
+      note: `🚩 <b>50 steps, base sampler.</b> The reference setup, and the one nobody should run at scale. Eight seconds to a final image, 3,400 GPUs at peak, and a cost per image that only works if users pay for every generation. Useful as a quality ceiling to measure everything else against.` },
     s28: { steps: 28, lat: 4.9, qual: 99, gpu: 1950, cost: 0.024,
-      note: `✅ <b>28 steps with a modern sampler.</b> Nearly half the compute for a quality difference most raters cannot see in a blind comparison — better samplers reach the same place in fewer, better-chosen steps. This is close to free and should be the baseline before any other optimisation is considered.` },
+      note: `✅ <b>28 steps with a modern sampler.</b> Nearly half the compute, for a quality difference most people can't see in a blind comparison. A better sampler (the method that decides each denoising step) gets to the same place in fewer, smarter steps. This is almost free, and should be your starting point before any other optimisation.` },
     s8: { steps: 8, lat: 1.6, qual: 93, gpu: 620, cost: 0.008,
-      note: `✅ <b>8 steps, distilled.</b> A student model trained to match the teacher's trajectory in far fewer steps. Roughly a fifth of the fleet and a five-fold cost reduction, at a real but modest quality cost — visible on fine detail and complex prompts, invisible on most. The natural default for interactive drafting, with a higher-step path for final renders.` },
+      note: `✅ <b>8 steps, distilled.</b> A "student" model trained to reach the same result as the big "teacher" model in far fewer steps. About a fifth of the GPUs and a five-fold cost cut. The quality loss is real but modest: you can see it on fine detail and complex prompts, but not on most. The natural default for quick drafts, with a higher-step path for final renders.` },
     s4: { steps: 4, lat: 0.9, qual: 87, gpu: 340, cost: 0.004,
-      note: `⚠️ <b>4 steps, distilled, fp8 weights.</b> Sub-second generation changes what the product can be — live previews that update as you type. The quality gap is now noticeable on detailed prompts, so this belongs on previews, thumbnails, variations and free-tier traffic rather than on a user's final image. Ten times cheaper than the 50-step path, which is why tiering wins over choosing.` },
+      note: `⚠️ <b>4 steps, distilled, fp8 weights.</b> Generating in under a second changes what the product can do — for example, live previews that update as you type. The quality gap is now noticeable on detailed prompts. So use this for previews, thumbnails, variations and free-tier traffic, not for a user's final image. It's ten times cheaper than the 50-step path, which is why using tiers beats picking just one setting.` },
   };
 
   function draw() {

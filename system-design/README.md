@@ -1,6 +1,6 @@
-# Palak's System Design Playlist
+# Palak Deb Patra's System Design Playlist
 
-An interactive system-design course: **42 chapters** across five levels, each with animated
+An interactive system-design course: **42 chapters** across five levels — plus an 8-chapter **Prerequisites** level (how computers work, processes and concurrency, clients and servers, networking, HTTP/REST/JSON, databases and SQL, Big-O and data structures, estimation) — each with animated
 diagrams, live simulators, a "common mistakes" box, an interview drill and a 5-question quiz —
 plus a 174-term glossary, a spaced-repetition flashcard deck and a timed mock-interview room.
 
@@ -39,6 +39,7 @@ Open `index.html` in any browser. That's the whole setup.
 
 | Level | Chapters | Covers |
 | --- | --- | --- |
+| **Prerequisites** | P1–P8 | How computers work, processes & concurrency, clients & servers, networking, HTTP/REST/JSON, databases & SQL, Big-O & data structures, estimation & reading a question |
 | **Beginner** | 1–4 | Client–server, networking, APIs, scalability & estimation |
 | **Intermediate** | 5–12 | Load balancing, caching, databases, sharding, storage, search, security, graphs |
 | **Advanced** | 13–19 | CAP & consensus, queues, microservices, reliability, CDC, streaming, testing |

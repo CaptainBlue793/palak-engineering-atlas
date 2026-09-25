@@ -27,17 +27,29 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 45</span><span class="pill pink">Case Study</span><span class="pill">⏱ 55 min</span></div>
     <h1>Case Study: <span class="grad">LLM Chat Assistant</span></h1>
-    <p class="lead">Serve a conversational assistant to 10 million daily users: streaming responses, multi-turn context that grows every message, tool use, safety filtering, several model tiers, and a cost per conversation that has to stay below what the product earns.</p>
+    <p class="lead">You need to run a chat assistant for 10 million people a day. Answers stream in word by word. Each conversation gets longer with every message. The assistant can call tools, its output is checked for safety, and several model sizes are on offer. On top of all that, each conversation has to cost less than the product earns from it.</p>
     <ul class="objectives">
-      <li>Design the request path from gateway to token stream</li>
-      <li>Control the cost of growing conversation context</li>
-      <li>Exploit prefix caching and routing to cut spend several-fold</li>
-      <li>Build the safety pipeline without destroying usefulness</li>
-      <li>Measure quality continuously in production</li>
+      <li>Design the path a message takes, from the front door (the gateway) to the stream of words coming back</li>
+      <li>Keep the cost of ever-growing conversations under control</li>
+      <li>Use prefix caching and smart routing to cut spending several times over</li>
+      <li>Build safety checks that don't make the assistant useless</li>
+      <li>Measure answer quality all the time, on live traffic</li>
     </ul>
   </section>
 
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><a href="14-transformers.html">Understand attention and the KV cache.</a></li>
+        <li><a href="26-inference-serving.html">Separate prefill, decoding and scheduling.</a></li>
+        <li><a href="36-ai-security.html">Treat tools and retrieved content as security boundaries.</a></li>
+        <li><a href="39-ai-platforms.html">Apply tenant quotas and routing policies.</a></li>
+      </ul></div>
+  </div>
+
   <h2>1 · Requirements</h2>
+  <p>A daily total is not a peak rate. Here, 120 million messages ÷ 86,400 seconds is about 1,389 messages/second on average. If an answer has 350 tokens and streams at 25 tokens/second, decoding lasts about 14 seconds. At that average arrival rate, roughly 19,400 answers would be decoding at once, before tool waits. The 180,000-stream peak therefore represents a much busier interval or longer-lived streams; size for the measured traffic shape.</p>
   <div class="req">
     <div><b>DAU</b><span>10M</span></div>
     <div><b>Messages/day</b><span>120M</span></div>
@@ -46,15 +58,19 @@
     <div><b>Output speed</b><span>&gt; 25 tok/s</span></div>
     <div><b>Context window</b><span>up to 200k</span></div>
   </div>
-  <p class="small muted" style="margin-top:10px"><b>In scope:</b> serving, routing, context management, safety, evaluation, cost. <b>Out of scope:</b> pretraining the base model (Chapter 52), the mobile client, billing.</p>
+  <p class="small muted" style="margin-top:10px"><b>In scope:</b> serving, routing, context management, safety, evaluation, cost. <b>Out of scope:</b> training the base model from scratch (Chapter 52), the mobile app, billing. TTFT means "time to first token": how long before the first word of the answer appears. p95 means 95% of requests are at least this fast.</p>
 
   <div class="callout tip">
     <div class="ico">🎯</div>
     <div class="body"><div class="title">Metrics</div>
-      <p><b>Primary:</b> weekly retained users and conversations per user — quality shows up as people coming back. <b>Quality proxies:</b> sampled judge scores on live traffic, thumbs-down rate, regeneration rate, conversation abandonment. <b>Guardrails:</b> p95 TTFT and tokens/second, refusal and false-refusal rates, safety-violation rate, cost per conversation. <b>Baseline for any change:</b> the current production configuration, compared pairwise (Chapter 35).</p></div>
+      <p><b>Primary:</b> how many users come back each week, and how many conversations each user has. Good quality shows up as people returning.</p>
+      <p><b>Quality proxies</b> (indirect signs of quality): scores from an automated judge on a sample of live chats, thumbs-down rate, how often users hit "regenerate", and how often they abandon a conversation.</p>
+      <p><b>Guardrails</b> (numbers that must not get worse): p95 TTFT, tokens per second, refusal rate and false-refusal rate (refusing harmless requests), safety-violation rate, and cost per conversation.</p>
+      <p><b>Baseline for any change:</b> the current production setup. You compare the new version against it side by side (Chapter 35).</p></div>
   </div>
 
   <h2>2 · The request path</h2>
+  <p>Give each user message a stable request ID. When the connection drops, the client should ask about that request before starting another generation. The server can distinguish an unfinished response, a completed response whose delivery failed, and a genuinely new attempt. Tool actions need their own deduplication keys because retrying generation must not repeat a purchase or send a message twice.</p>
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One message, end to end</span><span class="p-tag">Step-through</span></div>
     <div class="panel-body svg-scroll">
@@ -80,20 +96,23 @@
     </div>
     <div class="stepper" data-diagram="chatSvg">
       <ol class="steps">
-        <li data-title="Client opens a stream" data-on="c-client">Server-sent events over a long-lived HTTP connection. The client sends the new message plus a conversation id — <b>not</b> the whole history, which the server already has. Disconnection must be detectable so the server can cancel and free the slot (Chapter 26).</li>
-        <li data-title="Gateway" data-on="c-client c-gw c-e1" data-packet="c-client>c-gw">Authenticate, resolve tenant and plan, check rate limit and token quota, choose the model tier, attach a trace id. Thin and fast — this is on the path of every message in the product (Chapter 39).</li>
-        <li data-title="Build the context" data-on="c-gw c-ctx c-e2" data-packet="c-gw>c-ctx">Stable system prompt and tool schemas first (for caching), then long-term memory, then retrieved documents if the query needs them, then the conversation history, then the new message. Order is chosen for prefix caching, not for readability.</li>
-        <li data-title="Input safety" data-on="c-ctx c-safe c-e3" data-packet="c-ctx>c-safe" data-color="var(--amber)">A fast classifier on the user message; retrieved content fenced as untrusted data. Runs in parallel with cache warming so it costs almost no wall-clock time (Chapter 36).</li>
-        <li data-title="Inference with prefix caching" data-on="c-safe c-inf c-e4" data-packet="c-safe>c-inf" data-color="var(--green)">The scheduler finds the cached KV prefix for this conversation, prefills only the new tokens, and joins the continuous batch. This is the difference between prefilling 400 tokens and 40,000 on turn twenty.</li>
-        <li data-title="Tool calls, if any" data-on="c-inf c-tools c-tool" data-packet="c-inf>c-tools" data-color="var(--accent-2)">The model emits a structured call; the gateway authorises it against the user's permissions, executes in a sandbox with a timeout, and feeds the result back as untrusted data. The conversation continues in the same stream (Chapter 22).</li>
-        <li data-title="Stream out, filtered" data-on="c-inf c-out c-e5" data-packet="c-inf>c-out">Tokens stream to the client as they're produced, through an output filter that buffers a small window so a policy violation can be stopped mid-stream rather than after the user has read it.</li>
-        <li data-title="Return and record" data-on="c-out c-client c-e6 c-logs c-log" data-packet="c-out>c-client">First token typically within 600 ms. Everything — prompt version, model version, cache hit, token counts, latency, tool calls, user feedback — is traced. A sample goes to automated grading and weekly human review (Chapter 35).</li>
+        <li data-title="Client opens a stream" data-on="c-client">The app opens a long-lived HTTP connection and receives the answer through server-sent events (SSE: the server pushes small pieces down the open connection as they are ready). The app sends only the new message and a conversation id — <b>not</b> the whole history, because the server already has it. The server must notice if the user disconnects, so it can stop work and free the slot (Chapter 26).</li>
+        <li data-title="Gateway" data-on="c-client c-gw c-e1" data-packet="c-client>c-gw">The gateway checks who you are, which customer (tenant) and plan you belong to, and whether you are within your rate limit and token quota. It picks the model tier and attaches a trace id for logging. It must stay thin and fast, because every single message passes through it (Chapter 39).</li>
+        <li data-title="Build the context" data-on="c-gw c-ctx c-e2" data-packet="c-gw>c-ctx">The context builder assembles everything the model will read, in this order: the fixed system prompt and tool descriptions, then long-term memory, then any retrieved documents, then the conversation so far, then the new message. The parts that never change go first so they can be cached. The order is chosen for caching, not for readability.</li>
+        <li data-title="Input safety" data-on="c-ctx c-safe c-e3" data-packet="c-ctx>c-safe" data-color="var(--amber)">A fast classifier (a small model that labels text as fine or not) checks the user's message. Retrieved content is clearly marked as untrusted data, not instructions. This check runs at the same time as the cache is being loaded, so it adds almost no waiting time (Chapter 36).</li>
+        <li data-title="Inference with prefix caching" data-on="c-safe c-inf c-e4" data-packet="c-safe>c-inf" data-color="var(--green)">The model keeps a KV cache: its saved working memory for text it has already read. The scheduler finds the saved cache for the start of this conversation (the "prefix"). It then prefills (reads in) only the new tokens and joins the continuous batch of requests sharing the GPU. On turn twenty, that means reading 400 tokens instead of 40,000.</li>
+        <li data-title="Tool calls, if any" data-on="c-inf c-tools c-tool" data-packet="c-inf>c-tools" data-color="var(--accent-2)">The model outputs a structured request to use a tool. The gateway checks it against the user's permissions. The tool runs in a sandbox (an isolated space) with a time limit. The result goes back to the model, marked as untrusted data. The conversation carries on in the same stream (Chapter 22).</li>
+        <li data-title="Stream out, filtered" data-on="c-inf c-out c-e5" data-packet="c-inf>c-out">Tokens stream to the user as soon as they are produced. They pass through an output filter that holds back a small window of text first. That way, a policy violation can be stopped mid-answer, before the user reads it.</li>
+        <li data-title="Return and record" data-on="c-out c-client c-e6 c-logs c-log" data-packet="c-out>c-client">The first token usually arrives within 600 ms. Everything is recorded: prompt version, model version, cache hit, token counts, latency, tool calls and user feedback. A sample of conversations is graded automatically, and a smaller sample is reviewed by people each week (Chapter 35).</li>
       </ol>
     </div>
   </div>
 
   <h2>3 · Deep dive: the cost of a long conversation</h2>
-  <p>Every turn resends the entire history. Without intervention, cost grows quadratically with conversation length — turn 30 pays for the 29 turns before it, again.</p>
+  <p>With 700 tokens added per turn, the simplified uncached model reads 700 × (1 + 2 + … + 30). The sum is 30 × 31 ÷ 2 = 465, giving 325,500 processed input tokens. Perfect prefix reuse reduces new prefill to 700 × 30 = 21,000 tokens. That is a 15.5-fold reduction in this part of the work, not in the total bill: output generation, cache storage and history attention still cost resources.</p>
+  <p>The simulation assumes every cached prefix survives and ignores cache-transfer time, summary-writing cost and length-dependent attention work. Real caches can be evicted or invalidated by a prompt change. A rolling summary can also lose an exact name or commitment. Preserve important structured facts separately, retain the source conversation under its retention policy, and test questions that refer back many turns.</p>
+  <p>The model has no memory between messages. So every turn sends the whole conversation history again. If you do nothing about it, cost grows quadratically (with the square of the number of turns). Turn 30 pays again for all 29 turns before it.</p>
+  <p>Think of a friend who, each time you add a sentence, re-reads the entire letter from the top. A short note is fine. A long letter gets slower and slower.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Context strategy over a 30-turn conversation</span><span class="p-tag">Interactive</span></div>
@@ -113,10 +132,13 @@
   <div class="callout tip">
     <div class="ico">💾</div>
     <div class="body"><div class="title">Conversation-aware routing is what makes prefix caching work</div>
-      <p>A cached KV prefix lives on one specific replica. If the next turn lands elsewhere, the cache misses and you prefill 40,000 tokens again. So the router uses <b>sticky, conversation-affine routing</b> — hash the conversation id to a replica, with a fallback when that replica is overloaded or dies. Cache hit rate becomes a first-class serving metric: a drop from 85% to 40% roughly doubles prefill cost and visibly raises TTFT, and it's usually caused by a deployment or a routing change rather than by anything about the model.</p></div>
+      <p>The saved KV cache for a conversation lives on one specific replica (one copy of the model on one set of GPUs). If the next turn goes to a different replica, the cache is missing there, and you prefill 40,000 tokens again.</p>
+      <p>So the router uses <b>sticky, conversation-affine routing</b>: the same conversation always goes to the same replica. It does this by hashing the conversation id to pick a replica, with a fallback if that replica is overloaded or dies.</p>
+      <p>This makes cache hit rate a key serving metric. A drop from 85% to 40% roughly doubles prefill cost and makes TTFT visibly worse. The cause is usually a deployment or a routing change, not anything about the model.</p></div>
   </div>
 
   <h2>4 · Deep dive: model tiers and routing</h2>
+  <p>Measure the routing policy on complete tasks, including escalations. A cheap first attempt followed by a large-model retry may cost more and take longer than choosing the large model initially. Compare success rate, total tokens and elapsed time by route. Use the model tier and prompt version in cache keys so a cache entry from a different configuration is never treated as interchangeable.</p>
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Tier</th><th>Handles</th><th>Share</th><th>Relative cost</th></tr></thead>
@@ -128,34 +150,38 @@
       </tbody>
     </table>
   </div>
-  <p class="small muted" style="margin-top:8px">Routing signals: an explicit user choice, a cheap difficulty classifier on the message, conversation state (has it already escalated?), the tenant's plan, and current load. Every routing decision is logged so the router itself can be evaluated — misrouting to a too-small model is a quality incident that no model-level metric will show.</p>
+  <p class="small muted" style="margin-top:8px">How the router picks a tier: the user's own choice, a cheap classifier that guesses how hard the message is, the state of the conversation (has it already moved up to a bigger model?), the customer's plan, and current load. Every routing decision is logged, so you can check whether the router itself is doing a good job. Sending a hard question to a model that is too small hurts quality, and no metric about the model itself will show it.</p>
 
   <h2>5 · Deep dive: safety without ruining the product</h2>
+  <p>A streaming filter cannot retract text already delivered. Holding 10 tokens at 25 tokens/second adds about 400 ms of buffering if those tokens must accumulate first. Choose buffering based on the content risk and include it in the visible first-token target. For outputs that need whole-answer validation, complete the check before releasing the answer. Independently enforce tool permissions in code.</p>
   <div class="safety">
-    <div class="r"><b>Input</b><span>Fast classifier on the user message; separate handling for retrieved and tool content, which is fenced as data. Latency budget: under 30 ms, run concurrently with cache warming.</span></div>
-    <div class="r"><b>System</b><span>Policy in the system prompt sets defaults, not guarantees. It is the cheapest layer and the weakest one (Chapter 36).</span></div>
-    <div class="r"><b>Output</b><span>Streaming filter with a small look-ahead buffer, so a violation is caught before the user reads it. Must not add perceptible delay to the first token.</span></div>
-    <div class="r"><b>Action</b><span>Anything with a side effect — sending, purchasing, deleting — is authorised in code against the user's real permissions, never by the model's say-so.</span></div>
-    <div class="r"><b>Feedback</b><span>Red-team suite in CI, sampled human review of refusals <i>and</i> near-misses, and a measured <b>false-refusal rate</b> so safety work doesn't quietly make the product useless.</span></div>
+    <div class="r"><b>Input</b><span>A fast classifier checks the user's message. Retrieved and tool content is handled separately and marked as data, not instructions. Time budget: under 30 ms, run at the same time as cache loading.</span></div>
+    <div class="r"><b>System</b><span>Rules written in the system prompt set default behaviour, but they don't guarantee it. This is the cheapest layer and also the weakest (Chapter 36).</span></div>
+    <div class="r"><b>Output</b><span>A streaming filter holds back a small buffer of upcoming text, so a violation is caught before the user reads it. It must not add a noticeable delay to the first token.</span></div>
+    <div class="r"><b>Action</b><span>Anything with a real-world effect — sending, buying, deleting — is checked in code against the user's real permissions. The model saying "this is fine" is never enough.</span></div>
+    <div class="r"><b>Feedback</b><span>A red-team suite (a set of deliberate attack prompts) runs in CI. People review a sample of refusals <i>and</i> near-misses. You also measure the <b>false-refusal rate</b>, so safety work doesn't quietly make the product useless.</span></div>
   </div>
 
   <div class="callout warn">
     <div class="ico">🙅</div>
     <div class="body"><div class="title">Over-refusal is a product failure with no error code</div>
-      <p>Every safety change should be evaluated on two sets: the harmful set (does it block?) and a <b>benign near-miss set</b> — security questions, medical questions, fiction, anything that pattern-matches to something risky. Teams that only measure the first ship assistants that refuse to explain how to kill a Linux process. Track false-refusal rate as a guardrail with the same seriousness as the violation rate.</p></div>
+      <p>Test every safety change on two sets of prompts. The first is a harmful set: does the change block these? The second is a <b>benign near-miss set</b>: harmless requests that only look risky, such as security questions, medical questions and fiction.</p>
+      <p>Teams that only measure the first set end up with an assistant that refuses to explain how to kill a Linux process. Treat the false-refusal rate as a guardrail, and take it as seriously as the violation rate.</p></div>
   </div>
 
   <h2>6 · Capacity and cost</h2>
+  <p>The output estimate is 120 million × 350 = 42 billion tokens/day, or about 486,000 tokens/second on average. At the stated peak, 180,000 active decoders × 25 tokens/second = 4.5 million output tokens/second. Dividing by 2,200 decode GPUs implies about 2,045 tokens/second per GPU across batched requests. Treat that as a throughput requirement to benchmark across the model mix, not a hardware fact.</p>
+  <p>Similarly, 90 TB ÷ 180,000 streams is about 500 MB of KV memory per stream on average. A 200,000-token context can be much larger, so admission must account for tokens and memory, not just stream count. The table's cost and fleet sizes are scenario assumptions. Recompute them from measured throughput, the conversation-length distribution, utilization and the price of the selected hardware.</p>
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Quantity</th><th>Estimate</th><th>Notes</th></tr></thead>
       <tbody>
         <tr><td>Output tokens/day</td><td>~42B</td><td>120M messages × ~350 tokens</td></tr>
-        <tr><td>Input tokens/day (uncached)</td><td>~180B</td><td>Dominated by history; prefix caching removes most of it</td></tr>
-        <tr><td>Decode GPUs (peak)</td><td>~2,200</td><td>Continuous batching, GQA, fp8 KV cache</td></tr>
-        <tr><td>Prefill GPUs</td><td>~700</td><td>Separated from decode so long prompts don't stall streams</td></tr>
-        <tr><td>KV cache memory</td><td>~90 TB aggregate</td><td>180k concurrent streams; the real concurrency limit (Chapter 14)</td></tr>
-        <tr><td>Cost per conversation</td><td>~£0.012</td><td>With routing + caching; roughly 5× that without either</td></tr>
+        <tr><td>Input tokens/day (uncached)</td><td>~180B</td><td>Mostly conversation history; prefix caching removes most of it</td></tr>
+        <tr><td>Decode GPUs (peak)</td><td>~2,200</td><td>Continuous batching, GQA (a way to shrink the KV cache), fp8 KV cache</td></tr>
+        <tr><td>Prefill GPUs</td><td>~700</td><td>Kept separate from decode so long prompts don't stall other people's streams</td></tr>
+        <tr><td>KV cache memory</td><td>~90 TB aggregate</td><td>180k streams at once; memory is the real limit on how many you can serve (Chapter 14)</td></tr>
+        <tr><td>Cost per conversation</td><td>~£0.012</td><td>With routing + caching; roughly 5× more without either</td></tr>
       </tbody>
     </table>
   </div>
@@ -163,39 +189,42 @@
   <div class="callout tip">
     <div class="ico">🔀</div>
     <div class="body"><div class="title">Disaggregating prefill from decode</div>
-      <p>Prefill is compute-bound and bursty; decode is memory-bound and steady. Running them on the same replicas means a single 100k-token prompt stalls everyone else's token stream. Splitting them — prefill on one pool, decode on another, with the KV cache transferred between them — lets each pool be sized, batched and scaled for its own profile. The cost is a network transfer of the cache, which is worth it above a certain scale and is over-engineering below it.</p></div>
+      <p>Answering a message has two phases. <b>Prefill</b> reads the whole prompt at once; it is limited by raw compute and comes in bursts. <b>Decode</b> writes the answer one token at a time; it is limited by memory speed and runs steadily.</p>
+      <p>If both run on the same replicas, one 100k-token prompt can freeze everyone else's token stream. So you split them: prefill on one pool of GPUs, decode on another, and the KV cache is sent from one to the other. Each pool can then be sized, batched and scaled for its own job.</p>
+      <p>The price is sending the cache over the network. That is worth it above a certain scale. Below it, it's over-engineering.</p></div>
   </div>
 
   <h2>7 · What breaks</h2>
+  <p>Separate queue wait, prefill, tool time, decode gaps and output-filter delay in traces. Otherwise the same symptom, a slow first word, can lead you to scale the wrong component. During overload, reject excess work early or offer a smaller tier within the user's plan. Bound retries and propagate cancellation all the way to the GPU scheduler and tools.</p>
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Failure</th><th>Symptom</th><th>Response</th></tr></thead>
       <tbody>
-        <tr><td>Prefix cache hit rate collapses</td><td>TTFT doubles, cost spikes, no errors</td><td>Check routing stickiness and recent deploys; alert on hit rate directly</td></tr>
-        <tr><td>One tenant's batch traffic</td><td>Interactive p95 breaks</td><td>Priority classes and per-tenant quotas (Chapter 39)</td></tr>
-        <tr><td>A long-context request storm</td><td>KV memory exhausted, requests preempted</td><td>Admission control on context length; chunked prefill</td></tr>
-        <tr><td>Safety classifier outage</td><td>Fail open or closed?</td><td>Decide in advance: degrade to the stricter model tier, don't disable filtering</td></tr>
-        <tr><td>Model regression after a routing change</td><td>Thumbs-down rate rises, no infra signal</td><td>Sampled quality grading on live traffic, alerted per route</td></tr>
-        <tr><td>Client retries on slow streams</td><td>Load amplification during an incident</td><td>Long client timeouts, server-side cancellation, circuit breaker</td></tr>
+        <tr><td>Prefix cache hit rate collapses</td><td>TTFT doubles, cost spikes, but no errors</td><td>Check that routing is still sticky and look at recent deploys; alert on hit rate directly</td></tr>
+        <tr><td>One customer's bulk (batch) traffic</td><td>p95 latency for live chat breaks</td><td>Priority classes and per-customer quotas (Chapter 39)</td></tr>
+        <tr><td>A flood of very long requests</td><td>KV memory runs out, requests get paused and pushed out</td><td>Limit how much context a request may bring (admission control); prefill long prompts in chunks</td></tr>
+        <tr><td>Safety classifier goes down</td><td>Do you let everything through, or block everything?</td><td>Decide in advance: fall back to the stricter model tier, never switch filtering off</td></tr>
+        <tr><td>Quality drops after a routing change</td><td>Thumbs-down rate rises, but infrastructure looks fine</td><td>Grade a sample of live traffic, with alerts per route</td></tr>
+        <tr><td>Apps retry when streams are slow</td><td>Retries multiply the load during an incident</td><td>Long client timeouts, server-side cancellation, circuit breaker (stop sending requests to a failing part for a while)</td></tr>
       </tbody>
     </table>
   </div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Follow-up:</b> “Cost per conversation doubled last week with flat traffic.” Where do you look?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Cost per conversation is tokens × price, so I'd decompose it. Input tokens per message: did a prompt change, a memory feature, or a retrieval change add context? Prefix cache hit rate: a system-prompt edit or a routing change invalidates every cached prefix and silently doubles prefill — this is the single most common cause. Output length: a model or prompt change can make answers longer. Routing mix: are requests that used to go to the small tier now escalating? Conversation length: did a product change make sessions longer? All five are visible in the traces if the gateway logs token counts, cache hits and the routing decision per request — which is exactly why it should.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Cost per conversation is tokens × price, so I'd break it into parts and check each one. (1) Input tokens per message: did a prompt change, a memory feature or a retrieval change add more context? (2) Prefix cache hit rate: editing the system prompt or changing routing makes every cached prefix useless, which silently doubles prefill. This is the most common cause. (3) Output length: a new model or prompt can make answers longer. (4) Routing mix: are requests that used to go to the small tier now moving up to bigger ones? (5) Conversation length: did a product change make sessions longer? You can see all five in the traces, as long as the gateway logs token counts, cache hits and the routing decision for each request. That is exactly why it should.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Follow-up:</b> “How do you know quality hasn't regressed?”</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Offline gates before release: a golden set of real conversations graded pairwise against the current production configuration, plus capability slices and a safety suite (Chapter 35). In production, continuously: sample a fraction of live conversations for automated rubric grading, with weekly human review of a smaller sample calibrated against the judge; watch implicit signals — regeneration rate, thumbs-down, conversation abandonment, escalation to support — sliced by model tier and route. Then any change ships through shadow and canary with those as guardrails. The offline number decides whether we try it; the production signals decide whether it stays.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Before release, there are offline checks. A golden set of real conversations is graded side by side against the current production setup. There are also tests for specific skills and a safety suite (Chapter 35). In production, checking never stops. A fraction of live conversations is graded automatically against a rubric. Each week, people review a smaller sample, which also checks that the automated judge agrees with humans. I'd also watch indirect signals — regeneration rate, thumbs-down, abandoned conversations, escalations to support — broken down by model tier and route. Any change then ships through shadow mode (runs alongside, results not shown) and a canary (a small share of real users), with those signals as guardrails. The offline number decides whether we try a change. The production signals decide whether it stays.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Conversation cost grows quadratically with turns unless you cache prefixes and manage history.</li>
-      <li>Prefix caching only works with conversation-affine routing — track cache hit rate as a serving metric.</li>
-      <li>Tiered routing plus caching is the difference between viable and unviable unit economics.</li>
-      <li>Safety is layered, and false-refusal rate is a guardrail as important as violation rate.</li>
-      <li>Quality needs continuous sampled grading in production; infrastructure metrics cannot see it.</li>
+      <li>A conversation's cost grows with the square of its length, unless you cache prefixes and manage the history.</li>
+      <li>Prefix caching only works if each conversation keeps going to the same replica. Track cache hit rate as a serving metric.</li>
+      <li>Routing to the right model size, plus caching, decides whether each conversation makes or loses money.</li>
+      <li>Safety comes in layers. The false-refusal rate matters as much as the violation rate.</li>
+      <li>Quality needs constant grading of sampled live traffic. Infrastructure metrics can't see it.</li>
     </ul>
   </div>
 
@@ -211,7 +240,7 @@
         <button class="opt">Because the model gets slower as context grows</button>
         <button class="opt">Because safety filtering compounds</button>
       </div>
-      <div class="explain">Turn n prefills roughly n turns of history. Summed over a conversation that's O(n²) — which is why prefix caching is the single most valuable optimisation here.</div>
+      <div class="explain">Turn n re-reads roughly n turns of history. Add that up over a whole conversation and you get O(n²). That's why prefix caching is the most valuable optimisation here.</div>
     </div>
 
     <div class="quiz" data-answer="2">
@@ -222,7 +251,7 @@
         <button class="opt">Because the cached KV prefix lives on a specific replica — a different replica means a full re-prefill</button>
         <button class="opt">Because models differ between replicas</button>
       </div>
-      <div class="explain">Cache locality is the whole point. Sticky routing with an overload fallback preserves hit rate; round-robin destroys it.</div>
+      <div class="explain">The cache only helps if the request reaches the machine that holds it. Sticky routing, with a fallback for overload, keeps the hit rate high. Round-robin (taking turns across replicas) destroys it.</div>
     </div>
 
     <div class="quiz" data-answer="0">
@@ -233,7 +262,7 @@
         <button class="opt">Decode cannot be batched</button>
         <button class="opt">To reduce model memory</button>
       </div>
-      <div class="explain">Prefill is compute-bound and bursty, decode is memory-bound and steady. Splitting lets each be sized and batched appropriately, at the cost of transferring the KV cache.</div>
+      <div class="explain">Prefill is limited by compute and comes in bursts. Decode is limited by memory and runs steadily. Splitting them lets you size and batch each pool for its own job. The price is sending the KV cache between pools.</div>
     </div>
 
     <div class="quiz" data-answer="3">
@@ -244,7 +273,7 @@
         <button class="opt">Cache hit rate</button>
         <button class="opt">False-refusal rate on a benign near-miss set</button>
       </div>
-      <div class="explain">Blocking more is trivially easy. The cost shows up as refusing legitimate requests, which has no error code and drives users away silently.</div>
+      <div class="explain">Blocking more is easy. The hidden cost is refusing legitimate requests. That produces no error code, and it quietly drives users away.</div>
     </div>
 
     <div class="quiz" data-answer="1">
@@ -255,7 +284,7 @@
         <button class="opt">The tokenizer changed</button>
         <button class="opt">Users are typing longer messages</button>
       </div>
-      <div class="explain">A cache miss means prefilling the whole conversation again. It shows up as a latency and cost change with every system metric looking healthy — which is why hit rate needs its own alert.</div>
+      <div class="explain">A cache miss means re-reading the whole conversation. You see slower responses and higher cost while every system metric looks healthy. That's why hit rate needs its own alert.</div>
     </div>
   </div>
 </main>
@@ -292,10 +321,10 @@
     $('#tCost').textContent = '$' + cost.toFixed(4);
     $('#tTtft').textContent = ttft.toFixed(2) + ' s';
     const notes = {
-      full: ['⚠️ none', `🚩 <b>Quadratic growth.</b> By turn 30 each message prefills 21,000 tokens, and the conversation has prefilled <b>${fmt(total, 0)}</b> in total. TTFT degrades visibly as the conversation goes on — users describe this as "it gets slower the longer you talk to it", and they are describing your architecture.`],
-      cache: ['✅ none', `✅ <b>Prefix caching.</b> Only the new turn is prefilled; the rest of the KV state is already resident. Total prefill drops to <b>${fmt(total, 0)}</b> tokens — a ${(30 * 31 / 2 / 30).toFixed(0)}× reduction — and TTFT stays flat regardless of conversation length. Nothing about the model or the context changed, only where the computation happened. This is the highest-leverage optimisation in the entire system.`],
-      window: ['🚩 forgets earlier turns', `⚠️ <b>Sliding window.</b> Cost is bounded, and the assistant genuinely forgets what was said 9 turns ago — users notice immediately and it reads as incompetence. Acceptable only with caching on top, or for short-lived task-shaped conversations.`],
-      summary: ['⚠️ lossy compression', `✅ <b>Rolling summary plus recent turns.</b> Older history is compressed into a running summary (itself generated by a cheap model) while the last few turns stay verbatim. Cost stays flat, most long-range context survives, and the failure mode is subtle: details dropped by the summariser are gone. Combine with caching and it is the standard approach for very long sessions.`],
+      full: ['⚠️ none', `🚩 <b>Quadratic growth.</b> By turn 30, each message re-reads 21,000 tokens, and the conversation has prefilled <b>${fmt(total, 0)}</b> tokens in total. The first word of each reply takes longer and longer to appear. Users say "it gets slower the longer you talk to it" — and they are describing your architecture.`],
+      cache: ['✅ none', `✅ <b>Prefix caching.</b> Only the new turn is read in; the saved KV state for everything earlier is already in memory. Total prefill drops to <b>${fmt(total, 0)}</b> tokens — a ${(30 * 31 / 2 / 30).toFixed(0)}× reduction — and TTFT stays flat however long the conversation gets. The model and the context didn't change at all; only where the work happened. This is the most valuable optimisation in the whole system.`],
+      window: ['🚩 forgets earlier turns', `⚠️ <b>Sliding window.</b> Only the last 8 turns are kept, so cost has a ceiling. But the assistant really does forget what was said 9 turns ago. Users notice straight away, and it looks incompetent. Only acceptable with caching on top, or for short conversations about a single task.`],
+      summary: ['⚠️ lossy compression', `✅ <b>Rolling summary plus recent turns.</b> Older history is squashed into a running summary (written by a cheap model), while the last few turns are kept word for word. Cost stays flat and most of the long-range context survives. The catch is subtle: any detail the summary leaves out is gone for good. Combined with caching, this is the standard approach for very long sessions.`],
     };
     $('#tQual').textContent = notes[mode][0];
     $('#ctxInfo p').innerHTML = notes[mode][1];

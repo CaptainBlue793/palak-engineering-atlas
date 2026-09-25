@@ -26,15 +26,27 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 41</span><span class="pill pink">Case Study</span><span class="pill">⏱ 50 min</span></div>
     <h1>Case Study: <span class="grad">Recommendation Feed</span></h1>
-    <p class="lead">Design the “For You” feed for a short-video app: 400 million daily users, a catalogue of 2 billion videos, a new video must be able to find its audience within minutes, and the whole thing has to render in under 200 ms.</p>
+    <p class="lead">Design the “For You” feed for a short-video app. It has 400 million users a day and 2 billion videos. A brand-new video must be able to find its audience within minutes. And the whole feed has to appear in under 200 ms.</p>
     <ul class="objectives">
       <li>Turn a vague product brief into a metric and a budget</li>
-      <li>Design the retrieval → ranking → re-ranking pipeline at this scale</li>
-      <li>Handle freshness, cold start and the feedback loop</li>
-      <li>Size the serving fleet and the near-line pipelines</li>
+      <li>Design the retrieval → ranking → re-ranking pipeline (find candidates, score them, then arrange the final list) at this scale</li>
+      <li>Handle fresh content, cold start (new users and videos with no history) and the feedback loop</li>
+      <li>Size the serving machines and the near-line pipelines (ones that update within seconds to minutes)</li>
       <li>Say what you'd ship first and what breaks at 10×</li>
     </ul>
   </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The retrieval → ranking funnel and two-tower models.</b> Why recommenders find a few thousand candidates first and score them second — <a href="30-recommenders.html">Chapter 30</a>.</li>
+        <li><b>Approximate nearest-neighbour search.</b> How you find the closest vectors among billions without checking every one — <a href="20-vector-search.html">Chapter 20</a>.</li>
+        <li><b>Online features and training/serving skew.</b> Where the ranker's inputs come from at request time — <a href="29-feature-stores.html">Chapter 29</a>.</li>
+        <li><b>AUC and ranking metrics.</b> What AUC measures and why offline scores are only stand-ins — <a href="07-evaluation.html">Chapter 7</a>.</li>
+        <li><b>Canary releases and A/B tests.</b> How a new model reaches users safely — <a href="33-deployment-experiments.html">Chapter 33</a>.</li>
+      </ul></div>
+  </div>
 
   <h2>1 · Requirements</h2>
   <div class="req">
@@ -45,15 +57,18 @@
     <div><b>Latency budget</b><span>200 ms p95</span></div>
     <div><b>Items per response</b><span>10</span></div>
   </div>
-  <p class="small muted" style="margin-top:10px"><b>In scope:</b> ranking the personalised feed. <b>Out of scope:</b> video encoding and delivery, creator tools, ads insertion (a separate auction that interleaves with these results), moderation (Chapter 51).</p>
+  <p class="small muted" style="margin-top:10px"><b>In scope:</b> ranking the personalised feed. <b>Out of scope:</b> video encoding and delivery, creator tools, inserting ads (a separate auction whose results are mixed in with these), moderation (Chapter 51).</p>
+  <p><b>Where 350k requests per second comes from.</b> Numbers like this should be derived, not guessed. Each feed request returns 10 videos. Assume an average user swipes through about 250 videos a day, so they make about 25 requests. Then 400M users × 25 = 10 billion requests a day. A day has 86,400 seconds, so the average is 10B ÷ 86,400 ≈ 116k requests per second. Traffic is not flat: evenings are much busier than 4 a.m. A common rule of thumb is that peak is about 3× the average, which gives ≈ 350k/s. You size the system for the peak, because that is when it must not fall over.</p>
+  <p>The other numbers follow the same way. 80M uploads a day is 80M ÷ 86,400 ≈ 930 new videos every second, each of which needs content embeddings before it can be recommended. And 200 ms is not arbitrary: the next video must be ready before the user finishes swiping, or the app feels stuck.</p>
 
   <div class="callout tip">
     <div class="ico">🎯</div>
     <div class="body"><div class="title">Metrics, stated before any architecture</div>
-      <p><b>Primary (online):</b> next-day retention, plus daily time-spent-per-user as a secondary. <b>Ranking proxies (offline):</b> multi-task AUC for watch-completion, like, share and follow; NDCG@10.<br>
-      <b>Guardrails:</b> p95 latency, creator concentration (share of impressions to the top 1% of creators), new-video exposure rate, reported-content rate, and the share of sessions ending in an explicit “not interested”.<br>
-      <b>Baseline:</b> trending-by-region plus content from accounts the user follows. It's a genuinely strong baseline, and it's what runs when the model fails.</p></div>
+      <p><b>Primary (online):</b> next-day retention (does the user come back tomorrow?), with daily time spent per user as a second metric. <b>Ranking stand-ins (offline):</b> AUC for each prediction — finishing the video, like, share and follow; plus NDCG@10 (how good the order of the top 10 is).<br>
+      <b>Guardrails:</b> p95 latency; creator concentration (share of views going to the top 1% of creators); how often new videos get shown; how often content is reported; and the share of sessions that end with an explicit “not interested”.<br>
+      <b>Baseline:</b> what's trending in the user's region, plus videos from accounts they follow. It's a truly strong baseline, and it's what runs when the model fails.</p></div>
   </div>
+  <p><b>Why retention, and not time spent, is the main metric.</b> Time spent is easy to measure and moves fast, but it is easy to game. Outrage bait and endless near-duplicates can raise today's minutes while users feel worse and quietly leave. “Did they come back tomorrow?” is closer to “was this worth their time?”. The catch is that retention is slow and noisy: you only learn it a day later, and one user gives you one yes/no per day. Training directly on that delayed user-level outcome needs careful attribution across many recommendations, so this design uses faster labels for the ranker. Instead the ranker predicts fast signals (finished, liked, shared), and A/B tests check that improving those signals actually moves retention. If a change raises likes but not retention, the stand-in has drifted away from what you care about.</p>
 
   <h2>2 · Architecture</h2>
   <div class="panel">
@@ -82,43 +97,66 @@
     </div>
     <div class="stepper" data-diagram="archSvg">
       <ol class="steps">
-        <li data-title="Request arrives" data-on="f-req">User id, device, locale, time, session state (what they've just watched and for how long). Session context is the strongest short-term signal you have — a user who watched three cooking videos in a row is telling you more than their entire history.</li>
-        <li data-title="Candidate generation — six sources in parallel" data-on="f-req f-cand f-e1" data-packet="f-req>f-cand">Two-tower ANN retrieval on the user embedding (~1,500), co-visitation from the last watched videos (~800), followed creators (~400), trending in region (~600), fresh uploads under 6 hours old (~500), and a bandit-driven exploration slate (~200). Each source has its own budget and its own recall metric.</li>
-        <li data-title="Filter" data-on="f-cand f-filt f-e2" data-packet="f-cand>f-filt">Remove already-seen (a Bloom filter per user keeps this cheap), blocked creators, muted topics, region-restricted and policy-flagged content. Roughly 4,000 → 3,200.</li>
-        <li data-title="Pre-rank" data-on="f-filt f-pre f-e3" data-packet="f-filt>f-pre" data-color="var(--accent-2)">A deliberately cheap model — a few dozen features, no cross-attention — scores everything and keeps the top ~500. This stage exists purely so the expensive ranker sees a tractable number of items, and its own quality metric is “does the item the heavy ranker would have chosen survive?”.</li>
-        <li data-title="Heavy ranking" data-on="f-pre f-rank f-e4" data-packet="f-pre>f-rank" data-color="var(--accent-2)">A multi-task network predicts P(watch ≥ 80%), P(like), P(share), P(follow), P(hide). Hundreds of features: user history embeddings, creator stats, video content embeddings, crosses. One forward pass over 500 items, batched on GPU, ~25 ms.</li>
-        <li data-title="Mix" data-on="f-rank f-mix f-e5" data-packet="f-rank>f-mix" data-color="var(--green)">Combine heads into one score with product-negotiated weights, then apply constraints: at most 2 per creator in 10, topic diversity, a minimum share of fresh and exploratory items, and ad slots. Return 10.</li>
-        <li data-title="Log impressions, not just clicks" data-on="f-mix f-log f-e6" data-packet="f-mix>f-log" data-color="var(--amber)">Every item shown is logged with its position and the scores that produced it. Without impressions you cannot compute propensities, build negatives or evaluate off-policy — this single decision determines whether your training data is usable (Chapter 30).</li>
-        <li data-title="Near-line learning" data-on="f-log f-near f-e7" data-packet="f-log>f-near">Engagement events stream back within seconds. Video-level statistics update continuously; user embeddings refresh every few minutes; the ranker is retrained hourly on a sliding window and the retrieval towers nightly. Freshness of <i>statistics</i> matters more than freshness of <i>weights</i>.</li>
-        <li data-title="Close the loop" data-on="f-near f-rank f-e8" data-packet="f-near>f-rank" data-color="var(--pink)">New models flow into serving through the standard shadow → canary → A/B path (Chapter 33), with the guardrails from the metrics section attached as automatic rollback conditions.</li>
+        <li data-title="Request arrives" data-on="f-req">User id, device, language and region, time, and session state (what they've just watched and for how long). The current session is your strongest short-term signal. A user who just watched three cooking videos in a row is telling you more than their entire history.</li>
+        <li data-title="Candidate generation — six sources in parallel" data-on="f-req f-cand f-e1" data-packet="f-req>f-cand">Six sources each propose videos at the same time: two-tower retrieval that finds videos whose embeddings are near the user's, using approximate nearest-neighbour (ANN) search (~1,500); videos often watched together with the ones just watched (~800); followed creators (~400); trending in the region (~600); fresh uploads under 6 hours old (~500); and an exploration set chosen by a bandit, an algorithm that balances trying new things with using what works (~200). Each source has its own budget and its own recall metric (how many good videos it finds).</li>
+        <li data-title="Filter" data-on="f-cand f-filt f-e2" data-packet="f-cand>f-filt">Remove videos the user has already seen (a Bloom filter per user — a compact “have I seen this?” structure — keeps this cheap), blocked creators, muted topics, content not allowed in the region, and content flagged by policy. Roughly 4,000 → 3,200.</li>
+        <li data-title="Pre-rank" data-on="f-filt f-pre f-e3" data-packet="f-filt>f-pre" data-color="var(--accent-2)">A deliberately cheap model — a few dozen features, no cross-attention — scores everything and keeps the top ~500. This stage exists only so the expensive ranker has a manageable number of items to score. Its own quality check is: “do the items the heavy ranker would have chosen survive this cut?”.</li>
+        <li data-title="Heavy ranking" data-on="f-pre f-rank f-e4" data-packet="f-pre>f-rank" data-color="var(--accent-2)">One network makes several predictions at once (multi-task): P(watch ≥ 80%), P(like), P(share), P(follow), P(hide). It uses hundreds of features: embeddings of the user's history, creator stats, embeddings of the video's content, and feature combinations (crosses). All 500 items are scored in one batched GPU pass, in ~25 ms.</li>
+        <li data-title="Mix" data-on="f-rank f-mix f-e5" data-packet="f-rank>f-mix" data-color="var(--green)">Combine the predictions into one score, using weights agreed with the product team. Then apply rules: at most 2 videos per creator in every 10, a mix of topics, a minimum share of fresh and exploratory items, and room for ads. Return 10.</li>
+        <li data-title="Log impressions, not just clicks" data-on="f-mix f-log f-e6" data-packet="f-mix>f-log" data-color="var(--amber)">Every item shown (an <i>impression</i>) is logged with its position and the scores that put it there. Without impressions, you can't estimate how likely each item was to be shown (propensities), you can't find negatives (shown but ignored), and you can't test a new ranker on old logs (off-policy evaluation). This one decision decides whether your training data is usable (Chapter 30).</li>
+        <li data-title="Near-line learning" data-on="f-log f-near f-e7" data-packet="f-log>f-near">Engagement events (views, likes, skips) stream back within seconds. Per-video stats update continuously. User embeddings refresh every few minutes. The ranker is retrained every hour on the most recent data, and the retrieval towers every night. Up-to-date <i>stats</i> matter more than up-to-date model <i>weights</i>.</li>
+        <li data-title="Close the loop" data-on="f-near f-rank f-e8" data-packet="f-near>f-rank" data-color="var(--pink)">New models reach users through the standard shadow → canary → A/B path (Chapter 33). The guardrails from the metrics section act as automatic rollback triggers.</li>
       </ol>
     </div>
   </div>
+
+  <h3>Why these design choices, and not the obvious alternatives</h3>
+  <ul>
+    <li><b>Six candidate sources instead of one great retriever.</b> Each source covers a gap the others have. Two-tower retrieval needs interaction history, so it barely knows a video uploaded an hour ago — the fresh source covers that. “Followed creators” captures intent the user stated outright, which a similarity search may rank low. Separate sources also fail separately: if the ANN cluster is slow, the other five still produce a feed.</li>
+    <li><b>A pre-ranker instead of sending all 3,200 items to the heavy ranker.</b> Heavy ranking costs roughly the same per item. Cutting 3,200 items to 500 cuts that GPU bill by about 6×, while the pre-ranker costs only a small fraction of the heavy ranker per item. The risk is that it throws away a video the heavy ranker would have loved, which is why its quality check is recall of the heavy ranker's picks.</li>
+    <li><b>One multi-task network instead of five separate models.</b> The five predictions share most of what they need to know (“does this user like cooking videos?”). A shared network computes that once. It also helps rare labels: follows are about 100× rarer than finished watches, and a follow-only model would have too few examples to learn well on its own.</li>
+    <li><b>A Bloom filter for “already seen”.</b> A Bloom filter can say “maybe seen” for a video that was never shown (a false positive), but it never says “not seen” for one that was. That is the right way to be wrong here: wrongly hiding one unseen video out of billions costs nothing, while showing a repeat annoys the user. Sizing it: at a 1% false-positive rate a Bloom filter needs about 10 bits per item, so a user with 10,000 seen videos needs about 12 KB. Across 400M users that is about 5 TB — large, but it fits in the online store.</li>
+  </ul>
+  <p><b>Edge cases the pipeline must handle.</b> A user who has watched almost everything in a niche (the filter removes most candidates, so sources must be able to return more on demand). A candidate that was deleted or taken down after it was indexed (the filter checks policy status at request time, not only at indexing time). Two sources proposing the same video (de-duplicate before scoring, or it wastes ranker slots and may appear twice). And a request with no user history at all, which the cold-start section below covers.</p>
 
   <h2>3 · Deep dive: the latency budget</h2>
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Stage</th><th>Budget</th><th>How it's achieved</th></tr></thead>
       <tbody>
-        <tr><td>Fetch user state &amp; embeddings</td><td>8 ms</td><td>Online store, single batched read, co-located with the ranker</td></tr>
-        <tr><td>Candidate generation (6 sources, parallel)</td><td>30 ms</td><td>Sharded ANN indexes, per-source timeout — a slow source is dropped, not waited for</td></tr>
-        <tr><td>Filter</td><td>6 ms</td><td>Per-user Bloom filter of seen items held in memory</td></tr>
-        <tr><td>Pre-rank 3,200 items</td><td>18 ms</td><td>Tiny model, quantized, vectorised over the batch</td></tr>
-        <tr><td>Heavy rank 500 items</td><td>45 ms</td><td>One batched GPU forward pass; features pre-joined</td></tr>
-        <tr><td>Mix &amp; constraints</td><td>10 ms</td><td>Greedy re-ranking with hard caps</td></tr>
-        <tr><td>Serialisation, network, buffer</td><td>~40 ms</td><td>Leaves headroom for the p95 tail</td></tr>
+        <tr><td>Fetch user state &amp; embeddings</td><td>8 ms</td><td>Online store, one batched read, running next to the ranker</td></tr>
+        <tr><td>Candidate generation (6 sources, parallel)</td><td>30 ms</td><td>ANN indexes split across machines (sharded), a timeout per source — a slow source is dropped, not waited for</td></tr>
+        <tr><td>Filter</td><td>6 ms</td><td>A per-user Bloom filter of seen items, kept in memory</td></tr>
+        <tr><td>Pre-rank 3,200 items</td><td>18 ms</td><td>Tiny model, quantized (smaller number formats), scoring the whole batch at once</td></tr>
+        <tr><td>Heavy rank 500 items</td><td>45 ms</td><td>One batched GPU pass; features gathered in advance</td></tr>
+        <tr><td>Mix &amp; constraints</td><td>10 ms</td><td>Pick the best allowed item one slot at a time, with strict limits</td></tr>
+        <tr><td>Serialisation, network, buffer</td><td>~40 ms</td><td>Leaves room for the slowest 5% of requests</td></tr>
       </tbody>
     </table>
   </div>
+  <p><b>Checking the sum.</b> The working stages add up to 8 + 30 + 6 + 18 + 45 + 10 = 117 ms. Add ~40 ms for serialisation and network and you reach about 157 ms, which leaves roughly 40 ms of headroom under the 200 ms target. Two details are easy to miss. First, the six candidate sources run in parallel, so that stage costs as much as the <i>slowest</i> source, not the sum of all six — which is exactly why each source has a timeout. Second, the architecture step says heavy ranking takes ~25 ms, but the budget here is 45 ms. The extra time covers gathering the ranker's features and waiting in the GPU's batch queue, not the model itself.</p>
+  <p><b>Why the headroom is needed.</b> Slowness compounds. Suppose each of six sequential stages is independently “slow” 5% of the time. The chance that at least one of them is slow on a given request is 1 − 0.95⁶ ≈ 26%. Without slack and timeouts, a quarter of requests would miss their budget even though every single stage looks fine on its own dashboard.</p>
 
   <div class="callout warn">
     <div class="ico">⏱️</div>
     <div class="body"><div class="title">Every stage needs its own timeout and its own fallback</div>
-      <p>At 350k requests per second, something is always slow. Each candidate source has a deadline and is simply omitted if it misses; if the heavy ranker is unavailable, the pre-rank ordering is served; if everything fails, the trending baseline is served. <b>The feed must never fail to render.</b> Each degradation is logged so you can see the quality cost of a bad minute.</p></div>
+      <p>At 350k requests per second, something is always slow. So every stage has a plan B:</p><ul><li>Each candidate source has a deadline, and is simply left out if it misses it.</li><li>If the heavy ranker is down, serve the pre-rank order.</li><li>If everything fails, serve the trending baseline.</li></ul><p><b>The feed must never fail to appear.</b> Each fallback is logged, so you can see how much quality a bad minute cost.</p></div>
   </div>
 
   <h2>4 · Deep dive: feed composition</h2>
-  <p>The mixer is where product strategy becomes numbers. Move the sliders and watch engagement trade against ecosystem health.</p>
+  <p>The mixer is where product strategy turns into numbers. Move the sliders and watch short-term engagement trade off against the health of the whole ecosystem (creators and catalogue).</p>
+  <p><b>Step 1: turn five predictions into one score.</b> The ranker gives five probabilities per video, but you can only sort by one number. So the mixer takes a weighted sum. Rarer, stronger signals of satisfaction get bigger weights, and “hide” gets a negative one. A worked example with illustrative weights <code>1·P(watch) + 2·P(like) + 4·P(share) + 8·P(follow) − 10·P(hide)</code>:</p>
+  <div class="table-wrap">
+    <table class="t">
+      <thead><tr><th>Video</th><th>P(watch)</th><th>P(like)</th><th>P(share)</th><th>P(follow)</th><th>P(hide)</th><th>Score</th></tr></thead>
+      <tbody>
+        <tr><td>A — catchy, a bit clickbait</td><td>0.60</td><td>0.05</td><td>0.01</td><td>0.002</td><td>0.02</td><td>0.60 + 0.10 + 0.04 + 0.016 − 0.20 = <b>0.556</b></td></tr>
+        <tr><td>B — niche, loved by its fans</td><td>0.50</td><td>0.08</td><td>0.03</td><td>0.010</td><td>0.005</td><td>0.50 + 0.16 + 0.12 + 0.08 − 0.05 = <b>0.810</b></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Video B wins even though A is more likely to be watched through. That is the point of the weights: they encode what the product values. Choosing them is a product decision tested with A/B experiments, not something the model learns by itself.</p>
+  <p><b>Step 2: fill the slots one at a time.</b> Rules like “at most 2 videos per creator in every 10” depend on what has already been placed, so you can't just sort once and take the top 10. The mixer walks down the slots. For each one it picks the highest-scoring video that doesn't break a rule, given what's already chosen. For example, if slots 1 and 2 went to the same creator, that creator's third video is skipped for now, even if it scores higher than everything else left. Picking greedily like this isn't mathematically optimal, but it is fast, easy to explain, and the rules are guaranteed to hold.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Slot allocation in a 10-item feed</span><span class="p-tag">Interactive</span></div>
@@ -140,52 +178,63 @@
 
   <h2>5 · Deep dive: cold start</h2>
   <div class="split">
-    <div class="card"><h4 class="mt0">New video (80M/day)</h4><p class="small mb0">No engagement history, so collaborative signals are empty. It enters via the <b>fresh</b> and <b>exploration</b> slots, scored from content embeddings (video, audio, caption, OCR), creator priors and early-viewer response. The first few hundred impressions are effectively a measurement experiment: a bandit allocates them and the video graduates to normal retrieval within minutes if the early signal is strong. Guaranteeing that exposure budget is what keeps the catalogue alive.</p></div>
-    <div class="card"><h4 class="mt0">New user</h4><p class="small mb0">Region and device popularity for the first few items, updated after <i>every</i> interaction — the first session is where retention is won or lost, so the user embedding is recomputed within the session rather than nightly. An optional interest-picker at signup helps, but observed behaviour overtakes stated preference within about twenty videos.</p></div>
+    <div class="card"><h4 class="mt0">New video (80M/day)</h4><p class="small mb0">It has no views yet, so signals based on other users' behaviour are empty. It gets in through the <b>fresh</b> and <b>exploration</b> slots. It's scored from its content embeddings (video, audio, caption, on-screen text via OCR), the creator's track record, and how the first viewers react. The first few hundred views are really a measurement experiment: a bandit hands them out, and if early signals are strong the video moves to normal retrieval within minutes. Guaranteeing that exposure is what keeps the catalogue alive.</p></div>
+    <div class="card"><h4 class="mt0">New user</h4><p class="small mb0">Start with what's popular for their region and device, and update after <i>every</i> interaction. The first session decides whether they come back, so the user embedding is recomputed during the session, not overnight. An optional “pick your interests” screen at signup helps. But after about twenty videos, what they actually watch tells you more than what they said they like.</p></div>
   </div>
+  <p><b>What exploration costs, in numbers.</b> Suppose every new video gets 100 trial views. That is 80M × 100 = 8 billion impressions a day. The whole feed shows about 10B requests × 10 videos = 100 billion impressions a day, so trial views alone would take 8% of all feed slots. That is a real price in short-term engagement, because trial videos are, on average, worse than proven ones. Real systems shrink it in stages: every upload gets a small first batch (say, a few dozen views, shown to people whose interests match its content embedding). Only videos whose early completion and like rates beat their peers get a second, bigger batch. Most uploads stop after the first round, and a few earn millions of views.</p>
+  <p><b>Edge cases.</b> A new video from a creator with a strong record starts with a better prior (the system's best guess before it has data), so it can skip the smallest test batch. A new user on a shared or reset device may look new but isn't, so device and account signals should be joined carefully (and within privacy rules). And a burst of trial views from bots can fake a strong early signal, which is why early engagement is checked against spam signals before a video is promoted.</p>
 
   <h2>6 · Deep dive: the feedback loop</h2>
   <div class="callout danger">
     <div class="ico">🌀</div>
     <div class="body"><div class="title">The failure mode that defines this product</div>
-      <p>The model shows what it predicts you'll watch → you watch it → that becomes training data → it becomes more certain. Within weeks, catalogue coverage narrows, a few creators take most impressions, and the system is blind to everything it stopped showing. Structural defences, all of which cost short-term engagement: a guaranteed exploration budget, impression logging with propensities for off-policy evaluation, diversity caps in the mixer, a floor on new-creator exposure, and <b>monitoring coverage and concentration as SLOs</b> rather than as curiosities. Report them next to engagement in every launch review, or they will lose every argument.</p></div>
+      <p>The loop: the model shows what it predicts you'll watch → you watch it → that becomes training data → the model grows more certain. Within weeks, the range of videos shown shrinks, a few creators get most of the views, and the system knows nothing about everything it stopped showing.</p><p>Defences built into the system (each costs some short-term engagement):</p><ul><li>A guaranteed exploration budget.</li><li>Impression logs with propensities, so you can evaluate new rankers on old data.</li><li>Diversity limits in the mixer.</li><li>A minimum amount of exposure for new creators.</li><li><b>Coverage and concentration tracked as SLOs</b> (targets you must meet), not as curiosities.</li></ul><p>Report them next to engagement in every launch review, or they will lose every argument.</p></div>
   </div>
+  <p><b>How propensities let you test a new ranker on old logs.</b> A <i>propensity</i> is the probability that the old system showed an item in a given spot. Suppose a new ranker would put video X first. In the logs, X was shown only 10% of the time it was eligible, and it was liked in some of those showings. Because X was shown in only 1 of every 10 eligible moments, each logged showing has to stand in for about 10 of them. So when you estimate how the new ranker would do, each logged like on X counts about 1 ÷ 0.10 = 10 times. This is called inverse propensity weighting. Its weak spot is items the old system almost never showed: a propensity of 0.001 means a weight of 1,000, so one lucky like swings the whole estimate. That's another reason exploration matters. It gives eligible alternatives a chance to appear. That does not guarantee stable estimates across billions of items: evaluate only policies whose choices have support in the logs, and report uncertainty when the weights are large.</p>
 
   <h2>7 · Capacity and cost</h2>
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Component</th><th>Sizing</th><th>Notes</th></tr></thead>
       <tbody>
-        <tr><td>Ranker GPUs</td><td>~1,200</td><td>350k rps × 500 items, batched; the dominant cost</td></tr>
-        <tr><td>ANN retrieval</td><td>~600 nodes</td><td>2B vectors at 128 dims, int8, sharded and replicated</td></tr>
+        <tr><td>Ranker GPUs</td><td>~1,200</td><td>350k requests/s × 500 items, batched; the biggest cost</td></tr>
+        <tr><td>ANN retrieval</td><td>~600 nodes</td><td>2B vectors of 128 numbers each, stored as int8, split across machines and copied for safety</td></tr>
         <tr><td>Online feature store</td><td>~40 TB RAM</td><td>User and video features; p99 under 5 ms</td></tr>
-        <tr><td>Event pipeline</td><td>~25M events/s</td><td>Impressions dominate — far more than engagements</td></tr>
+        <tr><td>Event pipeline</td><td>~25M events/s</td><td>Mostly impressions — there are far more of them than likes or shares</td></tr>
         <tr><td>Training</td><td>~300 GPUs continuous</td><td>Hourly ranker refresh, nightly towers, plus experiments</td></tr>
       </tbody>
     </table>
   </div>
+  <p><b>Where the table's numbers come from.</b> Each row is a short calculation. The per-machine throughputs are assumptions you would measure on your own model and hardware, so state them out loud in an interview.</p>
+  <ul>
+    <li><b>Ranker GPUs.</b> 350k requests/s × 500 items = 175 million item-scorings per second at peak. If one GPU scores about 150,000 items per second for a model this size (large batches, gathered features), you need 175M ÷ 150k ≈ 1,170 GPUs, so ~1,200. Halve the item count with a better pre-ranker and you halve this line.</li>
+    <li><b>ANN retrieval.</b> 2B vectors × 128 numbers × 1 byte (int8) = 256 GB, plus the index's own links, so roughly 0.5 TB. That fits on a few dozen large machines. The node count is driven by <i>throughput</i>, not memory: each request may send several queries (one per interest the user has), so say ~1M queries per second. At ~1,500–2,000 queries per second per node, that is ~500–650 nodes once you add copies for safety.</li>
+    <li><b>Online feature store.</b> Around 50 KB per user (history embeddings, recent watch list, counters) × 400M ≈ 20 TB, plus about 10 KB per video × 2B ≈ 20 TB. Together, about 40 TB held in RAM, because a disk read per feature would blow the 8 ms budget.</li>
+    <li><b>Event pipeline.</b> At peak, 350k requests × 10 videos = 3.5M impressions per second. Each viewed video then produces several playback events (start, progress ticks, finish or swipe away), so the total stream reaches the tens of millions of events per second.</li>
+    <li><b>Cost per request.</b> At an assumed $2 per GPU-hour, 1,200 ranker GPUs cost 1,200 × 24 × $2 ≈ $58k a day. Spread over 10B requests a day, that is about $0.006 per 1,000 feeds. Tiny per request, about $21M a year in total — which is why the pre-ranker is worth so much engineering effort.</li>
+  </ul>
 
   <h2>8 · What I'd ship first, and what breaks at 10×</h2>
   <div class="split">
-    <div class="card"><h4 class="mt0">🚀 Week one</h4><p class="small mb0">Trending + followed baseline, full impression logging, and the metric dashboard. You cannot train anything useful without logged impressions, and the baseline is what the model must beat. Then: co-visitation candidates and a simple GBDT ranker. Two-tower retrieval and multi-task deep ranking come after there's data and a measurement loop.</p></div>
-    <div class="card"><h4 class="mt0">💥 At 10×</h4><p class="small mb0">The heavy ranker's GPU cost becomes the binding constraint — the fix is a better pre-ranker, not a bigger cluster. The seen-items filter grows unboundedly (bound it by time). The event pipeline's impression volume outgrows the warehouse budget, so you sample impressions while keeping all engagements. And feedback-loop effects that were tolerable become structural, because the model's influence on the catalogue grows with its reach.</p></div>
+    <div class="card"><h4 class="mt0">🚀 Week one</h4><p class="small mb0">The trending + followed baseline, full impression logging, and the metrics dashboard. You can't train anything useful without logged impressions, and the baseline is what the model must beat. Next: “watched together” candidates and a simple gradient-boosted tree (GBDT) ranker. Two-tower retrieval and multi-task deep ranking come later, once you have data and a way to measure.</p></div>
+    <div class="card"><h4 class="mt0">💥 At 10×</h4><p class="small mb0">The heavy ranker's GPU cost becomes the main limit — the fix is a better pre-ranker, not a bigger cluster. The seen-items filter grows without limit (cap it by time, e.g. forget old views). Impression logs outgrow the data warehouse budget, so you keep a sample of impressions but all engagements. And feedback-loop effects that were bearable become serious, because the model's influence on the catalogue grows with its reach.</p></div>
   </div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Follow-up:</b> “Engagement is up 6% but creators are complaining.” What do you look at?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Creator-side metrics, which the engagement number deliberately hides. Concentration: what share of impressions goes to the top 1% of creators, and how has it moved? New-creator exposure: is a first upload still getting its measurement budget? Catalogue coverage: how many distinct videos received meaningful impressions this week versus last? If concentration rose, the model is exploiting a narrowing set of reliable winners, which raises short-term engagement and starves supply — and in a two-sided market, supply leaving is a much slower and much more expensive problem than a 6% engagement dip. I'd check whether the exploration budget was reduced or the diversity caps loosened in the same release, and I'd put those guardrails into the launch criteria so this trade is made deliberately rather than discovered.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Creator-side metrics, which the engagement number hides. Concentration: what share of views goes to the top 1% of creators, and how has it changed? New-creator exposure: does a first upload still get its trial views? Catalogue coverage: how many different videos got a meaningful number of views this week versus last? If concentration went up, the model is leaning on a shrinking set of safe hits. That lifts short-term engagement but starves the supply side. In a two-sided market (viewers and creators), creators leaving is a much slower and more expensive problem than a 6% engagement dip. I'd check whether the same release cut the exploration budget or loosened the diversity limits. And I'd add those guardrails to the launch criteria, so this trade-off is made on purpose rather than discovered later.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Follow-up:</b> “Why not skip retrieval and rank everything with the big model?”</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>The arithmetic: 2 billion items × 350,000 requests per second is 7×10¹⁴ scorings per second. Even at a microsecond each that's impossible by many orders of magnitude, and the heavy ranker takes far longer than a microsecond per item. The funnel exists so each stage spends the most compute it can afford on the number of items it sees — and the metric that links the stages is candidate recall, because the ranker can only order what retrieval returned. The interesting engineering question isn't whether to have a funnel, it's how to measure what each stage loses.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Do the maths: 2 billion items × 350,000 requests per second is 7×10¹⁴ scorings per second. Even at one microsecond each, that's impossible by many orders of magnitude — and the heavy ranker takes far longer than a microsecond per item. The funnel lets each stage spend as much compute per item as it can afford for the number of items it sees. The metric that links the stages is candidate recall, because the ranker can only order what retrieval gave it. The interesting question isn't whether to have a funnel, but how to measure what each stage throws away.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Define retention as the primary metric and engagement proxies as ranking targets — and guardrail the ecosystem.</li>
-      <li>Six candidate sources with independent budgets, timeouts and recall metrics beat one clever retriever.</li>
-      <li>A cheap pre-ranker is what makes the expensive ranker affordable; measure what it discards.</li>
-      <li>Log impressions with positions and scores, or your training data and off-policy evaluation are unusable.</li>
-      <li>Exploration budgets and diversity caps are the structural defence against the feedback loop.</li>
+      <li>Make retention the main metric and use engagement signals as ranking targets — and protect the ecosystem with guardrails.</li>
+      <li>Six candidate sources, each with its own budget, timeout and recall metric, beat one clever retriever.</li>
+      <li>A cheap pre-ranker is what makes the expensive ranker affordable; measure what it throws away.</li>
+      <li>Log every impression with its position and scores, or your training data and offline testing of new rankers are unusable.</li>
+      <li>Exploration budgets and diversity limits are the built-in defence against the feedback loop.</li>
     </ul>
   </div>
 
@@ -201,7 +250,7 @@
         <button class="opt">Impressions give negatives, position propensities and the basis for off-policy evaluation</button>
         <button class="opt">To comply with privacy rules</button>
       </div>
-      <div class="explain">Without knowing what was shown, you can't construct negatives, correct for position bias, or estimate how an alternative ranker would have performed.</div>
+      <div class="explain">If you don't know what was shown, you can't find negatives (shown but ignored), correct for position bias (top slots get more clicks anyway), or estimate how a different ranker would have done.</div>
     </div>
 
     <div class="quiz" data-answer="0">
@@ -212,7 +261,7 @@
         <button class="opt">Retry it twice</button>
         <button class="opt">Fail the request</button>
       </div>
-      <div class="explain">Each source has its own deadline. Losing 600 candidates costs a little quality; missing the latency budget costs the whole request. Log the drop so the quality cost is visible.</div>
+      <div class="explain">Each source has its own deadline. Losing 600 candidates costs a little quality; missing the latency budget ruins the whole request. Log the drop so the quality cost stays visible.</div>
     </div>
 
     <div class="quiz" data-answer="3">
@@ -223,7 +272,7 @@
         <button class="opt">It is ranked by creator follower count alone</button>
         <button class="opt">Via a guaranteed fresh/exploration slot budget, scored from content embeddings and creator priors</button>
       </div>
-      <div class="explain">Waiting for engagement is circular. A reserved exploration budget buys the measurement, and strong early signal graduates the video into normal retrieval within minutes.</div>
+      <div class="explain">Waiting for engagement is circular — it can't get views without views. A reserved exploration budget pays for the first measurement, and a strong early signal moves the video into normal retrieval within minutes.</div>
     </div>
 
     <div class="quiz" data-answer="1">
@@ -234,7 +283,7 @@
         <button class="opt">More users per day</button>
         <button class="opt">Higher click-through rate</button>
       </div>
-      <div class="explain">The system converges on a narrowing set of reliable winners. Engagement can rise while the catalogue quietly dies, which is why coverage and concentration belong in the launch criteria.</div>
+      <div class="explain">The system settles on a shrinking set of safe hits. Engagement can rise while the catalogue quietly dies, which is why coverage and concentration belong in the launch criteria.</div>
     </div>
 
     <div class="quiz" data-answer="2">
@@ -245,7 +294,7 @@
         <button class="opt">Whether the items the heavy ranker would have picked survive into its output</button>
         <button class="opt">The number of candidates it returns</button>
       </div>
-      <div class="explain">It exists to shrink the candidate set without discarding what matters. Agreement with the heavy ranker's top items — recall of the eventual winners — is the property to measure.</div>
+      <div class="explain">Its job is to shrink the candidate list without throwing away what matters. So measure how often it keeps the heavy ranker's top items — its recall of the eventual winners.</div>
     </div>
   </div>
 </main>
@@ -280,12 +329,12 @@
     $('#mCov').textContent = (cov * 100).toFixed(0) + '%';
     $('#mRet').textContent = (ret * 100).toFixed(1) + '%';
     $('#slotInfo p').innerHTML = total !== 10
-      ? `⚠️ <b>${total} slots allocated for a 10-item feed.</b> In production this is a hard constraint — the mixer fills exactly the slots that exist, so over-allocating one source means starving another. Adjust to 10.`
+      ? `⚠️ <b>${total} slots allocated for a 10-item feed.</b> In production this is a strict limit — the mixer fills exactly the slots that exist, so giving one source more means taking from another. Adjust to 10.`
       : expl === 0
-        ? `🚩 <b>No exploration.</b> Session engagement looks best right now, and the system is learning only about what it already shows. Coverage falls, new videos never get measured, and within weeks the catalogue narrows to what worked last month — with retention following it down.`
+        ? `🚩 <b>No exploration.</b> Session engagement looks best right now, but the system only learns about what it already shows. Coverage falls, new videos never get tested, and within weeks the feed shrinks to what worked last month — and retention falls with it.`
         : pers >= 8
-          ? `⚠️ <b>Exploitation-heavy.</b> Strong short-term engagement, thin ecosystem: only ${(freshExp * 100).toFixed(0)}% of impressions reach new content. This is the setting that wins the A/B test and loses the creators.`
-          : `✅ <b>Balanced.</b> Roughly ${pers} exploit slots against ${expl + fresh} that buy information about the catalogue. Note the projected retention is higher than the pure-exploitation setting despite lower immediate engagement — the exploration is an investment in tomorrow's recommendations, which is precisely why it must be defended with a guardrail rather than tuned by whoever owns the engagement metric.`;
+          ? `⚠️ <b>Too much “play it safe”.</b> Strong short-term engagement, weak ecosystem: only ${(freshExp * 100).toFixed(0)}% of impressions reach new content. This is the setting that wins the A/B test and loses the creators.`
+          : `✅ <b>Balanced.</b> Roughly ${pers} “safe bet” slots against ${expl + fresh} that gather information about the catalogue. Notice that projected retention is higher than the all-safe-bets setting, even though engagement right now is lower. Exploration is an investment in tomorrow's recommendations. That's exactly why it needs a guardrail, instead of being tuned by whoever owns the engagement metric.`;
   }
   ['#sPers', '#sFresh', '#sExpl', '#sFoll'].forEach(id => $(id).addEventListener('input', slots));
   slots();

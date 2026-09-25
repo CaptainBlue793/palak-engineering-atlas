@@ -108,8 +108,13 @@ function matchTargets(text) {
   for (const [needle, target] of MAP) {
     let from = 0, at;
     while ((at = text.indexOf(needle, from)) !== -1) {
-      hits.push({ at, end: at + needle.length, needle, target });
       from = at + 1;
+      // Whole words only (plain plurals allowed), so "nim" never fires inside
+      // "minimum" nor "prim" inside "prime", but "sparse table" still matches "sparse tables".
+      if (/\w/.test(needle[0]) && /\w/.test(text[at - 1] || '')) continue;
+      const tail = text.slice(at + needle.length).match(/^\w*/)[0];
+      if (/\w/.test(needle.at(-1)) && tail && tail !== 's') continue;
+      hits.push({ at, end: at + needle.length, needle, target });
     }
   }
   hits.sort((a, b) => b.needle.length - a.needle.length);

@@ -37,33 +37,55 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 17</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>IDs, Outbox, CDC & <span class="grad">Distributed Locks</span></h1>
-    <p class="lead">Once data lives in more than one place — a database <i>and</i> a queue, a cache, a search index, another service — a handful of small-looking problems become the source of most production bugs. How do you name things uniquely without coordination? How do you update two systems without losing one of the writes? How do you make sure only one worker does a job? This chapter is the toolkit.</p>
+    <p class="lead">Sooner or later your data lives in more than one place: a database <i>and</i> a queue, a cache, a search index, another service. At that point, a few small-looking problems cause most of the bugs in production. How do you give things unique IDs when many machines create them at once? How do you update two systems without losing one of the writes? How do you make sure only one worker does a job? This chapter is the toolkit for all three.</p>
     <ul class="objectives">
-      <li>Generate unique, sortable IDs across many machines (Snowflake, UUIDv7)</li>
-      <li>Understand why dual writes lose data — and fix it with the transactional outbox</li>
-      <li>Use change data capture to feed caches, search and analytics</li>
-      <li>Build idempotent consumers with an inbox/dedupe table</li>
-      <li>Model state as events with event sourcing and CQRS</li>
-      <li>Use leases and fencing tokens so distributed locks are actually safe</li>
+      <li>Create unique IDs on many machines that also sort by creation time (Snowflake, UUIDv7)</li>
+      <li>Understand why writing to two systems separately ("dual writes") loses data — and fix it with the transactional outbox</li>
+      <li>Use change data capture (turning database changes into events) to keep caches, search and analytics up to date</li>
+      <li>Build idempotent consumers (safe to receive the same message twice) with an inbox/dedupe table</li>
+      <li>Store history as a list of events with event sourcing, and split reads from writes with CQRS</li>
+      <li>Use leases (locks that expire) and fencing tokens so distributed locks are actually safe</li>
     </ul>
   </section>
 
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Transactions, indexes and B-trees</b> — why "all or nothing" and sorted inserts matter. See <a href="07-databases.html">Chapter 7: Databases Deep Dive</a>.</li>
+        <li><b>Sharding and replication logs</b> — how data is split and copied to replicas. See <a href="08-replication-sharding.html">Chapter 8</a>.</li>
+        <li><b>Clock skew, leases and consensus</b> — why clocks and timeouts can't be fully trusted. See <a href="13-distributed-theory.html">Chapter 13</a>.</li>
+        <li><b>Kafka partitions, at-least-once delivery and idempotency</b>. See <a href="14-message-queues.html">Chapter 14</a> (and <a href="03-apis.html">Chapter 3</a> for idempotency keys).</li>
+        <li><b>Binary and bits</b> — for reading the Snowflake ID layout. See <a href="p1-how-computers-work.html">P1: How Computers Work</a>.</li>
+      </ul>
+    </div>
+  </div>
+
   <h2>Generating unique IDs at scale</h2>
-  <p>A single database hands out <code>1, 2, 3…</code> with an auto-increment column. Shard that database, or create records in 40 services, and auto-increment breaks: two shards both produce ID 1001. You need IDs that are <b>unique without coordination</b>, and ideally <b>roughly time-sortable</b> (so B-tree inserts stay appended at the end and “newest first” is a cheap sort).</p>
+  <p>A single database hands out <code>1, 2, 3…</code> with an auto-increment column. That breaks once you shard the database (split it across machines) or create records in 40 different services: two shards will both produce ID 1001. You need IDs that are <b>unique without machines having to check with each other</b>. Ideally they should also be <b>roughly sorted by time</b>. Then new rows always go at the end of the B-tree index (the sorted structure databases use to find rows), and “newest first” is a cheap sort.</p>
 
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Approach</th><th>Size</th><th>Sortable by time</th><th>Coordination</th><th>Watch out for</th></tr></thead>
       <tbody>
-        <tr><td><b>Auto-increment</b></td><td>64-bit</td><td class="yes">Yes</td><td class="no">Single DB</td><td>Doesn't shard; leaks business volume (order #1043 → you have ~1,000 orders)</td></tr>
-        <tr><td><b>Per-shard ranges / step</b></td><td>64-bit</td><td class="meh">Per shard</td><td class="meh">Config</td><td>Shard 1 uses odd, shard 2 even — adding shards is painful</td></tr>
-        <tr><td><b>Ticket server / range allocation</b></td><td>64-bit</td><td class="meh">Roughly</td><td class="meh">Central, batched</td><td>Services lease blocks of 1,000 IDs; the allocator must be highly available (Flickr, Tinder)</td></tr>
-        <tr><td><b>UUIDv4</b></td><td>128-bit</td><td class="no">No — random</td><td class="yes">None</td><td>Random inserts fragment B-tree indexes and hurt cache locality</td></tr>
-        <tr><td><b>UUIDv7 / ULID</b></td><td>128-bit</td><td class="yes">Yes (ms)</td><td class="yes">None</td><td>Larger than 64-bit; a great modern default</td></tr>
-        <tr><td><b>Snowflake</b></td><td>64-bit</td><td class="yes">Yes (ms)</td><td class="meh">Worker IDs assigned</td><td>Clock going backwards; worker ID collisions</td></tr>
+        <tr><td><b>Auto-increment</b></td><td>64-bit</td><td class="yes">Yes</td><td class="no">Single DB</td><td>Doesn't work across shards; reveals business size (order #1043 → you have ~1,000 orders)</td></tr>
+        <tr><td><b>Per-shard ranges / step</b></td><td>64-bit</td><td class="meh">Per shard</td><td class="meh">Config</td><td>Shard 1 uses odd numbers, shard 2 even — adding shards later is painful</td></tr>
+        <tr><td><b>Ticket server / range allocation</b></td><td>64-bit</td><td class="meh">Roughly</td><td class="meh">Central, batched</td><td>Services grab blocks of 1,000 IDs at a time; the central server must never go down (Flickr, Tinder)</td></tr>
+        <tr><td><b>UUIDv4</b></td><td>128-bit</td><td class="no">No — random</td><td class="yes">None</td><td>Random values land all over the B-tree index, splitting pages and making caching less effective</td></tr>
+        <tr><td><b>UUIDv7 / ULID</b></td><td>128-bit</td><td class="yes">Yes (ms)</td><td class="yes">None</td><td>Bigger than 64-bit; a great modern default</td></tr>
+        <tr><td><b>Snowflake</b></td><td>64-bit</td><td class="yes">Yes (ms)</td><td class="meh">Worker IDs assigned</td><td>Server clock jumping backwards; two workers given the same ID</td></tr>
       </tbody>
     </table>
   </div>
+
+  <p><b>How a Snowflake ID is built.</b> It packs three facts into one 64-bit number: <i>when</i> (a timestamp in milliseconds), <i>who</i> (which datacenter and worker made it) and <i>which one</i> (a counter within that millisecond). The field sizes explain the limits you'll see below:</p>
+  <ul>
+    <li><b>41 bits of time</b> can count 2<sup>41</sup> ≈ 2.2 trillion milliseconds, which is about 69 years from a chosen start date (the "epoch", often the year the system launched).</li>
+    <li><b>5 + 5 bits of datacenter and worker</b> give 32 × 32 = 1,024 machines that can each make IDs on their own. Two machines can never clash, because their "who" bits differ.</li>
+    <li><b>12 bits of sequence</b> count 0 to 4,095 within one millisecond on one worker. If a worker needs a 4,097th ID in the same millisecond, it waits for the next millisecond.</li>
+  </ul>
+  <p>Because the timestamp sits in the highest bits, a bigger number always means "made later" (give or take small clock differences between machines). That's what makes these IDs sort by time.</p>
+  <p><b>Which approach to pick:</b> a single database with modest volume can keep using auto-increment internally. If you're sharded or have many services creating records, and 128-bit keys are fine, UUIDv7 is the easiest choice because it needs no setup. Choose Snowflake when you want compact 64-bit IDs (smaller indexes, fits in a <code>BIGINT</code>) and can assign each worker a unique number. Avoid UUIDv4 as a primary key on large, write-heavy tables because of the random-insert problem in the table above.</p>
 
   <div class="panel" id="sfPanel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Snowflake ID generator — 64 bits, no coordination</span><span class="p-tag">Simulator</span></div>
@@ -86,22 +108,22 @@
             <div class="stat good"><div class="k">Sequence</div><div class="v" id="sfSeq">–</div></div>
             <div class="stat"><div class="k">Sorted = creation order?</div><div class="v" id="sfSorted">–</div></div>
           </div>
-          <p class="small muted" style="margin-top:10px" id="sfNote">Each worker can mint 4,096 IDs per millisecond — ~4 million per second — with zero network calls.</p>
+          <p class="small muted" style="margin-top:10px" id="sfNote">Each worker can create 4,096 IDs per millisecond — about 4 million per second — without a single network call.</p>
         </div>
       </div>
     </div>
-    <div class="panel-foot">🧪 Hit <b>Clock jumps back</b>: NTP corrections can move a server's clock backwards. A naive generator would reuse old timestamps and risk duplicates, so real implementations <b>refuse to issue IDs</b> (or wait) until the clock catches up.</div>
+    <div class="panel-foot">🧪 Hit <b>Clock jumps back</b>. Servers sync their clocks over the network (NTP), and a correction can move a clock backwards. A naive generator would reuse old timestamps and could create duplicate IDs. So real implementations <b>refuse to issue IDs</b> (or wait) until the clock catches up.</div>
   </div>
 
-  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview answer template</div><p>“I'd use <b>Snowflake-style 64-bit IDs</b>: time-ordered, so they index well and double as a creation timestamp; generated locally, so there's no bottleneck. Worker IDs are assigned from ZooKeeper/etcd or the pod ordinal. If 128 bits are fine, <b>UUIDv7</b> needs no worker assignment at all.” Also: don't expose sequential IDs publicly if they leak business metrics or invite enumeration.</p></div></div>
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview answer template</div><p>“I'd use <b>Snowflake-style 64-bit IDs</b>. They are ordered by time, so they index well and also tell you when a record was created. Each server generates them locally, so there's no bottleneck. Each worker gets its number from ZooKeeper/etcd or from its pod number. If 128 bits are fine, <b>UUIDv7</b> needs no worker numbers at all.” Also: don't show sequential IDs publicly. They can reveal business numbers, and they let attackers guess other valid IDs by counting.</p></div></div>
 
   <h2>The dual-write problem</h2>
-  <p>A very common piece of code: save an order to the database, then publish <code>OrderPlaced</code> to Kafka so email, analytics and shipping can react. It looks innocent. It's broken.</p>
+  <p>Here is a very common piece of code. Save an order to the database, then publish an <code>OrderPlaced</code> message to Kafka (a message broker) so email, analytics and shipping can react. It looks harmless. It's broken.</p>
 <pre class="code"><span class="k">def</span> <span class="f">place_order</span>(order):
     db.<span class="f">insert</span>(order)                 <span class="c"># ✓ committed</span>
     <span class="c"># 💥 process crashes / deploy kills pod / network blips here</span>
     kafka.<span class="f">publish</span>(<span class="s">"OrderPlaced"</span>, order)  <span class="c"># never happens → no email, no shipping</span></pre>
-  <p>Flip the order and it's broken the other way: the event is published, then the DB insert fails, and shipping sends a package for an order that doesn't exist. You can't wrap a Postgres commit and a Kafka publish in one ACID transaction, and 2PC across them is slow and poorly supported (Chapter 13). The fix is to <b>write only once</b>.</p>
+  <p>Swap the order and it breaks the other way. The event is published, then the database insert fails — and shipping sends a package for an order that doesn't exist. You can't put a Postgres commit and a Kafka publish inside one all-or-nothing (ACID) transaction. Two-phase commit (2PC) across them is slow and poorly supported (Chapter 13). The fix is to <b>write to only one place</b>.</p>
 
   <div class="panel" id="dwPanel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Dual write vs transactional outbox — inject failures</span><span class="p-tag">Simulator</span></div>
@@ -127,11 +149,11 @@
         <div class="stat warn"><div class="k">Duplicates ignored</div><div class="v" id="dwDup">0</div></div>
       </div>
     </div>
-    <div class="panel-foot">🧪 In dual-write mode, crash after commit or take Kafka down — events vanish. Switch to outbox and repeat: events wait in the outbox and are delivered once Kafka recovers. The relay gives <b>at-least-once</b> delivery, so consumers must be idempotent.</div>
+    <div class="panel-foot">🧪 In dual-write mode, crash after the commit or take Kafka down — events vanish. Switch to outbox and try again: events wait in the outbox and are delivered once Kafka is back. The relay gives <b>at-least-once</b> delivery (a message may arrive more than once), so consumers must be idempotent — handling the same message twice must be harmless.</div>
   </div>
 
   <h2>The transactional outbox</h2>
-  <p>Write the business row <b>and</b> the event into the <b>same database, in the same local transaction</b>. Either both commit or neither does. A separate <b>relay</b> process then reads the outbox and publishes to the broker, retrying until it succeeds.</p>
+  <p>Write the business row <b>and</b> the event into the <b>same database, in the same transaction</b>. The event goes into an extra table called the <b>outbox</b>. Either both rows are saved or neither is. A separate <b>relay</b> process then reads the outbox and publishes each event to the broker, retrying until it succeeds. Think of it like a mail tray: you drop the letter in the tray as part of your work, and the mail carrier picks it up later.</p>
 <pre class="code"><span class="k">BEGIN</span>;
   <span class="k">INSERT INTO</span> orders (id, user_id, total, status) <span class="k">VALUES</span> (<span class="g">7321</span>, <span class="g">42</span>, <span class="g">89.00</span>, <span class="s">'PLACED'</span>);
   <span class="k">INSERT INTO</span> outbox (event_id, aggregate_id, type, payload, created_at)
@@ -139,12 +161,16 @@
 <span class="k">COMMIT</span>;   <span class="c">-- atomic: the order and its event exist together, or not at all</span></pre>
 
   <div class="grid c2">
-    <div class="card"><h4 class="mt0">🔁 Relay option A: polling publisher</h4><p class="small mb0">A worker runs <code>SELECT … FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED</code>, publishes, marks rows sent, and deletes old rows. Simple; adds polling latency and DB load.</p></div>
-    <div class="card"><h4 class="mt0">📜 Relay option B: log tailing (CDC)</h4><p class="small mb0">Debezium reads new outbox rows straight from the database's <b>write-ahead log</b> and publishes them. No polling, low latency, preserves commit order. Rows can be deleted immediately after insert — the log already captured them.</p></div>
+    <div class="card"><h4 class="mt0">🔁 Relay option A: polling publisher</h4><p class="small mb0">A worker keeps running <code>SELECT … FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED</code>. It publishes the rows it gets, marks them as sent, and deletes old rows. Simple — but checking on a timer adds delay and extra database load.</p></div>
+    <div class="card"><h4 class="mt0">📜 Relay option B: log tailing (CDC)</h4><p class="small mb0">Debezium reads new outbox rows straight from the database's <b>write-ahead log</b> (the internal record of every change, written before the change is applied) and publishes them. No polling, low delay, and events keep their commit order. Rows can even be deleted right after insert — the log has already captured them.</p></div>
   </div>
+  <p><b>Why the relay can send duplicates.</b> The relay publishes an event, then marks the row as sent. If it crashes between those two steps, it restarts, sees the row still unsent, and publishes it again. There's no way to make "publish to Kafka" and "update the outbox row" a single atomic step, which is the dual-write problem in miniature. The difference is that this failure gives a <i>duplicate</i>, never a <i>loss</i>, and duplicates are easy to handle with the idempotent consumers described below. That's why every outbox event carries a unique <code>event_id</code>.</p>
+  <p><b>Choosing a relay:</b> start with polling if you have modest volume (hundreds of events a second) and want no extra infrastructure; a 100–500 ms polling interval is usually fine. Move to log tailing when you need low delay, high volume, or strict ordering, and you're ready to run Debezium and Kafka Connect.</p>
 
   <h2>Change data capture (CDC)</h2>
-  <p>Every serious database already keeps an ordered log of every change for replication: Postgres's WAL, MySQL's binlog, MongoDB's oplog. <strong>CDC</strong> tools subscribe to that log like a replica would and turn each committed insert/update/delete into an event. Your application doesn't need to publish anything at all.</p>
+  <p>Every serious database already keeps an ordered log of every change, so it can copy data to replicas: Postgres's WAL, MySQL's binlog, MongoDB's oplog. <strong>CDC</strong> (change data capture) tools read that log just like a replica would. They turn each committed insert, update or delete into an event. Your application doesn't need to publish anything at all.</p>
+  <p>Why is this useful? Think of a product price that must show up correctly in the database, the cache, the search index and the analytics warehouse. Without CDC, every piece of code that changes a price must remember to update all four, and the one forgotten place (a nightly admin script, a manual SQL fix) leaves them out of step. With CDC, <i>any</i> change that commits to the database, from any source, flows out to all four automatically.</p>
+  <p><b>CDC or outbox?</b> Use raw CDC when the consumers are your own copies of the same data (cache, search index, warehouse) and matching the table layout is fine. Use an outbox when other teams consume the events: you choose a clean, stable event like <code>OrderPlaced</code> instead of exposing your internal columns, so you can change your tables without breaking them. Many systems use both: CDC for internal copies, and CDC on the outbox table to publish business events.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One write, many derived systems</span><span class="p-tag">Step-through</span></div>
@@ -169,27 +195,36 @@
     </div>
     <div class="stepper" id="cdcStep" data-diagram="cdcSvg">
       <ol class="steps">
-        <li data-title="The app only writes to its database" data-on="c-app c-db c-e1" data-packet="c-app>c-db"><code>UPDATE products SET price = 79 WHERE id = 5</code>. No Kafka client, no cache-invalidation code, no search sync code in the request path.</li>
-        <li data-title="The change lands in the WAL" data-on="c-db">On commit, Postgres appends the change to its write-ahead log with a monotonically increasing <b>LSN</b> (log sequence number). Committed changes appear in commit order.</li>
-        <li data-title="CDC reads the log like a replica" data-on="c-db c-dbz c-e2" data-packet="c-db>c-dbz" data-color="var(--accent-2)">Debezium holds a <b>replication slot</b> and decodes the change into <code>{op: "u", before: {price: 99}, after: {price: 79}, lsn: …}</code>. It checkpoints its LSN, so after a restart it resumes exactly where it left off.</li>
-        <li data-title="Publish to a partitioned topic" data-on="c-dbz c-k c-e3" data-packet="c-dbz>c-k" data-color="var(--accent-2)">Events are keyed by primary key, so all changes to product 5 land in the same partition — <b>per-row ordering is preserved</b> (Chapter 14).</li>
-        <li data-title="Every derived store follows along" data-on="c-k c-cache c-search c-dw c-svc c-e4 c-e5 c-e6 c-e7" data-packet="c-k>c-cache,c-k>c-search,c-k>c-dw,c-k>c-svc" data-color="var(--green)">Consumers invalidate the cache, re-index the product, append to the warehouse, and update other services' local copies — each at its own pace. Add a new consumer next year and replay from the beginning to backfill.</li>
+        <li data-title="The app only writes to its database" data-on="c-app c-db c-e1" data-packet="c-app>c-db"><code>UPDATE products SET price = 79 WHERE id = 5</code>. The request code has no Kafka client, no code to clear the cache, and no code to update search.</li>
+        <li data-title="The change lands in the WAL" data-on="c-db">On commit, Postgres adds the change to the end of its write-ahead log. Each entry gets an <b>LSN</b> (log sequence number) that only ever goes up. Committed changes appear in the order they were committed.</li>
+        <li data-title="CDC reads the log like a replica" data-on="c-db c-dbz c-e2" data-packet="c-db>c-dbz" data-color="var(--accent-2)">Debezium holds a <b>replication slot</b> (a bookmark in the log that Postgres keeps for it). It turns the change into <code>{op: "u", before: {price: 99}, after: {price: 79}, lsn: …}</code>. It saves the last LSN it handled, so after a restart it picks up exactly where it left off.</li>
+        <li data-title="Publish to a partitioned topic" data-on="c-dbz c-k c-e3" data-packet="c-dbz>c-k" data-color="var(--accent-2)">Events are keyed by the row's primary key. So all changes to product 5 land in the same partition, and <b>changes to each row stay in order</b> (Chapter 14).</li>
+        <li data-title="Every derived store follows along" data-on="c-k c-cache c-search c-dw c-svc c-e4 c-e5 c-e6 c-e7" data-packet="c-k>c-cache,c-k>c-search,c-k>c-dw,c-k>c-svc" data-color="var(--green)">Consumers clear the cache entry, update the search index, add a row to the data warehouse, and update other services' local copies — each at its own pace. If you add a new consumer next year, it can replay events from the beginning to fill in the past.</li>
       </ol>
     </div>
   </div>
 
-  <div class="callout warn"><div class="ico">⚠️</div><div class="body"><div class="title">CDC gotchas</div><p><b>Schema changes</b> flow downstream — use a schema registry and compatible evolution. Raw table CDC <b>couples consumers to your internal schema</b>; publishing curated domain events through an outbox table avoids that. And an abandoned replication slot makes Postgres <b>retain WAL forever</b> until the disk fills — monitor slot lag.</p></div></div>
+  <div class="callout warn"><div class="ico">⚠️</div><div class="body"><div class="title">CDC gotchas</div><p><b>Schema changes</b> flow downstream to every consumer. Use a schema registry and make only backward-compatible changes. CDC on raw tables also <b>ties consumers to your internal table layout</b>. Publishing hand-picked business events through an outbox table avoids that. And if a replication slot is abandoned, Postgres <b>keeps its WAL forever</b>, until the disk fills up — so monitor how far behind each slot is.</p></div></div>
 
   <h2>Idempotent consumers</h2>
-  <p>Outbox relays, CDC connectors and Kafka consumers all deliver <b>at least once</b>. After a crash or rebalance, the same event will arrive again. Exactly-once <i>effects</i> come from making the consumer idempotent (Chapter 3's idempotency, applied to events).</p>
+  <p>Outbox relays, CDC connectors and Kafka consumers all deliver <b>at least once</b>. After a crash or a rebalance (consumers reshuffling their work), the same event will arrive again. You get "exactly once" <i>effects</i> by making the consumer idempotent: processing an event twice has the same result as processing it once (Chapter 3's idempotency, applied to events).</p>
   <div class="grid c3">
-    <div class="card feature reveal"><div class="f-ico">📥</div><h4>Inbox / dedupe table</h4><p>In the same transaction as the side effect: <code>INSERT INTO processed_events(event_id)</code>. A unique-key violation means “already handled — skip”.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧮</div><h4>Naturally idempotent writes</h4><p>Prefer <code>SET status = 'SHIPPED'</code> or upserts over <code>balance = balance + 10</code>. Applying “set” twice is harmless.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🔢</div><h4>Version checks</h4><p>Carry a version or LSN in each event and ignore anything older than what you've stored — handles duplicates <i>and</i> out-of-order delivery.</p></div>
+    <div class="card feature reveal"><div class="f-ico">📥</div><h4>Inbox / dedupe table</h4><p>In the same transaction as the real work, run <code>INSERT INTO processed_events(event_id)</code>. If the insert fails because the ID already exists, the event was “already handled — skip it”.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧮</div><h4>Naturally idempotent writes</h4><p>Prefer <code>SET status = 'SHIPPED'</code> or upserts (insert-or-update) over <code>balance = balance + 10</code>. Setting a value twice is harmless; adding twice is not.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🔢</div><h4>Version checks</h4><p>Put a version number or LSN in each event, and ignore anything older than what you've already stored. This handles duplicates <i>and</i> events that arrive out of order.</p></div>
   </div>
+  <p>A small trace shows why the version check matters. The search indexer keeps product 5 at version 7, price $99. Then:</p>
+  <ol>
+    <li>Event <code>{id: 5, version: 9, price: 79}</code> arrives. 9 &gt; 7, so apply it. Stored: v9, $79.</li>
+    <li>A delayed event <code>{id: 5, version: 8, price: 85}</code> arrives late. 8 &lt; 9, so ignore it. Without the check, the price would wrongly go back to $85.</li>
+    <li>The v9 event is redelivered after a rebalance. 9 is not greater than 9, so ignore it. The duplicate is harmless.</li>
+  </ol>
+  <p>A dedupe table alone would catch step 3 but not step 2; a version check catches both. Use the dedupe table when events are actions ("send this email") and the version check when events carry the new state of something.</p>
 
   <h2>Event sourcing</h2>
-  <p>Most systems store <b>current state</b> and overwrite it: <code>balance = 70</code>. <strong>Event sourcing</strong> stores the <b>sequence of facts</b> that happened — <code>Opened, Deposited 100, Withdrew 30</code> — as the source of truth. Current state is derived by replaying events. It's how ledgers, version control and databases' own logs work.</p>
+  <p>Most systems store the <b>current state</b> and overwrite it: <code>balance = 70</code>. <strong>Event sourcing</strong> instead stores the <b>list of things that happened</b> — <code>Opened, Deposited 100, Withdrew 30</code> — and treats that list as the source of truth. You get the current state by replaying the events in order. Think of a bank statement: the balance is just the sum of every line. It's how ledgers, version control and databases' own logs work.</p>
+  <p>Two words matter here. A <b>command</b> is a request that might be refused: "withdraw $30". An <b>event</b> is a fact that already happened: "$30 was withdrawn". The system checks each command against the current state (is there enough money?), and only if it passes does it append an event. Events are never edited or deleted; a mistake is fixed by appending a new event, like a correcting line on a bank statement.</p>
+  <p>Snapshots keep replays fast. An account with 50,000 events would need 50,000 steps to rebuild. If you save a snapshot every 1,000 events ("balance was $4,210 after event 49,000"), loading it takes one read plus at most 1,000 replayed events.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A bank account as an event stream — time-travel through it</span><span class="p-tag">Simulator</span></div>
@@ -216,16 +251,16 @@
         </div>
       </div>
     </div>
-    <div class="panel-foot">🧪 Withdraw $500 on an empty account: the <b>command</b> is validated against current state and rejected, so no event is written — events are facts, and facts can't be invalid. Take a snapshot, and later replays start from it instead of event #1.</div>
+    <div class="panel-foot">🧪 Withdraw $500 from an empty account. The <b>command</b> (the request to do something) is checked against the current state and rejected, so no event is written. Events are facts about the past, and facts can't be invalid. Take a snapshot, and later replays start from it instead of from event #1.</div>
   </div>
 
   <div class="pros-cons">
-    <div class="pros"><h5>Why teams choose it</h5><ul><li>Complete audit trail by construction — required in finance and healthcare</li><li>Time travel: reconstruct state at any moment to debug</li><li>Build brand-new read models later by replaying history</li><li>Events feed other services naturally</li></ul></div>
-    <div class="cons"><h5>What it costs</h5><ul><li>Replays get slow → need snapshots</li><li>Event schemas are forever → versioning and upcasting</li><li>Deleting personal data (GDPR) is hard in an immutable log → crypto-shredding</li><li>Querying current state requires projections → CQRS, eventual consistency</li></ul></div>
+    <div class="pros"><h5>Why teams choose it</h5><ul><li>A full audit trail comes built in — required in finance and healthcare</li><li>Time travel: rebuild the state at any past moment to debug</li><li>Build brand-new views of the data later by replaying history</li><li>Events feed other services naturally</li></ul></div>
+    <div class="cons"><h5>What it costs</h5><ul><li>Replays get slow → you need snapshots</li><li>Old events are kept forever → you must version event formats and convert old ones when reading ("upcasting")</li><li>Deleting personal data (GDPR) is hard in a log you never change → crypto-shredding (encrypt each person's data with their own key, then delete the key)</li><li>Querying current state needs projections (pre-built views) → CQRS, and views that lag slightly behind (eventual consistency)</li></ul></div>
   </div>
 
   <h2>CQRS: separate models for writes and reads</h2>
-  <p><strong>Command Query Responsibility Segregation</strong> splits the model that handles <b>commands</b> (validate, enforce invariants, write) from one or more models optimized for <b>queries</b>. The write side is normalized and transactional; read sides are denormalized views built from change events — a search index, a Redis leaderboard, a pre-joined “order summary” table.</p>
+  <p><strong>Command Query Responsibility Segregation</strong> (CQRS) uses separate models for writing and reading. One model handles <b>commands</b>: it checks the rules that must always hold (invariants) and writes. One or more other models are built just for <b>queries</b>. The write side is normalized (no duplicated data) and transactional. The read sides are denormalized views, built from change events and shaped for fast reads — a search index, a Redis leaderboard, a pre-joined “order summary” table.</p>
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">CQRS with projections</span><span class="p-tag">Step-through</span></div>
     <div class="panel-body svg-scroll">
@@ -245,22 +280,24 @@
     </div>
     <div class="stepper" data-diagram="cqSvg">
       <ol class="steps">
-        <li data-title="Command in" data-on="q-c q-w q-e1" data-packet="q-c>q-w"><code>PlaceOrder</code> goes to the write model, which checks stock, credit limits and other invariants in one transaction.</li>
-        <li data-title="Facts out" data-on="q-w q-ev q-e2" data-packet="q-w>q-ev" data-color="var(--accent-2)">On success it emits <code>OrderPlaced</code> (event-sourced, or via the outbox).</li>
-        <li data-title="Projections update asynchronously" data-on="q-ev q-r1 q-r2 q-e3 q-e4" data-packet="q-ev>q-r1,q-ev>q-r2" data-color="var(--green)">Projectors consume events and update each read model, shaped exactly for its screens. Reads and writes scale independently.</li>
-        <li data-title="Queries hit the views" data-on="q-c q-rd q-r1 q-e5" data-packet="q-c>q-rd" data-color="var(--green)">Queries never touch the write model. The trade-off: views lag by milliseconds to seconds. Handle “I just placed an order but don't see it” with read-your-writes tricks: return the new state in the command response, or have the UI wait for the projection to reach the command's version.</li>
+        <li data-title="Command in" data-on="q-c q-w q-e1" data-packet="q-c>q-w"><code>PlaceOrder</code> goes to the write model. It checks stock, credit limits and other rules in one transaction.</li>
+        <li data-title="Facts out" data-on="q-w q-ev q-e2" data-packet="q-w>q-ev" data-color="var(--accent-2)">If that succeeds, it sends out an <code>OrderPlaced</code> event (either as an event-sourced fact, or through the outbox).</li>
+        <li data-title="Projections update asynchronously" data-on="q-ev q-r1 q-r2 q-e3 q-e4" data-packet="q-ev>q-r1,q-ev>q-r2" data-color="var(--green)">Projectors read the events and update each read model, each shaped exactly for the screens that use it. Reads and writes can now scale separately.</li>
+        <li data-title="Queries hit the views" data-on="q-c q-rd q-r1 q-e5" data-packet="q-c>q-rd" data-color="var(--green)">Queries never touch the write model. The trade-off: views lag behind by milliseconds to seconds. So a user might think “I just placed an order but don't see it”. Fix that with read-your-writes tricks: return the new state in the command's response, or have the UI wait until the view has caught up to that command's version.</li>
       </ol>
     </div>
   </div>
-  <div class="callout warn"><div class="ico">🧯</div><div class="body"><p><b>Don't reach for event sourcing + CQRS by default.</b> They shine in domains with rich business rules, audit needs and many read shapes. For a CRUD settings page, they add a lot of machinery for nothing. CQRS <i>without</i> event sourcing (a DB plus CDC-fed read views) is a much lighter, very common middle ground.</p></div></div>
+  <div class="callout warn"><div class="ico">🧯</div><div class="body"><p><b>Don't use event sourcing + CQRS by default.</b> They shine when there are complex business rules, audit requirements and many different ways to read the data. For a simple settings page that just creates, reads, updates and deletes (CRUD), they add a lot of machinery for nothing. CQRS <i>without</i> event sourcing — a normal database plus read views fed by CDC — is a much lighter and very common middle ground.</p></div></div>
 
   <h2>Distributed locks, leases & fencing tokens</h2>
-  <p>Sometimes exactly one worker must do something: run the nightly billing job, process a given file, act as leader. A <b>distributed lock</b> is usually a <b>lease</b>: a lock with a timeout, so a crashed holder doesn't block everyone forever. The classic Redis version:</p>
+  <p>Sometimes exactly one worker must do something: run the nightly billing job, process a given file, or act as leader. A <b>distributed lock</b> is a lock shared across many machines. It is usually a <b>lease</b>: a lock with a timeout, like a hotel key card that stops working at checkout. That way a crashed holder doesn't block everyone forever. The classic Redis version:</p>
 <pre class="code"><span class="k">SET</span> lock:billing <span class="s">worker-7:uuid</span> <span class="k">NX PX</span> <span class="g">30000</span>   <span class="c"># acquire only if absent, auto-expire in 30s</span>
 <span class="c"># … do work …</span>
 <span class="c"># release only if we still own it (atomic check-and-delete via Lua)</span>
 <span class="k">if</span> redis.<span class="f">call</span>(<span class="s">"GET"</span>, KEYS[1]) == ARGV[1] <span class="k">then return</span> redis.<span class="f">call</span>(<span class="s">"DEL"</span>, KEYS[1]) <span class="k">end</span></pre>
-  <p>But timeouts create a nasty failure mode. A process can <b>pause</b> for longer than the lease — stop-the-world garbage collection, VM migration, a page fault on a swapped-out process — then wake up <b>still believing it holds the lock</b>.</p>
+  <p>Each part of that has a reason. <code>NX</code> means "only set it if it doesn't already exist", so only one worker can win. <code>PX 30000</code> makes the key vanish after 30 seconds, so a crashed worker's lock frees itself. The value <code>worker-7:uuid</code> is a random ID unique to this attempt, and the release script deletes the key only if it still holds that value. Why check? Suppose worker 7 runs for 35 seconds. Its lock expired at 30 s and worker 9 took it. If worker 7 then blindly ran <code>DEL</code>, it would delete <i>worker 9's</i> lock, and a third worker could jump in.</p>
+  <p>But timeouts create a nasty problem. A process can <b>pause</b> for longer than the lease — for example, during a garbage-collection pause that freezes the whole program, a VM being moved to another host, or waiting for memory that was swapped to disk. Then it wakes up <b>still believing it holds the lock</b>.</p>
+  <p>You might think "just check the lease before each write". It doesn't help: the pause can happen right <i>after</i> the check and right <i>before</i> the write. The worker checks ("I still have 5 seconds left"), freezes for 15 seconds, then writes. No amount of checking inside the worker closes that gap. The fix has to be on the other side, in the storage being written to, which is what fencing tokens do.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">The zombie lock holder — and how fencing tokens stop it</span><span class="p-tag">Step-through</span></div>
@@ -278,45 +315,45 @@
     </div>
     <div class="stepper" id="fenStep" data-diagram="fenSvg">
       <ol class="steps">
-        <li data-title="A acquires the lease — token 33" data-on="f-a f-l f-e1" data-packet="f-a>f-l,f-l>f-a">The lock service grants a 10-second lease and returns a <b>fencing token</b>: a number that increases every time the lock is granted (etcd's revision, ZooKeeper's zxid).</li>
-        <li data-title="A freezes" data-on="f-a">A long GC pause stops Worker A for 15 seconds. It can't renew the lease, and it has no idea time is passing.</li>
-        <li data-title="Lease expires — B gets token 34" data-on="f-b f-l f-e2" data-packet="f-b>f-l,f-l>f-b" data-color="var(--accent-2)">After 10 s the lease expires. Worker B acquires the lock legitimately with token <b>34</b>.</li>
+        <li data-title="A acquires the lease — token 33" data-on="f-a f-l f-e1" data-packet="f-a>f-l,f-l>f-a">The lock service grants a 10-second lease and returns a <b>fencing token</b>: a number that goes up every time the lock is granted (etcd's revision, ZooKeeper's zxid).</li>
+        <li data-title="A freezes" data-on="f-a">A long garbage-collection (GC) pause stops Worker A for 15 seconds. It can't renew the lease, and it has no idea time is passing.</li>
+        <li data-title="Lease expires — B gets token 34" data-on="f-b f-l f-e2" data-packet="f-b>f-l,f-l>f-b" data-color="var(--accent-2)">After 10 s the lease expires. Worker B gets the lock, fairly, with token <b>34</b>.</li>
         <li data-title="B writes with token 34" data-on="f-b f-s f-e4" data-packet="f-b>f-s" data-color="var(--green)">B writes to storage, passing its token. Storage records “highest token seen = 34”.</li>
-        <li data-title="Zombie A wakes up and writes" data-on="f-a f-s f-e3" data-packet="f-a>f-s" data-color="var(--red)">A resumes mid-task, still thinking it holds the lock, and writes with token <b>33</b>. <b>Without fencing</b>, this silently overwrites B's work — two “exclusive” holders, corrupted data.</li>
-        <li data-title="Storage rejects the stale token" data-on="f-s f-a">With fencing, storage checks <code>33 &lt; 34</code> and rejects the write. Safety no longer depends on clocks or pauses. The protected resource itself must enforce this — e.g. <code>UPDATE … WHERE fencing_token &lt; :token</code>.</li>
+        <li data-title="Zombie A wakes up and writes" data-on="f-a f-s f-e3" data-packet="f-a>f-s" data-color="var(--red)">A carries on mid-task, still thinking it holds the lock, and writes with token <b>33</b>. <b>Without fencing</b>, this quietly overwrites B's work. Two “exclusive” holders means corrupted data.</li>
+        <li data-title="Storage rejects the stale token" data-on="f-s f-a">With fencing, storage sees <code>33 &lt; 34</code> and rejects the write. Safety no longer depends on clocks or pauses. The protected resource itself must do this check — e.g. <code>UPDATE … WHERE fencing_token &lt; :token</code>.</li>
       </ol>
     </div>
   </div>
 
   <div class="grid c2">
-    <div class="card"><h4 class="mt0">⚡ Locks for efficiency</h4><p class="small mb0">If two workers occasionally doing the same job is merely wasteful (sending a duplicate cache-warming request), a single Redis <code>SET NX PX</code> lock is fine.</p></div>
-    <div class="card"><h4 class="mt0">🛡️ Locks for correctness</h4><p class="small mb0">If double execution corrupts data or double-charges money, use a consensus-backed store (<b>etcd, ZooKeeper, Consul</b>) and <b>fencing tokens</b>. Better still, avoid the lock entirely with database constraints, conditional writes (compare-and-set) or idempotency keys.</p></div>
+    <div class="card"><h4 class="mt0">⚡ Locks for efficiency</h4><p class="small mb0">If two workers sometimes doing the same job only wastes a little effort (say, a duplicate request to pre-fill a cache), a single Redis <code>SET NX PX</code> lock is fine.</p></div>
+    <div class="card"><h4 class="mt0">🛡️ Locks for correctness</h4><p class="small mb0">If running twice would corrupt data or charge someone twice, use a store built on consensus — where several machines must agree before anything changes (<b>etcd, ZooKeeper, Consul</b>) — plus <b>fencing tokens</b>. Better still, avoid the lock entirely: use database constraints, conditional writes (compare-and-set: "update only if the value is still X") or idempotency keys.</p></div>
   </div>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
-      <li><b>Dual writes.</b> Writing to the database and then publishing to a broker will eventually lose events. Use the outbox.</li>
-      <li><b>Assuming a lock makes you safe.</b> A process can pause past its lease; without a fencing token the “exclusive” holder can still write.</li>
-      <li><b>Event sourcing everything.</b> It's powerful for audit-heavy domains and heavy machinery for a settings page.</li>
+      <li><b>Dual writes.</b> Writing to the database and then publishing to a broker will lose events sooner or later. Use the outbox.</li>
+      <li><b>Assuming a lock makes you safe.</b> A process can pause past the end of its lease. Without a fencing token, the old “exclusive” holder can still write.</li>
+      <li><b>Event sourcing everything.</b> It's powerful where audits matter, but far too much machinery for a settings page.</li>
     </ul></div></div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Design:</b> Keep a search index in sync with Postgres, with no lost updates and no dual writes.</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Two good options. CDC: Debezium reads the WAL and publishes row changes to Kafka; the indexer consumes and upserts. Or the outbox: the application writes a curated domain event in the same transaction as the row change, and a relay publishes it. CDC is less code but couples consumers to your table schema; the outbox gives you a stable contract. Either way the indexer must be idempotent and handle out-of-order events with a version check, and a full rebuild from the database must always be possible.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>There are two good options. First, CDC: Debezium reads the WAL and publishes row changes to Kafka, and the indexer reads them and upserts into search. Second, the outbox: the application writes a hand-picked business event in the same transaction as the row change, and a relay publishes it. CDC means less code, but it ties consumers to your table layout. The outbox gives you a stable contract. Either way, the indexer must be idempotent and must handle out-of-order events with a version check. And you must always be able to rebuild the whole index from the database.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Reason:</b> Two workers both think they hold the lock for a job. How does your storage layer protect itself?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>The lock service hands out a monotonically increasing fencing token with each grant. Every write to the protected resource carries the token, and the resource rejects any write whose token is lower than the highest it has seen — <code>UPDATE … WHERE fencing_token &lt; :token</code>. That makes safety independent of clocks, GC pauses and lease timeouts, which can never be made reliable on their own.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The lock service hands out a fencing token with each grant, and the number only ever goes up. Every write to the protected resource includes the token. The resource rejects any write whose token is lower than the highest it has seen — <code>UPDATE … WHERE fencing_token &lt; :token</code>. That makes safety independent of clocks, GC pauses and lease timeouts, none of which can ever be fully relied on by themselves.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Snowflake IDs and UUIDv7 are unique without coordination and time-sortable, which keeps indexes healthy.</li>
-      <li>Writing to a database and a broker separately (dual write) will eventually lose or invent events.</li>
-      <li>The transactional outbox writes the event in the same local transaction; a relay publishes it at least once.</li>
+      <li>Snowflake IDs and UUIDv7 are unique without machines checking with each other, and they sort by time, which keeps indexes healthy.</li>
+      <li>Writing to a database and a broker separately (dual write) will sooner or later lose events, or send events for things that never happened.</li>
+      <li>The transactional outbox saves the event in the same transaction as the data; a relay then publishes it at least once.</li>
       <li>CDC turns the database log into an event stream to feed caches, search, warehouses and other services.</li>
-      <li>At-least-once delivery requires idempotent consumers: dedupe tables, upserts or version checks.</li>
-      <li>Event sourcing stores facts and derives state; CQRS separates write invariants from read-optimized views.</li>
-      <li>Distributed locks are leases that can expire under a paused holder — use fencing tokens for correctness.</li>
+      <li>At-least-once delivery needs idempotent consumers: dedupe tables, upserts or version checks.</li>
+      <li>Event sourcing stores facts and works out the state from them; CQRS separates the write side (which enforces the rules) from views built for fast reads.</li>
+      <li>Distributed locks are leases that can expire while the holder is paused — use fencing tokens when correctness matters.</li>
     </ul>
   </div>
 
@@ -326,27 +363,27 @@
     <div class="quiz" data-answer="1">
       <p class="q">Why are random UUIDv4 primary keys often slower to insert than Snowflake or UUIDv7 IDs?</p>
       <div class="opts"><button class="opt">UUIDs can't be indexed</button><button class="opt">Random keys insert all over the B-tree, causing page splits and poor cache locality</button><button class="opt">UUIDs require a network call to generate</button><button class="opt">They are always duplicated</button></div>
-      <div class="explain">Time-ordered IDs append near the right edge of the index, keeping hot pages in memory and splits rare.</div>
+      <div class="explain">Time-ordered IDs are always added near the end of the index. That keeps the busy pages in memory and page splits rare.</div>
     </div>
     <div class="quiz" data-answer="3">
       <p class="q">A service commits an order to Postgres and then publishes to Kafka. Sometimes customers never get confirmation emails. Best fix?</p>
       <div class="opts"><button class="opt">Publish to Kafka first</button><button class="opt">Retry the publish three times</button><button class="opt">Use two-phase commit between Postgres and Kafka</button><button class="opt">Write the event to an outbox table in the same transaction and relay it asynchronously</button></div>
-      <div class="explain">The outbox makes the state change and the event atomic. Retries can't help if the process crashes between the two writes.</div>
+      <div class="explain">The outbox saves the data change and the event together — both or neither. Retries can't help if the process crashes between the two writes.</div>
     </div>
     <div class="quiz" data-answer="0">
       <p class="q">An outbox relay publishes an event, then crashes before marking it sent. What happens, and what must consumers do?</p>
       <div class="opts"><button class="opt">The event is published again; consumers must be idempotent</button><button class="opt">The event is lost; consumers must poll the DB</button><button class="opt">Kafka rejects the duplicate automatically</button><button class="opt">The database transaction rolls back</button></div>
-      <div class="explain">Outbox relays provide at-least-once delivery. Dedupe by event ID (inbox table) or make handlers naturally idempotent.</div>
+      <div class="explain">Outbox relays deliver at least once. Skip repeats by event ID (an inbox table), or write handlers so running them twice is harmless.</div>
     </div>
     <div class="quiz" data-answer="2">
       <p class="q">In an event-sourced system, how do you get current state quickly once an account has 2 million events?</p>
       <div class="opts"><button class="opt">Delete old events</button><button class="opt">Replay all events on every request</button><button class="opt">Periodically store snapshots and replay only events after the latest snapshot</button><button class="opt">Switch to UUIDv7</button></div>
-      <div class="explain">Snapshots cap replay cost while keeping the full history for audits and new projections.</div>
+      <div class="explain">Snapshots limit how much you must replay, while still keeping the full history for audits and new views.</div>
     </div>
     <div class="quiz" data-answer="1">
       <p class="q">A worker holding a Redis lock pauses for 40 s (lease 30 s). Another worker takes the lock. What prevents the first worker's late write from corrupting data?</p>
       <div class="opts"><button class="opt">A longer TTL</button><button class="opt">A monotonically increasing fencing token checked by the storage layer</button><button class="opt">Using NTP on all servers</button><button class="opt">Releasing the lock with DEL</button></div>
-      <div class="explain">Any TTL can be exceeded by a pause. Fencing tokens let the resource reject writes from holders whose lease was superseded.</div>
+      <div class="explain">A pause can outlast any timeout (TTL). Fencing tokens let the resource reject writes from a holder whose lease has already passed to someone else.</div>
     </div>
   </div>
 </main>
@@ -366,7 +403,7 @@
     const now = BigInt(Date.now() + skew);
     const dc = BigInt($('#sfDc').value), w = BigInt($('#sfW').value);
     if (now < lastTs) {
-      $('#sfNote').innerHTML = `<b style="color:var(--red)">✕ Clock moved backwards by ${lastTs - now} ms — refusing to generate IDs</b> until the clock passes the last issued timestamp. Issuing now could duplicate an existing ID.`;
+      $('#sfNote').innerHTML = `<b style="color:var(--red)">✕ Clock moved backwards by ${lastTs - now} ms — refusing to generate IDs</b> until the clock passes the last timestamp used. Creating one now could duplicate an existing ID.`;
       SD.toast('Clock went backwards — generation paused');
       return null;
     }
@@ -385,13 +422,13 @@
     $('#sfSorted').parentElement.className = 'stat ' + (sorted ? 'good' : 'bad');
     return id;
   }
-  $('#sfOne').onclick = () => { if (gen()) $('#sfNote').textContent = 'Each worker can mint 4,096 IDs per millisecond — ~4 million per second — with zero network calls.'; };
+  $('#sfOne').onclick = () => { if (gen()) $('#sfNote').textContent = 'Each worker can create 4,096 IDs per millisecond — about 4 million per second — without a single network call.'; };
   $('#sfBurst').onclick = () => {
     // simulate same millisecond by freezing time for the burst
     const real = Date.now; const t = real();
     Date.now = () => t;
     try { for (let i = 0; i < 5; i++) gen(); } finally { Date.now = real; }
-    $('#sfNote').innerHTML = 'Same timestamp, same worker → the <b>12-bit sequence</b> increments (0, 1, 2…) to keep IDs unique. If it overflows past 4,095 within one ms, the generator waits for the next millisecond.';
+    $('#sfNote').innerHTML = 'Same timestamp, same worker → the <b>12-bit sequence</b> increments (0, 1, 2…) to keep IDs unique. If it goes past 4,095 within one ms, the generator waits for the next millisecond.';
   };
   $('#sfClock').onclick = async () => {
     skew = -2000; gen();

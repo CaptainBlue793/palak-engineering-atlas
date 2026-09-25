@@ -6,6 +6,15 @@
    ========================================================= */
 (function () {
   const CHAPTERS = [
+    { n: 0.1, file: 'p1-python-for-ml.html', title: 'Python for ML', level: 'Prerequisites', icon: '🐍', mins: 45, blurb: 'Variables, lists, dicts, loops, functions, comprehensions and classes — the Python every ML codebase is written in.' },
+    { n: 0.2, file: 'p2-numpy-pandas.html', title: 'NumPy & Pandas Essentials', level: 'Prerequisites', icon: '🔢', mins: 45, blurb: 'Arrays and shapes, indexing, vectorised maths, broadcasting, axis reductions, and tables with pandas.' },
+    { n: 0.3, file: 'p3-linear-algebra.html', title: 'Vectors, Matrices & the Dot Product', level: 'Prerequisites', icon: '📐', mins: 45, blurb: 'Vectors as lists of features, length and cosine similarity, matrix multiplication and the shape rule.' },
+    { n: 0.4, file: 'p4-calculus.html', title: 'Derivatives, Gradients & the Chain Rule', level: 'Prerequisites', icon: '📉', mins: 45, blurb: 'Slopes, partial derivatives, the gradient as the way uphill, and the chain rule that backpropagation runs on.' },
+    { n: 0.5, file: 'p5-probability-stats.html', title: 'Probability & Statistics', level: 'Prerequisites', icon: '🎲', mins: 50, blurb: 'Mean, variance, distributions, the normal curve, conditional probability, Bayes’ rule, expectation and sampling.' },
+    { n: 0.6, file: 'p6-logs-softmax.html', title: 'Logs, Exponentials & Softmax', level: 'Prerequisites', icon: '🧮', mins: 40, blurb: 'Exponents and logarithms, log-probabilities, sigmoid, softmax and cross-entropy — the functions inside every loss.' },
+    { n: 0.7, file: 'p7-what-training-means.html', title: 'What Training a Model Means', level: 'Prerequisites', icon: '🏋️', mins: 45, blurb: 'Features and labels, train/validation/test splits, loss, the training loop, overfitting and how to tell if a model is any good.' },
+    { n: 0.8, file: 'p8-hardware-numbers.html', title: 'Hardware & Numbers for ML', level: 'Prerequisites', icon: '🖥️', mins: 40, blurb: 'CPU vs GPU, memory, FLOPs, number formats (fp32, bf16, int8) and how to estimate a model’s memory and compute.' },
+
     { n: 1,  file: '01-what-is-an-ml-system.html',     title: 'What Is an ML System?',                              level: 'Beginner',     icon: '🧭', mins: 25, blurb: 'Where learning beats rules, the full ML lifecycle, and why the model is the small part.' },
     { n: 2,  file: '02-math-intuition.html',           title: 'Math & Intuition You Actually Need',                 level: 'Beginner',     icon: '➗', mins: 35, blurb: 'Vectors, matrices, probability, loss surfaces and gradients — visually, not symbolically.' },
     { n: 3,  file: '03-data-quality.html',             title: 'Data: Sourcing, Labeling & Quality',                 level: 'Beginner',     icon: '🧱', mins: 40, blurb: 'Collection, labels, splits, leakage, imbalance and the dataset bugs that sink models.' },
@@ -61,6 +70,7 @@
   ];
 
   const LEVELS = [
+    ['Prerequisites', 'var(--green)', 'The Python, NumPy, maths and training basics every later chapter builds on, taught from zero.'],
     ['Beginner', 'var(--accent)', 'How learning actually works, and the data and evaluation it rests on.'],
     ['Intermediate', 'color-mix(in srgb, var(--accent-2) 25%, var(--accent))', 'Deep learning, transformers and the machinery that trains them.'],
     ['Advanced', 'color-mix(in srgb, var(--accent-2) 50%, var(--accent))', 'Distributed training, retrieval, agents and serving at real scale.'],
@@ -69,16 +79,30 @@
   ];
 
 
+  // Prerequisites are stored as 0.1…0.8 (so they sort before Chapter 1) and shown as P1…P8.
+  const isPre = (n) => n > 0 && n < 1;
+  const numOf = (c) => (c && typeof c === 'object' ? c.n : +c);
+  const chNum = (c) => { const n = numOf(c); return isPre(n) ? 'P' + Math.round(n * 10) : String(n); };
+  const chName = (c) => { const n = numOf(c); return isPre(n) ? 'Prerequisite ' + Math.round(n * 10) : 'Chapter ' + n; };
+
   const LS = {
     get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
   };
+  // The old single "Chapter 0" became the Prerequisites level: finishing it counts as finishing all of them.
+  (function migratePrereqs() {
+    const d = LS.get('ml-done', []);
+    if (!Array.isArray(d) || !d.includes(0)) return;
+    const pre = CHAPTERS.filter((c) => isPre(c.n)).map((c) => c.n);
+    LS.set('ml-done', [...new Set(d.filter((n) => n !== 0).concat(pre))]);
+    const q = LS.get('ml-quiz', {}); delete q[0]; LS.set('ml-quiz', q);
+  })();
   const doneSet = () => new Set(LS.get('ml-done', []));
 
   /* ---------------- helpers ---------------- */
   const SVGNS = 'http://www.w3.org/2000/svg';
   const ML = {
-    CHAPTERS, LEVELS, LS,
+    CHAPTERS, LEVELS, LS, chNum, chName,
     $: (s, r = document) => r.querySelector(s),
     $$: (s, r = document) => [...r.querySelectorAll(s)],
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -203,7 +227,7 @@
   function buildShell() {
     const body = document.body;
     if (!/Palak/.test(document.title)) document.title += ` · ML & AI Systems by ${AUTHOR}`;
-    const chapNum = +body.dataset.chapter || 0;
+    const chapNum = body.dataset.chapter == null ? -1 : +body.dataset.chapter;   // -1 = not a chapter page (prerequisites are 0.1…0.8)
     const chap = CHAPTERS.find((c) => c.n === chapNum);
     const main = ML.$('main.content');
     if (!main) return { chap };
@@ -218,13 +242,13 @@
 
     // sidebar
     const done = doneSet();
-    let html = `<a class="brand" href="index.html"><span class="brand-logo"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 3v15.5h17"/><path d="M6.5 6.2c2.6.3 2.4 9.1 5.6 9.1 2.9 0 3-4.6 5.9-6.3"/><circle cx="12.1" cy="15.3" r="1.8" fill="currentColor" stroke="none"/></svg></span><span><span class="grad">ML &amp; AI Systems</span><br><small style="font-weight:500;color:var(--muted);font-size:12px">by Palak Deb Patra</small></span></a>
+    let html = `<a class="brand" href="index.html"><span class="brand-logo"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 3v15.5h17"/><path d="M6.5 6.2c2.6.3 2.4 9.1 5.6 9.1 2.9 0 3-4.6 5.9-6.3"/><circle cx="12.1" cy="15.3" r="1.8" fill="currentColor" stroke="none"/></svg></span><span><span class="brand-author">Palak Deb Patra</span><span class="grad brand-course">ML &amp; AI Systems Playlist</span></span></a>
       <div class="side-progress"><div class="bar"><i style="width:${(done.size / CHAPTERS.length) * 100}%"></i></div><small>${done.size} of ${CHAPTERS.length} chapters complete</small></div>`;
     let lastLevel = '';
     for (const c of CHAPTERS) {
       if (c.level !== lastLevel) { html += `<div class="nav-level">${c.level}</div>`; lastLevel = c.level; }
       const cls = ['nav-link', done.has(c.n) ? 'done' : '', c.n === chapNum ? 'current' : ''].join(' ');
-      html += `<a class="${cls}" href="${c.file}"><span class="num">${done.has(c.n) ? '✓' : c.n}</span><span>${c.title}</span></a>`;
+      html += `<a class="${cls}" href="${c.file}"><span class="num">${done.has(c.n) ? '✓' : chNum(c)}</span><span>${c.title}</span></a>`;
       if (c.n === chapNum) html += `<nav class="toc" id="toc"></nav>`;
     }
     html += `<div class="nav-level">Study tools</div>
@@ -239,7 +263,7 @@
     const top = document.createElement('header'); top.className = 'topbar';
     const theme = currentTheme();
     top.innerHTML = `<button class="icon-btn menu-btn" aria-label="Menu">☰</button>
-      <div class="crumb">${chap ? `<a href="index.html">Course</a> / Chapter ${chap.n} · <b>${chap.title}</b>` : '<b>ML &amp; AI Systems</b>'}</div>
+      <div class="crumb"><a href="../index.html">Atlas</a> / ${chap ? `<a href="index.html">Course</a> / ${chName(chap)} · <b>${chap.title}</b>` : '<b>ML &amp; AI Systems</b>'}</div>
       <div class="spacer"></div>
       <button class="search-btn" aria-label="Search the course" title="Search (Ctrl+K)">🔎 <span>Search</span> <kbd class="kbd">Ctrl K</kbd></button>
       <button class="icon-btn theme-btn" aria-label="Toggle theme" title="Toggle theme">${theme === 'dark' ? '☀️' : '🌙'}</button>`;
@@ -273,12 +297,12 @@
     h2s.forEach((h, i) => {
       if (!h.id) h.id = 's' + (i + 1) + '-' + h.textContent.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
       if (chap && !h.querySelector('.sec-num')) {
-        const s = document.createElement('span'); s.className = 'sec-num'; s.textContent = `${chap.n}.${i + 1}`;
+        const s = document.createElement('span'); s.className = 'sec-num'; s.textContent = `${chNum(chap)}.${i + 1}`;
         h.prepend(s);
       }
       if (toc) {
         const a = document.createElement('a'); a.href = '#' + h.id;
-        a.textContent = h.textContent.replace(/^\d+\.\d+/, '').trim();
+        a.textContent = h.textContent.replace(/^P?\d+\.\d+/, '').trim();
         toc.appendChild(a);
         a.addEventListener('click', () => { ML.$('.sidebar').classList.remove('open'); ML.$('.scrim').classList.remove('show'); });
       }
@@ -302,7 +326,7 @@
     const render = () => {
       box.className = 'complete-box' + (isDone() ? ' done' : '');
       box.innerHTML = isDone()
-        ? `<p style="font-size:26px;margin:0">🎉</p><p><strong>Chapter ${chap.n} complete!</strong></p><button class="btn sm ghost" data-undo>Mark as not complete</button>`
+        ? `<p style="font-size:26px;margin:0">🎉</p><p><strong>${chName(chap)} complete!</strong></p><button class="btn sm ghost" data-undo>Mark as not complete</button>`
         : `<p><strong>Finished this chapter?</strong><br><span class="muted small">Track your progress across the course.</span></p><button class="btn primary">✓ Mark chapter complete</button>`;
       box.querySelector('button').onclick = () => {
         const s = doneSet();
@@ -310,7 +334,7 @@
         LS.set('ml-done', [...s]);
         render();
         const side = ML.$('.sidebar .nav-link.current .num');
-        if (side) { side.textContent = isDone() ? '✓' : chap.n; side.parentElement.classList.toggle('done', isDone()); }
+        if (side) { side.textContent = isDone() ? '✓' : chNum(chap); side.parentElement.classList.toggle('done', isDone()); }
         const bar = ML.$('.side-progress');
         if (bar) { const n = doneSet().size; bar.querySelector('i').style.width = (n / CHAPTERS.length) * 100 + '%'; bar.querySelector('small').textContent = `${n} of ${CHAPTERS.length} chapters complete`; }
       };
@@ -557,7 +581,7 @@
       if (!results.length) { list.innerHTML = '<div class="pal-empty">No matches. Try a broader word.</div>'; return; }
       list.innerHTML = results.map((r, i) => `<a class="pal-item ${i === sel ? 'sel' : ''}" href="${r.f}${r.a ? '#' + r.a : ''}" data-i="${i}">
           <span class="pal-ico">${ICON[r.k] || '•'}</span>
-          <span class="pal-text"><b>${esc(r.t)}</b><small>Chapter ${r.n} · ${esc(r.ti)}</small></span>
+          <span class="pal-text"><b>${esc(r.t)}</b><small>${chName(r.n)} · ${esc(r.ti)}</small></span>
           <span class="pal-lv">${r.lv}</span></a>`).join('');
       ML.$$('.pal-item', list).forEach((el) => {
         el.addEventListener('mouseenter', () => { sel = +el.dataset.i; ML.$$('.pal-item', list).forEach((x) => x.classList.toggle('sel', x === el)); });

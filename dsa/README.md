@@ -1,7 +1,7 @@
 # DSA — Interactive Course
 
 A complete data structures and algorithms course, from "what is a loop doing" to bitmask DP,
-suffix arrays and interview technique. **56 chapters across five levels**, each self-contained,
+suffix arrays and interview technique. **56 chapters across five levels, plus an 8-chapter Prerequisites level** (P1–P8: setup and judges, C++ types and overflow, control flow, arrays and strings, the STL, memory and pointers, school maths, and input-size budgeting), each self-contained,
 with animated visualizers, simulators, a practice set, an interview drill and a five-question quiz.
 
 Static site, **zero dependencies**, no build step required to read it. Open `index.html` in a
@@ -22,10 +22,11 @@ open index.html           # macOS
 
 Keyboard: **Ctrl+K** opens the search palette (1,078 indexed entries across all chapters).
 
-## The five levels
+## The levels
 
 | Level | Chapters | What it covers |
 |---|---|---|
+| **Prerequisites** | P1–P8 | Compiler and judges, C++ types and overflow, control flow and functions, arrays/strings/vectors, the STL toolbox, memory and pointers, school maths, input size and how to practise |
 | **Foundations** | 1–11 | How to think about a problem, complexity, arrays, strings, hashing, prefix sums, two pointers, sliding window, binary search, sorting |
 | **Data Structures** | 12–24 | Stacks, queues, linked lists, monotonic stacks, heaps, trees, BSTs, tries, segment trees, Fenwick, union-find |
 | **Graphs & Paradigms** | 25–37 | DFS, BFS, topological sort, cycles, bipartite, Dijkstra, Bellman-Ford, Floyd-Warshall, MST, SCC, recursion, backtracking, greedy, divide & conquer |

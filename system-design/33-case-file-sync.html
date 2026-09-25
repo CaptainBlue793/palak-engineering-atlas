@@ -32,30 +32,43 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 33</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
     <h1>Design <span class="grad">Cloud File Sync</span></h1>
-    <p class="lead">Dropbox, Google Drive, OneDrive, iCloud: a folder on your laptop that magically appears on your phone, your colleague's machine and the web. The interesting problems are <b>bandwidth</b> (don't re-upload a 2 GB file because one paragraph changed), <b>metadata consistency</b> (millions of devices asking “what changed?”), and <b>conflicts</b> (two people editing offline).</p>
+    <p class="lead">Dropbox, Google Drive, OneDrive, iCloud: a folder on your laptop that magically appears on your phone, your colleague's machine and the web. Three problems make this interesting. <b>Bandwidth</b>: don't re-upload a 2 GB file because one paragraph changed. <b>Keeping the file list correct</b> when millions of devices keep asking “what changed?”. And <b>conflicts</b>, when two people edit the same file while offline.</p>
     <ul class="objectives">
-      <li>Split the system into metadata, block storage and notification services</li>
-      <li>Chunk files with content-defined boundaries and deduplicate</li>
-      <li>Sync only deltas, in both directions, efficiently</li>
+      <li>Split the system into three services: file details, file content and change alerts</li>
+      <li>Cut files into chunks whose boundaries follow the content, and store each chunk once</li>
+      <li>Sync only what changed, in both directions</li>
       <li>Detect and resolve conflicts</li>
-      <li>Handle sharing, versioning, garbage collection and security</li>
+      <li>Handle sharing, version history, cleaning up unused data, and security</li>
     </ul>
   </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>What a hash is</b> — a short fingerprint of some bytes; same bytes, same fingerprint. See <a href="p7-big-o-data-structures.html">P7: Big-O &amp; Everyday Data Structures</a>.</li>
+        <li><b>Cursors and idempotent APIs</b> — “give me everything after position X”, and safe retries (<a href="03-apis.html">Chapter 3</a>).</li>
+        <li><b>Transactions and sharding</b> — changing several rows all-or-nothing, and splitting data by a key (<a href="07-databases.html">Chapter 7</a>, <a href="08-replication-sharding.html">Chapter 8</a>).</li>
+        <li><b>Object storage and presigned URLs</b> — where the file bytes actually live (<a href="09-object-storage.html">Chapter 9</a>).</li>
+        <li><b>Long-lived connections</b> — WebSockets and long polling for push messages (<a href="28-case-chat-system.html">Chapter 28</a>).</li>
+      </ul>
+    </div>
+  </div>
 
   <div class="step-banner"><span>STEP 1 / 6</span></div>
   <h2>Requirements</h2>
   <div class="split">
     <div><h4 class="mt0">🛠️ Functional</h4><div class="req-list">
-      <div class="req"><span class="chk">✓</span><span>Add, edit, move, delete files in a synced folder; changes propagate to all devices</span></div>
+      <div class="req"><span class="chk">✓</span><span>Add, edit, move and delete files in a synced folder, and every device gets the change</span></div>
       <div class="req"><span class="chk">✓</span><span>Work offline; sync when reconnected</span></div>
       <div class="req"><span class="chk">✓</span><span>Share folders with other users; permissions</span></div>
-      <div class="req"><span class="chk">✓</span><span>Version history and restore of deleted files</span></div>
+      <div class="req"><span class="chk">✓</span><span>Keep old versions and restore deleted files</span></div>
       <div class="req"><span class="chk">✓</span><span>Files up to ~50 GB</span></div>
     </div></div>
     <div><h4 class="mt0">📏 Non-functional</h4><div class="req-list">
-      <div class="req"><span class="chk">✓</span><span><b>Bandwidth-efficient:</b> transfer only what changed</span></div>
-      <div class="req"><span class="chk">✓</span><span><b>Strongly consistent metadata:</b> devices must never disagree about the current version</span></div>
-      <div class="req"><span class="chk">✓</span><span><b>Durable:</b> never lose a file (11 nines)</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Saves bandwidth:</b> send only what changed</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>The file list is always exact:</b> devices must never disagree about which version is current</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Durable:</b> never lose a file (99.999999999% safe, “11 nines”)</span></div>
       <div class="req"><span class="chk">✓</span><span>Changes visible on other devices within seconds</span></div>
       <div class="req"><span class="chk">✓</span><span>Conflicts resolved without data loss</span></div>
     </div></div>
@@ -71,21 +84,43 @@
     <div class="stat acc"><div class="k">File changes / day</div><div class="v">~10B <small>~120K/s avg</small></div></div>
     <div class="stat bad"><div class="k">Idle devices polling</div><div class="v">300M <small>connections to hold</small></div></div>
   </div>
-  <p style="margin-top:16px">Two observations drive the architecture. <b>Metadata operations vastly outnumber content transfers</b> — most sync traffic is “has anything changed?”, which must be nearly free. And most “changed” files are <b>small edits to large files</b>, so chunk-level deltas save enormous bandwidth and storage.</p>
+  <p style="margin-top:16px">Two facts shape the whole design:</p>
+  <ul>
+    <li><b>Checking for changes happens far more often than moving files.</b> Most sync traffic is just “has anything changed?”, so that question must be almost free to answer.</li>
+    <li>Most changed files are <b>small edits inside large files</b>. So sending only the changed pieces saves a huge amount of bandwidth and storage.</li>
+  </ul>
+  <p>Where the numbers come from:</p>
+  <ul>
+    <li><b>Storage:</b> 500M users × 10 GB = 5 billion GB = <b>5 EB</b>. Many users hold the same files (the same installer, the same shared PDF, old versions that barely differ), so storing each identical chunk once saves ~40%, leaving ~3 EB.</li>
+    <li><b>Changes:</b> 10B a day ÷ 86,400 s ≈ <b>116K commits a second</b> on average, more at peak working hours. Every one is a small database transaction, which is why the metadata must be sharded.</li>
+    <li><b>Why not just poll?</b> If 300M devices asked “anything new?” every 30 seconds, that is 300M ÷ 30 = <b>10M requests a second</b>, and almost all of them answer “no”. Holding an open connection instead costs only memory. At ~100K idle connections per server, 300M connections need ~3,000 servers that do almost nothing until a change arrives.</li>
+    <li><b>Bandwidth saved:</b> editing one slide in a 200 MB presentation with 4 MB chunks means sending 1–2 chunks, 4–8 MB, instead of 200 MB, a 25–50× saving.</li>
+  </ul>
 
   <div class="step-banner"><span>STEP 3 / 6</span></div>
   <h2>Architecture: split metadata from content</h2>
+  <p>Why split the system three ways instead of storing files in one database? Because the three kinds of data behave completely differently. Metadata is small (a few hundred bytes per file) but must be exact and changed in transactions. Content is enormous (exabytes) but never edited in place, which suits cheap object storage. Notifications are neither: they're short-lived messages to connected devices. Putting 3 EB of file bytes into a relational database would make backups, replication and scaling impossible, while putting the file tree into object storage would lose transactions.</p>
   <div class="grid c3">
-    <div class="card feature reveal"><div class="f-ico">🗂️</div><h4>Metadata service</h4><p>The source of truth for the file tree: paths, sizes, versions, chunk lists, permissions, a per-user <b>change journal</b>. Relational and <b>strongly consistent</b>, sharded by user/namespace.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧱</div><h4>Block service + object storage</h4><p>Immutable, <b>content-addressed</b> chunks: the key is the hash of the bytes. Identical chunks are stored once. Clients upload/download blocks directly with presigned URLs (Chapter 9).</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">📡</div><h4>Notification service</h4><p>Long-lived connections (WebSocket / long polling) telling devices “your namespace changed — come fetch the delta”. Deliberately <b>tiny messages</b>; the client then pulls authoritative state.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🗂️</div><h4>Metadata service</h4><p>This is the official record of the file tree: paths, sizes, versions, which chunks make up each file, permissions, and a <b>change journal</b> (an ordered log of what changed) per user. It's a relational database, always exact, split into shards by user or shared folder.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧱</div><h4>Block service + object storage</h4><p>Chunks never change once written, and each one is <b>named by a hash of its own bytes</b>. So two identical chunks get the same name and are stored only once. Clients upload and download blocks directly using temporary signed links (Chapter 9).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">📡</div><h4>Notification service</h4><p>Connections that stay open (WebSocket or long polling) tell each device “something in your folder changed, come and fetch it”. The messages are <b>deliberately tiny</b>. The device then asks the metadata service for the real details.</p></div>
   </div>
 
-  <div class="callout tip"><div class="ico">🧠</div><div class="body"><div class="title">Why content-addressed chunks change everything</div><p>If the key <i>is</i> the hash, uploads are idempotent (re-uploading the same chunk is a no-op), dedupe is automatic across versions and users, integrity is verifiable (rehash and compare), and blocks are immutable — so they cache perfectly and never need invalidation. Versions become <b>lists of chunk hashes</b>, which makes version history almost free.</p></div></div>
+  <div class="callout tip"><div class="ico">🧠</div><div class="body"><div class="title">Why content-addressed chunks change everything</div><p>When the name <i>is</i> the hash of the content, four things follow:</p>
+  <ul>
+    <li>Uploading the same chunk twice does nothing extra, so retries are safe.</li>
+    <li>Identical data is stored once, across all versions and all users.</li>
+    <li>You can check nothing was corrupted: hash the bytes again and compare.</li>
+    <li>Blocks never change, so caches never need clearing.</li>
+  </ul>
+  <p>A version is then just a <b>list of chunk hashes</b>. That makes keeping version history almost free.</p></div></div>
 
   <div class="step-banner"><span>STEP 4 / 6</span></div>
   <h2>Deep dive: chunking & delta sync</h2>
-  <p>You edit one sentence in the middle of a document. With <b>fixed-size chunks</b>, inserting a few characters shifts every following byte, so every subsequent chunk gets a new hash and must be re-uploaded. <b>Content-defined chunking (CDC)</b> places boundaries where a rolling hash of the last few bytes hits a pattern — so boundaries move <i>with</i> the content and only the edited chunk changes.</p>
+  <p>Say you edit one sentence in the middle of a document. With <b>fixed-size chunks</b> (cut every 4 MB, say), adding a few characters pushes every later byte along. Every chunk after the edit now holds different bytes, gets a new hash, and has to be uploaded again.</p>
+  <p><b>Content-defined chunking (CDC)</b> fixes this. Instead of cutting at fixed positions, it cuts wherever a hash of the last few bytes matches a pattern. The boundaries move <i>with</i> the content, so only the edited chunk changes.</p>
+  <p>How it works in practice: slide a small window (say 48 bytes) across the file one byte at a time, and compute a <b>rolling hash</b> of the window, a hash that can be updated cheaply as one byte enters and one leaves. Cut a chunk whenever the lowest 22 bits of that hash are all zero. That happens by chance about once every 2<sup>22</sup> bytes, so chunks average ~4 MB. The key point: whether a position is a boundary depends only on the 48 bytes right before it. Insert a sentence, and once the window has moved past the new text it sees exactly the same bytes as before, so it finds exactly the same boundaries. Only the chunk containing the edit changes.</p>
+  <p>Two edge cases need limits. A file full of identical bytes (say, zeros) may never produce a boundary, so there's a <b>maximum chunk size</b> that forces a cut. And unlucky data could produce boundaries every few bytes, so there's a <b>minimum size</b> too, often a quarter of the average.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Edit the file — which chunks must be re-uploaded?</span><span class="p-tag">Simulator</span></div>
@@ -106,7 +141,7 @@
         <div class="stat bad"><div class="k">Chunks to upload</div><div class="v" id="ckUp">–</div></div>
         <div class="stat good"><div class="k">Bytes uploaded</div><div class="v" id="ckBytes">–</div></div>
       </div>
-      <p class="small muted mb0" style="margin-top:10px">Green = server already has this chunk (hash matches) · red = new chunk to upload. Real systems use 1–4 MB chunks and hashes like SHA-256; here chunks are tiny so you can see the effect. Dropbox uses 4 MB blocks; rsync, restic, Borg and Docker layers all use variants of this idea.</p>
+      <p class="small muted mb0" style="margin-top:10px">Green means the server already has that chunk, because the hash matches. Red means it's new and must be uploaded. Real systems use 1–4 MB chunks and hashes like SHA-256. Here the chunks are tiny so you can see the effect. Dropbox uses 4 MB blocks, and rsync, restic, Borg and Docker layers all use versions of this idea.</p>
     </div>
   </div>
 
@@ -131,20 +166,31 @@
     </div>
     <div class="stepper" id="syncStep" data-diagram="syncSvg">
       <ol class="steps">
-        <li data-title="Detect the local change" data-on="s-a">The client watches the filesystem (FSEvents / inotify / ReadDirectoryChangesW), debounces rapid saves, and re-chunks the file. It compares the new chunk hashes with the ones it last synced.</li>
-        <li data-title="Ask which blocks are missing" data-on="s-a s-meta s-e1" data-packet="s-a>s-meta" data-color="var(--accent-2)"><code>POST /commit_batch {path, base_version: 6, chunks:[a1,b2,z9,c3]}</code>. The server replies “I already have a1, b2, c3 — send z9.” Cross-user dedupe means a chunk someone else uploaded may already exist.</li>
-        <li data-title="Upload only new blocks" data-on="s-a s-blk s-e2" data-packet="s-a>s-blk" data-color="var(--accent)">The client uploads just the changed chunk(s) directly to block storage with a presigned URL, verified by hash. For a 2 GB file with a small edit, that's a few megabytes.</li>
-        <li data-title="Commit the new version" data-on="s-a s-meta s-e1" data-packet="s-a>s-meta" data-color="var(--green)">The metadata service atomically checks <code>base_version == current</code> (optimistic concurrency), writes <b>v7</b> with the chunk list, and appends an entry to the user's <b>change journal</b> with a new cursor. This is the moment the change becomes real.</li>
-        <li data-title="Fan out a notification" data-on="s-meta s-not s-b s-e3 s-e5" data-packet="s-meta>s-not,s-not>s-b" data-color="var(--pink)">The journal entry triggers a tiny push to every other device in the namespace: “changes available”. Devices that are offline simply pick it up on reconnect — the journal is the source of truth, not the push.</li>
-        <li data-title="Phone pulls the delta" data-on="s-b s-meta s-e6" data-packet="s-b>s-meta,s-meta>s-b" data-color="var(--accent-2)"><code>GET /delta?cursor=8341</code> returns the list of changes since that cursor plus a new cursor. Cursor-based pulling (Chapter 3) means a device can be offline for a month and still catch up exactly once.</li>
-        <li data-title="Download and apply" data-on="s-b s-blk s-e4" data-packet="s-blk>s-b" data-color="var(--green)">The phone fetches only the chunks it lacks, reassembles the file, verifies hashes, and writes it atomically (write temp file → rename). Local state now matches v7.</li>
+        <li data-title="Detect the local change" data-on="s-a">The client watches the folder using the operating system's file-watching API (FSEvents, inotify, ReadDirectoryChangesW). It waits for a pause so a burst of saves counts once, then re-chunks the file and compares the new chunk hashes with the ones it last synced.</li>
+        <li data-title="Ask which blocks are missing" data-on="s-a s-meta s-e1" data-packet="s-a>s-meta" data-color="var(--accent-2)"><code>POST /commit_batch {path, base_version: 6, chunks:[a1,b2,z9,c3]}</code>. The server answers “I already have a1, b2, c3, just send z9.” Because chunks are shared across all users, a chunk someone else uploaded may already be there.</li>
+        <li data-title="Upload only new blocks" data-on="s-a s-blk s-e2" data-packet="s-a>s-blk" data-color="var(--accent)">The client sends only the changed chunks, straight to block storage using a temporary signed link. The server checks each one's hash. For a 2 GB file with a small edit, that's a few megabytes instead of 2 GB.</li>
+        <li data-title="Commit the new version" data-on="s-a s-meta s-e1" data-packet="s-a>s-meta" data-color="var(--green)">The metadata service checks in one step that <code>base_version == current</code>. This is <b>optimistic concurrency</b>: assume no one else changed it, and fail if they did. Then it writes <b>v7</b> with the chunk list, and adds an entry to the user's <b>change journal</b> with a new cursor (a position marker). This is the moment the change becomes official.</li>
+        <li data-title="Fan out a notification" data-on="s-meta s-not s-b s-e3 s-e5" data-packet="s-meta>s-not,s-not>s-b" data-color="var(--pink)">The journal entry sends a tiny message to every other device in the folder: “changes available”. Offline devices simply find out when they reconnect. The journal is the official record, not the push message.</li>
+        <li data-title="Phone pulls the delta" data-on="s-b s-meta s-e6" data-packet="s-b>s-meta,s-meta>s-b" data-color="var(--accent-2)"><code>GET /delta?cursor=8341</code> returns every change since that position, plus a new position marker. Because the device tracks its own position (Chapter 3), it can be offline for a month and still get each change exactly once.</li>
+        <li data-title="Download and apply" data-on="s-b s-blk s-e4" data-packet="s-blk>s-b" data-color="var(--green)">The phone downloads only the chunks it doesn't have, rebuilds the file, checks the hashes, and saves it safely: write a temporary file first, then rename it. The phone now matches v7.</li>
       </ol>
     </div>
   </div>
 
+  <p><b>Why upload blocks first and commit last?</b> The commit is the moment other devices can see the new version. If the order were reversed, the phone could fetch v7 and find that chunk <code>z9</code> doesn't exist yet. Uploading first guarantees every chunk a version points to is already safely stored. The same order explains the failure cases:</p>
+  <ul>
+    <li><b>The laptop crashes after uploading blocks but before committing.</b> The server holds a few chunks that no version uses. Nothing is broken; garbage collection (Step 6) removes them later. When the laptop restarts, it re-chunks the file and the blocks are already there.</li>
+    <li><b>The commit times out and the laptop retries.</b> The first attempt may have succeeded, so the retry now fails the version check (the server is already on v7). The server should notice that v7's chunk list is identical to what is being committed and simply reply “done”, instead of reporting a false conflict.</li>
+    <li><b>The push message is lost.</b> Nothing is lost for good. The phone also asks for the delta when it reconnects and every few minutes, so it catches up from its cursor anyway.</li>
+    <li><b>The cursor is too old.</b> If the journal has been trimmed past a device's cursor (say, after a year offline), the server replies “reset”. The device then compares its whole file list with the server's, a slow full resync, but correct.</li>
+  </ul>
+
   <div class="step-banner"><span>STEP 5 / 6</span></div>
   <h2>Deep dive: conflicts</h2>
-  <p>Two devices edit the same file while offline. Both eventually commit with <code>base_version = 6</code>. The first wins; the second's optimistic check fails. Now what? A file's bytes can't be merged automatically in general (a PDF isn't text), so most sync products <b>never silently overwrite</b>: they keep both.</p>
+  <p>Two devices edit the same file while offline. Both later commit with <code>base_version = 6</code>. The first one wins. The second one's check fails, because the server is now on v7.</p>
+  <p>Now what? You usually can't merge two versions of a file automatically, since a PDF or a spreadsheet isn't plain text. So most sync products <b>never quietly overwrite</b> one with the other. They keep both and let a person decide.</p>
+  <p>A short trace. The server is on v6. Offline, the laptop saves chunks [a1, x5, c3] and the phone saves [a1, y8, c3]. The laptop reconnects first: <code>base_version 6 == current 6</code>, so it becomes v7. The phone reconnects: <code>base_version 6 ≠ current 7</code>, rejected. Its client downloads v7 as <code>report.pdf</code>, renames its own edit to a conflicted copy, and uploads that as a new file. Both edits survive.</p>
+  <p><b>Which resolution to choose depends on the data.</b> For binary files (PDFs, images, spreadsheets), keep both copies. For small settings files where only the newest matters, “last writer wins” is acceptable. For text documents edited live by several people, merge automatically with OT or CRDTs (<a href="34-case-collab-editing.html">Chapter 34</a>).</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Offline edits on two devices</span><span class="p-tag">Simulator</span></div>
@@ -162,49 +208,49 @@
       <div class="dev" style="margin-top:12px;border-color:var(--accent)"><h5><span>☁️ Server (metadata)</span><span class="badge" id="cfV">v6</span></h5><div id="cfSF"></div></div>
       <div class="log" id="cfLog" style="margin-top:12px;height:120px"></div>
     </div>
-    <div class="panel-foot">🧪 Edit on both devices while offline, then reconnect: the loser's version is preserved as <code>report (Phone's conflicted copy 2026-09-17).pdf</code>. Nothing is lost, and a human decides. For collaborative <i>documents</i>, the right answer instead is OT or CRDTs (Chapter 22) — which is why Google Docs and Dropbox Paper behave differently from a synced folder.</div>
+    <div class="panel-foot">🧪 Edit on both devices while offline, then reconnect. The version that lost is kept as <code>report (Phone's conflicted copy 2026-09-17).pdf</code>. Nothing is lost, and a person decides. For live <i>documents</i>, the right answer is different: OT or CRDTs (Chapter 34), which merge edits automatically. That's why Google Docs and Dropbox Paper behave differently from a synced folder.</div>
   </div>
 
   <div class="grid c2">
-    <div class="card feature reveal"><div class="f-ico">🔢</div><h4>Detecting conflicts</h4><p>Every commit carries the <b>base version</b> (or a per-namespace vector). If it doesn't match the server's current version, there was a concurrent change. Comparing content hashes first avoids false conflicts when both sides made the <i>same</i> edit.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🌳</div><h4>Directory-level conflicts</h4><p>Moves and deletes conflict too: device A moves <code>/work</code> to <code>/archive/work</code> while device B adds a file inside it. Model the tree as operations on stable file IDs (not paths) so renames don't look like delete + create of every descendant.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🔢</div><h4>Detecting conflicts</h4><p>Every commit says which <b>version it started from</b>. If that doesn't match the server's current version, someone else changed the file in the meantime. Compare the content hashes first: if both sides made the <i>same</i> edit, there's no real conflict.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🌳</div><h4>Directory-level conflicts</h4><p>Moves and deletes can conflict too. Device A moves <code>/work</code> to <code>/archive/work</code> while device B adds a file inside it. Track changes against permanent file IDs rather than paths. Otherwise renaming a folder looks like deleting and recreating everything inside it.</p></div>
   </div>
 
   <div class="step-banner"><span>STEP 6 / 6</span></div>
   <h2>Deep dives & extensions</h2>
   <div class="grid c3">
-    <div class="card feature reveal"><div class="f-ico">🧮</div><h4>Metadata sharding</h4><p>Shard by <b>namespace</b> (a user's root or a shared folder) so all of a namespace's files, journal and locks live on one shard — commits stay a single-shard transaction. Shared folders are namespaces mounted into several users' trees.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🗑️</div><h4>Garbage collection</h4><p>Blocks are shared across versions and users, so deletion means <b>reference counting</b> (or periodic mark-and-sweep over chunk lists), with a grace period so restores and version history keep working.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🕰️</div><h4>Version history</h4><p>Versions are just chunk lists — cheap. Retain 30 days for free tiers, longer for business; prune intermediate versions of frequently saved files with a keep-every-N policy.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🔒</div><h4>Security & dedupe</h4><p>Naive global dedupe leaks information: “upload a chunk, was it instant?” reveals someone else has that file. Mitigations: dedupe per user/namespace, or require proof of possession. End-to-end encryption breaks cross-user dedupe entirely — a real product trade-off.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">📶</div><h4>Client efficiency</h4><p>Compress chunks before upload, throttle bandwidth, batch small files into one request, sync over LAN between devices on the same network, and support <b>selective sync</b> / on-demand files (placeholders that download on open).</p></div>
-    <div class="card feature reveal"><div class="f-ico">🧊</div><h4>Storage tiering</h4><p>Hot blocks on SSD-backed storage, cold ones in archive tiers (Chapter 9). Dropbox famously moved off S3 to its own “Magic Pocket” storage at exabyte scale for cost.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🧮</div><h4>Metadata sharding</h4><p>Split the data by <b>namespace</b>: one user's root folder, or one shared folder. Then all of that namespace's files, journal and locks sit on one shard, and a commit is a transaction on a single shard. A shared folder is one namespace that appears inside several users' trees. Rough size: 500M users × ~2,000 files × ~300 bytes per row is ~300 TB of metadata, which needs thousands of shards.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🗑️</div><h4>Garbage collection</h4><p>Blocks are shared between versions and users, so you can't just delete one. Count how many files still use each block (<b>reference counting</b>), or periodically scan all chunk lists and remove blocks nobody references. Wait a while before deleting, so restores and version history keep working. The wait also closes a race: the server may tell a client “I already have block b2” just as b2's last user deletes it. Without a grace period, the client would commit a version pointing at a block that has just vanished.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🕰️</div><h4>Version history</h4><p>A version is only a list of chunk hashes, so it's cheap to keep. Keep 30 days on free plans and longer for business ones. For files saved over and over, keep only every Nth version in between.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🔒</div><h4>Security & dedupe</h4><p>Sharing chunks across all users leaks information. Upload a chunk and see if it finishes instantly: that tells you someone else already has that file. Fixes: only share chunks within one user or folder, or make the client prove it really has the data. End-to-end encryption stops cross-user sharing completely, which is a real product trade-off.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">📶</div><h4>Client efficiency</h4><p>Compress chunks before uploading. Limit how much bandwidth the client takes. Send many small files in one request. Copy directly between devices on the same local network. And offer <b>selective sync</b> or on-demand files: the folder shows placeholders that download only when you open them.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🧊</div><h4>Storage tiering</h4><p>Keep frequently used blocks on fast SSD storage and rarely used ones in cheap archive storage (Chapter 9). Dropbox famously moved off S3 to its own “Magic Pocket” storage at exabyte scale, to cut costs.</p></div>
   </div>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
-      <li><b>Hashing whole files.</b> A one-byte edit then re-uploads gigabytes; chunk content-defined and hash chunks.</li>
-      <li><b>Trusting push notifications for correctness.</b> They're a latency optimization; the durable change journal plus a cursor is what guarantees sync.</li>
-      <li><b>Silently resolving conflicts.</b> Binary files can't be merged — keep both copies and let a human decide.</li>
+      <li><b>Hashing whole files.</b> Then a one-byte edit re-uploads gigabytes. Cut files into content-defined chunks and hash each chunk.</li>
+      <li><b>Relying on push notifications to be correct.</b> They only make sync faster. What actually guarantees it is the saved change journal plus each device's cursor.</li>
+      <li><b>Quietly picking a winner in a conflict.</b> Binary files can't be merged. Keep both copies and let a person decide.</li>
     </ul></div></div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Design:</b> Two devices and the web client all edit the same folder. How do you keep them consistent?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>One strongly consistent metadata service per namespace holds the file tree, versions and a monotonically increasing change journal. Clients commit with the base version (optimistic concurrency) and receive a new cursor; other clients pull deltas from their cursor, triggered by a lightweight push. Content lives in immutable, content-addressed blocks, so transfers are deduplicated and verifiable. Conflicts produce a conflicted copy rather than a silent overwrite.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Each namespace has one metadata service that is always exact. It holds the file tree, the versions, and a change journal whose numbers only go up. A client commits with the version it started from, and gets back a new cursor. Other clients ask for everything after their own cursor, nudged by a tiny push message. The content sits in blocks that never change and are named by their hash, so transfers are deduplicated and verifiable. A conflict creates a conflicted copy instead of quietly overwriting.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Scale:</b> A user has 2 million small files. What breaks and how do you fix it?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Per-file metadata operations and filesystem watching dominate: the initial index is slow, and every change triggers work. Fixes: batch metadata operations, coalesce filesystem events with debouncing, pack tiny files into fewer blocks, use selective sync/on-demand placeholders so most files aren't materialized locally, and paginate the delta API. The metadata store must also keep namespace operations single-shard so listing and moves stay transactional.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The cost is dominated by per-file work and by watching the filesystem: the first scan is slow, and every small change triggers more work. Fixes: send metadata operations in batches, merge bursts of file events with debouncing, pack tiny files into fewer blocks, and use selective sync or on-demand placeholders so most files aren't stored locally at all. Return the delta list one page at a time. The metadata store should also keep each namespace on one shard, so listing and moving files stay single transactions.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Separate strongly consistent metadata from immutable, content-addressed block storage.</li>
-      <li>Content-defined chunking keeps edits local so only changed chunks are transferred and stored.</li>
-      <li>Clients ask which blocks are missing, upload only those, then commit a new version with optimistic concurrency.</li>
-      <li>A per-namespace change journal plus cursors gives exactly-once, resumable delta sync; push notifications are only a hint.</li>
-      <li>Detect conflicts by base version and preserve both copies rather than losing data; use CRDTs/OT for live documents.</li>
-      <li>Shard metadata by namespace; reference-count blocks for safe garbage collection.</li>
-      <li>Global dedupe has privacy implications and conflicts with end-to-end encryption.</li>
+      <li>Keep the always-exact file details separate from the content blocks, which never change and are named by their hash.</li>
+      <li>Content-defined chunking keeps an edit inside one chunk, so only that chunk is sent and stored.</li>
+      <li>Clients ask which blocks the server is missing, upload only those, then commit a new version, which fails if someone else got there first.</li>
+      <li>A change journal per folder, plus each device's cursor, means every change arrives exactly once and sync can resume any time. Push messages are only a hint.</li>
+      <li>Spot conflicts by the version a commit started from, and keep both copies instead of losing data. For live documents, use CRDTs or OT.</li>
+      <li>Shard the metadata by namespace. Count how many files use each block, so you can delete unused ones safely.</li>
+      <li>Sharing chunks across all users leaks information, and it doesn't work with end-to-end encryption.</li>
     </ul>
   </div>
 
@@ -214,27 +260,27 @@
     <div class="quiz" data-answer="2">
       <p class="q">A user inserts one paragraph at the top of a 500 MB file. Why does fixed-size chunking re-upload nearly the whole file?</p>
       <div class="opts"><button class="opt">Because hashes are recomputed</button><button class="opt">Because the file must be re-encrypted</button><button class="opt">Because every byte shifts, so every subsequent chunk's contents — and hash — change</button><button class="opt">Because metadata is strongly consistent</button></div>
-      <div class="explain">Boundaries are at fixed offsets. Content-defined chunking anchors boundaries to content, so a shift affects only nearby chunks.</div>
+      <div class="explain">Fixed chunking cuts at fixed positions. Content-defined chunking cuts based on the content itself, so shifting the bytes only affects the chunks near the edit.</div>
     </div>
     <div class="quiz" data-answer="0">
       <p class="q">Why are blocks keyed by the hash of their content?</p>
       <div class="opts"><button class="opt">Automatic dedupe, idempotent uploads, verifiable integrity and immutable, perfectly cacheable objects</button><button class="opt">To make files smaller</button><button class="opt">To enforce permissions</button><button class="opt">To order changes</button></div>
-      <div class="explain">Content addressing gives all of those properties for free, which is why it appears in git, Docker, backups and file sync.</div>
+      <div class="explain">Naming data by its hash gives you all of those for free. That's why git, Docker, backup tools and file sync all do it.</div>
     </div>
     <div class="quiz" data-answer="3">
       <p class="q">A device has been offline for three weeks. How does it catch up correctly?</p>
       <div class="opts"><button class="opt">It re-downloads the entire folder</button><button class="opt">The server replays missed push notifications</button><button class="opt">It compares every file's hash with the server</button><button class="opt">It calls the delta API with its stored cursor and receives all changes since then</button></div>
-      <div class="explain">The change journal plus a cursor makes catch-up incremental and exactly-once. Push is only a latency optimization.</div>
+      <div class="explain">With the change journal and a saved cursor, the device catches up step by step and sees each change exactly once. Push messages only make it faster.</div>
     </div>
     <div class="quiz" data-answer="1">
       <p class="q">Two users edit the same spreadsheet offline and both commit with base version 6. What should happen?</p>
       <div class="opts"><button class="opt">Last write wins, silently</button><button class="opt">The second commit is rejected; its version is kept as a conflicted copy for a human to resolve</button><button class="opt">The server merges the binary files</button><button class="opt">Both edits are discarded</button></div>
-      <div class="explain">Binary files can't be merged safely. Preserving both copies guarantees no data loss.</div>
+      <div class="explain">Binary files can't be merged safely. Keeping both copies guarantees nothing is lost.</div>
     </div>
     <div class="quiz" data-answer="2">
       <p class="q">Why shard metadata by namespace rather than by file ID?</p>
       <div class="opts"><button class="opt">Namespaces are smaller</button><button class="opt">File IDs aren't unique</button><button class="opt">So a namespace's files, journal and version checks live on one shard, keeping commits single-shard transactions</button><button class="opt">To improve block dedupe</button></div>
-      <div class="explain">Sync operations are namespace-scoped; co-locating them avoids distributed transactions on the hot path.</div>
+      <div class="explain">Sync work always happens within one namespace. Keeping it on one shard avoids transactions that span machines on the busiest path.</div>
     </div>
   </div>
 </main>

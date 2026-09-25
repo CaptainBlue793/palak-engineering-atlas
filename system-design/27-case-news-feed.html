@@ -32,29 +32,43 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 27</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
     <h1>Design a <span class="grad">News Feed</span></h1>
-    <p class="lead">Facebook, Instagram, X, LinkedIn: open the app and see recent posts from people you follow, ranked and loaded instantly. The core challenge is deceptively simple — <i>when</i> do we assemble each person's feed: when someone posts, or when someone reads?</p>
+    <p class="lead">Facebook, Instagram, X, LinkedIn: you open the app and instantly see recent posts from people you follow, best ones first. The core question sounds simple but isn't. <i>When</i> do we build each person's feed? When someone posts, or when someone opens the app to read?</p>
     <ul class="objectives">
-      <li>Scope a feed system and estimate its load</li>
-      <li>Compare fan-out on write vs fan-out on read</li>
-      <li>Solve the celebrity problem with a hybrid</li>
+      <li>Decide what a feed system must do and estimate its load</li>
+      <li>Compare fan-out on write vs fan-out on read (copying posts out when written vs gathering them when read)</li>
+      <li>Solve the celebrity problem (accounts with millions of followers) with a hybrid</li>
       <li>Design the publish and read pipelines</li>
-      <li>Understand feed ranking signals</li>
+      <li>Understand the signals used to rank a feed</li>
     </ul>
   </section>
 
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Caching with Redis, including sorted sets and lists</b> (<a href="06-caching.html">Chapter 6: Caching</a>).</li>
+        <li><b>Sharding and replicas</b> — splitting a big table across machines (<a href="08-replication-sharding.html">Chapter 8</a>).</li>
+        <li><b>The social graph</b> — storing who follows whom, in both directions (<a href="12-graph-social.html">Chapter 12</a>).</li>
+        <li><b>Queues and background workers</b> — handing slow work to Kafka consumers (<a href="14-message-queues.html">Chapter 14</a>).</li>
+        <li><b>Quick estimates and the interview method</b> (<a href="p8-estimation-design-questions.html">P8: Estimation &amp; Reading a Design Question</a>, <a href="25-interview-playbook.html">Chapter 25</a>).</li>
+      </ul>
+    </div>
+  </div>
+
   <div class="step-banner"><span>STEP 1 / 6</span></div>
   <h2>Requirements</h2>
+  <p>Two requirements matter more than the rest. <b>“Eventual consistency is OK”</b> gives you permission to build feeds in the background instead of while the user waits — without it, most of this design would not work. And <b>“some accounts have 100M+ followers”</b> is the hint that one approach will not fit every user. Always ask about the follower distribution; the whole design turns on it.</p>
   <div class="split">
     <div><h4 class="mt0">🛠️ Functional</h4><div class="req-list">
       <div class="req"><span class="chk">✓</span><span>Users create posts (text, images, video)</span></div>
-      <div class="req"><span class="chk">✓</span><span>Users follow other users (asymmetric, like X/Instagram)</span></div>
+      <div class="req"><span class="chk">✓</span><span>Users follow other users (one-way: I can follow you without you following me, like X/Instagram)</span></div>
       <div class="req"><span class="chk">✓</span><span>Home feed shows posts from followed accounts, newest/most relevant first</span></div>
-      <div class="req"><span class="chk">✓</span><span>Infinite scroll with pagination</span></div>
+      <div class="req"><span class="chk">✓</span><span>Infinite scroll, loading one page of posts at a time</span></div>
     </div></div>
     <div><h4 class="mt0">📏 Non-functional</h4><div class="req-list">
-      <div class="req"><span class="chk">✓</span><span><b>Feed loads fast:</b> p99 &lt; 200ms</span></div>
-      <div class="req"><span class="chk">✓</span><span><b>Highly available</b> — a stale feed beats an error</span></div>
-      <div class="req"><span class="chk">✓</span><span><b>Eventual consistency OK:</b> a new post can take a few seconds to appear</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Feed loads fast:</b> p99 &lt; 200ms (99 out of 100 loads finish within 200ms)</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Highly available</b> — a slightly old feed beats an error</span></div>
+      <div class="req"><span class="chk">✓</span><span><b>Eventual consistency OK:</b> a new post may take a few seconds to show up everywhere</span></div>
       <div class="req"><span class="chk">✓</span><span>Some accounts have <b>100M+ followers</b></span></div>
     </div></div>
   </div>
@@ -69,7 +83,10 @@
     <div class="stat"><div class="k">Avg follows / user</div><div class="v">200</div></div>
     <div class="stat bad"><div class="k">Feed inserts if pushed</div><div class="v">100B/day</div></div>
   </div>
-  <p style="margin-top:16px">That last number is the crux: 500M posts × ~200 followers = <strong>100 billion feed insertions a day</strong> (~1.2M/sec) if we precompute every feed. Reads are 10× writes, but fan-out makes writes explode. Keep that tension in mind.</p>
+  <p style="margin-top:16px">That last number is the key one. Suppose we build every feed ahead of time. Then each post gets copied into every follower's feed: 500M posts × ~200 followers = <strong>100 billion feed insertions a day</strong> (~1.2M per second).</p>
+  <p>Reads are 10× more common than posts. But copying each post to every follower (<b>fan-out</b>) makes the write work explode. Keep that tension in mind.</p>
+  <p>Where do the numbers come from? 500M posts ÷ 86,400 s ≈ 5,800 posts/s, and a 2–3× daily peak gives ~15K. Feed loads: 500M users × 10 opens = 5B loads/day ÷ 86,400 ≈ 58,000/s. Fan-out: 100B inserts ÷ 86,400 ≈ 1.2M inserts/s — a Redis cluster can take that if it's spread over enough machines, but it is by far the biggest number on the board.</p>
+  <p>Now the other side. If instead we build feeds only when someone reads (pull), each of the 60K feed loads per second must fetch recent posts from ~200 followed accounts: 60K × 200 = <b>12 million lookups per second</b>, plus a merge, all while the user waits. Neither extreme is free. The design question is where to put the work so that it's cheapest overall and never lands on the user.</p>
 
   <div class="step-banner"><span>STEP 3 / 6</span></div>
   <h2>API & data model</h2>
@@ -87,20 +104,23 @@
       <thead><tr><th>Store</th><th>Holds</th><th>Tech</th></tr></thead>
       <tbody>
         <tr><td><b>Posts</b></td><td>post_id, author_id, text, media refs, ts</td><td>Sharded by post_id (Cassandra / MySQL shards)</td></tr>
-        <tr><td><b>Social graph</b></td><td>follower ↔ followee edges</td><td>Sharded KV / graph store, both directions indexed</td></tr>
+        <tr><td><b>Social graph</b></td><td>follower ↔ followee edges</td><td>Sharded KV / graph store, indexed both ways (who I follow, and who follows me)</td></tr>
         <tr><td><b>Feed cache</b></td><td>user_id → list of recent post IDs</td><td>Redis sorted sets / lists (IDs only, ~500 per user)</td></tr>
         <tr><td><b>Media</b></td><td>images, video</td><td>Object storage (S3) + CDN</td></tr>
       </tbody>
     </table></div>
   </div>
+  <p>Why four different stores? Each has a different access pattern. Posts are read by ID in batches, so a store sharded by <code>post_id</code> spreads them evenly. The social graph is read in two directions — “who do I follow?” when reading, “who follows this author?” when fanning out — so it keeps an index each way. Feeds are short, ordered lists that change constantly, which is what Redis sorted sets are good at. Media are large files that never change, which is what object storage and a CDN are for.</p>
+  <p>Why cursor pagination instead of <code>?page=2</code>? With page numbers, if 5 new posts arrive while you read page 1, page 2 starts 5 posts earlier and you see 5 posts again. A cursor says “continue after post X”, so new posts at the top don't shift anything.</p>
 
   <div class="step-banner"><span>STEP 4 / 6</span></div>
   <h2>The core decision: push, pull or hybrid?</h2>
+  <p>This is the question the whole case study is about: <b>when</b> do we do the work of putting a post into your feed? Either when the post is written (push), or when the feed is read (pull). The estimates above show both extremes are expensive in different places, so the answer depends on who is posting.</p>
 
   <div class="grid c3">
-    <div class="card feature reveal"><div class="f-ico">📤</div><h4>Fan-out on write (push)</h4><p>When someone posts, insert the post ID into <b>every follower's</b> precomputed feed. Reads are a single fast cache lookup. Writes are expensive and slow for huge accounts.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">📥</div><h4>Fan-out on read (pull)</h4><p>Store posts once. When a user opens the app, fetch recent posts from <b>everyone they follow</b> and merge. Writes are trivial; reads are heavy and slow.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🔀</div><h4>Hybrid</h4><p>Push for normal accounts; <b>pull for celebrities</b> at read time and merge. Used in some form by Twitter/X, Instagram and Facebook.</p></div>
+    <div class="card feature reveal"><div class="f-ico">📤</div><h4>Fan-out on write (push)</h4><p>When someone posts, add the post ID to <b>every follower's</b> ready-made feed. Like a newspaper delivered to each doorstep. Reading is then a single fast cache lookup. But posting is expensive and slow for huge accounts.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">📥</div><h4>Fan-out on read (pull)</h4><p>Store each post once. When a user opens the app, fetch recent posts from <b>everyone they follow</b> and merge them. Like walking to each friend's house to collect their news. Posting is trivial; reading is heavy and slow.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🔀</div><h4>Hybrid</h4><p>Push for normal accounts. For <b>celebrities, pull</b> their posts when the reader opens the app, and merge. Twitter/X, Instagram and Facebook all use some form of this.</p></div>
   </div>
 
   <div class="panel" id="fanPanel">
@@ -128,7 +148,7 @@
         </div>
       </div>
     </div>
-    <div class="panel-foot">🧪 Push: post as a celebrity — 80M inserts, followers wait many minutes. Pull: open a feed — hundreds of queries per read, ×60K reads/sec. Hybrid: try all three buttons.</div>
+    <div class="panel-foot">🧪 In Push mode, post as a celebrity: 80M inserts, and followers wait many minutes. In Pull mode, open a feed: hundreds of queries per read, times 60K reads/sec. In Hybrid mode, try all three buttons.</div>
   </div>
 
   <div class="table-wrap">
@@ -142,6 +162,13 @@
       </tbody>
     </table>
   </div>
+  <p>Why does hybrid win? Look at who pays in each case. Most accounts have a few hundred followers, so pushing their posts costs a few hundred cheap inserts — easy. A handful of accounts have millions of followers; pushing their posts would cost millions of inserts per post and delay everyone's feed. But a reader follows only a <i>few</i> of those big accounts, so pulling them at read time adds only a few extra lookups, and those posts are cached because millions of readers ask for the same ones.</p>
+  <p>Where do you draw the line? A threshold on follower count, such as 1M, is a reasonable starting point; tune it by measuring fan-out lag. Watch the edge cases:</p>
+  <ul>
+    <li><b>An account crosses the threshold.</b> Old posts were pushed, new ones are pulled. That's fine as long as the read path merges and removes duplicates by post ID.</li>
+    <li><b>A reader follows many celebrities.</b> Someone following 500 big accounts makes the pull part slow. Cap how many celebrity accounts you pull per request (take the most-interacted-with) or build that reader's feed with a background job.</li>
+    <li><b>A normal user's post goes viral.</b> The fan-out cost depends on followers, not on popularity, so going viral doesn't hurt fan-out — only the like counters and the post cache get hot.</li>
+  </ul>
 
   <div class="step-banner"><span>STEP 5 / 6</span></div>
   <h2>High-level design</h2>
@@ -175,20 +202,30 @@
     </div>
     <div class="stepper" data-diagram="nfSvg">
       <ol class="steps">
-        <li data-title="Author publishes" data-on="n-u1 n-ps n-e1 n-media n-e3" data-packet="n-u1>n-ps">Media is uploaded directly to object storage via a pre-signed URL (never through app servers), then the post service receives text + media IDs.</li>
-        <li data-title="Store the post" data-on="n-ps n-db n-e2" data-packet="n-ps>n-db" data-color="var(--green)">Post saved durably in the sharded posts DB and cached by ID. The author immediately sees it — “read-your-writes” for their own profile.</li>
-        <li data-title="Publish an event" data-on="n-db n-k n-e4" data-packet="n-db>n-k" data-color="var(--pink)"><code>PostCreated</code> goes to Kafka. The API responds now; fan-out happens asynchronously so posting stays fast.</li>
-        <li data-title="Fan-out workers" data-on="n-k n-fw n-fc n-e5b n-e5" data-packet="n-k>n-fw,n-fw>n-fc" data-color="var(--amber)">Workers look up the author's followers. If the author is a <b>celebrity</b> (e.g. &gt;1M followers) → skip. Otherwise push the post ID into each <b>active</b> follower's Redis feed list, trimming to ~500 entries.</li>
-        <li data-title="Reader opens the app" data-on="n-u2 n-fs n-e6" data-packet="n-u2>n-fs">Feed service gets <code>GET /feed</code>. Step one: read the precomputed ID list from the feed cache.</li>
-        <li data-title="Merge celebrity posts" data-on="n-fs n-fc n-celeb n-e7 n-e8 n-e9 n-rank" data-packet="n-fs>n-fc,n-fs>n-celeb" data-color="var(--accent-2)">For the few celebrities this user follows, pull their latest posts (heavily cached — millions of readers share them) and merge with the pushed IDs.</li>
-        <li data-title="Hydrate, rank, return" data-on="n-fs n-rank n-db n-e10 n-e7" data-packet="n-rank>n-db,n-db>n-rank,n-fs>n-u2" data-color="var(--green)">Batch-fetch post bodies, author info and like counts from caches; filter deleted/blocked content; score with the ranking model; return 20 posts + a cursor.</li>
+        <li data-title="Author publishes" data-on="n-u1 n-ps n-e1 n-media n-e3" data-packet="n-u1>n-ps">Images and video go straight to object storage using a <b>pre-signed URL</b> (a temporary upload link), never through the app servers. Then the post service receives the text and the media IDs.</li>
+        <li data-title="Store the post" data-on="n-ps n-db n-e2" data-packet="n-ps>n-db" data-color="var(--green)">The post is saved safely in the sharded posts DB and cached by ID. The author sees it right away on their own profile. This is called “read-your-writes”: you always see your own changes.</li>
+        <li data-title="Publish an event" data-on="n-db n-k n-e4" data-packet="n-db>n-k" data-color="var(--pink)">A <code>PostCreated</code> event goes to Kafka. The API replies to the author now. Fan-out happens later in the background, so posting stays fast.</li>
+        <li data-title="Fan-out workers" data-on="n-k n-fw n-fc n-e5b n-e5" data-packet="n-k>n-fw,n-fw>n-fc" data-color="var(--amber)">Workers look up the author's followers. If the author is a <b>celebrity</b> (e.g. &gt;1M followers), they skip it. Otherwise they add the post ID to each <b>active</b> follower's feed list in Redis, keeping only the newest ~500 entries.</li>
+        <li data-title="Reader opens the app" data-on="n-u2 n-fs n-e6" data-packet="n-u2>n-fs">The feed service gets <code>GET /feed</code>. Step one: read the ready-made list of post IDs from the feed cache.</li>
+        <li data-title="Merge celebrity posts" data-on="n-fs n-fc n-celeb n-e7 n-e8 n-e9 n-rank" data-packet="n-fs>n-fc,n-fs>n-celeb" data-color="var(--accent-2)">For the few celebrities this user follows, pull their latest posts and merge them with the pushed IDs. These are heavily cached, because millions of readers ask for the same ones.</li>
+        <li data-title="Hydrate, rank, return" data-on="n-fs n-rank n-db n-e10 n-e7" data-packet="n-rank>n-db,n-db>n-rank,n-fs>n-u2" data-color="var(--green)"><b>Hydrate</b> the IDs: fetch the post text, author info and like counts from caches, all in one batch. Remove deleted or blocked content. Score the posts with the ranking model. Return 20 posts plus a cursor (a bookmark for the next page).</li>
       </ol>
     </div>
   </div>
 
   <div class="step-banner"><span>STEP 6 / 6</span></div>
   <h2>Ranking the feed</h2>
-  <p>Chronological feeds are simple but bury what matters. Ranked feeds score each candidate post with signals like <strong>affinity</strong> (how much you interact with the author), <strong>engagement</strong> (likes/comments velocity), <strong>recency</strong> (time decay) and <strong>content type</strong> preferences. Real systems use ML models with thousands of features — but the idea is the same. Tune the weights:</p>
+  <p>Newest-first feeds are simple, but important posts get buried. A ranked feed gives each post a score using signals like these:</p>
+  <p>Why bother? If you follow 300 accounts and open the app twice a day, several hundred posts may have arrived since your last visit, and you will only look at the first 20 or 30. Ranking decides which ones those are. A chronological feed shows whoever posted last; a ranked feed tries to show what you would most want to see.</p>
+  <ul>
+    <li><strong>Affinity:</strong> how much you interact with the author.</li>
+    <li><strong>Engagement:</strong> how fast the post is collecting likes and comments.</li>
+    <li><strong>Recency:</strong> newer posts score higher, and the boost fades over time.</li>
+    <li><strong>Content type:</strong> whether you tend to prefer videos, photos or text.</li>
+  </ul>
+  <p>Real systems use ML models with thousands of features, but the idea is the same. Try changing the weights:</p>
+  <p>A small worked example, using a hand-sized version of this formula (the playground scales each term a little differently, so its exact numbers won't match). Take two posts. Post A: 1 hour old, from your close friend (affinity 0.9), 20 likes. Post B: 12 hours old, from someone you rarely interact with (affinity 0.1), 5,000 likes. Recency decays as e<sup>−age/6h</sup>: that's about 0.85 for A and 0.14 for B. With weights 5, 6 and 4 for recency, affinity and engagement, and natural log for engagement (log 20 ≈ 3.0, log 5,000 ≈ 8.5): A scores 5×0.85 + 6×0.9 + 4×3.0 ≈ 21.6, and B scores 5×0.14 + 6×0.1 + 4×8.5 ≈ 35.3. B wins because of its huge engagement. Lower the engagement weight to 1 and A wins (12.6 vs 9.8). The log is there so that 5,000 likes counts more than 20, but not 250 times more.</p>
+  <p>Ranking also has a cost: scoring every candidate post takes time. Real systems first pick a few hundred candidates cheaply (the IDs in your feed cache plus pulled celebrity posts), then run the expensive model only on those.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Ranking playground</span><span class="p-tag">Interactive</span><button class="btn sm ghost" id="chronoBtn" style="margin-left:auto">🕒 Pure chronological</button></div>
@@ -207,38 +244,48 @@
   </div>
 
   <h2>Deep dives</h2>
+  <p>Each card is a problem that appears once the basic design runs at full scale, with the fix and why it works.</p>
   <div class="grid c2">
-    <div class="card feature reveal"><div class="f-ico">💤</div><h4>Don't precompute for inactive users</h4><p>Most accounts don't open the app daily. Only fan out to users active in the last N days; rebuild a feed on demand (pull) when a dormant user returns.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧠</div><h4>Store IDs, not posts</h4><p>Feed caches hold only 8-byte post IDs. 500 IDs × 300M active users ≈ 1.2TB — manageable in a Redis cluster. Post bodies live once in a separate post cache.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--red-soft)">🗑️</div><h4>Deletes & privacy</h4><p>Pushed IDs can point to deleted posts or blocked authors. Filter during hydration at read time rather than chasing down every copy in millions of feeds.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">🔥</div><h4>Hot posts & counters</h4><p>A viral post's like count changes thousands of times a second. Buffer counts (write-behind in Redis) and flush periodically; display approximate numbers (“1.2M likes”).</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🌍</div><h4>Multi-region</h4><p>Serve feeds from the user's region. Replicate posts across regions asynchronously; eventual consistency of a few seconds is acceptable per the requirements.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🧯</div><h4>Graceful degradation</h4><p>If ranking is slow, fall back to chronological. If the feed cache is cold, pull a smaller feed. A slightly worse feed is far better than an error screen.</p></div>
+    <div class="card feature reveal"><div class="f-ico">💤</div><h4>Don't precompute for inactive users</h4><p>Most people don't open the app every day. So only fan out to users who were active in the last N days. When an inactive user comes back, build their feed on the spot by pulling.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧠</div><h4>Store IDs, not posts</h4><p>Feed caches hold only 8-byte post IDs. 500 IDs × 300M active users ≈ 1.2TB, which a Redis cluster can handle. The full posts live once, in a separate post cache.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--red-soft)">🗑️</div><h4>Deletes & privacy</h4><p>A pushed ID may point to a post that was later deleted, or to an author you blocked. Filter these out when you hydrate at read time. That's far easier than hunting down every copy in millions of feeds.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--amber-soft)">🔥</div><h4>Hot posts & counters</h4><p>A viral post's like count changes thousands of times a second. Collect the counts in Redis first and save them to the database every so often (<b>write-behind</b>). Show rounded numbers (“1.2M likes”).</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🌍</div><h4>Multi-region</h4><p>Serve feeds from the user's own region. Copy posts to other regions in the background. The requirements say a few seconds of delay is fine.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🧯</div><h4>Graceful degradation</h4><p>If ranking is slow, fall back to newest-first. If the feed cache is empty, pull a smaller feed. A slightly worse feed is far better than an error screen.</p></div>
   </div>
+
+  <h3>Failure and edge cases, component by component</h3>
+  <ul>
+    <li><b>Fan-out workers fall behind.</b> Kafka keeps the <code>PostCreated</code> events, so nothing is lost; posts just appear late. Watch <i>consumer lag</i> (how far behind the workers are) and add workers when it grows. Because events for one author go to one partition, order within an author is kept.</li>
+    <li><b>A worker crashes halfway through a fan-out.</b> It restarts from its last committed offset and repeats some inserts. That's safe because adding the same post ID to a sorted set twice leaves one entry — the insert is <i>idempotent</i>.</li>
+    <li><b>The feed cache loses a node.</b> Those users' feeds are gone from memory. Rebuild them on demand by pulling, like an inactive user returning, and let fan-out fill them again from then on.</li>
+    <li><b>Someone unfollows.</b> Their old posts are still in your feed list. Filter by the current follow list when hydrating, the same way deleted posts are filtered.</li>
+    <li><b>The social graph service is slow.</b> Fan-out slows down but reads are unaffected, since reads use the ready-made feed. This is one of the quiet benefits of push: the heavy dependency is off the read path.</li>
+  </ul>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
-      <li><b>Choosing push or pull globally.</b> The right answer is hybrid, decided per account by follower count.</li>
-      <li><b>Storing whole posts in every follower's feed.</b> Store IDs and hydrate from a cache — otherwise an edit means rewriting millions of rows.</li>
-      <li><b>Unbounded feed lists.</b> Cap each user's materialized feed (a few hundred entries) and fall back to a query for deep scrolling.</li>
+      <li><b>Choosing push or pull for everyone.</b> The right answer is hybrid, decided per account by its follower count.</li>
+      <li><b>Storing whole posts in every follower's feed.</b> Store IDs and fill in the details from a cache. Otherwise one edit means rewriting millions of rows.</li>
+      <li><b>Feed lists with no size limit.</b> Cap each user's stored feed at a few hundred entries. If someone scrolls further, fall back to a query.</li>
     </ul></div></div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Design:</b> A user with 80M followers posts. Trace what happens.</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Nothing fans out. The account is flagged as a celebrity, so the post is written once to the posts store and cached. When each follower loads their feed, the service merges their precomputed feed (from normal accounts) with a small pull query for the handful of celebrities they follow, then ranks and returns. That keeps write amplification bounded while read cost stays roughly constant, because nobody follows thousands of celebrities.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Nothing fans out. The account is flagged as a celebrity, so the post is written once to the posts store and cached. When a follower loads their feed, the service takes their ready-made feed (from normal accounts). It adds a small pull query for the handful of celebrities they follow, then ranks and returns. So one post never turns into millions of writes. And reads stay about the same cost, because nobody follows thousands of celebrities.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Operate:</b> Feed loads are at p99 = 900 ms and the target is 200 ms. Where do you look?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Break the request down: feed-ID fetch, hydration of posts, ranking, and media URLs. The usual culprits are hydration (N+1 lookups instead of a multi-get), a cold or undersized cache, ranking model latency, and tail amplification from fanning out to many shards. Fixes in order of payoff: batch the hydration, raise cache hit rate, cap the candidate set before ranking, and add request hedging for the slowest shard.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Time each part of the request: fetching feed IDs, hydrating posts, ranking, and building media URLs. The usual culprits:<ul><li>Hydration doing N+1 lookups (one query per post) instead of one batch get.</li><li>A cache that is empty or too small.</li><li>A slow ranking model.</li><li>Asking many shards at once, so the slowest one sets the pace.</li></ul>Fixes, biggest win first: batch the hydration, raise the cache hit rate, limit how many posts go into ranking, and add <b>request hedging</b> (send a backup request if a shard is slow, and use whichever answers first).</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>The feed problem is a trade-off between write-time and read-time work.</li>
-      <li>Push makes reads O(1) but explodes for accounts with millions of followers.</li>
-      <li>Pull makes posting trivial but reads too expensive at 60K feeds/sec.</li>
+      <li>The feed problem is a trade-off: do the work when a post is written, or when a feed is read.</li>
+      <li>Push makes reads a single lookup, but blows up for accounts with millions of followers.</li>
+      <li>Pull makes posting trivial, but reads are too expensive at 60K feeds/sec.</li>
       <li>Hybrid pushes normal accounts, pulls celebrities, and skips inactive users.</li>
-      <li>Fan-out runs asynchronously through a log; feed caches store IDs only.</li>
-      <li>Hydrate, filter and rank at read time; paginate with cursors.</li>
+      <li>Fan-out runs in the background through a log. Feed caches store IDs only.</li>
+      <li>Fill in post details, filter and rank at read time. Page through results with cursors.</li>
     </ul>
   </div>
 
@@ -248,27 +295,27 @@
     <div class="quiz" data-answer="1">
       <p class="q">A pop star with 90M followers posts. In a pure push model, what goes wrong?</p>
       <div class="opts"><button class="opt">The post can't be stored</button><button class="opt">90M feed inserts take a long time and a huge burst of write capacity; followers see the post late</button><button class="opt">Readers need 90M queries</button><button class="opt">Nothing</button></div>
-      <div class="explain">Fan-out cost is proportional to followers. That's exactly why celebrity posts are pulled at read time instead.</div>
+      <div class="explain">Fan-out cost grows with the number of followers. That's exactly why celebrity posts are pulled at read time instead.</div>
     </div>
     <div class="quiz" data-answer="3">
       <p class="q">Why store only post IDs in each user's feed cache?</p>
       <div class="opts"><button class="opt">IDs are more secure</button><button class="opt">Redis can't store text</button><button class="opt">It makes ranking unnecessary</button><button class="opt">It keeps memory small and edits/deletes happen in one place (the post store)</button></div>
-      <div class="explain">Copying full posts into millions of feeds wastes memory and makes updates a nightmare. Hydrate IDs from a shared post cache.</div>
+      <div class="explain">Copying full posts into millions of feeds wastes memory and makes updates a nightmare. Store IDs, and look up the details in a shared post cache.</div>
     </div>
     <div class="quiz" data-answer="0">
       <p class="q">Why does the post service publish to Kafka instead of doing fan-out itself?</p>
       <div class="opts"><button class="opt">So posting returns fast and fan-out can retry, scale and lag independently</button><button class="opt">Kafka stores the feeds</button><button class="opt">To guarantee strong consistency</button><button class="opt">To avoid needing a database</button></div>
-      <div class="explain">Async fan-out decouples user-facing latency from the heavy background work (Chapter 14).</div>
+      <div class="explain">With fan-out in the background, the user doesn't wait for the heavy work to finish (Chapter 14).</div>
     </div>
     <div class="quiz" data-answer="2">
       <p class="q">A user who hasn't opened the app in 6 months returns. With a hybrid model that skips inactive users, what happens?</p>
       <div class="opts"><button class="opt">They see an empty feed forever</button><button class="opt">The system replays 6 months of fan-out</button><button class="opt">Their feed is built on demand by pulling recent posts from accounts they follow, then cached</button><button class="opt">They must re-follow everyone</button></div>
-      <div class="explain">Fall back to fan-out on read for cold users — a one-time cost instead of maintaining feeds nobody reads.</div>
+      <div class="explain">For returning inactive users, fall back to fan-out on read. It's a one-time cost, much cheaper than keeping up feeds nobody reads.</div>
     </div>
     <div class="quiz" data-answer="1">
       <p class="q">What consistency model does a news feed typically need?</p>
       <div class="opts"><button class="opt">Linearizable</button><button class="opt">Eventual — a post appearing a few seconds late is acceptable</button><button class="opt">Serializable transactions across all feeds</button><button class="opt">None at all</button></div>
-      <div class="explain">Availability and latency matter more than instant consistency for feeds; the author gets read-your-writes on their own profile.</div>
+      <div class="explain">For feeds, staying up and staying fast matter more than showing every post instantly. The author still sees their own post right away on their profile.</div>
     </div>
   </div>
 </main>
@@ -321,7 +368,7 @@
       setProg(0, 'Fan-out progress (at ~200K inserts/sec)');
       await animateFan(80e6, '', false);
       stats('80,000,001', '~6.7 min', null, null);
-      SD.log(flog, '🐢 80M writes at 200K/s ≈ 400 seconds. Fans complain the post is “missing”; Redis write load spikes; fan-out queue backs up for everyone else.', 'bad');
+      SD.log(flog, '🐢 80M writes at 200K/s ≈ 400 seconds. Fans complain the post is “missing”. Redis write load spikes, and the fan-out queue backs up for everyone else.', 'bad');
     } else {
       SD.log(flog, `⭐ Celebrity posts → 1 insert.${m === 'hybrid' ? ' Author flagged as celebrity → NO fan-out.' : ''}`, 'ok');
       setProg(0, 'Fan-out progress'); $('#progPct').textContent = 'skipped';
@@ -343,7 +390,7 @@
     } else if (m === 'pull') {
       for (let i = 0; i < N; i++) { dots[i].classList.add('pull'); setProg((i + 1) / N); if (i % 5 === 0) await sleep(15); }
       stats(null, null, '~450 ms', '300');
-      SD.log(flog, '🐌 Query recent posts for 300 followees (scatter across shards), merge-sort, rank. ×60K feed loads/sec = 18M queries/sec!', 'bad');
+      SD.log(flog, '🐌 Query recent posts for 300 followed accounts (spread across shards), merge, rank. ×60K feed loads/sec = 18M queries/sec!', 'bad');
     } else {
       dots.forEach((d, i) => { if (i < 20) d.classList.add('lit'); });
       for (let i = 0; i < 3; i++) { dots[N - 1 - i * 7].classList.add('pull'); await sleep(120); }

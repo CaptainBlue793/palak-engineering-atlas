@@ -33,7 +33,7 @@ const THEME_BOOTSTRAP =
 /* ---------- registry ---------- */
 const appJs = fs.readFileSync(path.join(ROOT, 'assets', 'app.js'), 'utf8');
 const regBlock = appJs.slice(appJs.indexOf('const CHAPTERS = ['), appJs.indexOf('const LEVELS = ['));
-const CHAPTERS = [...regBlock.matchAll(/\{\s*n:\s*(\d+),\s*file:\s*'([^']+)',\s*title:\s*'((?:[^'\\]|\\.)*)'/g)]
+const CHAPTERS = [...regBlock.matchAll(/\{\s*n:\s*([\d.]+),\s*file:\s*'([^']+)',\s*title:\s*'((?:[^'\\]|\\.)*)'/g)]
   .map((m) => ({ n: +m[1], file: m[2], title: m[3] }));
 
 if (!CHAPTERS.length) fail('could not parse CHAPTERS out of assets/app.js');
@@ -62,11 +62,12 @@ for (const ch of wanted) {
   if (mainOpens !== 1 || mainCloses !== 1) errs.push(`expected one <main class="content"> and one </main>, found ${mainOpens}/${mainCloses}`);
 
   /* data-chapter */
-  const dc = (src.match(/<body[^>]*data-chapter=["']?(\d+)/i) || [])[1];
+  const dc = (src.match(/<body[^>]*data-chapter=["']?([\d.]+)/i) || [])[1];
   if (+dc !== ch.n) errs.push(`data-chapter is ${dc === undefined ? 'absent' : dc}, registry says ${ch.n}`);
 
   /* hero pill */
-  const pill = (src.match(/<span class="pill accent">Chapter (\d+)<\/span>/) || [])[1];
+  const pm = src.match(/<span class="pill accent">(?:Chapter (\d+)|Prerequisite (\d))<\/span>/) || [];
+  const pill = pm[1] !== undefined ? pm[1] : pm[2] !== undefined ? '0.' + pm[2] : undefined;
   if (+pill !== ch.n) errs.push(`hero pill says "Chapter ${pill === undefined ? '?' : pill}", registry says ${ch.n}`);
 
   /* stylesheet + runtime */

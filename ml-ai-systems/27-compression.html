@@ -29,33 +29,55 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 27</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>Making Models <span class="grad">Cheap &amp; Fast</span></h1>
-    <p class="lead">The same answer, for a fifth of the money. Quantization, distillation, pruning and speculative decoding each attack a different part of the bill — and each trades away something you must measure rather than assume.</p>
+    <p class="lead">The same answer, for a fifth of the money. Quantization, distillation, pruning and speculative decoding each cut a different part of the bill. Each one also gives something up — and you have to measure what, not assume it's fine.</p>
     <ul class="objectives">
-      <li>Quantize weights and activations, and know what breaks</li>
+      <li>Quantize weights and activations (store them in fewer bits), and know what breaks</li>
       <li>Distil a large model into a small one that's good enough</li>
-      <li>Explain speculative decoding and estimate its speedup</li>
-      <li>Use cascades and routing so most traffic never touches the big model</li>
-      <li>Build a regression suite that catches compression damage</li>
+      <li>Explain speculative decoding and estimate how much faster it makes things</li>
+      <li>Use cascades and routing so most requests never reach the big model</li>
+      <li>Build a set of tests that catches quality lost to compression</li>
     </ul>
   </section>
 
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Prefill vs decode, and the KV cache.</b> Why generating tokens is limited by memory speed — <a href="26-inference-serving.html">Chapter 26</a>.</li>
+        <li><b>Bits, bytes and number formats.</b> What fp16, bf16 and int8 mean in memory — <a href="p8-hardware-numbers.html">P8: Hardware &amp; Numbers for ML</a> and <a href="09-training-deep-nets.html">Chapter 9</a>.</li>
+        <li><b>Softmax, logits and probabilities.</b> How a model turns scores into a next-token distribution — <a href="p6-logs-softmax.html">P6: Logs, Exponentials &amp; Softmax</a>.</li>
+        <li><b>Fine-tuning.</b> Training an existing model further on your own data — <a href="17-finetuning-peft.html">Chapter 17</a>.</li>
+        <li><b>Evaluation sets and slices.</b> How to tell whether a change made a model worse — <a href="07-evaluation.html">Chapter 7</a>.</li>
+      </ul></div>
+  </div>
+
   <h2>Know which cost you're attacking</h2>
+  <p>Before picking a technique, find out what you're actually short of. If requests queue because the KV cache is full, making the maths faster won't help. If one user waits for slow token streaming, adding requests per GPU won't help either. Measure first (memory in use, TTFT, TPOT, cost per request), then pick the row below that targets that limit.</p>
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Technique</th><th>Attacks</th><th>Typical gain</th><th>Risk</th></tr></thead>
       <tbody>
-        <tr><td><b>Weight quantization</b></td><td>Memory &amp; bandwidth (decode is memory-bound)</td><td>2–4× smaller, 1.5–3× faster decode</td><td>Small quality loss, task-dependent</td></tr>
-        <tr><td><b>Activation/KV quantization</b></td><td>KV cache → concurrency</td><td>~2× more concurrent requests</td><td>More sensitive than weights; measure</td></tr>
-        <tr><td><b>Distillation</b></td><td>Parameter count</td><td>5–20× smaller for a narrow task</td><td>Loses generality; needs training data</td></tr>
-        <tr><td><b>Pruning / sparsity</b></td><td>Parameters &amp; FLOPs</td><td>1.5–2× with structured 2:4</td><td>Unstructured sparsity rarely speeds anything up</td></tr>
-        <tr><td><b>Speculative decoding</b></td><td>Sequential decode latency</td><td>1.5–3× faster, <b>identical outputs</b></td><td>Extra memory for the draft; poor on hard text</td></tr>
-        <tr><td><b>Cascades / routing</b></td><td>How often the big model runs at all</td><td>Often the largest single win</td><td>Needs a reliable difficulty signal</td></tr>
+        <tr><td><b>Weight quantization</b></td><td>Memory &amp; bandwidth (generating tokens is limited by memory speed, not maths)</td><td>2–4× smaller, 1.5–3× faster decode</td><td>Small quality loss; how much depends on the task</td></tr>
+        <tr><td><b>Activation/KV quantization</b></td><td>KV cache (the model's saved attention state) → how many requests fit at once</td><td>~2× more concurrent requests</td><td>More sensitive than weights; measure it</td></tr>
+        <tr><td><b>Distillation</b></td><td>Parameter count</td><td>5–20× smaller for a narrow task</td><td>Only good at the narrow task; needs training data</td></tr>
+        <tr><td><b>Pruning / sparsity</b></td><td>Parameters &amp; FLOPs</td><td>1.5–2× with the structured 2:4 pattern</td><td>Zeros scattered at random rarely speed anything up</td></tr>
+        <tr><td><b>Speculative decoding</b></td><td>Latency of generating tokens one at a time</td><td>1.5–3× faster, <b>identical outputs</b></td><td>Extra memory for the small draft model; weak on hard text</td></tr>
+        <tr><td><b>Cascades / routing</b></td><td>How often the big model runs at all</td><td>Often the largest single win</td><td>Needs a reliable way to tell which requests are hard</td></tr>
       </tbody>
     </table>
   </div>
 
   <h2>Quantization</h2>
-  <p>Store weights in fewer bits. A tensor is divided into groups; each group gets a scale (and maybe a zero point) so its values map onto the available levels. Fewer bits means fewer levels, and the error shows up wherever the distribution has long tails.</p>
+  <p><b>Quantization</b> means storing weights in fewer bits — say 4 instead of 16. With 4 bits, each weight can only take one of 16 values (levels), so every real value is rounded to the nearest level.</p>
+  <p>To make this work, the weights are split into groups. Each group gets its own <b>scale</b> (and maybe a zero point) that stretches the levels to fit that group's values. Fewer bits means fewer levels and coarser rounding. The error is worst when a few values are far bigger than the rest (a long-tailed distribution).</p>
+  <p>A worked example with a group of four weights, <code>[0.12, −0.30, 0.05, 0.90]</code>, quantized to 4 bits. We use the whole-number levels −7 to +7 and set the scale so the largest weight lands on 7: <code>scale = 0.90 / 7 ≈ 0.129</code>.</p>
+  <ul>
+    <li><b>Quantize:</b> divide each weight by the scale and round. 0.12/0.129 ≈ 0.93 → 1; −0.30/0.129 ≈ −2.3 → −2; 0.05/0.129 ≈ 0.39 → 0; 0.90/0.129 = 7 → 7. Stored as <code>[1, −2, 0, 7]</code>: four 4-bit integers plus one scale.</li>
+    <li><b>Dequantize:</b> multiply back. <code>[0.129, −0.257, 0, 0.90]</code>. Errors of at most about 0.05. Close enough.</li>
+    <li><b>Now add an outlier:</b> change the last weight to 9.0. The scale becomes 9.0 / 7 ≈ 1.29, and 0.12, −0.30 and 0.05 all round to <b>0</b>. Three of the four weights are wiped out by one big value. That's the outlier problem in miniature, and it's why small groups help: an outlier only ruins its own group.</li>
+  </ul>
+  <p>The size maths: a 7B model at 16 bits is 14 GB. At 4 bits it's 3.5 GB, plus the scales. With one 16-bit scale per group of 128 weights, the scales add 16/128 = 0.125 bits per weight, so the real figure is about 4.125 bits, or ~3.6 GB.</p>
+  <p><b>Weight-only vs weights-and-activations.</b> Weight-only quantization (like int4 GPTQ) stores weights small but turns them back into 16-bit numbers just before the maths. It saves memory and memory bandwidth, which is what decode needs. Quantizing activations too (for example W8A8: 8-bit weights and 8-bit activations) lets the GPU do the maths itself in int8 or fp8, which also speeds up compute-bound work like prefill and big batches. It's harder to do well, because activations have the worst outliers.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Quantization explorer</span><span class="p-tag">Interactive</span></div>
@@ -77,43 +99,51 @@
   <div class="callout warn">
     <div class="ico">📈</div>
     <div class="body"><div class="title">Outliers are the whole problem</div>
-      <p>Transformer activations contain a few channels with values 10–100× larger than the rest. A single scale per tensor then has to cover that range, and every ordinary weight collapses into a couple of levels. Every good quantization method is an answer to this: smaller groups, per-channel scales, keeping outlier channels in high precision (LLM.int8), smoothing the scale between activations and weights (SmoothQuant), or using calibration data to minimise output error layer by layer (GPTQ, AWQ).</p></div>
+      <p>Transformer activations have a few channels with values 10–100× larger than the rest. If one scale covers the whole tensor, it has to stretch to fit those giants, and all the ordinary values get squeezed into just a couple of levels.</p>
+  <p>Every good quantization method is a fix for this: smaller groups, a separate scale per channel, keeping the outlier channels in high precision (LLM.int8), shifting the scale between activations and weights to even things out (SmoothQuant), or running sample data through the model to minimise output error layer by layer (GPTQ, AWQ).</p></div>
   </div>
 
   <div class="ladder" style="margin-top:14px">
-    <div class="r"><b>fp16 / bf16</b><span>The baseline. 2 bytes per weight, no quality question to answer.</span></div>
-    <div class="r"><b>fp8</b><span>Native on recent GPUs, ~2× smaller with negligible loss for most models. Increasingly the default for serving.</span></div>
-    <div class="r"><b>int8 weight-only</b><span>Reliable, ~4× smaller than fp32, quality loss usually under a point. A safe production default.</span></div>
-    <div class="r"><b>int4 (GPTQ / AWQ)</b><span>~8× smaller; excellent for single-user latency, where memory bandwidth is everything. Measure per task — reasoning and code suffer first.</span></div>
-    <div class="r"><b>2–3 bit</b><span>Research territory. Large quality loss without aggressive compensation; rarely worth it in production.</span></div>
-    <div class="r"><b>QAT</b><span>Train with quantization simulated in the forward pass. Best quality at low bit widths, and it costs a training run.</span></div>
+    <div class="r"><b>fp16 / bf16</b><span>The baseline. 2 bytes per weight, no quality loss to worry about.</span></div>
+    <div class="r"><b>fp8</b><span>Built into recent GPUs. ~2× smaller with almost no loss for most models. More and more the default for serving.</span></div>
+    <div class="r"><b>int8 weight-only</b><span>Reliable. ~4× smaller than fp32, quality loss usually under one point. A safe default for production.</span></div>
+    <div class="r"><b>int4 (GPTQ / AWQ)</b><span>~8× smaller. Excellent for speed with one user at a time, where memory bandwidth is everything. Measure it on each task — reasoning and code suffer first.</span></div>
+    <div class="r"><b>2–3 bit</b><span>Still mostly research. Big quality loss unless you work hard to compensate; rarely worth it in production.</span></div>
+    <div class="r"><b>QAT</b><span>Quantization-aware training: train with the rounding simulated in the forward pass, so the model learns to cope with it. Best quality at low bit counts, but it costs a training run.</span></div>
   </div>
 
   <h2>Distillation</h2>
-  <p>Train a small <b>student</b> to imitate a large <b>teacher</b>. Crucially, the student learns from the teacher's full output distribution — its “soft labels” carry far more information than a hard answer, including how the teacher ranked the alternatives it rejected.</p>
+  <p>Train a small <b>student</b> model to copy a large <b>teacher</b> model. The key idea: the student learns from the teacher's full set of probabilities, not just its final answer. These “soft labels” carry far more information. For example, “80% cat, 15% fox, 5% dog” also tells the student how the teacher ranked the answers it rejected.</p>
+  <p>Compare what each kind of label teaches. The hard label “cat” only says <i>cat is right</i>. The soft label also says <i>a fox is an understandable mistake, a dog less so</i>. That's knowledge about how the classes relate, and the student gets it from every single example. To bring out these small probabilities, distillation often divides the teacher's logits by a <b>temperature</b> greater than 1 before the softmax, which flattens the distribution so the runner-up answers carry more weight.</p>
+  <p>Why can a small student get close at all? A general-purpose teacher spends its capacity on everything: poetry, law, a hundred languages. If your product only needs, say, support-ticket classification in English, the student only has to copy that small corner of the teacher's behaviour.</p>
 
   <div class="grid c3">
-    <div class="card feature reveal"><div class="f-ico">🗣️</div><h4>Response distillation</h4><p>Generate teacher outputs for your real traffic, then fine-tune the student on them. Simple, effective, and the standard approach for narrowing a general model to your task.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">📊</div><h4>Logit / KL distillation</h4><p>Match the teacher's full next-token distribution with a KL loss. More sample-efficient, but needs access to logits — so usually only for models you host.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🧠</div><h4>Reasoning distillation</h4><p>Have the teacher produce step-by-step traces, keep only the ones that reach verified-correct answers, and train the student on those. Surprisingly strong on maths and code.</p></div>
+    <div class="card feature reveal"><div class="f-ico">🗣️</div><h4>Response distillation</h4><p>Have the teacher answer your real requests, then fine-tune the student on those answers. Simple, effective, and the standard way to turn a general model into one for your task.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">📊</div><h4>Logit / KL distillation</h4><p>Train the student to match the teacher's full probabilities for the next token, using a KL loss (a measure of how different two distributions are). Needs fewer examples, but you need the teacher's raw scores (logits) — so usually only for models you host yourself.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🧠</div><h4>Reasoning distillation</h4><p>Have the teacher write out its step-by-step working. Keep only the ones that reach answers you've checked are correct, and train the student on those. Surprisingly strong on maths and code.</p></div>
   </div>
 
   <div class="callout tip">
     <div class="ico">🎯</div>
     <div class="body"><div class="title">Distil on your own traffic, not a benchmark</div>
-      <p>The student only needs to be good at what your users actually ask. Sample real production prompts (with permission and PII handling), generate teacher answers, filter them with a verifier or a judge, and train. A 3B student trained on 50k of your real queries routinely matches a 70B model <i>on that distribution</i> — and is no substitute for it anywhere else. Keep the big model as a fallback for the tail.</p></div>
+      <p>The student only needs to be good at what your users actually ask. So: sample real production prompts (with permission, and with personal data handled properly), generate teacher answers, filter them with a checker or a judge model, and train.</p>
+  <p>A 3B student trained on 50k of your real queries often matches a 70B model <i>on those kinds of queries</i> — and is no replacement for it anywhere else. Keep the big model as a fallback for the rare, unusual requests.</p></div>
   </div>
 
   <h2>Pruning and sparsity</h2>
-  <p>Remove weights that contribute least. The catch is that hardware doesn't speed up for randomly scattered zeros — you save memory but not time.</p>
+  <p><b>Pruning</b> removes the weights that contribute least, setting them to zero (making the model <b>sparse</b>). The catch: hardware doesn't get faster when zeros are scattered at random. You save memory but not time.</p>
+  <p>The usual rule for “contribute least” is simply size: weights closest to zero change the output least, so they go first (<b>magnitude pruning</b>). The 2:4 pattern applies that rule inside every block of four. For example, <code>[0.50, −0.10, 0.02, 0.80]</code> keeps its two largest-magnitude weights and becomes <code>[0.50, 0, 0, 0.80]</code>. Because every block has exactly two zeros in a known pattern, the GPU can store half the values plus a small index and skip the zero multiplications in hardware. Random zeros have no such pattern, so the GPU still has to multiply by them.</p>
 
   <div class="split">
-    <div class="card"><h4 class="mt0">Unstructured</h4><p class="small mb0">Zero out the smallest weights anywhere. High sparsity is achievable with little quality loss, but you need specialised kernels to see any speedup, and usually you don't.</p></div>
-    <div class="card"><h4 class="mt0">Structured (2:4, heads, layers)</h4><p class="small mb0">Remove whole heads, layers or a fixed pattern (2 of every 4 weights) that tensor cores support natively. Real 1.5–2× gains, larger quality cost, and usually a recovery fine-tune afterwards.</p></div>
+    <div class="card"><h4 class="mt0">Unstructured</h4><p class="small mb0">Zero out the smallest weights, wherever they are. You can remove a lot with little quality loss. But you need special GPU code (kernels) to get any speedup, and usually it doesn't come.</p></div>
+    <div class="card"><h4 class="mt0">Structured (2:4, heads, layers)</h4><p class="small mb0">Remove whole attention heads, whole layers, or a fixed pattern (2 of every 4 weights) that the GPU's tensor cores can skip in hardware. Real 1.5–2× gains, but a bigger quality cost, and usually a short fine-tune afterwards to recover.</p></div>
   </div>
 
   <h2>Speculative decoding</h2>
-  <p>Decode is sequential and memory-bound, so the GPU is idle most of the step. A small <b>draft</b> model proposes k tokens cheaply; the big model then verifies all k <i>in a single forward pass</i> — the same cost as producing one token. Accepted tokens are kept; the first rejection resets. The output distribution is provably identical to the target model's.</p>
+  <p>A model generates text one token at a time, and each step is slowed by reading weights from memory. So the GPU's compute sits mostly idle during each step.</p>
+  <p>Speculative decoding uses that idle time. A small, cheap <b>draft</b> model guesses the next k tokens. The big (target) model then checks all k <i>in a single forward pass</i> — about the same cost as producing one token. Tokens it agrees with are kept. At the first one it rejects, the big model puts in its own token instead, the rest of the guesses are thrown away, and drafting starts again from there. It's mathematically proven that the output follows exactly the same probabilities as the big model alone.</p>
+  <p>A small trace. The text so far is “The cat”. The draft guesses 4 tokens: “sat on the mat”. The big model checks all four in one pass. It agrees with “sat” and “on”, but at position three it would have said “a”, not “the”. So you keep “sat on”, add the big model's “a”, and throw away “mat”. One big-model pass produced 3 tokens instead of 1. Even in the worst case, when the very first guess is rejected, the pass still yields one token from the big model, so you never lose progress.</p>
+  <p><b>Estimating the speed-up.</b> If each guess is accepted with probability α, the expected tokens per round with k guesses is <code>(1 − α^(k+1)) / (1 − α)</code>. With α = 0.75 and k = 4, that's (1 − 0.237) / 0.25 ≈ 3.05 tokens. Each round costs one big-model pass plus 4 draft passes; if a draft pass costs 10% of a big one, that's 1.4 big-pass equivalents. Speed-up ≈ 3.05 / 1.4 ≈ 2.2×. The calculator below does the same sum. Notice that raising k helps less and less, because each extra guess only counts if every guess before it was accepted.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Speculative decoding calculator</span><span class="p-tag">Interactive</span></div>
@@ -128,12 +158,12 @@
         <div class="stat"><div class="k">Output quality change</div><div class="v" id="spQual" style="font-size:16px">none — identical distribution</div></div>
       </div>
       <div class="callout" id="spInfo" style="margin-top:12px"><div class="ico">⚡</div><div class="body"><p style="margin:0"></p></div></div>
-      <p class="small muted">Acceptance depends on the text: boilerplate, code and formatting are highly predictable (0.8–0.9), while dense reasoning is not (0.4–0.6). Variants such as Medusa or EAGLE attach extra prediction heads to the target model itself, removing the separate draft model entirely.</p>
+      <p class="small muted">How often guesses are accepted depends on the text. Boilerplate, code and formatting are very predictable (0.8–0.9); dense reasoning is not (0.4–0.6). Variants such as Medusa or EAGLE add extra prediction heads to the big model itself, so no separate draft model is needed.</p>
     </div>
   </div>
 
   <h2>Cascades and routing: the biggest lever</h2>
-  <p>Most production traffic is easy. Running every request through your largest model is usually the most expensive design decision in the system.</p>
+  <p>Most real requests are easy. Sending every one of them to your largest model is usually the most expensive design decision in the whole system. A <b>cascade</b> tries a cheap model first and only passes hard requests up to the big one.</p>
 
   <pre class="code">1. cheap classifier / heuristic  → is this simple?
 2. small model answers            → confidence or verifier check
@@ -142,54 +172,64 @@
 <span class="c"># 70% handled by the small model at 1/15th the cost</span>
 <span class="c"># blended cost ≈ 0.7·(1/15) + 0.3·1 ≈ 0.35× the all-big baseline</span></pre>
 
+  <p>Read the cost line carefully. The 30% that escalate have <i>also</i> already paid for the small model's attempt, so the honest figure is 0.7 × 1/15 + 0.3 × (1 + 1/15) ≈ 0.37×. Still close to a third of the cost. Escalated requests also wait longer, because they run two models in a row.</p>
+  <p><b>Cascade or router?</b> A <b>router</b> decides up front which single model gets the request, so nobody pays for two calls. Pick it when you can judge difficulty from the prompt alone (length, topic, a classifier score). A <b>cascade</b> lets the small model try first and checks its answer. Pick it when difficulty only shows in the answer, and when you have a cheap, reliable check such as a schema, tests or a verifier.</p>
+
   <div class="callout warn">
     <div class="ico">🎚️</div>
     <div class="body"><div class="title">The escalation signal is the hard part</div>
-      <p>Routing only works if you can tell, cheaply and before answering, that a request is hard — or tell afterwards that the cheap answer is unreliable. Options: a small trained classifier on the prompt, the small model's own confidence (weak but usable), a verifier (unit tests, a schema check, a retrieval-support check), or a judge model on a sample. Measure the <b>escalation rate and the quality of the non-escalated answers</b>, or you're silently shipping the cheap model's mistakes.</p></div>
+      <p>Routing only works if you can tell — cheaply, before answering — that a request is hard. Or tell afterwards that the cheap answer can't be trusted. Options:</p>
+      <ul>
+        <li>a small classifier trained to judge the prompt;</li>
+        <li>the small model's own confidence (weak, but usable);</li>
+        <li>a checker (unit tests, a schema check, a check that the answer is backed by retrieved documents);</li>
+        <li>a judge model on a sample of answers.</li>
+      </ul>
+      <p>Measure the <b>escalation rate and the quality of the answers that weren't escalated</b>. Otherwise you're quietly shipping the cheap model's mistakes.</p></div>
   </div>
 
   <h2>Measuring the damage</h2>
-  <p>Every compression technique is a quality change. Treat it exactly like a model change (Chapters 33, 35):</p>
+  <p>Every compression technique changes quality. Treat it exactly like shipping a new model (Chapters 33, 35):</p>
 
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Check</th><th>Why</th></tr></thead>
       <tbody>
-        <tr><td><b>Task-specific eval set</b></td><td>Aggregate benchmarks hide the regression that matters to your users</td></tr>
-        <tr><td><b>Per-capability slices</b></td><td>Quantization hits reasoning, long-context and code before it hits chat</td></tr>
-        <tr><td><b>Long-context probe</b></td><td>KV quantization degrades with context length — test at your maximum, not at 1k</td></tr>
-        <tr><td><b>Non-English</b></td><td>Low-resource languages degrade first and are least likely to be in your eval set</td></tr>
-        <tr><td><b>Output format compliance</b></td><td>Small models break JSON contracts more often — measure parse failures</td></tr>
-        <tr><td><b>Side-by-side in production</b></td><td>Shadow traffic, then a canary with a quality guardrail (Chapter 33)</td></tr>
+        <tr><td><b>Task-specific eval set</b></td><td>Overall benchmark scores can hide the drop that matters to your users</td></tr>
+        <tr><td><b>Per-capability slices</b></td><td>Quantization hurts reasoning, long inputs and code before it hurts chat</td></tr>
+        <tr><td><b>Long-context probe</b></td><td>Quantizing the KV cache gets worse as inputs get longer — test at your maximum length, not at 1k tokens</td></tr>
+        <tr><td><b>Non-English</b></td><td>Languages with little training data get worse first, and are the least likely to be in your eval set</td></tr>
+        <tr><td><b>Output format compliance</b></td><td>Small models produce invalid JSON more often — measure how often parsing fails</td></tr>
+        <tr><td><b>Side-by-side in production</b></td><td>Run on copied live traffic first (shadow), then send a small share of real users to it (canary) with a quality alarm (Chapter 33)</td></tr>
       </tbody>
     </table>
   </div>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
-      <li><b>Accepting a vendor's “no quality loss”.</b> It means no loss on <i>their</i> benchmark; run yours.</li>
-      <li><b>Quantizing everything uniformly.</b> Embedding, first/last layers and outlier channels usually need higher precision.</li>
-      <li><b>Expecting speedups from unstructured sparsity.</b> Without matching kernels, scattered zeros save memory and no time.</li>
-      <li><b>Distilling only on benchmark data.</b> The student ends up good at the benchmark and weak on your traffic.</li>
-      <li><b>Using speculative decoding at very large batch sizes.</b> It helps most when you're memory-bound; at high batch the GPU is already busy and the draft is overhead.</li>
-      <li><b>Compressing before measuring.</b> Establish the quality baseline and the cost baseline first, or you can't tell whether the trade was good.</li>
+      <li><b>Believing a vendor's “no quality loss”.</b> It means no loss on <i>their</i> benchmark; run yours.</li>
+      <li><b>Quantizing everything the same way.</b> The embedding layer, the first and last layers and outlier channels usually need more bits.</li>
+      <li><b>Expecting speedups from randomly scattered zeros.</b> Without matching GPU code, they save memory but no time.</li>
+      <li><b>Distilling only on benchmark data.</b> The student ends up good at the benchmark and weak on your real requests.</li>
+      <li><b>Using speculative decoding with very large batches.</b> It helps most when memory speed is the limit. With big batches the GPU is already busy, and the draft is just extra work.</li>
+      <li><b>Compressing before measuring.</b> Record today's quality and cost first, or you can't tell whether the trade was worth it.</li>
     </ul></div></div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Warm-up:</b> Why does int4 weight quantization speed up single-user decoding so much?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Because decoding at batch 1 is memory-bandwidth bound: every step reads all the weights from HBM to produce one token, so time is essentially bytes-moved divided by bandwidth. Quartering the bytes roughly quarters that time. It does not help much at large batch, where the weight read is amortised across many sequences and the kernel is closer to compute-bound — which is exactly why quantization is a bigger win for interactive single-stream latency than for bulk throughput.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because decoding one request at a time (batch 1) is limited by memory bandwidth. Every step reads all the weights from GPU memory (HBM) to produce one token, so the time is basically bytes moved divided by bandwidth. Cut the bytes to a quarter and that time drops to roughly a quarter. It helps much less with large batches: one weight read is shared across many sequences, and the limit becomes compute instead. That's why quantization is a bigger win for one interactive user's latency than for bulk throughput.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your serving bill is $180k/month for a 70B model. Where do you start?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Measure first: the split between prefill and decode tokens, the distribution of request difficulty, and the prefix-cache hit rate. Then in order of expected payoff: (1) routing — if 60–70% of traffic is simple, a distilled small model plus escalation cuts the bill more than any kernel work; (2) prompt-caching and context trimming, which reduce prefill directly; (3) fp8 or int8 weights and a quantized KV cache, which raise concurrency per GPU; (4) speculative decoding for the interactive path; (5) batching and scheduling tuning. Each step ships behind a quality guardrail with a task-specific eval and a canary, and I'd track cost per successful request rather than cost per token — the metric that rewards not calling the big model at all.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Measure first: how many tokens are input processing (prefill) versus generation (decode), how hard requests typically are, and how often the prompt cache is hit. Then work through these, biggest expected payoff first: (1) routing — if 60–70% of traffic is simple, a distilled small model that hands hard cases up cuts the bill more than any low-level GPU work; (2) prompt caching and trimming the context, which directly shrink prefill; (3) fp8 or int8 weights and a quantized KV cache, which fit more requests on each GPU; (4) speculative decoding for interactive requests; (5) tuning batching and scheduling. Each step ships behind a quality alarm, with a task-specific eval and a canary. I'd track cost per successful request rather than cost per token, because that metric rewards not calling the big model at all.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Match the technique to the bottleneck: bandwidth (quantization), parameters (distillation), sequential latency (speculation), volume (routing).</li>
-      <li>Quantization quality is decided by outlier handling and group size, not just bit width.</li>
-      <li>Distillation on your own traffic gives large models' quality on your distribution — and nowhere else.</li>
-      <li>Speculative decoding is free quality: identical outputs, 1.5–3× faster when memory-bound.</li>
-      <li>Cascades usually beat every micro-optimisation; the hard part is a trustworthy escalation signal.</li>
+      <li>Match the technique to the bottleneck: memory bandwidth (quantization), parameter count (distillation), one-token-at-a-time latency (speculative decoding), request volume (routing).</li>
+      <li>Quantization quality depends on how you handle outliers and on group size, not just on the number of bits.</li>
+      <li>Distilling on your own traffic gives large-model quality on your kind of requests — and nowhere else.</li>
+      <li>Speculative decoding costs no quality: identical outputs, 1.5–3× faster when memory speed is the limit.</li>
+      <li>Cascades usually beat every small optimisation; the hard part is a trustworthy signal for when to escalate.</li>
     </ul>
   </div>
 
@@ -205,7 +245,7 @@
         <button class="opt">Because the target model verifies each token and rejects any that don't match its own distribution</button>
         <button class="opt">It does change quality slightly</button>
       </div>
-      <div class="explain">The acceptance test is constructed so the resulting samples come from exactly the target model's distribution. The draft only proposes; the target decides.</div>
+      <div class="explain">The accept/reject test is designed so the final tokens follow exactly the big model's probabilities. The draft only suggests; the big model decides.</div>
     </div>
 
     <div class="quiz" data-answer="0">
@@ -216,7 +256,7 @@
         <button class="opt">GPUs don't support integer arithmetic</button>
         <button class="opt">Attention requires floating point</button>
       </div>
-      <div class="explain">One shared scale must cover the outliers, crushing everything else into a couple of levels. Per-group scales, outlier isolation and calibration-based methods all attack this.</div>
+      <div class="explain">One shared scale has to stretch to cover the outliers, squeezing everything else into a couple of levels. Per-group scales, handling outliers separately and calibration-based methods all tackle this.</div>
     </div>
 
     <div class="quiz" data-answer="3">
@@ -227,7 +267,7 @@
         <button class="opt">Sparsity only helps at large batch sizes</button>
         <button class="opt">Dense kernels still multiply the zeros — scattered sparsity needs special hardware/kernels</button>
       </div>
-      <div class="explain">Memory falls if stored sparsely, but the matmul is unchanged. Structured patterns like 2:4, which tensor cores accelerate natively, are what produce real speedups.</div>
+      <div class="explain">Memory drops if you store only the non-zeros, but the matrix multiply does the same work. Structured patterns like 2:4, which tensor cores speed up in hardware, are what give real speedups.</div>
     </div>
 
     <div class="quiz" data-answer="1">
@@ -238,7 +278,7 @@
         <button class="opt">Increasing the batch size</button>
         <button class="opt">Adding more GPUs</button>
       </div>
-      <div class="explain">Not running the big model at all beats making it cheaper. Quantization multiplies savings on the remaining 30%.</div>
+      <div class="explain">Not running the big model at all beats making it cheaper. Quantization can then add further savings on the remaining 30%.</div>
     </div>
 
     <div class="quiz" data-answer="2">
@@ -249,7 +289,7 @@
         <button class="opt">Multi-step reasoning, code and long-context tasks</button>
         <button class="opt">Model file size</button>
       </div>
-      <div class="explain">Precision loss compounds over long dependency chains. Casual chat quality can look unchanged while maths, code and long-context retrieval degrade measurably.</div>
+      <div class="explain">Small rounding errors add up over long chains of steps. Casual chat can look unchanged while maths, code and finding facts in long inputs get measurably worse.</div>
     </div>
   </div>
 </main>
@@ -320,12 +360,12 @@
     const qual = clamp(100 - rel * 100 * (outMode === 'keep' ? 0.35 : 1.1), 55, 100);
     $('#qQual').textContent = qual.toFixed(1) + '%';
     $('#qInfo p').innerHTML = bits >= 8
-      ? `✅ <b>${bits}-bit is comfortably safe.</b> Error is a small fraction of the weight distribution's spread; quality loss is typically under a point on most tasks. int8 weight-only is a reasonable production default with essentially no measurement anxiety.`
+      ? `✅ <b>${bits}-bit is comfortably safe.</b> The rounding error is small compared with how spread out the weights are; quality loss is usually under a point on most tasks. int8 weight-only is a sensible production default that you rarely need to worry about.`
       : bits >= 4
         ? (outMode === 'keep'
-          ? `✅ <b>${bits}-bit with outlier channels kept in fp16.</b> This is what GPTQ/AWQ-style methods do in spirit: the handful of extreme channels no longer dictate the scale for everyone else, so error drops sharply for a tiny memory cost. The standard recipe for 4-bit serving.`
-          : `⚠️ <b>${bits}-bit naive.</b> Look at the dashed levels against the histogram: the outliers stretch the range so the bulk of weights collapse onto a few levels. Switch on outlier handling, or use a smaller group size, and watch the error fall.`)
-        : `🚩 <b>${bits}-bit.</b> Only a handful of levels for the entire distribution. Expect visible quality loss on reasoning, code and long context even with good outlier handling — this range needs quantization-aware training to be usable.`;
+          ? `✅ <b>${bits}-bit with outlier channels kept in fp16.</b> This is the core idea behind GPTQ/AWQ-style methods: the few extreme channels no longer set the scale for everyone else, so the error drops sharply for a tiny memory cost. The standard recipe for 4-bit serving.`
+          : `⚠️ <b>${bits}-bit naive.</b> Compare the dashed levels with the histogram: the outliers stretch the range, so most weights get squeezed onto a few levels. Turn on outlier handling, or use a smaller group size, and watch the error fall.`)
+        : `🚩 <b>${bits}-bit.</b> Only a handful of levels for all the weights. Expect visible quality loss on reasoning, code and long inputs, even with good outlier handling — at this range you need quantization-aware training to make it usable.`;
   }
   ['#qBits', '#qGroup'].forEach(id => $(id).addEventListener('input', quant));
   $('#qOut').addEventListener('segchange', quant);
@@ -360,10 +400,10 @@
     $('#spSvg').innerHTML = g;
 
     $('#spInfo p').innerHTML = speedup < 1.05
-      ? `❌ <b>Not worth it here.</b> Either acceptance is too low (the draft model disagrees too often) or the draft is too expensive. Rules of thumb: the draft should cost under ~10% of the target, and acceptance above ~0.6 before speculation pays.`
+      ? `❌ <b>Not worth it here.</b> Either too few guesses are accepted (the draft model disagrees too often) or the draft is too expensive. Rules of thumb: the draft should cost under ~10% of the target, and acceptance should be above ~0.6 before speculation pays off.`
       : speedup < 1.6
-        ? `⚠️ <b>Modest ${speedup.toFixed(2)}× gain.</b> Try a larger k if acceptance is high, or a better-matched draft model — a draft distilled from the target accepts far more often than an unrelated small model.`
-        : `✅ <b>${speedup.toFixed(2)}× faster with identical outputs.</b> This is the appealing property: it is a pure latency win, not a quality trade. Note that k has a sweet spot — beyond it, the extra drafts are usually rejected and you pay for them anyway.`;
+        ? `⚠️ <b>Modest ${speedup.toFixed(2)}× gain.</b> Try a larger k if acceptance is high, or a draft model that better matches the target — a draft distilled from the target gets accepted far more often than an unrelated small model.`
+        : `✅ <b>${speedup.toFixed(2)}× faster with identical outputs.</b> That's the appeal: a pure speed win, with no quality given up. Note that k has a sweet spot — beyond it, the extra guesses are usually rejected and you pay for them anyway.`;
   }
   ['#spK', '#spAcc', '#spCost'].forEach(id => $(id).addEventListener('input', spec));
   spec();

@@ -6,6 +6,15 @@
    ========================================================= */
 (function () {
   const CHAPTERS = [
+    { n: 0.1, file: 'p1-how-computers-work.html', title: 'How Computers Work', level: 'Prerequisites', icon: '🖥️', mins: 40, blurb: 'CPU, RAM, disk and network: what each part does, how fast it is, and why RAM forgets while disk remembers.' },
+    { n: 0.2, file: 'p2-processes-concurrency.html', title: 'Processes, Threads & Concurrency', level: 'Prerequisites', icon: '🧵', mins: 40, blurb: 'The operating system, processes vs threads, race conditions, locks and the event loop — how one server juggles thousands of requests.' },
+    { n: 0.3, file: 'p3-clients-servers-web.html', title: 'Clients, Servers & the Web', level: 'Prerequisites', icon: '📨', mins: 35, blurb: 'Requests and responses, frontends and backends, what happens when you open a page, and why servers stay stateless.' },
+    { n: 0.4, file: 'p4-networking-basics.html', title: 'Networking Basics', level: 'Prerequisites', icon: '📡', mins: 45, blurb: 'IP addresses, ports, DNS, packets, TCP vs UDP, TLS, and the difference between latency and bandwidth.' },
+    { n: 0.5, file: 'p5-http-rest-json.html', title: 'HTTP, REST & JSON', level: 'Prerequisites', icon: '🧾', mins: 45, blurb: 'Read any HTTP exchange: methods, paths, headers, status codes, cookies, REST-style URLs and the JSON format.' },
+    { n: 0.6, file: 'p6-databases-sql.html', title: 'Databases & SQL Basics', level: 'Prerequisites', icon: '🗃️', mins: 50, blurb: 'Tables, keys and SQL queries, joins, indexes and transactions — and what a database gives you that plain files do not.' },
+    { n: 0.7, file: 'p7-big-o-data-structures.html', title: 'Big-O & Everyday Data Structures', level: 'Prerequisites', icon: '🗂️', mins: 40, blurb: 'How cost grows with size, and the hash tables, sorted trees, queues and logs that every system is built from.' },
+    { n: 0.8, file: 'p8-estimation-design-questions.html', title: 'Estimation & Reading a Design Question', level: 'Prerequisites', icon: '🧮', mins: 45, blurb: 'Bits vs bytes, powers of ten, QPS and storage math, latency numbers, and turning a vague prompt into requirements.' },
+
     { n: 1,  file: '01-foundations.html',          title: 'Foundations of System Design', level: 'Beginner',     icon: '🧭', mins: 25, blurb: 'Client–server, requests, requirements and the qualities every system is judged by.' },
     { n: 2,  file: '02-networking.html',           title: 'Networking Essentials',        level: 'Beginner',     icon: '🌐', mins: 35, blurb: 'IP, DNS, TCP vs UDP, HTTP and TLS — how bytes actually travel.' },
     { n: 3,  file: '03-apis.html',                 title: 'APIs & Communication',         level: 'Beginner',     icon: '🔌', mins: 40, blurb: 'REST, GraphQL, gRPC, WebSockets, pagination, idempotency, versioning and webhooks.' },
@@ -51,6 +60,7 @@
   ];
 
   const LEVELS = [
+    ['Prerequisites', 'var(--green)', 'Computers, networks, HTTP, databases and estimation — everything the course assumes, taught from zero.'],
     ['Beginner', 'var(--accent)', 'The vocabulary and building blocks of every system.'],
     ['Intermediate', 'color-mix(in srgb, var(--accent-2) 25%, var(--accent))', 'The core components you will combine in every design.'],
     ['Advanced', 'color-mix(in srgb, var(--accent-2) 50%, var(--accent))', 'Distributed systems: where things get genuinely hard.'],
@@ -58,6 +68,12 @@
     ['Case Studies', 'var(--accent-2)', 'Put it all together on real-world design problems.'],
   ];
 
+
+  // Prerequisites are stored as 0.1…0.8 (so they sort before Chapter 1) and shown as P1…P8.
+  const isPre = (n) => n > 0 && n < 1;
+  const numOf = (c) => (c && typeof c === 'object' ? c.n : +c);
+  const chNum = (c) => { const n = numOf(c); return isPre(n) ? 'P' + Math.round(n * 10) : String(n); };
+  const chName = (c) => { const n = numOf(c); return isPre(n) ? 'Prerequisite ' + Math.round(n * 10) : 'Chapter ' + n; };
 
   const LS = {
     get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -83,12 +99,20 @@
     }
     LS.set('sd-ver', TARGET);
   })();
+  // The old single "Chapter 0" became the Prerequisites level: finishing it counts as finishing all of them.
+  (function migratePrereqs() {
+    const d = LS.get('sd-done', []);
+    if (!Array.isArray(d) || !d.includes(0)) return;
+    const pre = CHAPTERS.filter((c) => isPre(c.n)).map((c) => c.n);
+    LS.set('sd-done', [...new Set(d.filter((n) => n !== 0).concat(pre))]);
+    const q = LS.get('sd-quiz', {}); delete q[0]; LS.set('sd-quiz', q);
+  })();
   const doneSet = () => new Set(LS.get('sd-done', []));
 
   /* ---------------- helpers ---------------- */
   const SVGNS = 'http://www.w3.org/2000/svg';
   const SD = {
-    CHAPTERS, LEVELS, LS,
+    CHAPTERS, LEVELS, LS, chNum, chName,
     $: (s, r = document) => r.querySelector(s),
     $$: (s, r = document) => [...r.querySelectorAll(s)],
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -213,7 +237,7 @@
   function buildShell() {
     const body = document.body;
     if (!/Palak/.test(document.title)) document.title += ` · System Design by ${AUTHOR}`;
-    const chapNum = +body.dataset.chapter || 0;
+    const chapNum = body.dataset.chapter == null ? -1 : +body.dataset.chapter;   // -1 = not a chapter page (prerequisites are 0.1…0.8)
     const chap = CHAPTERS.find((c) => c.n === chapNum);
     const main = SD.$('main.content');
     if (!main) return { chap };
@@ -228,13 +252,13 @@
 
     // sidebar
     const done = doneSet();
-    let html = `<a class="brand" href="index.html"><span class="brand-logo"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="4.5" rx="1.5"/><path d="M12 7.5v3M4.5 10.5h15M6.75 10.5v3.5M17.25 10.5v3.5"/><rect x="2.75" y="14" width="8" height="5.5" rx="1.6"/><rect x="13.25" y="14" width="8" height="5.5" rx="1.6"/></svg></span><span><span class="grad">System Design</span><br><small style="font-weight:500;color:var(--muted);font-size:12px">by Palak Deb Patra</small></span></a>
+    let html = `<a class="brand" href="index.html"><span class="brand-logo"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="4.5" rx="1.5"/><path d="M12 7.5v3M4.5 10.5h15M6.75 10.5v3.5M17.25 10.5v3.5"/><rect x="2.75" y="14" width="8" height="5.5" rx="1.6"/><rect x="13.25" y="14" width="8" height="5.5" rx="1.6"/></svg></span><span><span class="brand-author">Palak Deb Patra</span><span class="grad brand-course">System Design Playlist</span></span></a>
       <div class="side-progress"><div class="bar"><i style="width:${(done.size / CHAPTERS.length) * 100}%"></i></div><small>${done.size} of ${CHAPTERS.length} chapters complete</small></div>`;
     let lastLevel = '';
     for (const c of CHAPTERS) {
       if (c.level !== lastLevel) { html += `<div class="nav-level">${c.level}</div>`; lastLevel = c.level; }
       const cls = ['nav-link', done.has(c.n) ? 'done' : '', c.n === chapNum ? 'current' : ''].join(' ');
-      html += `<a class="${cls}" href="${c.file}"><span class="num">${done.has(c.n) ? '✓' : c.n}</span><span>${c.title}</span></a>`;
+      html += `<a class="${cls}" href="${c.file}"><span class="num">${done.has(c.n) ? '✓' : chNum(c)}</span><span>${c.title}</span></a>`;
       if (c.n === chapNum) html += `<nav class="toc" id="toc"></nav>`;
     }
     html += `<div class="nav-level">Study tools</div>
@@ -249,7 +273,7 @@
     const top = document.createElement('header'); top.className = 'topbar';
     const theme = currentTheme();
     top.innerHTML = `<button class="icon-btn menu-btn" aria-label="Menu">☰</button>
-      <div class="crumb">${chap ? `<a href="index.html">Course</a> / Chapter ${chap.n} · <b>${chap.title}</b>` : '<b>System Design</b>'}</div>
+      <div class="crumb"><a href="../index.html">Atlas</a> / ${chap ? `<a href="index.html">Course</a> / ${chName(chap)} · <b>${chap.title}</b>` : '<b>System Design</b>'}</div>
       <div class="spacer"></div>
       <button class="search-btn" aria-label="Search the course" title="Search (Ctrl+K)">🔎 <span>Search</span> <kbd class="kbd">Ctrl K</kbd></button>
       <button class="icon-btn theme-btn" aria-label="Toggle theme" title="Toggle theme">${theme === 'dark' ? '☀️' : '🌙'}</button>`;
@@ -283,12 +307,12 @@
     h2s.forEach((h, i) => {
       if (!h.id) h.id = 's' + (i + 1) + '-' + h.textContent.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
       if (chap && !h.querySelector('.sec-num')) {
-        const s = document.createElement('span'); s.className = 'sec-num'; s.textContent = `${chap.n}.${i + 1}`;
+        const s = document.createElement('span'); s.className = 'sec-num'; s.textContent = `${chNum(chap)}.${i + 1}`;
         h.prepend(s);
       }
       if (toc) {
         const a = document.createElement('a'); a.href = '#' + h.id;
-        a.textContent = h.textContent.replace(/^\d+\.\d+/, '').trim();
+        a.textContent = h.textContent.replace(/^P?\d+\.\d+/, '').trim();
         toc.appendChild(a);
         a.addEventListener('click', () => { SD.$('.sidebar').classList.remove('open'); SD.$('.scrim').classList.remove('show'); });
       }
@@ -312,7 +336,7 @@
     const render = () => {
       box.className = 'complete-box' + (isDone() ? ' done' : '');
       box.innerHTML = isDone()
-        ? `<p style="font-size:26px;margin:0">🎉</p><p><strong>Chapter ${chap.n} complete!</strong></p><button class="btn sm ghost" data-undo>Mark as not complete</button>`
+        ? `<p style="font-size:26px;margin:0">🎉</p><p><strong>${chName(chap)} complete!</strong></p><button class="btn sm ghost" data-undo>Mark as not complete</button>`
         : `<p><strong>Finished this chapter?</strong><br><span class="muted small">Track your progress across the course.</span></p><button class="btn primary">✓ Mark chapter complete</button>`;
       box.querySelector('button').onclick = () => {
         const s = doneSet();
@@ -320,7 +344,7 @@
         LS.set('sd-done', [...s]);
         render();
         const side = SD.$('.sidebar .nav-link.current .num');
-        if (side) { side.textContent = isDone() ? '✓' : chap.n; side.parentElement.classList.toggle('done', isDone()); }
+        if (side) { side.textContent = isDone() ? '✓' : chNum(chap); side.parentElement.classList.toggle('done', isDone()); }
         const bar = SD.$('.side-progress');
         if (bar) { const n = doneSet().size; bar.querySelector('i').style.width = (n / CHAPTERS.length) * 100 + '%'; bar.querySelector('small').textContent = `${n} of ${CHAPTERS.length} chapters complete`; }
       };
@@ -567,7 +591,7 @@
       if (!results.length) { list.innerHTML = '<div class="pal-empty">No matches. Try a broader word.</div>'; return; }
       list.innerHTML = results.map((r, i) => `<a class="pal-item ${i === sel ? 'sel' : ''}" href="${r.f}${r.a ? '#' + r.a : ''}" data-i="${i}">
           <span class="pal-ico">${ICON[r.k] || '•'}</span>
-          <span class="pal-text"><b>${esc(r.t)}</b><small>Chapter ${r.n} · ${esc(r.ti)}</small></span>
+          <span class="pal-text"><b>${esc(r.t)}</b><small>${chName(r.n)} · ${esc(r.ti)}</small></span>
           <span class="pal-lv">${r.lv}</span></a>`).join('');
       SD.$$('.pal-item', list).forEach((el) => {
         el.addEventListener('mouseenter', () => { sel = +el.dataset.i; SD.$$('.pal-item', list).forEach((x) => x.classList.toggle('sel', x === el)); });

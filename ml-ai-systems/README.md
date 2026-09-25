@@ -1,6 +1,6 @@
-# Palak's ML & AI Systems Playlist
+# Palak Deb Patra's ML & AI Systems Playlist
 
-An interactive course on machine learning and AI systems: **52 chapters** across five levels, from
+An interactive course on machine learning and AI systems: **52 chapters** across five levels — plus an 8-chapter **Prerequisites** level (Python, NumPy and pandas, linear algebra, calculus, probability, logs and softmax, what training means, hardware numbers) — from
 how learning actually works up to a 10,000-GPU frontier training run — each with animated diagrams,
 live simulators, an interview drill and a 5-question quiz, plus a 175-term glossary, a
 spaced-repetition flashcard deck and a timed mock-interview room.
@@ -40,6 +40,7 @@ Open `index.html` in any browser. That's the whole setup.
 
 | Level | Chapters | Covers |
 | --- | --- | --- |
+| **Prerequisites** | P1–P8 | Python, NumPy & pandas, vectors & matrices, derivatives & the chain rule, probability & statistics, logs & softmax, what training means, hardware numbers |
 | **Beginner** | 1–9 | The ML lifecycle, the maths you actually need, data & labels, features, gradient descent, trees & ensembles, evaluation, neural networks, training deep nets |
 | **Intermediate** | 10–20 | GPUs & the roofline, the DL stack, computer vision, attention, transformers, tokenizers & embeddings, pretraining & scaling laws, fine-tuning & PEFT, alignment, prompting, vector search |
 | **Advanced** | 21–30 | RAG, agents & tools, distributed training (ZeRO/FSDP, tensor/pipeline/MoE), running big training jobs, inference & serving, compression, data engineering, feature stores, recommenders |

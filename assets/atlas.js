@@ -22,7 +22,7 @@
      store     localStorage prefix -> `<store>-done`, `<store>-theme`
      indexVar  global that assets/study-data.js defines (e.g. SD_INDEX)
      dir       the course's folder, next to this file (use a url-safe slug)
-     first     filename of chapter 1
+     first     filename of the first page to read (Prerequisite 1)
      dist      single-file offline build inside <dir>/dist/
      release   download URL, or null to link the in-repo dist/ file
      repo      GitHub URL, or null (omit inside the monorepo)
@@ -42,14 +42,14 @@
       tagline: 'From "what happens when I type a URL" to multi-region failover.',
       blurb: 'The vocabulary and the building blocks of every large system — then consensus, stream processing and global scale, finishing with 17 full case studies.',
       topics: ['Caching', 'Sharding', 'Queues', 'Consensus', 'Multi-region', '17 case studies'],
-      chapters: 42,
-      hours: 30,
+      chapters: 50,
+      hours: 36,
       c1: '#2563eb',
       c2: '#0284c7',
       store: 'sd',
       indexVar: 'SD_INDEX',
       dir: 'system-design',
-      first: '01-foundations.html',
+      first: 'p1-how-computers-work.html',
       dist: 'system-design-course.html',
       release: null,
     },
@@ -63,14 +63,14 @@
       tagline: 'How learning actually works, up to a 10,000-GPU training run.',
       blurb: 'Data, gradients and evaluation first; then transformers, RAG, agents, distributed training and serving — and what it takes to keep all of it alive in production.',
       topics: ['Transformers', 'RAG', 'Agents', 'Distributed training', 'Inference', '12 case studies'],
-      chapters: 52,
-      hours: 39,
+      chapters: 60,
+      hours: 45,
       c1: '#0d9488',
       c2: '#8b5cf6',
       store: 'ml',
       indexVar: 'ML_INDEX',
       dir: 'ml-ai-systems',
-      first: '01-what-is-an-ml-system.html',
+      first: 'p1-python-for-ml.html',
       dist: 'ml-ai-systems-course.html',
       release: null,
     },
@@ -84,14 +84,14 @@
       tagline: 'From "what is this loop doing" to bitmask DP and suffix arrays.',
       blurb: 'Every data structure and algorithm you will be asked about, in one consistent C++ house style — with a visualiser, a practice set and an interview drill per chapter.',
       topics: ['Two pointers', 'Graphs', 'Segment trees', 'DP', 'Bitmask & math', 'C++ house style'],
-      chapters: 56,
-      hours: 42,
+      chapters: 64,
+      hours: 48,
       c1: '#c026d3',
       c2: '#db2777',
       store: 'dsa',
       indexVar: 'DSA_INDEX',
       dir: 'dsa',
-      first: '01-how-to-think.html',
+      first: 'p1-setup-judges.html',
       dist: 'dsa-course.html',
       release: null,
     },
@@ -126,8 +126,6 @@
     { icon: '🎤', file: 'mock-interview.html', title: 'Mock-interview rooms', blurb: 'A timed room with a prompt, a scratchpad and the rubric an interviewer would actually score you against.' },
   ];
 
-  var REPO = 'https://github.com/CaptainBlue793/palak-engineering-atlas';
-
   var LS = {
     get: function (k, d) { try { var v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
     set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
@@ -136,6 +134,11 @@
 
   var $ = function (sel, root) { return (root || document).querySelector(sel); };
   var esc = function (s) { return String(s).replace(/[&<>"]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]; }); };
+
+  /* Each course opens with a Prerequisites level stored as 0.1…0.8 and shown as P1…P8. */
+  function isPre(n) { return n > 0 && n < 1; }
+  function chShort(n) { return isPre(n) ? 'P' + Math.round(n * 10) : 'Ch ' + n; }
+  function chLong(n) { return isPre(n) ? 'Prerequisite ' + Math.round(n * 10) : 'Chapter ' + n; }
 
   /* One repo, one site: every course is a folder next to this file. */
   function baseOf(c) { return c.dir + '/'; }
@@ -150,9 +153,12 @@
   function countOf(c) { return (c.data && c.data.length) || c.chapters; }
   function doneCount(c) {
     var d = doneOf(c), total = countOf(c), n = 0;
-    d.forEach(function (x) { if (x >= 1 && x <= total) n++; });
+    d.forEach(function (x) {
+      if (c.data ? !!chapterAt(c, x) : (x >= 1 && x <= total)) n++;
+    });
     return n;
   }
+  function preCount(c) { return c.data ? c.data.filter(function (ch) { return isPre(ch.n); }).length : 8; }
   function pct(a, b) { return b ? Math.round((a / b) * 100) : 0; }
 
   /* The course's own mark, stroked in its own two colours. */
@@ -177,18 +183,18 @@
     el.innerHTML =
       '<div class="c-no">' + String(i + 1).padStart(2, '0') + '</div>' +
       '<div class="c-head">' +
-        '<span class="ic">' + markSvg(c, 30) + '</span>' +
+        '<span class="ic">' + markSvg(c, 36) + '</span>' +
         '<h3><a href="' + url(c, 'index.html') + '">' + esc(c.title) + '</a></h3>' +
-        '<p class="tag">' + esc(c.tagline) + '</p>' +
+        '' +
       '</div>' +
       '<div class="c-meta" data-meta></div>' +
-      '<p class="c-blurb">' + esc(c.blurb) + '<br><span style="color:var(--faint)">' + esc(c.topics.join(' · ')) + '</span></p>' +
+      '' +
       '<div class="pctline"><b data-pct>0%</b><span data-pcttxt></span></div>' +
       '<div class="meter" data-meter></div>' +
       '<div class="legend" data-legend></div>' +
       '<div class="c-next" data-next><span class="lbl">Next</span><span class="nm">…</span></div>' +
       '<div class="c-actions">' +
-        '<a class="btn primary sm" data-start href="' + url(c, c.first) + '">Start chapter 1 →</a>' +
+        '<a class="btn primary sm" data-start href="' + url(c, c.first) + '">Start with the prerequisites →</a>' +
         '<a class="btn sm" href="' + url(c, 'index.html') + '">All chapters</a>' +
         '<a class="btn sm" href="' + url(c, 'glossary.html') + '">Glossary</a>' +
       '</div>';
@@ -221,7 +227,8 @@
 
     $('[data-pct]', el).textContent = p + '%';
     $('[data-pcttxt]', el).textContent = done + ' of ' + total + ' chapters read';
-    $('[data-meta]', el).textContent = total + ' chapters · ~' + c.hours + ' h' + (groups ? ' · ' + groups.length + ' levels' : '');
+    var pre = preCount(c);
+    $('[data-meta]', el).textContent = (pre ? pre + ' prerequisites + ' + (total - pre) + ' chapters' : total + ' chapters') + ' · ~' + c.hours + ' h' + (groups ? ' · ' + groups.length + ' levels' : '');
 
     if (groups) {
       $('[data-meter]', el).innerHTML = groups.map(function (g, i) {
@@ -238,12 +245,12 @@
 
     var next = nextChapter(c), nextEl = $('[data-next]', el), startEl = $('[data-start]', el);
     if (!c.data) {
-      nextEl.innerHTML = '<span class="lbl">Next</span><span class="nm">' + (done ? 'Chapter ' + (done + 1) : 'Chapter 1') + '</span>';
-      startEl.textContent = done ? 'Continue →' : 'Start chapter 1 →';
+      nextEl.innerHTML = '<span class="lbl">Next</span><span class="nm">' + (done ? 'Chapter ' + (done + 1) : 'Prerequisite 1') + '</span>';
+      startEl.textContent = done ? 'Continue →' : 'Start with the prerequisites →';
       startEl.href = url(c, done ? 'index.html' : c.first);
     } else if (next) {
-      nextEl.innerHTML = '<span class="lbl">Next</span><span class="nm">Ch ' + next.n + ' · ' + esc(next.ti) + '</span>';
-      startEl.textContent = (done ? 'Continue' : 'Start') + ' → Ch ' + next.n;
+      nextEl.innerHTML = '<span class="lbl">Next</span><span class="nm">' + chShort(next.n) + ' · ' + esc(next.ti) + '</span>';
+      startEl.textContent = (done ? 'Continue' : 'Start') + ' → ' + chShort(next.n);
       startEl.href = url(c, next.f);
     } else {
       nextEl.innerHTML = '<span class="lbl">Done</span><span class="nm">All ' + total + ' chapters complete 🎉</span>';
@@ -264,13 +271,15 @@
   function renderMosaic() {
     $('#mosaic').innerHTML = COURSES.map(function (c) {
       var total = countOf(c), d = doneOf(c), next = nextChapter(c), sq = '';
-      for (var n = 1; n <= total; n++) {
-        var ch = chapterAt(c, n);
+      var chapters = c.data ? c.data.slice().sort(function (a, b) { return a.n - b.n; }) :
+        Array.from({ length: total }, function (_, i) { return { n: i + 1 }; });
+      chapters.forEach(function (ch) {
+        var n = ch.n;
         var cls = d.has(n) ? ' done' : (next && next.n === n ? ' next' : '');
         sq += '<a class="' + cls.trim() + '" href="' + url(c, ch ? ch.f : 'index.html') + '" ' +
-          'title="Ch ' + n + (ch ? ' · ' + ch.ti.replace(/"/g, '') : '') + (d.has(n) ? ' ✓' : '') + '" ' +
+          'title="' + chShort(n) + (ch ? ' · ' + (ch.ti || ch.title || '').replace(/"/g, '') : '') + (d.has(n) ? ' ✓' : '') + '" ' +
           'aria-label="' + esc(c.title) + ' chapter ' + n + '"></a>';
-      }
+      });
       // pick a column count that fills whole rows — no ragged tail
       var rows = Math.max(1, Math.ceil(total / 30));
       var cols = Math.ceil(total / rows);
@@ -313,12 +322,12 @@
       var c = live[0], next = nextChapter(c);
       var href = next ? url(c, next.f) : url(c, 'index.html');
       btn.href = href;
-      btn.textContent = 'Resume ' + c.title + (next ? ' · Ch ' + next.n : '') + ' →';
+      btn.textContent = 'Resume ' + c.title + (next ? ' · ' + chShort(next.n) : '') + ' →';
       hint.innerHTML = next
-        ? 'Next: <b>Ch ' + next.n + ' · ' + esc(next.ti) + '</b>'
+        ? 'Next: <b>' + chShort(next.n) + ' · ' + esc(next.ti) + '</b>'
         : 'Pick up where you left off in <b>' + esc(c.title) + '</b>';
       band.t.textContent = "You're " + p + '% of the way through.';
-      band.p.textContent = next ? 'Next up: Chapter ' + next.n + ' · ' + next.ti + ' — in ' + c.title + '.'
+      band.p.textContent = next ? 'Next up: ' + chLong(next.n) + ' · ' + next.ti + ' — in ' + c.title + '.'
         : 'Pick up where you left off in ' + c.title + '.';
       band.b.textContent = 'Resume ' + c.title + ' →';
       band.b.href = href;
@@ -336,7 +345,7 @@
       hint.innerHTML = '<span class="muted">Nothing read yet — every square below is a chapter.</span>';
       band.t.textContent = 'Start with one chapter.';
       band.p.textContent = 'Progress saves itself in this browser as you go — no account, nothing to install, and it works with the wifi off.';
-      band.b.textContent = 'Open ' + COURSES[0].title + ' Ch 1 →';
+      band.b.textContent = 'Start ' + COURSES[0].title + ' at Prerequisite 1 →';
       band.b.href = url(COURSES[0], COURSES[0].first);
     }
 
@@ -344,6 +353,7 @@
     $('#stats').innerHTML = [
       [COURSES.length, 'courses'],
       [total, 'chapters'],
+      [COURSES.reduce(function (s, c) { return s + preCount(c); }, 0), 'prerequisites'],
       ['~' + hours, 'hours'],
       ['0', 'dependencies'],
     ].map(function (s) { return '<div class="stat"><b>' + s[0] + '</b><span>' + s[1] + '</span></div>'; }).join('');
@@ -389,9 +399,6 @@
         return '<a class="btn sm" href="' + (c.release || url(c, 'dist/' + c.dist)) + '">' + esc(c.title) + '</a>';
       }).join(''));
 
-    tools += tool('💻', 'Source',
-      'Every course lives in one repository — static HTML, CSS and vanilla JavaScript, no framework, no build step to read it, nothing that phones home.',
-      '<a class="btn sm" href="' + REPO + '">CaptainBlue793/palak-engineering-atlas</a>');
     $('#toolGrid').innerHTML = tools;
   }
 
@@ -432,9 +439,9 @@
     COURSES.forEach(function (c) {
       if (!c.data) return;
       c.data.forEach(function (ch) {
-        ITEMS.push({ c: c, f: ch.f, a: '', label: ch.ti, sub: 'Chapter ' + ch.n + ' · ' + (ch.lv || ''), kind: 'chapter', n: ch.n, boost: 14 });
+        ITEMS.push({ c: c, f: ch.f, a: '', label: ch.ti, sub: chLong(ch.n) + ' · ' + (ch.lv || ''), kind: 'chapter', n: ch.n, boost: 14 });
         (ch.e || []).forEach(function (e) {
-          ITEMS.push({ c: c, f: ch.f, a: e.a || '', label: e.t, sub: 'Ch ' + ch.n + ' · ' + ch.ti, kind: e.k || 'section', n: ch.n, boost: e.k === 'section' ? 4 : 0 });
+          ITEMS.push({ c: c, f: ch.f, a: e.a || '', label: e.t, sub: chShort(ch.n) + ' · ' + ch.ti, kind: e.k || 'section', n: ch.n, boost: e.k === 'section' ? 4 : 0 });
         });
       });
     });
@@ -489,7 +496,7 @@
       COURSES.forEach(function (c) {
         if (filter !== 'all' && c.id !== filter) return;
         var n = nextChapter(c);
-        if (n) out.push({ c: c, f: n.f, a: '', label: n.ti, sub: 'Continue · Chapter ' + n.n, kind: 'next' });
+        if (n) out.push({ c: c, f: n.f, a: '', label: n.ti, sub: 'Continue · ' + chLong(n.n), kind: 'next' });
       });
       pool.forEach(function (it) { if (it.kind === 'chapter' && out.length < 26) out.push(it); });
     } else {

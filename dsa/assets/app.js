@@ -6,6 +6,15 @@
    ========================================================= */
 (function () {
   const CHAPTERS = [
+    { n: 0.1, file: 'p1-setup-judges.html', title: 'Setup, Judges & Your First Program', level: 'Prerequisites', icon: '🛠️', mins: 40, blurb: 'Install a compiler, compile and run a program, fast input and output, and how online judges test your code.' },
+    { n: 0.2, file: 'p2-types-overflow.html', title: 'C++ Types, Operators & Overflow', level: 'Prerequisites', icon: '🔣', mins: 45, blurb: 'int, long long, double, char and bool; integer division, casting, and the overflow trap that fails hidden tests.' },
+    { n: 0.3, file: 'p3-control-flow-functions.html', title: 'Control Flow & Functions', level: 'Prerequisites', icon: '🔁', mins: 40, blurb: 'if, loops, break and continue, functions, pass by value vs reference, scope, and your first recursive function.' },
+    { n: 0.4, file: 'p4-arrays-strings-vectors.html', title: 'Arrays, Strings & Vectors', level: 'Prerequisites', icon: '📦', mins: 45, blurb: 'Fixed arrays vs vector, 2D grids, strings and characters as numbers, and the index errors to avoid.' },
+    { n: 0.5, file: 'p5-stl-toolbox.html', title: 'The STL Toolbox', level: 'Prerequisites', icon: '🧰', mins: 50, blurb: 'pair, set, map, unordered_map, stack, queue, priority_queue, iterators, sort with comparators, lambdas and the algorithms library.' },
+    { n: 0.6, file: 'p6-memory-pointers.html', title: 'Memory: Stack, Heap & Pointers', level: 'Prerequisites', icon: '🧠', mins: 45, blurb: 'How memory is laid out, the call stack, heap allocation, pointers, references, structs and classes.' },
+    { n: 0.7, file: 'p7-school-math.html', title: 'School Math for DSA', level: 'Prerequisites', icon: '➗', mins: 45, blurb: 'Powers of two, logarithms, arithmetic series, floor and ceiling, modulo with negatives, binary numbers, primes and nCr.' },
+    { n: 0.8, file: 'p8-input-size-practice.html', title: 'Input Size, Time Limits & How to Practise', level: 'Prerequisites', icon: '⏱️', mins: 40, blurb: 'Turn constraints into an operation budget, pick the complexity you can afford, and practise in a way that sticks.' },
+
     { n: 1,  file: '01-how-to-think.html',          title: 'How to Think in DSA (& My House Style)',   level: 'Foundations',   icon: '🧭', mins: 30, blurb: 'The method: read constraints first, name the pattern, then write it — plus the exact C++ conventions every chapter uses.' },
     { n: 2,  file: '02-complexity.html',            title: 'Complexity: Time, Space & Amortized',      level: 'Foundations',   icon: '📈', mins: 40, blurb: 'Big-O from first principles, the complexity ladder, amortized analysis, and reading a budget straight off the constraints.' },
     { n: 3,  file: '03-arrays-memory.html',         title: 'Arrays & How Memory Actually Works',       level: 'Foundations',   icon: '🧱', mins: 35, blurb: 'Contiguous memory, cache lines, vector growth, and why an O(n) array beats an O(1) linked list in practice.' },
@@ -69,6 +78,7 @@
   ];
 
   const LEVELS = [
+    ['Prerequisites', 'var(--green)', 'The C++, memory model, STL and school math every chapter assumes, taught from zero.'],
     ['Foundations', 'var(--accent)', 'The method, complexity, and the array/string/search patterns everything else rests on.'],
     ['Data Structures', 'color-mix(in srgb, var(--accent-2) 25%, var(--accent))', 'Every structure you will ever be asked to use or build, from linked lists to lazy segment trees.'],
     ['Graphs & Paradigms', 'color-mix(in srgb, var(--accent-2) 50%, var(--accent))', 'Graph algorithms end to end, plus backtracking, greedy and divide & conquer.'],
@@ -76,16 +86,30 @@
     ['Mastery', 'var(--accent-2)', 'String algorithms, design problems, the pattern playbook, debugging and the interview itself.'],
   ];
 
+  // Prerequisites are stored as 0.1…0.8 (so they sort before Chapter 1) and shown as P1…P8.
+  const isPre = (n) => n > 0 && n < 1;
+  const numOf = (c) => (c && typeof c === 'object' ? c.n : +c);
+  const chNum = (c) => { const n = numOf(c); return isPre(n) ? 'P' + Math.round(n * 10) : String(n); };
+  const chName = (c) => { const n = numOf(c); return isPre(n) ? 'Prerequisite ' + Math.round(n * 10) : 'Chapter ' + n; };
+
   const LS = {
     get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
   };
+  // The old single "Chapter 0" became the Prerequisites level: finishing it counts as finishing all of them.
+  (function migratePrereqs() {
+    const d = LS.get('dsa-done', []);
+    if (!Array.isArray(d) || !d.includes(0)) return;
+    const pre = CHAPTERS.filter((c) => isPre(c.n)).map((c) => c.n);
+    LS.set('dsa-done', [...new Set(d.filter((n) => n !== 0).concat(pre))]);
+    const q = LS.get('dsa-quiz', {}); delete q[0]; LS.set('dsa-quiz', q);
+  })();
   const doneSet = () => new Set(LS.get('dsa-done', []));
 
   /* ---------------- helpers ---------------- */
   const SVGNS = 'http://www.w3.org/2000/svg';
   const DSA = {
-    CHAPTERS, LEVELS, LS,
+    CHAPTERS, LEVELS, LS, chNum, chName,
     $: (s, r = document) => r.querySelector(s),
     $$: (s, r = document) => [...r.querySelectorAll(s)],
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -210,7 +234,7 @@
   function buildShell() {
     const body = document.body;
     if (!/Palak/.test(document.title)) document.title += ` · DSA Playlist by ${AUTHOR}`;
-    const chapNum = +body.dataset.chapter || 0;
+    const chapNum = body.dataset.chapter == null ? -1 : +body.dataset.chapter;   // -1 = not a chapter page (prerequisites are 0.1…0.8)
     const chap = CHAPTERS.find((c) => c.n === chapNum);
     const main = DSA.$('main.content');
     if (!main) return { chap };
@@ -225,13 +249,13 @@
 
     // sidebar
     const done = doneSet();
-    let html = `<a class="brand" href="index.html"><span class="brand-logo"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="4.3" r="2.1"/><circle cx="6.2" cy="11.7" r="2.1"/><circle cx="17.8" cy="11.7" r="2.1"/><circle cx="3.3" cy="19.5" r="1.6"/><circle cx="9.1" cy="19.5" r="1.6"/><path d="M10.7 5.9 7.5 10.1M13.3 5.9l3.2 4.2M5 13.4l-.9 4.5M7.4 13.4l.9 4.5"/></svg></span><span><span class="grad">DSA Playlist</span><br><small style="font-weight:500;color:var(--muted);font-size:12px">by Palak Deb Patra</small></span></a>
+    let html = `<a class="brand" href="index.html"><span class="brand-logo"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="4.3" r="2.1"/><circle cx="6.2" cy="11.7" r="2.1"/><circle cx="17.8" cy="11.7" r="2.1"/><circle cx="3.3" cy="19.5" r="1.6"/><circle cx="9.1" cy="19.5" r="1.6"/><path d="M10.7 5.9 7.5 10.1M13.3 5.9l3.2 4.2M5 13.4l-.9 4.5M7.4 13.4l.9 4.5"/></svg></span><span><span class="brand-author">Palak Deb Patra</span><span class="grad brand-course">DSA Playlist</span></span></a>
       <div class="side-progress"><div class="bar"><i style="width:${(done.size / CHAPTERS.length) * 100}%"></i></div><small>${done.size} of ${CHAPTERS.length} chapters complete</small></div>`;
     let lastLevel = '';
     for (const c of CHAPTERS) {
       if (c.level !== lastLevel) { html += `<div class="nav-level">${c.level}</div>`; lastLevel = c.level; }
       const cls = ['nav-link', done.has(c.n) ? 'done' : '', c.n === chapNum ? 'current' : ''].join(' ');
-      html += `<a class="${cls}" href="${c.file}"><span class="num">${done.has(c.n) ? '✓' : c.n}</span><span>${c.title}</span></a>`;
+      html += `<a class="${cls}" href="${c.file}"><span class="num">${done.has(c.n) ? '✓' : chNum(c)}</span><span>${c.title}</span></a>`;
       if (c.n === chapNum) html += `<nav class="toc" id="toc"></nav>`;
     }
     html += `<div class="nav-level">Study tools</div>
@@ -246,7 +270,7 @@
     const top = document.createElement('header'); top.className = 'topbar';
     const theme = currentTheme();
     top.innerHTML = `<button class="icon-btn menu-btn" aria-label="Menu">☰</button>
-      <div class="crumb">${chap ? `<a href="index.html">Course</a> / Chapter ${chap.n} · <b>${chap.title}</b>` : '<b>DSA Playlist</b>'}</div>
+      <div class="crumb"><a href="../index.html">Atlas</a> / ${chap ? `<a href="index.html">Course</a> / ${chName(chap)} · <b>${chap.title}</b>` : '<b>DSA Playlist</b>'}</div>
       <div class="spacer"></div>
       <button class="search-btn" aria-label="Search the course" title="Search (Ctrl+K)">🔎 <span>Search</span> <kbd class="kbd">Ctrl K</kbd></button>
       <button class="icon-btn theme-btn" aria-label="Toggle theme" title="Toggle theme">${theme === 'dark' ? '☀️' : '🌙'}</button>`;
@@ -280,12 +304,12 @@
     h2s.forEach((h, i) => {
       if (!h.id) h.id = 's' + (i + 1) + '-' + h.textContent.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
       if (chap && !h.querySelector('.sec-num')) {
-        const s = document.createElement('span'); s.className = 'sec-num'; s.textContent = `${chap.n}.${i + 1}`;
+        const s = document.createElement('span'); s.className = 'sec-num'; s.textContent = `${chNum(chap)}.${i + 1}`;
         h.prepend(s);
       }
       if (toc) {
         const a = document.createElement('a'); a.href = '#' + h.id;
-        a.textContent = h.textContent.replace(/^\d+\.\d+/, '').trim();
+        a.textContent = h.textContent.replace(/^P?\d+\.\d+/, '').trim();
         toc.appendChild(a);
         a.addEventListener('click', () => { DSA.$('.sidebar').classList.remove('open'); DSA.$('.scrim').classList.remove('show'); });
       }
@@ -309,7 +333,7 @@
     const render = () => {
       box.className = 'complete-box' + (isDone() ? ' done' : '');
       box.innerHTML = isDone()
-        ? `<p style="font-size:26px;margin:0">🎉</p><p><strong>Chapter ${chap.n} complete!</strong></p><button class="btn sm ghost" data-undo>Mark as not complete</button>`
+        ? `<p style="font-size:26px;margin:0">🎉</p><p><strong>${chName(chap)} complete!</strong></p><button class="btn sm ghost" data-undo>Mark as not complete</button>`
         : `<p><strong>Finished this chapter?</strong><br><span class="muted small">Track your progress across the course.</span></p><button class="btn primary">✓ Mark chapter complete</button>`;
       box.querySelector('button').onclick = () => {
         const s = doneSet();
@@ -317,7 +341,7 @@
         LS.set('dsa-done', [...s]);
         render();
         const side = DSA.$('.sidebar .nav-link.current .num');
-        if (side) { side.textContent = isDone() ? '✓' : chap.n; side.parentElement.classList.toggle('done', isDone()); }
+        if (side) { side.textContent = isDone() ? '✓' : chNum(chap); side.parentElement.classList.toggle('done', isDone()); }
         const bar = DSA.$('.side-progress');
         if (bar) { const n = doneSet().size; bar.querySelector('i').style.width = (n / CHAPTERS.length) * 100 + '%'; bar.querySelector('small').textContent = `${n} of ${CHAPTERS.length} chapters complete`; }
       };
@@ -564,7 +588,7 @@
       if (!results.length) { list.innerHTML = '<div class="pal-empty">No matches. Try a broader word.</div>'; return; }
       list.innerHTML = results.map((r, i) => `<a class="pal-item ${i === sel ? 'sel' : ''}" href="${r.f}${r.a ? '#' + r.a : ''}" data-i="${i}">
           <span class="pal-ico">${ICON[r.k] || '•'}</span>
-          <span class="pal-text"><b>${esc(r.t)}</b><small>Chapter ${r.n} · ${esc(r.ti)}</small></span>
+          <span class="pal-text"><b>${esc(r.t)}</b><small>${chName(r.n)} · ${esc(r.ti)}</small></span>
           <span class="pal-lv">${r.lv}</span></a>`).join('');
       DSA.$$('.pal-item', list).forEach((el) => {
         el.addEventListener('mouseenter', () => { sel = +el.dataset.i; DSA.$$('.pal-item', list).forEach((x) => x.classList.toggle('sel', x === el)); });

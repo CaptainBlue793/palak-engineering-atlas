@@ -28,7 +28,7 @@ const OUT = path.join(ROOT, 'assets', 'study-data.js');
 /* ---------- chapter registry, read from the single source of truth ---------- */
 const appJs = fs.readFileSync(path.join(ROOT, 'assets', 'app.js'), 'utf8');
 const regBlock = appJs.slice(appJs.indexOf('const CHAPTERS = ['), appJs.indexOf('const LEVELS = ['));
-const CHAPTERS = [...regBlock.matchAll(/\{\s*n:\s*(\d+),\s*file:\s*'([^']+)',\s*title:\s*'([^']+)',\s*level:\s*'([^']+)'/g)]
+const CHAPTERS = [...regBlock.matchAll(/\{\s*n:\s*([\d.]+),\s*file:\s*'([^']+)',\s*title:\s*'([^']+)',\s*level:\s*'([^']+)'/g)]
   .map((m) => ({ n: +m[1], file: m[2], title: m[3].replace(/\\'/g, "'"), level: m[4] }));
 
 if (CHAPTERS.length < 2) fail('could not parse CHAPTERS out of assets/app.js — did the registry format change?');

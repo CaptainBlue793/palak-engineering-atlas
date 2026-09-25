@@ -30,23 +30,36 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 20</span><span class="pill cyan">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Vector Search &amp; <span class="grad">ANN Indexes</span></h1>
-    <p class="lead">Retrieval is the backbone of RAG, recommendation, deduplication and semantic search. The core operation — find the nearest vectors to this one — is trivially simple and computationally brutal at scale, so everything interesting is in the approximations.</p>
+    <p class="lead">An <b>embedding</b> turns text (or an image) into a list of numbers, a <b>vector</b>, so that similar things get nearby vectors. Finding “the stored vectors closest to this one” powers RAG, recommendations, duplicate detection and search by meaning. The idea is simple, but doing it over millions of vectors is extremely expensive. So all the clever work is in finding answers that are <i>nearly</i> right, very fast.</p>
     <ul class="objectives">
       <li>Explain why exact nearest-neighbour search doesn't scale</li>
       <li>Compare flat, IVF, HNSW and product-quantized indexes</li>
-      <li>Tune recall against latency and memory deliberately</li>
-      <li>Handle metadata filters, updates and multi-tenancy</li>
-      <li>Combine lexical and vector retrieval into hybrid search</li>
+      <li>Trade accuracy (recall) against speed and memory on purpose</li>
+      <li>Handle metadata filters, updates and multiple customers (tenants) in one system</li>
+      <li>Combine keyword search and vector search into hybrid search</li>
     </ul>
   </section>
 
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Vectors and dot products.</b> Multiply matching numbers and add them up. See <a href="p3-linear-algebra.html">P3: Vectors, Matrices &amp; the Dot Product</a> and <a href="02-math-intuition.html">Chapter 2</a>.</li>
+        <li><b>Embeddings and cosine similarity.</b> How text becomes a vector, and why close vectors mean similar meaning — <a href="15-tokenizers-embeddings.html">Chapter 15</a>.</li>
+        <li><b>Recall and precision.</b> What “found 9 of the 10 right answers” means — <a href="07-evaluation.html">Chapter 7</a>.</li>
+        <li><b>Memory sizes.</b> Bytes per float32 / int8 and why RAM is the budget — <a href="10-hardware.html">Chapter 10</a>.</li>
+      </ul></div>
+  </div>
+
   <h2>The problem</h2>
-  <p>Exact search compares the query to every vector: 50M vectors × 768 dimensions is ~38 billion multiply-adds per query. On one core that's seconds; you need single-digit milliseconds, at thousands of queries per second. <b>Approximate</b> nearest neighbour search trades a little recall for two to three orders of magnitude of speed.</p>
+  <p>First, what “closest” means. With 2-number vectors, take the query <code>q = [1, 0]</code>, and two stored items <code>a = [0.8, 0.6]</code> and <code>b = [0, 1]</code>. The dot product q·a = 1×0.8 + 0×0.6 = 0.8, and q·b = 0. So <code>a</code> is the closer match. When all vectors are scaled to length 1 (normalized), as here, the dot product equals the <b>cosine similarity</b>, and ranking by straight-line (L2) distance gives the same order. That is why most systems normalize once and then use the cheap dot product.</p>
+  <p>Exact search compares the query to every stored vector. With 50M vectors of 768 numbers each, that's 50,000,000 × 768 ≈ 38 billion multiply-adds per query. On one CPU core that takes seconds. But you usually need an answer in a few milliseconds, for thousands of queries per second.</p>
+  <p><b>Approximate nearest neighbour (ANN)</b> search fixes this. It gives up a little <b>recall</b> (occasionally missing one of the true closest matches) in exchange for being 100 to 1,000 times faster.</p>
 
   <div class="callout tip">
     <div class="ico">🎯</div>
     <div class="body"><div class="title">Approximate is fine — but measure it</div>
-      <p>Recall@10 of 0.95 means you found 9.5 of the true top 10 on average. For RAG that's usually invisible, because a re-ranker and the LLM both tolerate a missing marginal result. For deduplication or compliance search it may not be. Decide the recall target from the <i>application</i>, then tune to hit it — never accept a library's defaults blind.</p></div>
+      <p><b>Recall@10</b> of 0.95 means that, on average, you found 9.5 of the true top 10 matches. You measure it by running a query both ways: exact search says the true top 10 are items {1…10}; the index returns 9 of them plus item 57. That query scores 9/10 = 0.9. Average over many queries and you get the index's recall@10. For RAG you usually won't notice, because the re-ranker and the LLM cope fine if one borderline result is missing. For duplicate detection or legal/compliance search, you might. Choose the recall target based on what your <i>application</i> needs, then tune the index to hit it. Never blindly trust a library's default settings.</p></div>
   </div>
 
   <h2>The index families</h2>
@@ -54,18 +67,26 @@
     <table class="t">
       <thead><tr><th>Index</th><th>Idea</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
       <tbody>
-        <tr><td><b>Flat (brute force)</b></td><td>Compare with everything</td><td>Exact; trivial to update; no build step</td><td>O(N) per query — fine to ~100k vectors</td></tr>
-        <tr><td><b>IVF</b></td><td>Cluster vectors; search only the <code>nprobe</code> nearest clusters</td><td>Simple, low memory overhead, tunable</td><td>Needs training; recall suffers near cluster edges</td></tr>
-        <tr><td><b>HNSW</b></td><td>Multi-layer proximity graph; greedy descent</td><td><b>Best recall/latency</b>; incremental inserts</td><td>~1.5–2× memory overhead; deletes are awkward</td></tr>
-        <tr><td><b>PQ / IVF-PQ</b></td><td>Compress vectors into sub-space codes</td><td>10–50× less memory; billions of vectors per node</td><td>Lossy — usually needs a rerank pass on exact vectors</td></tr>
-        <tr><td><b>DiskANN / SPANN</b></td><td>Graph index that lives on SSD</td><td>Billions of vectors cheaply</td><td>Higher latency; build is heavy</td></tr>
-        <tr><td><b>Binary + rerank</b></td><td>1-bit vectors, Hamming distance, then exact rerank</td><td>32× smaller, extremely fast first pass</td><td>Needs a good rerank stage to recover recall</td></tr>
+        <tr><td><b>Flat (brute force)</b></td><td>Compare with everything</td><td>Exact; easy to update; nothing to build</td><td>O(N) per query (time grows with the number of vectors); fine up to ~100k vectors</td></tr>
+        <tr><td><b>IVF</b></td><td>Group vectors into clusters; search only the <code>nprobe</code> clusters closest to the query</td><td>Simple, little extra memory, tunable</td><td>Clusters must be learned first; misses matches that sit near a cluster's edge</td></tr>
+        <tr><td><b>HNSW</b></td><td>A graph linking each vector to its neighbours, in layers; walk towards the query</td><td><b>Best recall for the speed</b>; can add vectors one at a time</td><td>~1.5–2× extra memory; deleting is awkward</td></tr>
+        <tr><td><b>PQ / IVF-PQ</b></td><td>Compress each vector into short codes (product quantization)</td><td>10–50× less memory; billions of vectors per machine</td><td>Loses detail, so usually needs a second pass (rerank) using the exact vectors</td></tr>
+        <tr><td><b>DiskANN / SPANN</b></td><td>A graph index stored on SSD instead of RAM</td><td>Billions of vectors, cheaply</td><td>Slower queries; building it is heavy</td></tr>
+        <tr><td><b>Binary + rerank</b></td><td>Shrink each number to 1 bit, compare by counting differing bits (Hamming distance), then rerank exactly</td><td>32× smaller, extremely fast first pass</td><td>Needs a good rerank stage to win back recall</td></tr>
       </tbody>
     </table>
   </div>
 
+  <p>Two of these are easier to trust once you see the numbers.</p>
+  <ul>
+    <li><b>IVF, sized.</b> Split 1M vectors into 1,000 clusters of about 1,000 each. A query first compares itself with the 1,000 cluster centres, then searches only the <code>nprobe = 10</code> nearest clusters: 1,000 + 10 × 1,000 = 11,000 comparisons instead of 1,000,000 — about 90× less work. The edge case: if the query's true nearest neighbour sits just across the border in the 11th-closest cluster, it is never looked at. Raising nprobe fixes that at the cost of speed.</li>
+    <li><b>PQ, sized.</b> A 768-dimension float32 vector is 768 × 4 = 3,072 bytes. PQ cuts it into 96 pieces of 8 numbers. For each piece it learns 256 typical patterns, and stores just the number (0–255) of the closest pattern: one byte. So the vector becomes 96 bytes — 32× smaller. Distances computed from these codes are approximate, which is why the top candidates are re-checked against the full vectors.</li>
+  </ul>
+
   <h2>How HNSW actually searches</h2>
-  <p>Vectors become nodes in a graph where each node links to its near neighbours. Search is greedy: start somewhere, hop to whichever neighbour is closer to the query, repeat until no neighbour improves. Multiple layers (sparse at the top, dense at the bottom) turn this into a coarse-to-fine descent — a skip list in metric space.</p>
+  <p><b>HNSW</b> (Hierarchical Navigable Small World) turns each vector into a node in a graph, linked to its nearby neighbours. Search is <b>greedy</b>: start at some node, hop to whichever neighbour is closer to the query, and repeat until no neighbour is any closer.</p>
+  <p>The graph has several layers. The top layers have few nodes and long links; the bottom layer has every node and short links. So search starts with big jumps and finishes with small steps. Think of finding a house: first you drive to the right city, then the right street, then walk to the door.</p>
+  <p>Why the layers and the candidate list? Plain greedy search can get stuck: it reaches a node where no neighbour is closer to the query, even though the true nearest item is elsewhere — a <b>local minimum</b>, like a valley that is not the lowest one. The long top-layer links make it unlikely you start somewhere hopeless. The candidate list (<code>ef_search</code>) keeps the best few dozen nodes seen so far instead of only one, so the search can back out of a dead end. Two build-time settings matter too: <code>M</code>, how many neighbours each node links to (more links, better recall, more memory), and <code>ef_construction</code>, how hard the builder searches when choosing those links (slower build, better graph).</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Greedy graph search — click anywhere to query</span><span class="p-tag">Interactive</span></div>
@@ -83,12 +104,12 @@
         <div class="stat warn"><div class="k">vs exact search</div><div class="v" id="hSpeed" style="font-size:16px">–</div></div>
       </div>
       <div class="legend"><span><i style="background:var(--pink)"></i>query</span><span><i style="background:var(--accent-2)"></i>visited</span><span><i style="background:var(--green)"></i>returned</span><span><i style="border:2px solid var(--pink);background:transparent"></i>true nearest neighbour</span></div>
-      <p class="small muted" style="margin-top:8px">Raising <code>ef_search</code> keeps more candidates alive, exploring more of the graph: higher recall, more distance computations, more latency. It is a <b>query-time</b> knob, so you can tune it per request — cheap for autocomplete, thorough for compliance search.</p>
+      <p class="small muted" style="margin-top:8px">Raising <code>ef_search</code> keeps more candidates in play, so the search explores more of the graph. You get higher recall, but more distance calculations and more latency. It is set <b>at query time</b>, so you can pick a value per request: low for autocomplete, high for compliance search.</p>
     </div>
   </div>
 
   <h2>The three-way trade-off</h2>
-  <p>Recall, latency and memory. You can have two comfortably; the third is what you're paying for.</p>
+  <p>Every index balances three things: recall, latency and memory. You can easily get two of them. The third is where you pay.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Index tuner</span><span class="p-tag">Interactive</span></div>
@@ -105,29 +126,39 @@
   <div class="callout warn">
     <div class="ico">💾</div>
     <div class="body"><div class="title">Memory is the real cost driver</div>
-      <p>A graph index must be in RAM to be fast, and RAM is the expensive part of the bill. 100M × 768-dim float32 vectors is ~307 GB before the graph's ~60% overhead. Scalar quantization to int8 cuts that 4× for around a point of recall; product quantization cuts it 10–50× and needs a rerank pass. <b>Design the memory budget first</b>, then pick the index that fits it.</p></div>
+      <p>A graph index must sit in RAM to be fast, and RAM is the expensive part of the bill. 100M vectors of 768 dimensions, stored as 4-byte floats (float32), take about 307 GB. The graph adds about 60% on top.</p>
+      <p><b>Scalar quantization</b> stores each number as a 1-byte integer (int8) instead. That cuts memory 4× and costs about one point of recall. <b>Product quantization</b> cuts it 10–50× but needs a rerank pass. <b>Plan the memory budget first</b>, then pick the index that fits it.</p></div>
   </div>
 
   <h2>Filters, updates and tenancy</h2>
+  <p>Real queries almost never mean “closest vectors in the whole collection”. They mean “closest vectors among documents this user may see, in French, updated this year”. These extra conditions are where simple vector search breaks. A quick example: if only 1% of documents match the filter and you post-filter the top 100, you expect to keep about 1 result — and the user asked for 10.</p>
   <div class="grid c3">
-    <div class="card feature reveal"><div class="f-ico">🔎</div><h4>Filtered search</h4><p><b>Post-filter</b> (search then drop) breaks when the filter is selective — you retrieve 100 and keep 2. <b>Pre-filter</b> (restrict then search) is exact but can defeat the index. Good engines do <b>filtered traversal</b>: apply the predicate during graph search.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">♻️</div><h4>Updates &amp; deletes</h4><p>Graph indexes don't remove nodes cleanly — deletes are usually tombstones, and quality degrades until a rebuild. Plan a periodic compaction, and treat “rebuild the index” as a routine operation with a shadow-index swap.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🏢</div><h4>Multi-tenancy</h4><p>Per-tenant indexes isolate perfectly but waste memory on small tenants. A shared index with a tenant filter is efficient but makes isolation a correctness <i>and</i> security property — test it explicitly (Chapters 37, 46).</p></div>
+    <div class="card feature reveal"><div class="f-ico">🔎</div><h4>Filtered search</h4><p>Say you only want results where country is France.<b>Post-filter</b> (search, then drop non-matches) breaks when few items match: you fetch 100 and keep 2. <b>Pre-filter</b> (narrow the set, then search) is exact but can stop the index from helping. Good engines do <b>filtered traversal</b>: they apply the filter while walking the graph.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">♻️</div><h4>Updates &amp; deletes</h4><p>Graph indexes can't remove nodes cleanly. Deleted items are usually just marked as deleted (a <b>tombstone</b>), and quality slowly drops until you rebuild. Plan regular clean-ups (compaction). Treat “rebuild the index” as routine: build a new copy on the side, then swap it in.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🏢</div><h4>Multi-tenancy</h4><p>A <b>tenant</b> is one customer of your system. One index per tenant keeps them perfectly apart, but wastes memory on small tenants. One shared index with a tenant filter is efficient, but then keeping tenants apart becomes both a correctness <i>and</i> a security issue. Test it explicitly (Chapters 37, 46).</p></div>
   </div>
 
   <div class="callout danger">
     <div class="ico">🔐</div>
     <div class="body"><div class="title">Permissions are part of retrieval, not a post-processing step</div>
-      <p>If a user may not see a document, it must not be retrievable — not filtered out afterwards, and certainly not summarised into an answer before filtering. Store ACLs alongside vectors and push them into the search as a filter; verify with a test that retrieves as user A and asserts nothing from user B appears. This is one of the few genuine security boundaries in a RAG system.</p></div>
+      <p>If a user isn't allowed to see a document, search must never return it. Filtering it out afterwards is not enough, and summarising it into an answer before filtering is far worse. Store the access rules (<b>ACLs</b>, access control lists) next to the vectors, and pass them into the search as a filter. Write a test that searches as user A and checks that nothing from user B comes back. This is one of the few real security walls in a RAG system.</p></div>
   </div>
 
   <h2>Hybrid search: lexical plus vector</h2>
-  <p>Embeddings are excellent at meaning and unreliable at exact strings: product codes, error numbers, names, rare acronyms. BM25 is the opposite. Running both and fusing the results beats either alone on almost every real corpus.</p>
+  <p>Embeddings are great at meaning but unreliable at exact strings: product codes, error numbers, names, rare acronyms. <b>BM25</b>, the classic keyword-matching score used by search engines, is the opposite. Run both and merge the results. On almost every real document collection, that beats either one alone.</p>
 
   <pre class="code"><span class="c"># Reciprocal Rank Fusion — no score calibration needed between systems</span>
 score(d) = Σ_over_retrievers  1 / (k + rank_in_that_retriever(d))     <span class="c"># k ≈ 60</span>
 
 <span class="c"># then re-rank the fused top ~100 with a cross-encoder (Chapter 21)</span></pre>
+
+  <p>Why merge by rank instead of by score? The two systems score on different scales: BM25 might give 12.4, while cosine similarity gives 0.83. Adding them would let BM25 drown out the vectors. Ranks are always 1, 2, 3…, so they can be combined fairly. A worked example with k = 60:</p>
+  <ul>
+    <li>Doc A: rank 1 in vector, rank 3 in BM25 → 1/61 + 1/63 ≈ 0.0164 + 0.0159 = <b>0.0323</b></li>
+    <li>Doc C: rank 5 in both → 1/65 + 1/65 ≈ <b>0.0308</b></li>
+    <li>Doc B: rank 1 in BM25, missing from vector results → 1/61 ≈ <b>0.0164</b></li>
+  </ul>
+  <p>A document both systems like beats one that only a single system loves. The large k keeps the gap between rank 1 and rank 2 small, so no single retriever can dominate with one lucky top hit.</p>
 
   <div class="table-wrap">
     <table class="t">
@@ -142,36 +173,44 @@ score(d) = Σ_over_retrievers  1 / (k + rank_in_that_retriever(d))     <span cla
   </div>
 
   <h2>Choosing the storage</h2>
+  <p>A quick size check helps here. 1M vectors × 768 dimensions × 4 bytes ≈ 3 GB. That fits comfortably in the RAM of an ordinary database server, alongside the rest of your data. 100M vectors is about 307 GB, which does not — and that is roughly where the choice starts to matter.</p>
   <div class="split">
-    <div class="card"><h4 class="mt0">Start with what you have</h4><p class="small mb0">Under ~1M vectors with modest QPS, <b>pgvector</b> (or your existing search engine's vector support) is usually enough — and it gives you transactions, joins, filters and backups for free. Adding a dedicated vector database is a real operational commitment.</p></div>
-    <div class="card"><h4 class="mt0">Move when you hit a wall</h4><p class="small mb0">Dedicated engines (Qdrant, Milvus, Vespa, Weaviate, managed services) earn their place at tens of millions of vectors, high QPS, heavy filtering or hybrid ranking. Migrate for a measured reason — index build time, p99 latency, memory cost — not for the category.</p></div>
+    <div class="card"><h4 class="mt0">Start with what you have</h4><p class="small mb0">Under about 1M vectors and moderate traffic (queries per second, <b>QPS</b>), <b>pgvector</b> (a Postgres extension) or your existing search engine's vector support is usually enough. You also get transactions, joins, filters and backups for free. Adding a separate vector database is a real commitment: one more system to run and keep healthy.</p></div>
+    <div class="card"><h4 class="mt0">Move when you hit a wall</h4><p class="small mb0">Dedicated engines (Qdrant, Milvus, Vespa, Weaviate, managed services) are worth it at tens of millions of vectors, high QPS, heavy filtering or hybrid ranking. Switch for a reason you've measured (index build time, p99 latency, memory cost), not because “we should have a vector database”.</p></div>
   </div>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
-      <li><b>Never measuring recall.</b> Sample 1,000 queries, compute exact top-k offline, and track recall@k as a monitored metric.</li>
-      <li><b>Mixing normalized and unnormalized vectors</b>, or cosine and L2 between index and query. Silent, severe quality loss.</li>
-      <li><b>Post-filtering a selective predicate.</b> Retrieve 100, filter to 3, wonder why results are poor — push the filter into the search.</li>
-      <li><b>Forgetting the index is stale.</b> Deletes leave tombstones; new documents need indexing latency budgets and a rebuild cadence.</li>
-      <li><b>Vector-only retrieval.</b> Exact identifiers, codes and names need lexical matching — hybrid is the default for a reason.</li>
-      <li><b>Changing the embedding model without reindexing.</b> Chapter 15's warning, and it stays the top cause of overnight quality collapse.</li>
+      <li><b>Never measuring recall.</b> Take 1,000 sample queries, compute the exact top-k offline, and track recall@k as a metric you monitor.</li>
+      <li><b>Mixing normalized and unnormalized vectors</b>, or using cosine distance in the index but L2 (straight-line) distance for the query. Quality drops badly, with no error.</li>
+      <li><b>Post-filtering when few items match.</b> Fetch 100, filter down to 3, then wonder why results are poor. Put the filter inside the search.</li>
+      <li><b>Forgetting the index goes stale.</b> Deletes leave tombstones. New documents need a target for how fast they get indexed, and the index needs a regular rebuild.</li>
+      <li><b>Vector-only retrieval.</b> Exact IDs, codes and names need keyword matching. That's why hybrid is the default.</li>
+      <li><b>Changing the embedding model without re-indexing.</b> Old and new vectors aren't comparable (Chapter 15). This is still the top cause of quality collapsing overnight.</li>
     </ul></div></div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Warm-up:</b> When would you pick IVF-PQ over HNSW?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>When memory is the binding constraint. HNSW gives the best recall-per-millisecond but stores full vectors plus a graph, so it's roughly 1.6× the raw vector size in RAM. IVF-PQ compresses vectors into short codes — often 10–50× smaller — so a billion vectors fit on a single machine, at the cost of lossy distances that need a rerank against exact vectors for the top candidates. So: HNSW for tens of millions where latency matters most; IVF-PQ or DiskANN when the corpus is enormous or the RAM budget is fixed.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>When memory is the limiting factor. HNSW gives the best recall for each millisecond, but it stores the full vectors plus a graph, so it needs roughly 1.6× the raw vector size in RAM. IVF-PQ compresses vectors into short codes, often 10–50× smaller, so a billion vectors fit on one machine. The cost is that distances become approximate, so you rerank the top candidates against the exact vectors. In short: HNSW for tens of millions of vectors where speed matters most; IVF-PQ or DiskANN when the collection is huge or the RAM budget is fixed.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Design retrieval for 500M chunks with per-user permissions and a 50 ms p99.</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Shard by document collection or tenant so each shard is a few tens of millions of vectors, with replicas for QPS and availability; fan out and merge. Per shard, use a compressed index (IVF-PQ or int8-quantized HNSW) sized to fit in RAM, and rerank the top ~200 against exact vectors. Permissions go into the index as filters applied during traversal, not afterwards, with ACL changes propagated on a short lag and a documented worst-case staleness. Add a lexical index for exact-identifier queries and fuse with RRF. For latency: cap ef_search per request, keep the fan-out bounded, cache hot queries, and measure recall@k continuously against an offline exact ground truth so I know what the speed is costing me.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>
+      <ul class="mb0">
+        <li><b>Split the data.</b> Shard by document collection or tenant, so each shard holds a few tens of millions of vectors. Add replicas (copies) for throughput and availability. Send each query to all shards and merge the results.</li>
+        <li><b>Per shard:</b> use a compressed index (IVF-PQ or HNSW with int8 vectors) sized to fit in RAM. Rerank the top ~200 against the exact vectors.</li>
+        <li><b>Permissions</b> go into the index as filters applied during the graph walk, not afterwards. Push ACL changes through quickly, and document the worst-case delay.</li>
+        <li><b>Hybrid:</b> add a keyword index for exact-ID queries and merge with RRF.</li>
+        <li><b>Latency:</b> cap ef_search per request, limit how many shards each query hits, and cache popular queries. Keep measuring recall@k against exact offline results, so I know what the speed is costing me.</li>
+      </ul></div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>ANN trades a measurable amount of recall for orders of magnitude in speed — pick the recall target from the application.</li>
-      <li>HNSW is the default for quality and latency; IVF-PQ and disk-based indexes win when memory is the constraint.</li>
-      <li>ef_search / nprobe is a per-query knob: tune effort by request type.</li>
-      <li>Push filters and permissions into the search itself, and plan for deletes and rebuilds.</li>
-      <li>Hybrid lexical + vector retrieval with rank fusion beats either alone on real corpora.</li>
+      <li>ANN gives up a small, measurable amount of recall for a huge gain in speed. Pick the recall target based on the application.</li>
+      <li>HNSW is the default for quality and speed. IVF-PQ and disk-based indexes win when memory is the limit.</li>
+      <li>ef_search / nprobe can be set per query: spend more effort only on requests that need it.</li>
+      <li>Put filters and permissions inside the search itself, and plan for deletes and rebuilds.</li>
+      <li>Hybrid search (keyword + vector, merged by rank) beats either one alone on real data.</li>
     </ul>
   </div>
 
@@ -187,7 +226,7 @@ score(d) = Σ_over_retrievers  1 / (k + rank_in_that_retriever(d))     <span cla
         <button class="opt">The vector dimensionality</button>
         <button class="opt">How many neighbours each node stores</button>
       </div>
-      <div class="explain">Neighbours per node is <code>M</code>, set at build time. <code>ef_search</code> is a query-time parameter you can vary per request.</div>
+      <div class="explain">The number of neighbours per node is <code>M</code>, which is fixed when the index is built. <code>ef_search</code> is set at query time, so you can change it for each request.</div>
     </div>
 
     <div class="quiz" data-answer="2">
@@ -198,7 +237,7 @@ score(d) = Σ_over_retrievers  1 / (k + rank_in_that_retriever(d))     <span cla
         <button class="opt">You're post-filtering: the top-k is fetched first, then almost all of it is discarded</button>
         <button class="opt">Cosine similarity is the wrong metric</button>
       </div>
-      <div class="explain">With a highly selective predicate, post-filtering leaves a handful of results from an unrelated neighbourhood. Apply the filter during traversal, or maintain a separate index for that partition.</div>
+      <div class="explain">When very few items match the filter, post-filtering leaves only a handful of results, and they come from the wrong area of the vector space. Apply the filter during the graph walk, or keep a separate index for that subset.</div>
     </div>
 
     <div class="quiz" data-answer="0">
@@ -209,7 +248,7 @@ score(d) = Σ_over_retrievers  1 / (k + rank_in_that_retriever(d))     <span cla
         <button class="opt">“ways to reduce cloud spend”</button>
         <button class="opt">“why is the app slow at night”</button>
       </div>
-      <div class="explain">Identifiers carry no semantics and tokenize into fragments. Exact lexical matching is what finds them — hence hybrid retrieval.</div>
+      <div class="explain">An ID has no meaning for an embedding to capture, and it gets chopped into random fragments. Exact keyword matching is what finds it. That's why hybrid retrieval exists.</div>
     </div>
 
     <div class="quiz" data-answer="3">
@@ -220,7 +259,7 @@ score(d) = Σ_over_retrievers  1 / (k + rank_in_that_retriever(d))     <span cla
         <button class="opt">Increase ef_search</button>
         <button class="opt">Compressed index (IVF-PQ / disk-based) with a rerank pass on exact vectors</button>
       </div>
-      <div class="explain">Raw float32 alone would be ~3.3 TB. Compression makes the corpus fit; reranking the top candidates against exact vectors restores most of the lost precision.</div>
+      <div class="explain">The raw float32 vectors alone would be about 3.3 TB. Compression makes them fit. Reranking the top candidates against the exact vectors wins back most of the lost accuracy.</div>
     </div>
 
     <div class="quiz" data-answer="1">
@@ -231,7 +270,7 @@ score(d) = Σ_over_retrievers  1 / (k + rank_in_that_retriever(d))     <span cla
         <button class="opt">It compresses vectors</button>
         <button class="opt">It guarantees 100% recall</button>
       </div>
-      <div class="explain">BM25 scores and cosine similarities aren't comparable. RRF uses only ranks, so the two systems can be fused robustly with one parameter.</div>
+      <div class="explain">BM25 scores and cosine similarities are on different scales, so you can't compare them directly. RRF looks only at each result's rank (1st, 2nd, 3rd...), so it can merge the two lists reliably with just one setting.</div>
     </div>
   </div>
 </main>
@@ -334,22 +373,22 @@ score(d) = Σ_over_retrievers  1 / (k + rank_in_that_retriever(d))     <span cla
     if (idx === 'flat') {
       mem = raw; recall = 1;
       latency = N * dim * 2 / 8e9 * 1000;
-      note = 'Exact search. Perfect recall, no build step, trivially correct — and latency grows linearly with the corpus. Below roughly a million vectors this is genuinely the right answer, and people reach for an ANN index far earlier than they need to.';
+      note = 'Exact search. Perfect recall, nothing to build, always correct. But latency grows in step with the number of vectors. Below roughly a million vectors this really is the right answer, and people often reach for an ANN index far sooner than they need to.';
     } else if (idx === 'hnsw') {
       mem = raw * 1.6;
       recall = clamp(0.62 + 0.36 * (1 - Math.exp(-effort / 18)), 0, 0.999);
       latency = 0.15 + effort * 0.045 + Math.log10(N) * 0.25;
-      note = 'The default choice. Recall rises quickly with ef_search and then flattens, so there is a knee beyond which you pay latency for nothing — find it with a recall-vs-ef sweep on your own data. Memory is the catch: full vectors plus graph links.';
+      note = 'The default choice. Recall rises quickly with ef_search and then levels off. Past that point you pay latency for almost nothing, so find it by testing several ef values on your own data. The catch is memory: it stores the full vectors plus the graph links.';
     } else if (idx === 'ivfpq') {
       mem = N * (dim / 8) + raw * 0.02;
       recall = clamp(0.48 + 0.42 * (1 - Math.exp(-effort / 22)), 0, 0.97);
       latency = 0.3 + effort * 0.06 + Math.log10(N) * 0.3;
-      note = 'Vectors are compressed into product-quantized codes, so memory drops by roughly an order of magnitude and billions of vectors become affordable. Distances are approximate twice over, so a rerank pass against exact vectors for the top few hundred candidates is essentially mandatory.';
+      note = 'Vectors are compressed into short product-quantized codes, so memory drops about 10× and billions of vectors become affordable. Distances are now approximate in two ways (clusters and compression), so you really must rerank the top few hundred candidates against the exact vectors.';
     } else {
       mem = N * dim / 8 + raw * 0.01;
       recall = clamp(0.40 + 0.45 * (1 - Math.exp(-effort / 25)), 0, 0.95);
       latency = 0.08 + effort * 0.02 + Math.log10(N) * 0.15;
-      note = 'One bit per dimension with Hamming distance: 32× smaller and extremely fast, because the comparison is a popcount. On its own recall is mediocre; as a first-stage filter feeding an exact rerank of the top ~1,000 it is remarkably strong for the memory.';
+      note = 'One bit per dimension, compared with Hamming distance: 32× smaller and extremely fast, because comparing is just counting differing bits (a single CPU instruction, popcount). On its own, recall is mediocre. As a first rough filter feeding an exact rerank of the top ~1,000, it is remarkably strong for so little memory.';
     }
     const rows = [
       ['Recall@10', recall, recall > 0.95 ? 'var(--green)' : recall > 0.85 ? 'var(--amber)' : 'var(--red)', (recall * 100).toFixed(1) + '%'],
@@ -361,7 +400,7 @@ score(d) = Σ_over_retrievers  1 / (k + rank_in_that_retriever(d))     <span cla
       `<div class="r"><span>${n}</span><div class="tk"><i style="width:${clamp(f * 100, 2, 100)}%;background:${c}"></i></div><span class="v">${v}</span></div>`).join('');
     $('#tInfo p').innerHTML = note +
       (mem > 200e9 ? ' <b>⚠️ At this size the index will not fit on one machine — plan sharding.</b>' : '') +
-      (latency > 20 ? ' <b>⚠️ Latency is too high for an interactive path; reduce effort or shard to parallelise.</b>' : '');
+      (latency > 20 ? ' <b>⚠️ Too slow for something a user is waiting on. Lower the effort, or shard so the work runs in parallel.</b>' : '');
   }
   ['#tN', '#tDim', '#tEffort'].forEach(id => $(id).addEventListener('input', tune));
   $('#tIdx').addEventListener('segchange', tune);

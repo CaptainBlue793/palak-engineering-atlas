@@ -2,16 +2,16 @@
 
 **[captainblue793.github.io/palak-engineering-atlas](https://captainblue793.github.io/palak-engineering-atlas/)**
 
-Every interactive engineering course I've written, in one place — **150 chapters, ~111 hours,
+Every interactive engineering course I've written, in one place — **174 chapters (150 main chapters plus a 24-chapter Prerequisites level), ~129 hours,
 zero dependencies**. No walls of text: every chapter has animated diagrams, simulators you can
 break, an interview drill and a quiz. It all runs in your browser, offline, with no account and
 no build step.
 
 | Course | Chapters | Covers |
 |---|---|---|
-| **[System Design](system-design/)** | 42 | Caching, sharding, queues, consensus, multi-region — plus 17 case studies |
-| **[ML & AI Systems](ml-ai-systems/)** | 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
-| **[DSA](dsa/)** | 56 | Every structure and algorithm, in one consistent C++ house style |
+| **[System Design](system-design/)** | 8 prerequisites + 42 | Caching, sharding, queues, consensus, multi-region — plus 17 case studies |
+| **[ML & AI Systems](ml-ai-systems/)** | 8 prerequisites + 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
+| **[DSA](dsa/)** | 8 prerequisites + 56 | Every structure and algorithm, in one consistent C++ house style |
 
 ```
 palak-engineering-atlas/
@@ -30,7 +30,7 @@ entry point:
 
 - **Combined progress** — reads each course's own `localStorage` key (`sd-done`, `ml-done`,
   `dsa-done`), so ticking a chapter off inside a course shows up on the hub, and vice versa.
-  The chapter mosaic on the home page is one square per chapter, all 150 of them.
+  The chapter mosaic on the home page is one square per chapter, all 174 of them.
 - **Resume** — deep-links to the next unread chapter of whichever course you're furthest into.
 - **Cross-course search** — `Ctrl+K` (or `/`) searches ~3,500 chapter, section and demo entries
   across all three courses at once, filterable by course, deep-linking to the exact anchor.

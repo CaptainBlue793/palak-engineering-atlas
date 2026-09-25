@@ -28,15 +28,27 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 47</span><span class="pill pink">Case Study</span><span class="pill">⏱ 50 min</span></div>
     <h1>Case Study: <span class="grad">Code Assistant</span></h1>
-    <p class="lead">Inline completions for 500,000 developers, fired on almost every keystroke. The model must see enough of a million-line repository to be useful, answer before the developer has finished thinking, and be wrong quietly — because a suggestion that arrives late or reads badly is worse than no suggestion at all.</p>
+    <p class="lead">You're building inline code completion (the grey "ghost text" that appears as you type) for 500,000 developers. A request fires on almost every keystroke. The model must see enough of a million-line repository to be useful. It must answer before the developer has finished thinking. And when it's wrong, it must be wrong quietly — a suggestion that arrives late or reads badly is worse than no suggestion at all.</p>
     <ul class="objectives">
-      <li>Design the keystroke-to-suggestion path under a 200 ms budget</li>
-      <li>Use fill-in-the-middle and repo context without blowing that budget</li>
-      <li>Cancel, debounce and cache aggressively — most requests should never reach a GPU</li>
-      <li>Measure acceptance and retention rather than token-level accuracy</li>
+      <li>Design the path from keystroke to suggestion within a 200 ms budget</li>
+      <li>Use fill-in-the-middle and repository context without going over that budget</li>
+      <li>Cancel, debounce and cache hard — most requests should never reach a GPU</li>
+      <li>Measure whether people accept and keep suggestions, not token-level accuracy</li>
       <li>Handle the security and licensing problems that come with generating code</li>
     </ul>
   </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>How a transformer generates text token by token.</b> Prompt in, one token out at a time, with a KV cache holding its working memory — <a href="14-transformers.html">Chapter 14</a>.</li>
+        <li><b>Prefill vs decode, batching and prefix caching.</b> Why reading the prompt and writing the answer cost different things — <a href="26-inference-serving.html">Chapter 26</a>.</li>
+        <li><b>Quantization and speculative decoding.</b> The two tricks that make a small model fast enough — <a href="27-compression.html">Chapter 27</a>.</li>
+        <li><b>A/B tests and guardrail metrics.</b> How to tell whether a change actually helped — <a href="33-deployment-experiments.html">Chapter 33</a>.</li>
+        <li><b>Percentiles and back-of-envelope arithmetic.</b> What p50/p95 mean and how to turn "per day" into "per second" — <a href="p5-probability-stats.html">P5: Probability &amp; Statistics</a>.</li>
+      </ul></div>
+  </div>
 
   <h2>1 · Requirements</h2>
   <div class="req">
@@ -47,18 +59,24 @@
     <div><b>p95 latency</b><span>&lt; 300 ms</span></div>
     <div><b>Target acceptance</b><span>&gt; 25%</span></div>
   </div>
-  <p class="small muted" style="margin-top:10px"><b>In scope:</b> inline completion, repo context, serving, caching, evaluation, safety. <b>Out of scope:</b> pretraining the code model (Chapter 16), the agentic multi-file editing mode, the IDE extension's UI.</p>
+  <p class="small muted" style="margin-top:10px"><b>In scope:</b> inline completion, repo context, serving, caching, evaluation, safety. <b>Out of scope:</b> pretraining the code model (Chapter 16), the agent mode that edits many files, the IDE extension's UI. p50 is the median: half of requests are faster than this.</p>
+  <p><b>Where the numbers come from.</b> 900M requests ÷ 500k developers = 1,800 requests per developer per day. Spread over about six hours of actual typing, that is one request every 12 seconds — believable once you remember a request can fire at every pause. The daily average is 900M ÷ 86,400 seconds ≈ 10,400 requests per second. But developers don't type evenly around the clock: most work happens in a few hours of overlapping time zones on weekdays. A peak of about 4× the average is a common rule of thumb, which gives the ~45k QPS in the box. You size the fleet for the peak, not the average.</p>
 
   <div class="callout tip">
     <div class="ico">🎯</div>
     <div class="body"><div class="title">Metrics</div>
-      <p><b>Primary:</b> accepted characters retained — code the developer kept in the file some minutes later, not merely pressed Tab on. <b>Secondary:</b> acceptance rate, suggestion shown rate, weekly active users, share of characters typed by the assistant. <b>Guardrails:</b> p50 and p95 latency, cost per accepted completion, the rate of suggestions that fail to compile or lint, and the secret-leak rate. <b>Deliberately not primary:</b> next-token accuracy, which correlates weakly with anything a developer cares about.</p></div>
+      <p><b>Primary:</b> accepted characters retained — code the developer still has in the file some minutes later, not just code they pressed Tab on.</p>
+      <p><b>Secondary:</b> acceptance rate, how often a suggestion is shown, weekly active users, and the share of characters typed by the assistant.</p>
+      <p><b>Guardrails:</b> p50 and p95 latency, cost per accepted completion, how often suggestions fail to compile or fail the linter, and how often secrets leak.</p>
+      <p><b>Deliberately not primary:</b> next-token accuracy. It barely tracks anything a developer cares about.</p>
+      <p><b>A tiny example of the difference.</b> Suppose 100 suggestions are shown. 30 are accepted — a 30% acceptance rate. Five minutes later, 12 of those 30 have been deleted or rewritten. If the 30 accepted suggestions totalled 900 characters and the 18 survivors hold 500 of them, retained characters is 500, not 900. A change that raised acceptance to 35% but left only 400 characters standing made the product worse, and only the retained number shows it.</p></div>
   </div>
 
   <div class="callout warn">
     <div class="ico">⏱️</div>
     <div class="body"><div class="title">Latency is the product</div>
-      <p>A completion at 80 ms feels like the editor reading your mind. The same completion at 600 ms arrives after you have typed past it and reads as noise you have to dismiss. Internal experiments in this product category consistently show acceptance falling steeply as latency rises, well before users would call it "slow". That reframes every design choice: a smaller model that answers in 90 ms beats a better model that answers in 400 ms, and most of the engineering here is about not doing work rather than doing it faster.</p></div>
+      <p>A completion at 80 ms feels like the editor reading your mind. The same completion at 600 ms arrives after you've typed past it. Now it's just noise you have to dismiss.</p>
+      <p>Experiments on products like this keep showing the same thing: acceptance drops steeply as latency rises, long before users would call it "slow". That changes every design choice. A smaller model that answers in 90 ms beats a better model that answers in 400 ms. Most of the engineering here is about avoiding work, not doing work faster.</p></div>
   </div>
 
   <h2>2 · The completion path</h2>
@@ -85,19 +103,30 @@
     </div>
     <div class="stepper" data-diagram="cSvg">
       <ol class="steps">
-        <li data-title="Debounce and cancel in the editor" data-on="k-ide">Fire after a short typing pause, not on every character, and cancel the in-flight request the moment the next keystroke lands. Without this you pay for three or four requests per accepted suggestion, and the cancelled ones still occupy GPU slots. The single highest-leverage optimisation here runs entirely on the client.</li>
-        <li data-title="Build the context locally" data-on="k-ide k-ctxb k-e1 k-repo k-ctx" data-packet="k-ide>k-ctxb">The prefix (code before the cursor), the suffix (code after it), the file path and language, plus snippets from recently edited and open files and the symbols the current file imports. Assembled inside the IDE against a local index — a network round trip to fetch context would eat the entire budget.</li>
-        <li data-title="Edge cache" data-on="k-ctxb k-gw k-e2 k-tel k-cache" data-packet="k-ctxb>k-gw" data-color="var(--green)">Hash the assembled prompt. Developers retype, undo, move the cursor back and re-trigger constantly, so an exact-match cache serves a surprising share of traffic in single-digit milliseconds. A close second: cache the model's KV prefix for the file so a second request on the same file skips most of the prefill.</li>
-        <li data-title="Fill-in-the-middle inference" data-on="k-gw k-inf k-e3" data-packet="k-gw>k-inf" data-color="var(--accent-2)">A small, quantized model — a few billion parameters — with a strict output cap: typically one line or one block, not a page. Speculative decoding with a tiny draft model roughly doubles throughput on code, which is unusually predictable text (Chapter 27).</li>
-        <li data-title="Post-process before showing" data-on="k-inf k-post k-e4" data-packet="k-inf>k-post" data-color="var(--amber)">Trim at the first point where the suggestion starts repeating the suffix; stop at the end of the current block; check it parses; drop anything containing a credential-shaped string. A syntactically broken suggestion costs the developer more attention than an empty one.</li>
-        <li data-title="Render — or discard silently" data-on="k-post k-ide k-back" data-packet="k-post>k-ide">If the developer has typed since the request left, the result is thrown away and never shown. Ghost text appears only if it still matches what is on screen. Roughly one in four shown suggestions is accepted; the rest should cost the developer nothing to ignore.</li>
-        <li data-title="Log what actually happened" data-on="k-tel">Shown, accepted, and — the number that matters — still present in the file some minutes later. Acceptance alone rewards suggestions that are easy to Tab through and immediately deleted (Chapter 33).</li>
+        <li data-title="Debounce and cancel in the editor" data-on="k-ide">Debounce: wait for a short pause in typing instead of firing on every character. Then cancel the request in flight as soon as the next key is pressed. Without this, you pay for three or four requests per accepted suggestion, and the cancelled ones still take up GPU slots. The single most valuable optimisation here runs entirely in the editor.</li>
+        <li data-title="Build the context locally" data-on="k-ide k-ctxb k-e1 k-repo k-ctx" data-packet="k-ide>k-ctxb">The editor gathers the prefix (code before the cursor), the suffix (code after it), the file path and language. It adds snippets from recently edited and open files, plus the symbols (functions, classes) the current file imports. This all happens inside the IDE using a local index. A network round trip to fetch context would use up the whole budget.</li>
+        <li data-title="Edge cache" data-on="k-ctxb k-gw k-e2 k-tel k-cache" data-packet="k-ctxb>k-gw" data-color="var(--green)">Hash the finished prompt and check a cache. Developers retype, undo, move the cursor back and re-trigger all the time. So an exact-match cache answers a surprising share of requests in a few milliseconds. Nearly as useful: cache the model's KV prefix (its saved working memory) for the file, so a second request on the same file skips most of the prefill.</li>
+        <li data-title="Fill-in-the-middle inference" data-on="k-gw k-inf k-e3" data-packet="k-gw>k-inf" data-color="var(--accent-2)">A small, quantized model (numbers stored with fewer bits, so it runs faster) with a few billion parameters. Output has a strict cap: usually one line or one block, not a page. Speculative decoding — a tiny draft model guesses tokens and the main model checks them — roughly doubles speed on code, because code is unusually predictable (Chapter 27).</li>
+        <li data-title="Post-process before showing" data-on="k-inf k-post k-e4" data-packet="k-inf>k-post" data-color="var(--amber)">Cut the suggestion off where it starts repeating the code below the cursor. Stop at the end of the current block. Check that it parses. Drop anything that looks like a password or API key. A broken suggestion wastes more of the developer's attention than no suggestion.</li>
+        <li data-title="Render — or discard silently" data-on="k-post k-ide k-back" data-packet="k-post>k-ide">If the developer has typed since the request left, the result is thrown away unseen. Ghost text only appears if it still fits what's on screen. About one in four shown suggestions is accepted. The rest should cost the developer nothing to ignore.</li>
+        <li data-title="Log what actually happened" data-on="k-tel">Record whether it was shown, whether it was accepted, and — the number that matters — whether it was still in the file some minutes later. Acceptance alone rewards suggestions that are easy to Tab in and then delete straight away (Chapter 33).</li>
       </ol>
     </div>
   </div>
 
+  <p><b>Debouncing, worked through.</b> Say a developer types <code>user.get_</code> at 8 keystrokes a second: one every 125 ms. A 75 ms debounce expires before the next key, so all 9 keys still send requests. Now consider a short burst with 50 ms between keys. Each key resets that same 75 ms timer before it expires, so the burst sends just one request after the final key. Debouncing only merges keys whose gaps are shorter than the delay. Increasing the delay saves more requests but makes every suggestion wait longer; cancellation and caching must handle the requests that still go out.</p>
+  <p><b>Why build context in the editor, not on the server?</b> The obvious design is to send the file to a backend that looks up context in a central index. But the editor already has everything: the open buffers, the unsaved edits, the recent-edit history. A server-side index would lag behind unsaved changes and add a network round trip (often 30–80 ms on its own). Keeping it local makes context both fresher and faster. The trade-off is that the editor extension has to stay light — it must never make typing itself feel sluggish, so indexing runs in the background at low priority.</p>
+  <p><b>Edge cases the path must handle.</b></p>
+  <ul>
+    <li><b>The backend is slow or down.</b> The editor simply shows nothing. There's no error dialog, no spinner — a missing suggestion is the correct failure.</li>
+    <li><b>The response arrives but the text has changed a little.</b> If the developer typed <code>re</code> and the suggestion starts with <code>return</code>, the editor can still show the remaining <code>turn …</code>. If what they typed contradicts the suggestion, it's thrown away.</li>
+    <li><b>The cursor is in the middle of a word.</b> Tokenizers split words into chunks, so a prompt ending in <code>pri</code> can push the model toward odd continuations. A common fix is to back the prompt up to the last clean token boundary and require the output to start with the characters that were cut.</li>
+    <li><b>Files the model shouldn't touch.</b> Generated files, minified bundles, huge data files and files the user or their company has excluded (for example, <code>.env</code>) are skipped before any request is built.</li>
+  </ul>
+
   <h2>3 · Deep dive: fill-in-the-middle</h2>
-  <p>A left-to-right model only sees what is above the cursor. Real editing happens in the middle of a file, where the code below the cursor is the strongest signal about what belongs. FIM training reorders documents so the model learns to condition on both sides.</p>
+  <p>A normal left-to-right model only sees what's above the cursor. But real editing happens in the middle of a file. There, the code below the cursor is the strongest clue about what belongs in the gap. Fill-in-the-middle (FIM) training reorders documents so the model learns to use both sides.</p>
+  <p>It's like a fill-in-the-blank exercise: knowing how the sentence ends makes the blank much easier to fill.</p>
 
   <div class="fim">
 <span class="tok">&lt;PRE&gt;</span><span class="pre">def parse_config(path: str) -&gt; dict:
@@ -108,13 +137,17 @@
 </span><span class="tok">&lt;MID&gt;</span><span class="mid">data = json.loads(raw)
     validated = ConfigSchema(**data).dict()</span>
   </div>
-  <p class="small muted" style="margin-top:8px">The training document is rearranged into prefix, then suffix, then middle, so at inference the model is asked to continue after <code>&lt;MID&gt;</code> with both sides already in context. The same model still serves plain left-to-right completion when there is no suffix — one model, two shapes of request.</p>
+  <p class="small muted" style="margin-top:8px">Each training document is rearranged into prefix, then suffix, then middle. So when it's used, the model is asked to continue after <code>&lt;MID&gt;</code>, with both sides already in view. The same model still handles plain left-to-right completion when there's no suffix. One model serves both kinds of request.</p>
+  <p><b>How the training data is made.</b> Take an ordinary source file. Pick two random cut points, which split it into three pieces: A (before), B (between), C (after). Rewrite the document as <code>&lt;PRE&gt; A &lt;SUF&gt; C &lt;MID&gt; B</code> and train on it with the usual next-token objective. Nothing about the model changes — only the order of the text. Because the model has seen C before it has to write B, it learns to write a middle that joins up with what follows. Usually only a share of documents is rearranged this way, so the model keeps its normal left-to-right skill.</p>
+  <p><b>Why not just paste the suffix into the prompt as a comment?</b> You could put "the code below the cursor is: …" above the prefix and hope. But a model trained only left to right has never learned to treat text <i>earlier</i> in the prompt as something its output must connect to <i>afterwards</i>. It tends to ignore it or copy it. FIM teaches that exact skill for the price of reordering the training data.</p>
+  <p><b>Edge cases.</b> At the end of a file the suffix is empty, so the request is plain left-to-right completion. When the suffix is very long, you keep only the part nearest the cursor — typically the next few dozen lines — because the end of the file rarely tells you what goes on this line. And the model must know when to stop: training includes an end-of-middle token, so a good FIM model emits it when the gap is filled rather than writing on into code that already exists below.</p>
 
   <div class="callout tip">
     <div class="ico">🧩</div>
     <div class="body"><div class="title">Repo context: retrieval with a millisecond budget</div>
-      <p>Embedding-based retrieval over the repository is the obvious idea and usually the wrong one here: even 40 ms of vector search is a third of the budget, and it happens on every keystroke. What works is cheaper and mostly lexical, computed continuously in the background by the IDE:</p>
-      <p><b>Recently edited files</b> (the strongest single signal — you are usually working on related code), <b>open tabs</b>, <b>the symbols this file imports</b> resolved to their definitions, <b>sibling files in the same directory</b>, and identifier overlap with the current function. Rank these by a simple score, take a few hundred tokens each, and stop. The heavier retrieval belongs in chat and agent modes, where a 400 ms retrieval is invisible next to a multi-second answer.</p></div>
+      <p>Searching the repository by meaning (embedding-based vector search) is the obvious idea, and usually the wrong one here. Even 40 ms of vector search is a third of the budget, and it would run on every keystroke. What works is cheaper and mostly based on matching names and words. The IDE keeps it up to date in the background:</p>
+      <p><b>Recently edited files</b> (the strongest single signal — you're usually working on related code), <b>open tabs</b>, <b>the symbols this file imports</b> with their definitions looked up, <b>other files in the same folder</b>, and shared identifier names with the current function. Rank these with a simple score, take a few hundred tokens from each, and stop. Heavier search belongs in chat and agent modes, where 400 ms of search goes unnoticed next to an answer that takes several seconds.</p>
+      <p><b>A typical 2,500-token prompt, split up:</b> about 1,200 tokens of prefix, 400 of suffix, four context snippets of about 200 tokens each (800), and around 100 tokens of file path, language tag and separators. When the budget is tight, the prefix near the cursor wins; far-away snippets are the first thing dropped.</p></div>
   </div>
 
   <h2>4 · Deep dive: spending the 200 ms</h2>
@@ -133,28 +166,31 @@
     </div>
   </div>
 
+  <p><b>Why the bars shrink the way they do.</b> Prefill is compute-bound: the model does about 2 × (parameters) × (prompt tokens) arithmetic operations. For a 3B model and a 2,500-token prompt that's 2 × 3×10⁹ × 2,500 = 1.5×10¹³, or 15 trillion operations. A modern data-centre GPU sustains a few hundred trillion per second in practice, so that's a few tens of milliseconds — in line with the 62 ms bar once you add batching overhead. A 30B model does ten times the arithmetic, which is why its prefill bar is so long even when split across several GPUs. Decode is different: it's limited by memory bandwidth, because each new token requires reading every weight once. A 3B model stored in 4 bits is about 1.5 GB; at roughly 2–3 TB/s that's under a millisecond per token at best, and a few milliseconds in a busy batch. Twenty-five tokens is tens of milliseconds, which is why capping the output is as powerful as shrinking the model.</p>
+  <p><b>Why caching gives the biggest cut.</b> Prefill is the largest bar, and prefix caching attacks it directly. If the first 2,000 of 2,500 prompt tokens (the top of the file) are unchanged since the last request, the replica only has to process the last 500 — about a fifth of the work. That only works if the next request for that file lands on the replica that holds its cache, which is why routing is "sticky" per file or per user.</p>
+
   <h2>5 · Deep dive: measuring whether it helps</h2>
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Signal</th><th>What it captures</th><th>How it lies</th></tr></thead>
       <tbody>
-        <tr><td>Next-token accuracy</td><td>Model fit on held-out code</td><td>Improves while acceptance stays flat; it rewards matching the original author, not being useful</td></tr>
-        <tr><td>Unit-test pass rate on benchmarks</td><td>Function-level correctness</td><td>Public benchmarks leak into pretraining; solving a puzzle is not completing a line in your codebase</td></tr>
+        <tr><td>Next-token accuracy</td><td>How well the model predicts held-out code it wasn't trained on</td><td>Can improve while acceptance stays flat; it rewards copying the original author, not being useful</td></tr>
+        <tr><td>Unit-test pass rate on benchmarks</td><td>Whether whole functions are correct</td><td>Public benchmarks leak into training data; solving a puzzle isn't the same as finishing a line in your codebase</td></tr>
         <tr><td>Acceptance rate</td><td>Did the developer press Tab?</td><td>Rewards short, safe, obvious suggestions — and accepting then deleting still counts</td></tr>
-        <tr><td><b>Retained characters</b></td><td>Still in the file minutes later</td><td>The best available proxy; noisy per-user, reliable in aggregate</td></tr>
-        <tr><td>Time to complete a task</td><td>The thing you actually care about</td><td>Requires a controlled study; too slow to guide a weekly release train</td></tr>
-        <tr><td>Weekly retention</td><td>Does anyone still use it?</td><td>Lags by weeks, but it is the honest verdict</td></tr>
+        <tr><td><b>Retained characters</b></td><td>Still in the file minutes later</td><td>The best signal available; noisy for one user, reliable across many</td></tr>
+        <tr><td>Time to complete a task</td><td>The thing you actually care about</td><td>Needs a controlled study; too slow to guide weekly releases</td></tr>
+        <tr><td>Weekly retention</td><td>Does anyone still use it?</td><td>Arrives weeks late, but it's the honest verdict</td></tr>
       </tbody>
     </table>
   </div>
-  <p class="small muted" style="margin-top:8px">Ship through online experiments with retained characters as the primary metric and latency as a guardrail (Chapter 33). Offline suites gate releases; only live traffic settles whether a change helped.</p>
+  <p class="small muted" style="margin-top:8px">Ship changes through live A/B experiments, with retained characters as the main metric and latency as a guardrail (Chapter 33). Offline test suites decide whether a release can go out. Only live traffic tells you whether a change actually helped.</p>
 
   <div class="callout warn">
     <div class="ico">🔑</div>
     <div class="body"><div class="title">Three failure modes that are not about quality</div>
-      <p><b>Secrets.</b> Models trained on public code will occasionally emit credential-shaped strings, and developers do paste keys into files. Scan every suggestion with the same detectors you run in CI, and never log raw prompts without redaction — the prompt <em>is</em> the customer's source code.</p>
-      <p><b>Licensing.</b> Long verbatim reproductions of distinctive training code create a legal exposure that no accuracy metric shows. A near-duplicate check against known corpora, plus an option to suppress long exact matches, is the standard mitigation.</p>
-      <p><b>Injection through the repository.</b> In agent and chat modes the model reads files, and a comment in a file can be written by anyone who can open a pull request. Treat repository content as data, and require confirmation before the assistant runs a command or edits outside the file in view (Chapter 36).</p></div>
+      <p><b>Secrets.</b> Models trained on public code sometimes output strings that look like passwords or API keys. And developers really do paste keys into files. Scan every suggestion with the same secret detectors you run in CI. Never log raw prompts without removing sensitive parts first — the prompt <em>is</em> the customer's source code.</p>
+      <p><b>Licensing.</b> If the model copies long, distinctive chunks of its training code word for word, that creates a legal risk no accuracy metric will show. The standard fix is a near-duplicate check against known code collections, plus an option to block long exact matches.</p>
+      <p><b>Injection through the repository.</b> In agent and chat modes, the model reads files. A comment in a file can be written by anyone who can open a pull request. Treat repository content as data, and ask the user to confirm before the assistant runs a command or edits anything outside the file on screen (Chapter 36).</p></div>
   </div>
 
   <h2>6 · Capacity and cost</h2>
@@ -162,47 +198,57 @@
     <table class="t">
       <thead><tr><th>Quantity</th><th>Estimate</th><th>Notes</th></tr></thead>
       <tbody>
-        <tr><td>Requests reaching a GPU</td><td>~35% of ~900M/day</td><td>Debounce, cancellation and caching remove the rest</td></tr>
+        <tr><td>Requests reaching a GPU</td><td>~35% of ~900M/day</td><td>Debouncing, cancelling and caching remove the rest</td></tr>
         <tr><td>Prompt tokens</td><td>~2.5k per request</td><td>Prefix, suffix, plus a few context snippets</td></tr>
         <tr><td>Output tokens</td><td>~25 per request</td><td>Hard cap; a long suggestion is almost never accepted</td></tr>
         <tr><td>Serving fleet</td><td>~600 GPUs at peak</td><td>Small quantized model, continuous batching, speculative decoding</td></tr>
-        <tr><td>Cost per accepted completion</td><td>~£0.0009</td><td>Dominated by prefill, not decode — the opposite of a chat product</td></tr>
+        <tr><td>Cost per accepted completion</td><td>~£0.0009</td><td>Mostly prefill (reading the prompt), not decode (writing output) — the opposite of a chat product</td></tr>
         <tr><td>Chat and agent modes</td><td>~4% of requests, ~45% of spend</td><td>Long contexts and large models; budgeted separately</td></tr>
       </tbody>
     </table>
   </div>
-  <p class="small muted" style="margin-top:8px">Note the inversion against Chapter 45: here the prompt is long and the output is tiny, so prefill dominates and prefix caching matters more than decode throughput. The same serving stack, tuned in the opposite direction.</p>
+  <p class="small muted" style="margin-top:8px">Notice this is the reverse of Chapter 45. Here the prompt is long and the output is tiny. So prefill is the main cost, and prefix caching matters more than decode speed. It's the same serving stack, tuned in the opposite direction.</p>
+  <p><b>The arithmetic behind the table.</b></p>
+  <ol>
+    <li><b>GPU requests at peak:</b> 45k QPS × 35% ≈ 16k requests per second reach the model.</li>
+    <li><b>Prompt tokens at peak:</b> 16k × 2,500 = 40M prompt tokens per second. If prefix caching means only about a third of those are new work, that's roughly 13M tokens per second to prefill.</li>
+    <li><b>Per GPU:</b> 13M ÷ 600 GPUs ≈ 22k prefill tokens per second each. For a 3B model that's 2 × 3×10⁹ × 22,000 ≈ 1.3×10¹⁴ operations per second — a realistic fraction of what one modern GPU can sustain, with headroom left for decode and spikes.</li>
+    <li><b>Daily cost:</b> assume ~£2 per GPU-hour. Even if all 600 GPUs ran all day (autoscaling means they don't), that's 600 × 24 × £2 ≈ £28.8k per day.</li>
+    <li><b>Accepted completions per day:</b> if roughly 15% of the 900M requests end with a suggestion on screen, and about a quarter of those are accepted, that's 900M × 0.15 × 0.25 ≈ 34M.</li>
+    <li><b>Cost per accepted completion:</b> £28.8k ÷ 34M ≈ £0.00085, or about £0.0009 — under a tenth of a penny.</li>
+  </ol>
+  <p>The useful lesson is which lever moves which line. Better debouncing shrinks step 1. Better caching shrinks step 2. A smaller model shrinks step 3. A better acceptance rate shrinks step 6 without touching the fleet at all.</p>
 
   <h2>7 · What breaks</h2>
   <div class="table-wrap">
     <table class="t">
       <thead><tr><th>Failure</th><th>Symptom</th><th>Response</th></tr></thead>
       <tbody>
-        <tr><td>Cancellation not honoured server-side</td><td>GPU load far above accepted suggestions</td><td>Propagate client disconnect to the scheduler; abandon partial decodes</td></tr>
-        <tr><td>Latency regression from a context change</td><td>Acceptance falls with no model change</td><td>Latency is a release gate; alert on p50, not only p95</td></tr>
-        <tr><td>Suggestions duplicate the code below</td><td>Ugly, obviously wrong completions</td><td>Trim against the suffix in post-processing; check FIM token formatting</td></tr>
-        <tr><td>Repo index stale after a branch switch</td><td>Context cites deleted symbols</td><td>Watch the working tree; invalidate on checkout</td></tr>
-        <tr><td>One enormous monorepo file</td><td>Prompt blows the context budget, latency spikes</td><td>Cap context bytes; truncate around the cursor, never from the front</td></tr>
-        <tr><td>Secret emitted in a suggestion</td><td>Credential appears in a developer's file</td><td>Pre-display scanning, plus redaction in every telemetry path</td></tr>
+        <tr><td>Server ignores cancellations</td><td>GPU load far higher than accepted suggestions would explain</td><td>Pass the client's disconnect on to the scheduler; stop half-finished generations</td></tr>
+        <tr><td>A context change makes things slower</td><td>Acceptance falls even though the model didn't change</td><td>Make latency a release gate; alert on p50, not only p95</td></tr>
+        <tr><td>Suggestions repeat the code below</td><td>Ugly, obviously wrong completions</td><td>Trim against the suffix after generation; check the FIM token formatting</td></tr>
+        <tr><td>Repo index out of date after switching branch</td><td>Context mentions symbols that no longer exist</td><td>Watch the working files; clear the index on checkout</td></tr>
+        <tr><td>One enormous file in a monorepo</td><td>Prompt goes over the context budget, latency spikes</td><td>Cap context size; cut around the cursor, never from the top</td></tr>
+        <tr><td>Secret appears in a suggestion</td><td>A password or key lands in a developer's file</td><td>Scan before display, and remove secrets from every logging path</td></tr>
       </tbody>
     </table>
   </div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Follow-up:</b> “You have a model with clearly better offline scores but 250 ms more latency. Ship it?”</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Not for inline completion, and I would want the experiment to prove it rather than arguing from principle. Acceptance is strongly latency-sensitive in this product shape, so a model that is better per suggestion but arrives after the developer has typed past it will usually lose on retained characters — the offline win never reaches the user. What I would do instead: run it as a shadow to confirm the quality gap is real on our traffic, then try to buy the latency back — quantization, speculative decoding, a tighter output cap, better prefix caching. If it still cannot fit the budget, route it to the modes where the budget is different: chat, multi-line block completion on an explicit trigger, and the agent path, where 400 ms is invisible. Two models serving two latency regimes is a perfectly good answer, and it is usually the right one.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Not for inline completion — and I'd want an experiment to prove it, not just argue from principle. In this kind of product, acceptance is very sensitive to latency. A model whose suggestions are better, but arrive after the developer has typed past them, will usually lose on retained characters. The offline win never reaches the user. What I'd do instead: run it in shadow (alongside, not shown) to confirm the quality gap is real on our traffic. Then try to win the latency back with quantization, speculative decoding, a tighter output cap and better prefix caching. If it still doesn't fit the budget, use it where the budget is different: chat, multi-line completion the user asks for explicitly, and agent mode, where 400 ms goes unnoticed. Two models for two latency needs is a perfectly good answer, and usually the right one.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Follow-up:</b> “Acceptance rate went up 3% after a change. Is that good?”</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>It is a hypothesis, not a result. Acceptance is gameable in ways that hurt users: shortening suggestions raises it, suggesting only in trivially predictable positions raises it, and a developer who accepts then immediately deletes still counts. I would check retained characters — is the accepted code still there minutes later? — and the shown rate, because acceptance is a ratio and it moves if the denominator changes. Then slice by language, by file size and by whether the suggestion was single or multi-line, since an aggregate win often hides a regression in the languages a minority of developers use all day. If retained characters moved with acceptance and latency held, I would believe it and ship.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It's a hypothesis, not a result. Acceptance can be pushed up in ways that hurt users. Shorter suggestions raise it. Only suggesting where the answer is obvious raises it. And a developer who accepts and then deletes straight away still counts. I'd check retained characters: is the accepted code still there minutes later? I'd also check the shown rate. Acceptance is a ratio (accepted ÷ shown), so it moves if the bottom number changes. Then I'd break it down by language, file size, and single-line versus multi-line suggestions. An overall win often hides a drop in languages that a minority of developers use all day. If retained characters rose along with acceptance, and latency held, I'd believe it and ship.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Latency is the dominant quality lever for inline completion; a smaller fast model usually beats a better slow one.</li>
-      <li>Most of the win comes from not doing work — debouncing, cancelling and caching remove roughly two-thirds of requests before a GPU sees them.</li>
-      <li>Fill-in-the-middle exists because real editing happens mid-file, and the code below the cursor is a strong signal.</li>
-      <li>Repo context must be assembled locally from cheap signals; embedding search is too slow for the keystroke path.</li>
-      <li>Measure retained characters, not acceptance and certainly not token accuracy — and treat secret leakage and licensing as first-class failure modes.</li>
+      <li>For inline completion, latency matters more than anything else. A smaller, fast model usually beats a better, slow one.</li>
+      <li>Most of the win comes from avoiding work. Debouncing, cancelling and caching remove about two-thirds of requests before a GPU sees them.</li>
+      <li>Fill-in-the-middle exists because real editing happens mid-file, and the code below the cursor is a strong clue.</li>
+      <li>Build repo context locally from cheap signals. Embedding search is too slow to run on every keystroke.</li>
+      <li>Measure retained characters — not acceptance, and certainly not token accuracy. Treat secret leaks and licensing as serious failure modes.</li>
     </ul>
   </div>
 
@@ -218,7 +264,7 @@
         <button class="opt">It allows longer outputs</button>
         <button class="opt">It avoids the need for a tokenizer</button>
       </div>
-      <div class="explain">FIM reorders training documents into prefix, suffix, middle so the model can condition on both sides — which is what a developer's cursor position actually looks like.</div>
+      <div class="explain">FIM rearranges training documents into prefix, suffix, middle, so the model learns to use the code on both sides. That's exactly the situation at a developer's cursor.</div>
     </div>
 
     <div class="quiz" data-answer="2">
@@ -229,7 +275,7 @@
         <button class="opt">Client-side debouncing plus server-honoured cancellation</button>
         <button class="opt">More aggressive sampling</button>
       </div>
-      <div class="explain">Requests that never reach a GPU are free. Without cancellation propagating to the scheduler, superseded requests keep decoding and you pay for suggestions nobody will ever see.</div>
+      <div class="explain">Requests that never reach a GPU are free. If cancellations don't reach the scheduler, out-of-date requests keep generating, and you pay for suggestions nobody will ever see.</div>
     </div>
 
     <div class="quiz" data-answer="3">
@@ -240,7 +286,7 @@
         <button class="opt">It lags by several weeks</button>
         <button class="opt">It is gameable — shorter, safer suggestions raise it, and accepted-then-deleted code still counts</button>
       </div>
-      <div class="explain">Retained characters (still in the file minutes later) is the better proxy: it penalises suggestions that are easy to accept and immediately deleted.</div>
+      <div class="explain">Retained characters (code still in the file minutes later) is a better signal. It doesn't reward suggestions that are easy to accept and then deleted straight away.</div>
     </div>
 
     <div class="quiz" data-answer="0">
@@ -251,7 +297,7 @@
         <button class="opt">FIM doubles decode cost</button>
         <button class="opt">Because quantization only helps decode</button>
       </div>
-      <div class="explain">The inverse of a chat product. That makes prefix caching and context-size discipline the highest-value optimisations, not decode throughput.</div>
+      <div class="explain">This is the reverse of a chat product. So the most valuable optimisations are prefix caching and keeping the context small — not decode speed.</div>
     </div>
 
     <div class="quiz" data-answer="2">
@@ -262,7 +308,7 @@
         <button class="opt">To catch credential-shaped strings and long verbatim reproductions before they land in a developer's file</button>
         <button class="opt">To translate comments</button>
       </div>
-      <div class="explain">Secret emission and verbatim reproduction are failure modes no accuracy metric surfaces, and both are far cheaper to stop before display than to clean up afterwards.</div>
+      <div class="explain">No accuracy metric will reveal leaked secrets or word-for-word copied code. Both are far cheaper to stop before display than to clean up afterwards.</div>
     </div>
   </div>
 </main>
@@ -276,22 +322,22 @@
     naive: {
       segs: [['net', 24, 'var(--muted)'], ['context', 18, 'var(--accent-2)'], ['prefill', 210, 'var(--amber)'], ['decode', 180, 'var(--pink)'], ['post', 8, 'var(--green)']],
       acc: 0.09, gpu: 5200, cost: 4.1,
-      note: `🚩 <b>A 30B model, full context, no output cap.</b> 440 ms to first suggestion. The completion is often excellent and the developer has already typed past it — acceptance collapses to single digits, and you are paying five thousand GPUs for suggestions nobody sees. Every instinct from a chat product ("use the better model") is wrong here.`,
+      note: `🚩 <b>A 30B model, full context, no output cap.</b> 440 ms to the first suggestion. The completion is often excellent — but the developer has already typed past it. Acceptance collapses to single digits, and you're paying for five thousand GPUs to make suggestions nobody sees. Every instinct from a chat product ("use the better model") is wrong here.`,
     },
     small: {
       segs: [['net', 24, 'var(--muted)'], ['context', 18, 'var(--accent-2)'], ['prefill', 62, 'var(--amber)'], ['decode', 44, 'var(--pink)'], ['post', 8, 'var(--green)']],
       acc: 0.21, gpu: 1900, cost: 1.5,
-      note: `⚠️ <b>A 3B quantized model, output capped at ~25 tokens.</b> 156 ms — now inside the range where suggestions feel responsive, and acceptance more than doubles despite the model being individually weaker on every offline benchmark. This is the trade that surprises people: capping the output is as important as shrinking the model, because a long suggestion is both slow and rarely accepted.`,
+      note: `⚠️ <b>A 3B quantized model, output capped at ~25 tokens.</b> 156 ms — now fast enough that suggestions feel responsive. Acceptance more than doubles, even though this model is weaker on every offline benchmark. This is the trade that surprises people. Capping the output matters as much as shrinking the model, because a long suggestion is slow and rarely accepted.`,
     },
     spec: {
       segs: [['net', 24, 'var(--muted)'], ['context', 18, 'var(--accent-2)'], ['prefill', 62, 'var(--amber)'], ['decode', 21, 'var(--pink)'], ['post', 8, 'var(--green)']],
       acc: 0.24, gpu: 1250, cost: 1.0,
-      note: `✅ <b>Speculative decoding on top.</b> A tiny draft model proposes tokens that the main model verifies in one pass. Code is unusually predictable — boilerplate, closing brackets, repeated identifiers — so acceptance of drafted tokens is high and decode roughly halves. 133 ms, with no change to output quality: the model produces exactly what it would have produced anyway (Chapter 27).`,
+      note: `✅ <b>Speculative decoding on top.</b> A tiny draft model guesses the next few tokens, and the main model checks them all in one pass. Code is unusually predictable — boilerplate, closing brackets, repeated names — so most guesses are right and decode time roughly halves. 133 ms, with no change in output quality: the model produces exactly what it would have produced anyway (Chapter 27).`,
     },
     cached: {
       segs: [['net', 24, 'var(--muted)'], ['context', 18, 'var(--accent-2)'], ['prefill', 14, 'var(--amber)'], ['decode', 21, 'var(--pink)'], ['post', 8, 'var(--green)']],
       acc: 0.27, gpu: 600, cost: 0.4,
-      note: `✅ <b>Exact-match cache plus KV prefix reuse.</b> Roughly a third of requests are byte-identical repeats — undo, re-type, cursor moved back — and return in under 10 ms. Of the rest, most share a file prefix already resident on the replica, so prefill drops four-fold. 85 ms p50, a third of the fleet, and the largest single cost reduction available. It requires file-affine routing, exactly as in Chapter 45.`,
+      note: `✅ <b>Exact-match cache plus KV prefix reuse.</b> About a third of requests are exact repeats — undo, retype, cursor moved back — and return in under 10 ms. Most of the rest share a file prefix that's already cached on the replica, so prefill drops four-fold. 85 ms p50, a third of the GPUs, and the biggest single cost cut available. It needs each file's requests to keep going to the same replica, exactly as in Chapter 45.`,
     },
   };
 

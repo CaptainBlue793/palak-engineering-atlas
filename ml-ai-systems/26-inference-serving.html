@@ -30,32 +30,54 @@
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 26</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
     <h1>Inference &amp; <span class="grad">Serving Systems</span></h1>
-    <p class="lead">Training is a project; serving is forever. An LLM serving stack is a scheduler around a memory-bound loop: keep the batch full, keep the KV cache packed, and hit a latency target you promised someone. Get this wrong and the model is fine while the product is unusable.</p>
+    <p class="lead">Training is a project that ends; serving (answering real users' requests) goes on forever. Answering a request happens in two phases. <b>Prefill</b> reads the whole prompt in one go. <b>Decode</b> then writes the answer one token at a time, and each step is limited by how fast weights can be read from memory, not by raw compute.</p>
+    <p class="lead">A serving system is a scheduler wrapped around that decode loop. Its jobs: keep the batch full, keep the KV cache (the model's saved notes about the text so far) tightly packed, and hit the speed you promised. Get this wrong and the model is fine, but the product is unusable.</p>
     <ul class="objectives">
-      <li>Separate prefill from decode and measure the right latency metrics</li>
+      <li>Separate prefill from decode, and measure the right latency numbers</li>
       <li>Explain continuous batching and why it beats static batching</li>
-      <li>Manage the KV cache with paging, preemption and prefix reuse</li>
-      <li>Plan capacity from QPS, token counts and a latency SLO</li>
-      <li>Design fallbacks, load shedding and autoscaling that behave under stress</li>
+      <li>Manage the KV cache with paging, pausing requests (preemption) and reusing shared prefixes</li>
+      <li>Work out how many GPUs you need from traffic, token counts and a latency target (SLO)</li>
+      <li>Design fallbacks, load shedding and autoscaling that hold up under stress</li>
     </ul>
   </section>
 
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Prefill, decode and the KV cache.</b> How a transformer writes text one token at a time — <a href="14-transformers.html">Chapter 14</a>.</li>
+        <li><b>Tokens.</b> What a token is and roughly how many a sentence takes — <a href="15-tokenizers-embeddings.html">Chapter 15</a>.</li>
+        <li><b>Memory bandwidth and the roofline.</b> Why some work is limited by reading memory, not by compute — <a href="10-hardware.html">Chapter 10</a>.</li>
+        <li><b>Prompt caching.</b> Why a shared prompt prefix saves work — <a href="19-prompting-context.html">Chapter 19</a>.</li>
+        <li><b>Percentiles (p95, p99).</b> Reading a distribution, not just its average — <a href="p5-probability-stats.html">P5: Probability &amp; Statistics</a>.</li>
+      </ul></div>
+  </div>
+
   <h2>Measure the right things</h2>
+  <p>Why two phases behave so differently comes down to how often each weight is used once it has been read from memory.</p>
+  <ul>
+    <li><b>Prefill</b> processes all the prompt tokens together. With a 2,000-token prompt, each weight read from memory is used for 2,000 tokens' worth of maths. The GPU's arithmetic units are the limit: prefill is <b>compute-bound</b>.</li>
+    <li><b>Decode</b> makes one new token per request per step. For an 8B model in bf16, every step reads all 16 GB of weights to produce just one token. On a GPU that reads around 3 TB/s, that alone takes about 5 ms, so one request can't go much faster than ~200 tokens/s however much compute is idle. Decode is <b>memory-bound</b>.</li>
+  </ul>
+  <p>The key consequence: if 64 requests decode together, the weights are read <i>once</i> per step and used for all 64. The step takes only a little longer, but produces 64 tokens instead of one. That is why batching matters so much for serving.</p>
+  <p>A worked request: queue wait 100 ms, prefill 200 ms, then 400 output tokens at 30 ms each. TTFT = 300 ms. TPOT = 30 ms, about 33 tokens/s. The whole answer takes 0.3 + 400 × 0.03 = 12.3 seconds. Users feel the 300 ms most, because after that they're reading.</p>
   <div class="grid c4">
-    <div class="card feature reveal"><div class="f-ico">⏱️</div><h4>TTFT</h4><p>Time to first token. Dominated by queueing plus prefill. This is what “feels” fast.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">⌨️</div><h4>TPOT / ITL</h4><p>Time per output token. Sets the reading speed; ~25 tokens/s is comfortably faster than reading.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">📦</div><h4>Throughput</h4><p>Total tokens/second across all users. What your bill is proportional to.</p></div>
-    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">👥</div><h4>Concurrency</h4><p>Requests in flight. Limited by KV-cache memory, not by compute.</p></div>
+    <div class="card feature reveal"><div class="f-ico">⏱️</div><h4>TTFT</h4><p>Time to first token: how long until the first word appears. Mostly waiting in the queue plus prefill. This is what makes an app “feel” fast.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">⌨️</div><h4>TPOT / ITL</h4><p>Time per output token (also called inter-token latency). It sets how fast text streams out. About 25 tokens/s is comfortably faster than people read.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">📦</div><h4>Throughput</h4><p>Total tokens per second across all users. Your bill grows with this.</p></div>
+    <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">👥</div><h4>Concurrency</h4><p>How many requests are being worked on at once. Limited by KV-cache memory, not by compute.</p></div>
   </div>
 
   <div class="callout warn">
     <div class="ico">⚖️</div>
     <div class="body"><div class="title">Throughput and latency pull in opposite directions</div>
-      <p>Bigger batches mean better GPU efficiency and higher total throughput — and a longer wait for any individual token. Every serving decision is a position on that curve, and the position should come from a stated SLO (“p95 TTFT &lt; 1s, p95 TPOT &lt; 50ms”), not from a default.</p></div>
+      <p>Bigger batches use the GPU more efficiently and raise total throughput. But each user waits longer for each token. Every serving decision picks a point between those two. Choose that point from a written latency target, an <b>SLO</b> (service level objective) such as “p95 TTFT &lt; 1s, p95 TPOT &lt; 50ms”, not from a default setting. (“p95” means 95% of requests are at least this fast.)</p></div>
   </div>
 
   <h2>Batching: static, dynamic, continuous</h2>
-  <p>Requests arrive at different times and finish after different numbers of tokens. Static batching — wait for N requests, run them together until all are done — wastes enormous capacity because the whole batch runs until the <i>longest</i> generation finishes.</p>
+  <p>Requests arrive at different times, and their answers have different lengths. <b>Static batching</b> waits for N requests, then runs them together until all are done. That wastes a huge amount of capacity, because the whole batch keeps running until the <i>longest</i> answer finishes. It's like a bus that can't pick anyone up until every passenger has reached their stop.</p>
+  <p>A worked example. Four requests start together, with answers of 10, 20, 30 and 100 tokens. Static batching runs 100 steps with 4 slots: 400 slot-steps. Only 10 + 20 + 30 + 100 = 160 of them produce a token, so <b>60% of the batch's capacity is wasted</b>. And any new request that arrives meanwhile waits up to 100 steps just to start.</p>
+  <p><b>Dynamic batching</b> is the middle option: wait a short, fixed time (say 10 ms) or until the batch is full, then run whatever has arrived. It cuts the waiting before a batch starts, and it works well for models that answer in a single pass, like image classifiers or rankers. For LLMs it still has the static problem: once a batch starts, it runs until its longest answer ends.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Static vs continuous batching</span><span class="p-tag">Interactive</span></div>
@@ -76,11 +98,17 @@
   <div class="callout tip">
     <div class="ico">🔁</div>
     <div class="body"><div class="title">Continuous batching, in one sentence</div>
-      <p>After <i>every decoding step</i>, evict finished sequences and admit waiting ones, so the batch is always as full as memory allows. It typically delivers 2–5× the throughput of static batching at the same latency, and it is the single most important feature of a modern inference server (vLLM, TensorRT-LLM, TGI, SGLang all do it).</p></div>
+      <p>After <i>every single decode step</i>, remove finished requests and let waiting ones in, so the batch is always as full as memory allows. It usually gives 2–5× the throughput of static batching at the same latency. It's the most important feature of a modern inference server (vLLM, TensorRT-LLM, TGI and SGLang all do it).</p></div>
   </div>
 
   <h2>The KV cache is the real constraint</h2>
-  <p>Chapter 14 sized it: cache bytes grow with layers × width × context × concurrency. Two problems follow — <b>fragmentation</b> (reserving the maximum possible length per request wastes most of it) and <b>eviction</b> (what do you do when memory runs out mid-generation?).</p>
+  <p>The <b>KV cache</b> stores the attention keys and values for every token so far, so the model doesn't have to reprocess the whole text at each step. Chapter 14 worked out its size: it grows with layers × width × context length × number of requests at once. That causes two problems:</p>
+  <ul>
+    <li><b>Fragmentation:</b> if you reserve room for the maximum possible length for each request, most of that room is never used.</li>
+    <li><b>Eviction:</b> what do you do when memory runs out halfway through an answer?</li>
+  </ul>
+  <p>Some real numbers. Take a 7B-class model with 32 layers and a width of 4,096, with no GQA, storing the cache in bf16. Each token needs a key and a value in every layer: 2 × 32 × 4,096 × 2 bytes ≈ <b>0.5 MB per token</b>. A 4,096-token context is then 2 GB for one request. On an 80 GB GPU with ~14 GB of weights, about 64 GB is left, enough for roughly 32 full-length requests.</p>
+  <p>Now suppose the average request actually uses 1,000 tokens. If you reserve 4,096 tokens of space for each one, about 75% of the reserved cache is never touched, and you fit 32 requests where the memory could have held about 128. That gap is exactly what paging recovers.</p>
 
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Contiguous reservation vs paged attention</span><span class="p-tag">Interactive</span></div>
@@ -93,7 +121,7 @@
         <div class="stat good"><div class="k">Concurrent requests possible</div><div class="v" id="kvConc" style="font-size:17px">–</div></div>
       </div>
       <div class="callout" id="kvInfo" style="margin-top:12px"><div class="ico">📄</div><div class="body"><p style="margin:0"></p></div></div>
-      <p class="small muted">Paged attention allocates the cache in small fixed blocks (like OS virtual memory pages) and keeps a per-request block table. Nothing is reserved for tokens that may never be generated, and identical prefixes can <b>share</b> blocks — which is how prefix caching works.</p>
+      <p class="small muted"><b>Paged attention</b> hands out cache memory in small fixed-size blocks, the way an operating system hands out memory pages. Each request keeps a table of which blocks are its own. Nothing is reserved for tokens that may never be generated. And requests that start with the same text can <b>share</b> blocks, which is how prefix caching works.</p>
     </div>
   </div>
 
@@ -101,18 +129,27 @@
     <table class="t">
       <thead><tr><th>Technique</th><th>What it buys</th><th>Cost</th></tr></thead>
       <tbody>
-        <tr><td><b>Paged KV cache</b></td><td>2–4× more concurrent requests from the same memory</td><td>Indirection in the attention kernel</td></tr>
-        <tr><td><b>Prefix caching</b></td><td>Skip prefill for shared system prompts and conversation history</td><td>Cache management; a hit-rate metric worth watching</td></tr>
-        <tr><td><b>Chunked prefill</b></td><td>Long prompts stop blocking other users' decoding</td><td>Slightly more scheduling complexity</td></tr>
-        <tr><td><b>Preemption / swapping</b></td><td>Graceful behaviour when memory runs out</td><td>Recompute or copy-out cost for the preempted request</td></tr>
-        <tr><td><b>GQA / MQA</b> (Ch 14)</td><td>8–64× smaller cache</td><td>An architecture decision — must be made before training</td></tr>
-        <tr><td><b>KV quantization (fp8/int8)</b></td><td>~2× more concurrency</td><td>Small quality impact; measure it</td></tr>
-        <tr><td><b>Disaggregated prefill/decode</b></td><td>Each phase gets hardware and batching suited to it</td><td>Extra network hop to transfer the KV cache</td></tr>
+        <tr><td><b>Paged KV cache</b></td><td>2–4× more requests at once from the same memory</td><td>The attention code has to look blocks up in a table</td></tr>
+        <tr><td><b>Prefix caching</b></td><td>Skip prefill for shared system prompts and chat history</td><td>Managing the cache; the hit rate is worth watching</td></tr>
+        <tr><td><b>Chunked prefill</b></td><td>Long prompts are processed in pieces, so they stop holding up other users' answers</td><td>Slightly more complex scheduling</td></tr>
+        <tr><td><b>Preemption / swapping</b></td><td>When memory runs out, pause a request instead of crashing</td><td>The paused request must be recomputed or copied out and back</td></tr>
+        <tr><td><b>GQA / MQA</b> (Ch 14)</td><td>8–64× smaller cache</td><td>A model design choice: it must be made before training</td></tr>
+        <tr><td><b>KV quantization (fp8/int8)</b></td><td>Store the cache in fewer bits: ~2× more requests at once</td><td>Small quality loss; measure it</td></tr>
+        <tr><td><b>Disaggregated prefill/decode</b></td><td>Prefill and decode run on separate machines, each set up for its phase</td><td>An extra network hop to send the KV cache across</td></tr>
       </tbody>
     </table>
   </div>
 
   <h2>Capacity planning</h2>
+  <p>Before launch someone will ask “how many GPUs do we need?” Guess too low and latency collapses at peak; guess too high and you pay for idle hardware. The trick is to plan from <b>tokens</b>, not requests, and to size decode and prefill separately because they are limited by different things.</p>
+  <p>A worked example by hand. The per-GPU speeds here are made-up round numbers for the arithmetic; in practice you measure them for your model and hardware at your latency target.</p>
+  <ul>
+    <li><b>Traffic:</b> 40 requests/s at peak, 2,000 input and 400 output tokens each.</li>
+    <li><b>Decode:</b> 40 × 400 = 16,000 output tokens/s. If one GPU produces 2,000 tokens/s while staying under the TPOT target, you need 8 GPUs.</li>
+    <li><b>Prefill:</b> 40 × 2,000 = 80,000 input tokens/s. A 40% prefix-cache hit rate removes 40% of that, leaving 48,000. At an assumed 20,000 tokens/s per GPU, that's 2.4, so 3 GPUs.</li>
+    <li><b>Headroom:</b> (8 + 3) × 1.3 ≈ 15 GPUs, so a spike or a failed GPU doesn't break the SLO.</li>
+  </ul>
+  <p>Check memory too. <b>Little's law</b> says the number of requests in progress equals arrival rate × time each one takes: 40/s × ~12 s ≈ 480 requests in flight at once. Each needs KV cache for about 2,400 tokens, so the whole fleet must hold 480 × 2,400 ≈ 1.15 million tokens of cache. If the fleet can't hold that, requests queue no matter how much compute you have.</p>
   <div class="panel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">How many GPUs do I need?</span><span class="p-tag">Interactive</span></div>
     <div class="panel-body">
@@ -132,17 +169,25 @@
   </div>
 
   <h2>Scheduling and fairness</h2>
-  <p>With one shared GPU pool, a single 100k-token prompt can stall everyone else. Real schedulers manage that explicitly.</p>
+  <p>When everyone shares one pool of GPUs, a single 100k-token prompt can hold up everyone else. Real schedulers deal with this on purpose.</p>
+  <p>How bad is it? If a GPU prefills 10,000 tokens per second, a 100k-token prompt keeps it busy for 10 seconds. Without chunking, every other request on that GPU gets no new tokens during those 10 seconds: their answers freeze mid-sentence. With <b>chunked prefill</b>, the long prompt is fed in pieces of, say, 512 tokens, mixed in with the normal decode steps. Its own TTFT gets a little longer, but everyone else keeps streaming.</p>
 
   <div class="split">
-    <div class="card"><h4 class="mt0">Prioritise by class</h4><p class="small mb0">Interactive chat, background batch and internal evaluation should not compete equally. Separate queues with weights, or separate pools entirely, so a batch job can never push an interactive p95 over its SLO.</p></div>
-    <div class="card"><h4 class="mt0">Bound the damage</h4><p class="small mb0">Chunk long prefills, cap max output tokens per request, admit only what memory allows, and shed load with a clear 429 rather than accepting requests you'll time out on. A queue that grows without bound is an outage in slow motion.</p></div>
+    <div class="card"><h4 class="mt0">Prioritise by class</h4><p class="small mb0">Live chat, background batch jobs and internal testing shouldn't compete as equals. Give them separate queues with weights, or entirely separate GPU pools, so a batch job can never push live chat's p95 latency past its target.</p></div>
+    <div class="card"><h4 class="mt0">Bound the damage</h4><p class="small mb0">Split long prefills into chunks, cap the output tokens per request, and only accept as many requests as memory allows. When you're full, <b>shed load</b>: reject quickly with a clear HTTP 429 (“too many requests”) instead of accepting work that will time out. A queue that grows without limit is an outage in slow motion.</p></div>
   </div>
 
   <div class="callout danger">
     <div class="ico">🌀</div>
     <div class="body"><div class="title">Retries are dangerous here</div>
-      <p>A client timeout on a 30-second generation, retried three times, triples the load on a server that is already saturated — the classic retry storm. Use long, explicit client timeouts, cancel server-side work when the client disconnects (streaming makes this detectable), retry only on fast failures, and always with jitter and a circuit breaker.</p></div>
+      <p>Say a client gives up on a 30-second answer and retries three times. The server is already overloaded, and now it has triple the work, because the original requests are usually still running. This is the classic <b>retry storm</b>. Defences:</p>
+      <ul class="mb0">
+        <li>Use long, explicit client timeouts.</li>
+        <li>Stop the server-side work when the client disconnects (streaming lets you notice this).</li>
+        <li>Retry only on failures that happen fast.</li>
+        <li>Always add random delay (<b>jitter</b>) to retries, and use a <b>circuit breaker</b> that stops calling a failing service for a while.</li>
+      </ul>
+      <p>Why random? If 1,000 clients all fail at the same moment and each retries after exactly 1 second, all 1,000 retries arrive together and overload the server again. <b>Exponential backoff</b> (wait 1 s, then 2 s, then 4 s) spaces out each client's attempts, and jitter (a random amount added to each wait) spreads different clients apart so they don't arrive in waves.</p></div>
   </div>
 
   <h2>Reliability patterns</h2>
@@ -150,12 +195,12 @@
     <table class="t">
       <thead><tr><th>Pattern</th><th>What it does</th></tr></thead>
       <tbody>
-        <tr><td><b>Model fallback ladder</b></td><td>Under load or on failure, route to a smaller/cheaper model rather than failing. Log which tier served each request.</td></tr>
-        <tr><td><b>Load shedding</b></td><td>Reject early with a retry-after when the queue exceeds what the SLO permits. Fast failure beats slow failure.</td></tr>
-        <tr><td><b>Circuit breaker</b></td><td>Stop calling a dependency that is failing, probe periodically. Applies to tools, retrievers and upstream model APIs.</td></tr>
-        <tr><td><b>Response cache</b></td><td>Exact-match cache for repeated prompts; optionally a semantic cache with a similarity threshold — and a clear policy for staleness.</td></tr>
-        <tr><td><b>Warm pools</b></td><td>Loading a 70B model takes minutes; keep spare warm replicas and scale on queue depth, not CPU.</td></tr>
-        <tr><td><b>Streaming + cancellation</b></td><td>Send tokens as they're produced and free the slot the moment the client goes away.</td></tr>
+        <tr><td><b>Model fallback ladder</b></td><td>When overloaded or failing, send requests to a smaller, cheaper model instead of failing. Log which model answered each request.</td></tr>
+        <tr><td><b>Load shedding</b></td><td>When the queue is longer than your latency target allows, reject early and tell the client when to retry. Failing fast beats failing slowly.</td></tr>
+        <tr><td><b>Circuit breaker</b></td><td>Stop calling a service that keeps failing, and check now and then whether it has recovered. Use it for tools, retrievers and outside model APIs.</td></tr>
+        <tr><td><b>Response cache</b></td><td>Save answers to prompts that repeat exactly. Optionally, also reuse answers for prompts that are very similar in meaning (a semantic cache). Decide clearly how long a cached answer stays valid.</td></tr>
+        <tr><td><b>Warm pools</b></td><td>Loading a 70B model takes minutes, so keep spare copies already loaded (warm). Scale on queue length, not CPU.</td></tr>
+        <tr><td><b>Streaming + cancellation</b></td><td>Send tokens as soon as they're made, and free the slot the moment the client leaves.</td></tr>
       </tbody>
     </table>
   </div>
@@ -163,34 +208,41 @@
   <div class="callout tip">
     <div class="ico">🚀</div>
     <div class="body"><div class="title">Autoscale on queue depth, not utilization</div>
-      <p>GPU utilization is near 100% whenever anything is running, so it carries no signal about whether you have enough capacity. Scale on <b>queue wait time</b> or pending requests per replica, which is what actually maps to your latency SLO. And remember cold start: if a replica takes four minutes to load weights, your scaling signal must lead demand by at least that much — or keep a warm pool.</p></div>
+      <p>GPU utilization reads close to 100% whenever anything at all is running. So it tells you nothing about whether you have enough capacity. Instead, scale on <b>queue wait time</b>, or on waiting requests per copy of the model. That's what actually drives your latency.</p>
+      <p>For example, suppose your TTFT target is 1 s and prefill takes 300 ms. Then requests can afford to wait at most about 700 ms in the queue. Set the scale-up trigger well below that, say when the p95 queue wait passes 300 ms, so new capacity arrives before the target is broken.</p>
+      <p>And remember the <b>cold start</b>: if a new copy takes four minutes to load its weights, you must scale up at least four minutes before the demand arrives. Or keep a warm pool ready.</p></div>
   </div>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
-      <li><b>Benchmarking with batch size 1.</b> It measures the worst possible efficiency and tells you nothing about production throughput.</li>
-      <li><b>Sizing GPUs by weights only.</b> The KV cache decides concurrency; run out and throughput collapses regardless of FLOPs.</li>
-      <li><b>Reporting mean latency.</b> Users experience p95 and p99, and the tail is where queueing lives.</li>
-      <li><b>No max-output-tokens cap.</b> One runaway generation holds a slot for minutes.</li>
-      <li><b>Ignoring cancellation.</b> Users close tabs constantly; without server-side cancellation you keep paying for abandoned work.</li>
-      <li><b>Putting variable content before the shared prefix.</b> Destroys prefix caching — the cheapest latency and cost win available (Chapter 19).</li>
+      <li><b>Benchmarking with batch size 1.</b> That measures the worst possible efficiency and tells you nothing about real throughput.</li>
+      <li><b>Sizing GPUs by the weights alone.</b> The KV cache decides how many requests fit at once. Run out of it and throughput collapses, however much compute you have.</li>
+      <li><b>Reporting average latency.</b> Users feel the p95 and p99, the slowest requests, and that's where queueing delays show up.</li>
+      <li><b>No cap on output tokens.</b> One runaway answer holds a slot for minutes.</li>
+      <li><b>Ignoring cancellation.</b> Users close tabs all the time. Without cancelling the server-side work, you keep paying for answers nobody will read.</li>
+      <li><b>Putting changing content before the shared prefix.</b> It breaks prefix caching, the cheapest latency and cost win there is (Chapter 19).</li>
     </ul></div></div>
 
   <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
     <p class="small" style="margin:10px 0 0"><b>Warm-up:</b> Why does continuous batching help so much more for LLMs than for image classifiers?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Two reasons. First, generation lengths vary wildly, so in a static batch most slots sit idle waiting for the longest sequence — with image classification every item finishes in one pass. Second, decode is memory-bound: the weights are read from HBM for every step regardless of batch size, so adding sequences to the batch is nearly free in time and multiplies throughput. Continuous batching exploits both by refilling the batch after every single decoding step.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Two reasons. First, answer lengths vary wildly, so in a static batch most slots sit idle waiting for the longest one. In image classification, every item finishes in a single pass. Second, decode is limited by memory speed: every step reads all the weights from GPU memory (HBM), whatever the batch size. So adding more sequences to the batch costs almost no extra time and multiplies throughput. Continuous batching takes advantage of both by refilling the batch after every single decode step.</div></details>
     <p class="small" style="margin:10px 0 0"><b>Deeper:</b> p95 TTFT has degraded from 800 ms to 6 s with no traffic change. How do you diagnose it?</p>
-    <details class="ans"><summary>How a strong answer sounds</summary><div>Split TTFT into queue time and prefill time — they have completely different causes. If queue time grew, the server is admission-limited: check KV-cache occupancy and preemption rate, since a few very long contexts can consume the memory that concurrency depends on; also check whether a batch workload started sharing the pool. If prefill time grew, look at input length distribution (a client started sending much larger prompts), prefix-cache hit rate (a prompt change invalidated it — a very common cause), and whether chunked prefill is enabled so long prompts don't block others. Then confirm with per-request logs of input tokens, cache hit, queue time and prefill time; that instrumentation is what makes this a five-minute investigation instead of a day.</div></details>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Split TTFT into queue time and prefill time. They have completely different causes.
+      <ul class="mb0">
+        <li><b>If queue time grew,</b> the server can't accept requests fast enough. Check how full the KV cache is and how often requests get paused (preempted): a few very long contexts can eat the memory that concurrency depends on. Also check whether a batch job started sharing the pool.</li>
+        <li><b>If prefill time grew,</b> look at input lengths (maybe a client started sending much bigger prompts), the prefix-cache hit rate (a prompt change can break it; this is very common), and whether chunked prefill is on so long prompts don't block others.</li>
+      </ul>
+      Then confirm with per-request logs of input tokens, cache hits, queue time and prefill time. Having those logs is what turns this into a five-minute investigation instead of a day.</div></details>
   </div></div>
 
   <div class="takeaways">
     <h3>🧠 Key takeaways</h3>
     <ul>
-      <li>Prefill is compute-bound and decode is memory-bound; measure TTFT and TPOT separately.</li>
-      <li>Continuous batching refills the batch every decoding step and is the biggest throughput lever.</li>
-      <li>The KV cache limits concurrency; paging, prefix reuse, GQA and quantization all buy it back.</li>
-      <li>Plan capacity from token volume and an SLO, and autoscale on queue depth with warm pools.</li>
-      <li>Design for overload: shed load, cap outputs, cancel abandoned work, fall back to smaller models.</li>
+      <li>Prefill is limited by compute, decode by memory speed. Measure TTFT and TPOT separately.</li>
+      <li>Continuous batching refills the batch after every decode step. It's the biggest throughput win.</li>
+      <li>The KV cache limits how many requests fit at once. Paging, prefix reuse, GQA and quantization all win space back.</li>
+      <li>Plan GPUs from token volume and a latency target. Autoscale on queue length, with warm pools ready.</li>
+      <li>Design for overload: shed load, cap output length, cancel abandoned work, fall back to smaller models.</li>
     </ul>
   </div>
 
@@ -206,7 +258,7 @@
         <button class="opt">GPU utilization</button>
         <button class="opt">Average request duration</button>
       </div>
-      <div class="explain">Users judge the wait before anything appears. After that, TPOT only needs to beat reading speed.</div>
+      <div class="explain">Users judge the app by the wait before anything appears. After that, text only needs to stream faster than they can read.</div>
     </div>
 
     <div class="quiz" data-answer="2">
@@ -217,7 +269,7 @@
         <button class="opt">KV cache memory</button>
         <button class="opt">PCIe bandwidth</button>
       </div>
-      <div class="explain">Each in-flight sequence needs cache proportional to its context length. When that memory is exhausted, new requests queue no matter how idle the arithmetic units are.</div>
+      <div class="explain">Each request in progress needs cache space in proportion to its context length. Once that memory is full, new requests wait in the queue, however idle the GPU's compute units are.</div>
     </div>
 
     <div class="quiz" data-answer="0">
@@ -228,7 +280,7 @@
         <button class="opt">Tokenizer overhead</button>
         <button class="opt">Network latency between replicas</button>
       </div>
-      <div class="explain">Fixed-size blocks allocated on demand — plus shareable blocks for identical prefixes — typically multiply usable concurrency several-fold.</div>
+      <div class="explain">Handing out fixed-size blocks only when needed, and sharing blocks between identical prefixes, usually lets several times more requests run at once.</div>
     </div>
 
     <div class="quiz" data-answer="3">
@@ -239,7 +291,7 @@
         <button class="opt">Requests per second</button>
         <button class="opt">Queue wait time or pending requests per replica</button>
       </div>
-      <div class="explain">GPU utilization saturates immediately and carries no headroom information. Queue depth maps directly to the latency SLO — and remember to lead demand by the replica cold-start time.</div>
+      <div class="explain">GPU utilization hits its maximum straight away, so it can't tell you how much room is left. Queue length maps directly to your latency target. And scale up ahead of demand by at least the time a new copy takes to start.</div>
     </div>
 
     <div class="quiz" data-answer="1">
@@ -250,7 +302,7 @@
         <button class="opt">Cache corruption</button>
         <button class="opt">Nothing — retries are always safe</button>
       </div>
-      <div class="explain">The original work usually continues server-side, so retries add load without removing any. Long client timeouts, server-side cancellation, jittered backoff and a circuit breaker are the defences.</div>
+      <div class="explain">The original request usually keeps running on the server, so each retry adds work without removing any. The defences: long client timeouts, cancelling work on the server, retries with growing random delays, and a circuit breaker.</div>
     </div>
   </div>
 </main>
@@ -319,8 +371,8 @@
     $('#bWait').textContent = (waits.reduce((a, b) => a + b, 0) / waits.length).toFixed(1) + ' steps';
     $('#bTput').textContent = (used / span).toFixed(2) + ' seq/step';
     $('#bInfo p').innerHTML = mode === 'static'
-      ? `<b>Static batching.</b> The whole batch runs until the longest generation finishes, so short requests hold their slot doing nothing and newly arrived requests wait for the entire batch. Slot utilization is only <b>${(util * 100).toFixed(0)}%</b> — and this gets worse as generation lengths vary more, which in real traffic they do enormously.`
-      : `<b>Continuous batching.</b> A finished sequence frees its slot immediately and a waiting request takes it on the next step. Utilization rises to <b>${(util * 100).toFixed(0)}%</b> and the mean wait falls, with no change to the model. This is why it is the default in every modern serving engine.`;
+      ? `<b>Static batching.</b> The whole batch runs until the longest answer finishes. Short requests sit in their slot doing nothing, and new arrivals wait for the entire batch. Only <b>${(util * 100).toFixed(0)}%</b> of the slots are in use. It gets worse the more answer lengths vary, and in real traffic they vary enormously.`
+      : `<b>Continuous batching.</b> A finished request frees its slot straight away, and a waiting request takes it on the next step. Slot use rises to <b>${(util * 100).toFixed(0)}%</b> and the average wait drops, with no change to the model. That's why every modern serving engine does this by default.`;
   }
   $('#batchSeg').addEventListener('segchange', drawBatch);
   drawBatch();
@@ -349,8 +401,8 @@
     $('#kvWaste').textContent = waste + ' blocks (' + (waste / TOTAL * 100).toFixed(0) + '%)';
     $('#kvConc').textContent = mode === 'contig' ? Math.floor(TOTAL / MAXLEN) + ' requests' : '~' + Math.floor(TOTAL / (used / reqs.length)) + ' requests';
     $('#kvInfo p').innerHTML = mode === 'contig'
-      ? `<b>Reserving the maximum length</b> for every request is simple and wastes <b>${(waste / (used + waste) * 100).toFixed(0)}%</b> of the cache on tokens that may never be generated. Concurrency is capped by the <i>maximum</i> context you allow, not by what requests actually use — which is why naive servers hit a hard low ceiling.`
-      : `<b>Paged blocks</b> are allocated only as tokens are produced, so nothing is reserved speculatively and the same memory holds far more concurrent requests. Blocks can also be <b>shared</b> between requests with identical prefixes, which makes prefix caching almost free. The cost is an indirection table in the attention kernel.`;
+      ? `<b>Reserving the maximum length</b> for every request is simple, but it wastes <b>${(waste / (used + waste) * 100).toFixed(0)}%</b> of the cache on tokens that may never be generated. How many requests fit is set by the <i>maximum</i> length you allow, not by what requests actually use. That's why simple servers hit a low, hard limit.`
+      : `<b>Paged blocks</b> are handed out only as tokens are produced. Nothing is reserved “just in case”, so the same memory holds far more requests at once. Requests that start with the same text can also <b>share</b> blocks, which makes prefix caching almost free. The cost is a lookup table the attention code has to go through.`;
   }
   $('#pageSeg').addEventListener('segchange', pages);
   pages();
@@ -378,8 +430,8 @@
     $('#cInfo p').innerHTML =
       `At ${qps} rps you generate <b>${fmt(qps * outTok, 0)} output tokens/s</b> and prefill <b>${fmt(qps * inTok * (1 - hit), 0)} input tokens/s</b> after caching. ` +
       (prefillGpus > decodeGpus
-        ? `Prefill dominates here — long prompts are your cost driver. Raising the prefix-cache hit rate, shortening retrieved context, or disaggregating prefill onto separate hardware are the levers with real leverage.`
-        : `Decode dominates — output length is your cost driver. Shorter answers, a smaller or quantized model, and speculative decoding (Chapter 27) are where the savings are.`) +
+        ? `Prefill is the bigger cost here: long prompts are what you're paying for. The changes that really help: raise the prefix-cache hit rate, send less retrieved context, or move prefill onto separate hardware.`
+        : `Decode is the bigger cost here: answer length is what you're paying for. The savings are in shorter answers, a smaller or quantized model, and speculative decoding (Chapter 27).`) +
       ` Monthly at $2.50/GPU-hour: <b>$${fmt(total * 2.5 * 730, 0)}</b>.`;
   }
   ['#cQps', '#cIn', '#cOut', '#cModel', '#cCache'].forEach(id => $(id).addEventListener('input', capacity));
