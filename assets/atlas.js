@@ -315,7 +315,7 @@
     // Resume = the started-but-unfinished course you are furthest into.
     var live = COURSES.filter(function (c) { return doneCount(c) > 0 && doneCount(c) < countOf(c); })
       .sort(function (a, b) { return doneCount(b) - doneCount(a); });
-    var btn = $('#resumeBtn'), hint = $('#progHint');
+    var btn = $('#resumeBtn') || document.createElement('a'), hint = $('#progHint');
     var band = { t: $('#bandTitle'), p: $('#bandText'), b: $('#bandBtn') };
 
     if (live.length) {
