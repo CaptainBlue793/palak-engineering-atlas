@@ -645,3 +645,13 @@
   initReveal();
   initPalette();
 })();
+
+/* Optional accounts & progress sync (../assets/account.js). Only over http(s): the offline
+   single-file edition runs from file:// and simply skips it. Dormant until configured. */
+(function () {
+  if (!/^https?:$/.test(location.protocol) || window.__atlasAccount) return;
+  var s = document.createElement("script");
+  s.type = "module"; s.src = "../assets/account.js";
+  s.onerror = function () {};
+  document.head.appendChild(s);
+})();

@@ -13,6 +13,12 @@ no build step.
 | **[ML & AI Systems](ml-ai-systems/)** | 8 prerequisites + 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
 | **[DSA](dsa/)** | 8 prerequisites + 56 | Every structure and algorithm, in one consistent C++ house style |
 
+
+## Optional accounts
+
+Learners can sign in with **email + password** or **phone + SMS code** to sync progress across devices.
+It stays switched off until a Firebase project is configured — see **[ACCOUNTS.md](ACCOUNTS.md)** for how it works and the setup steps.
+
 ```
 palak-engineering-atlas/
 ├── index.html          ← the Atlas (start here)
