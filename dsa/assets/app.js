@@ -230,6 +230,7 @@
 
   /* ---------------- shell ---------------- */
   const AUTHOR = 'Palak Deb Patra';
+  const ATLAS_WORDMARK = '<svg class="atlas-wordmark" viewBox="0 0 102 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><text x="1" y="25" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="800" letter-spacing="-1.3" fill="currentColor">Engg<tspan class="gold">A</tspan></text></svg>';
 
   function buildShell() {
     const body = document.body;
@@ -270,7 +271,7 @@
     const top = document.createElement('header'); top.className = 'topbar';
     const theme = currentTheme();
     top.innerHTML = `<button class="icon-btn menu-btn" aria-label="Menu">☰</button>
-      <div class="crumb"><a href="../index.html">Atlas</a> / ${chap ? `<a href="index.html">Course</a> / ${chName(chap)} · <b>${chap.title}</b>` : '<b>DSA Playlist</b>'}</div>
+      <div class="crumb"><a class="atlas-home" href="../index.html" aria-label="Engineering Atlas home">${ATLAS_WORDMARK}</a> / ${chap ? `<a href="index.html">Course</a> / ${chName(chap)} · <b>${chap.title}</b>` : '<b>DSA Playlist</b>'}</div>
       <div class="spacer"></div>
       <button class="search-btn" aria-label="Search the course" title="Search (Ctrl+K)">🔎 <span>Search</span> <kbd class="kbd">Ctrl K</kbd></button>
       <button class="icon-btn theme-btn" aria-label="Toggle theme" title="Toggle theme">${theme === 'dark' ? '☀️' : '🌙'}</button>`;
