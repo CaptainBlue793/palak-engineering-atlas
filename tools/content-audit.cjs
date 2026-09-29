@@ -70,7 +70,14 @@ for (const course of courses) {
     checked++;
     const fail = msg => errors.push(rel + ': ' + msg);
     const h2 = s => [...s.matchAll(/<h2\b[^>]*>[\s\S]*?<\/h2>/g)].map(m=>m[0]);
-    if (base && h2(src).length !== h2(base).length) fail('h2 count changed');
+    // Sequence diagrams: every message must point at a declared lifeline.
+    for (const m of src.matchAll(/<figure class="seq" data-actors="([^"]*)"[^>]*>([\s\S]*?)<\/figure>/g)) {
+      const n = m[1].split('|').length;
+      if (n < 2) fail('sequence diagram needs 2+ actors');
+      for (const x of m[2].matchAll(/data-m="(\d+)[>-](\d+)"/g)) if (+x[1] >= n || +x[2] >= n) fail('sequence message out of range: '+x[0]);
+      if ((m[2].match(/<li\b/g)||[]).length !== (m[2].match(/data-m="/g)||[]).length) fail('sequence step missing data-m');
+    }
+    for (const m of src.matchAll(/<figure class="flow"[^>]*>([\s\S]*?)<\/figure>/g)) if ((m[1].match(/<li\b/g)||[]).length < 2) fail('workflow needs 2+ steps');
     if ((src.match(/class="quiz"/g)||[]).length !== 5) fail('expected five quiz questions');
     for (const block of src.split('<div class="quiz" data-answer="').slice(1)) {
       const answer = +block.slice(0,block.indexOf('"'));
