@@ -166,7 +166,7 @@
       <ol class="steps">
         <li data-title="Accept fast, process later" data-on="n-src n-api n-e1" data-packet="n-src>n-api">The Order service calls <code>POST /v1/notifications</code>. The API checks the request is valid. Then it checks the <b>idempotency key</b> (a unique ID for this request) in Redis, using <code>SET NX</code> with a 24h TTL. If the caller retries, the second request does nothing. The API writes the request to Kafka and returns <code>202 Accepted</code> within milliseconds. Callers never wait on email providers.</li>
         <li data-title="Route: who, where, whether" data-on="n-api n-rt n-prefs n-e2 n-pref" data-packet="n-api>n-rt,n-rt>n-prefs" data-color="var(--accent-2)">Router workers read from the intake topic. For each notification they load the user's <b>preferences</b> (did they opt out of marketing email?), <b>quiet hours</b> in their timezone, <b>frequency caps</b> (e.g. max 3 promos a day) and device tokens. Then they fill in the template in the user's language.</li>
-        <li data-title="Split by channel and priority" data-on="n-rt n-q1 n-q2 n-q3 n-e3 n-e4 n-e5" data-packet="n-rt>n-q1,n-rt>n-q2" data-color="var(--amber)">Each message that passes the checks goes to a <b>queue for its channel and priority</b>. So a slow email provider can't hold up push. And a campaign in the low-priority queue can't delay a login code in the critical queue. Think of separate lanes at a toll booth.</li>
+        <li data-title="Split by channel and priority" data-on="n-rt n-q1 n-q2 n-q3 n-e3 n-e4 n-e5" data-packet="n-rt>n-q1,n-rt>n-q2" data-color="var(--amber)">Each message that passes the checks goes to a <b>queue for its channel and priority</b>. So a slow email provider can't hold up push. And a campaign in the low-priority queue can't delay a login code in the critical queue. It is the bulkhead pattern from <a href="16-reliability.html">Chapter 16</a>: separate queues and worker pools, so one flood cannot starve the rest.</li>
         <li data-title="Channel workers call providers" data-on="n-q1 n-q2 n-p1 n-p2 n-e6 n-e7" data-packet="n-q1>n-p1,n-q2>n-p2" data-color="var(--green)">Workers take messages and call the providers. They stay under each provider's <b>rate limits</b> using token buckets (Chapter 15). Temporary failures are retried, waiting longer each time (exponential backoff) plus a random delay (jitter). Permanent failures, like an invalid token or an email address that doesn't exist (a hard bounce), are recorded and not retried.</li>
         <li data-title="Track outcomes" data-on="n-p1 n-p2 n-p3 n-api n-e9" data-packet="n-p3>n-api" data-color="var(--pink)">Providers report deliveries, bounces and unsubscribes by calling us back (<b>webhooks</b>). Opens and clicks come from tracking pixels and redirect links. These events flow into Kafka → analytics. They also update our data: an invalid push token is deleted, and a bounced email address is blocked from future sends.</li>
       </ol>
@@ -213,7 +213,22 @@
   <p>How does the circuit breaker decide? It watches recent calls to a provider. A typical rule: if more than half of the last 20 calls failed or timed out, <b>open</b> the circuit — stop calling that provider and send to the backup. After, say, 30 seconds, go <b>half-open</b>: let a few test messages through. If they succeed, <b>close</b> the circuit and go back to normal; if not, stay open for another period. The point is to stop wasting time and money on a provider that is clearly down, while still noticing when it comes back.</p>
   <p>When should you fail over and when should you just wait? Fail over for <b>critical</b> messages, where a delay hurts (login codes, fraud alerts). For <b>low-priority</b> messages like promos, it's often better to let them wait in the queue until the main provider recovers — the backup may cost more, and a promo an hour late is fine.</p>
 
-  <h2>Deep dive: preferences, quiet hours & caps</h2>
+    <figure class="seq" data-actors="Auth service|Notification API|Critical queue|SMS worker|Provider A|Provider B">
+    <ol>
+      <li data-m="0>1">send OTP to +49…, key otp:login:8812</li>
+      <li data-m="1>1">dedupe key; skip preferences (transactional)<small>Security codes ignore quiet hours and marketing opt-outs, but still respect a per-phone rate limit to stop SMS-pumping fraud.</small></li>
+      <li data-m="1>2">enqueue (priority: critical, TTL 5 min)</li>
+      <li data-m="3>2">take job</li>
+      <li data-m="3>4" data-k="fail">POST /messages (timeout 3 s)</li>
+      <li data-m="3>3">circuit for A opens after 5 failures<small>Provider A's error rate crossed the threshold, so the worker stops trying it for 30 s instead of wasting each user's time on a timeout.</small></li>
+      <li data-m="3>5">POST /messages (same idempotency key)</li>
+      <li data-m="5>3" data-k="reply">accepted, id sm_77</li>
+      <li data-m="5>1" data-k="async">webhook: delivered sm_77<small>“Accepted” is not “delivered”. The delivery receipt arrives later and updates the notification's status.</small></li>
+    </ol>
+    <figcaption><b>A one-time password under provider failure.</b> A separate critical queue, a circuit breaker per provider, and failover keep login codes flowing while a campaign runs.</figcaption>
+  </figure>
+
+<h2>Deep dive: preferences, quiet hours & caps</h2>
   <p>Respecting user choices is required by law. It's also how you avoid getting your app uninstalled. Every notification goes through the same checks before it is queued. Play with this user's settings:</p>
   <p>The checks run in a fixed order, and each can stop the message:</p>
   <ol>
@@ -246,15 +261,20 @@
     </div>
   </div>
 
-  <h2>Deep dive: campaigns to 200 million users</h2>
+    <div class="callout usecase"><div class="ico">🔔</div><div class="body"><div class="title">Real-world use case: Slack's notification flowchart</div><p>Slack engineers once shared the flowchart their app follows to decide whether a message should notify you. It became famous because it is enormous: is the channel muted, is this a thread you follow, did someone mention you or a keyword, are you in do-not-disturb, are you active on another device right now, is it a direct message, what did you set for this channel on mobile versus desktop, and so on. Every branch is a real user complaint that became a rule. It is a good picture of why the preference and policy engine in this section deserves its own service, with its own tests, rather than a few <code>if</code> statements in each sender.</p></div></div>
+
+<h2>Deep dive: campaigns to 200 million users</h2>
   <p>A campaign is different from normal traffic: one request turns into hundreds of millions of messages. Doing that in one go would flood the queues, the providers and your own website. The steps below turn one huge job into many small, controlled ones.</p>
-  <div class="timeline">
-    <div class="ti reveal" data-n="1"><h4>Resolve the segment offline</h4><p>“Users in Germany who bought something in the last 90 days” is a query for the data warehouse, not the live production database. A batch job (Chapter 18) writes the matching user IDs to object storage, in chunks (shards) of, say, 100K.</p></div>
-    <div class="ti reveal" data-n="2"><h4>Fan out in controlled batches</h4><p>A campaign coordinator queues one task per chunk. Workers turn each chunk into individual low-priority notifications at a <b>limited rate</b>. That protects the providers, your own services, and the backend that users will hit when they tap the notification.</p></div>
-    <div class="ti reveal" data-n="3"><h4>Deliver in local time</h4><p>Group users by timezone and schedule each group for 10:00 local time. The campaign then rolls around the globe instead of waking up half the world.</p></div>
-    <div class="ti reveal" data-n="4"><h4>Checkpoint & pause</h4><p>Save progress for each chunk. Then you can pause a campaign (“wrong price in the template!”), resume it or cancel it, without re-sending to people who already got it.</p></div>
-  </div>
-  <p>The arithmetic for chunks: 200M users in chunks of 100K is 2,000 chunks. If the coordinator releases chunks so that the campaign sends at 20K/s, each chunk takes 5 seconds and the whole campaign takes 200M ÷ 20K = 10,000 s ≈ 2.8 hours — spread out, not a spike. If one chunk's worker crashes halfway, only that chunk is retried, and the per-message dedupe check (<code>notification_id, channel</code>) stops people in the finished half from getting it twice.</p>
+    <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Resolve the segment offline</b> “Germany, bought in the last 90 days” runs in the data warehouse (<a href="18-stream-batch.html">Chapter 18</a>); user IDs land in object storage in chunks.</li>
+      <li><b>Fan out in batches</b> A coordinator queues one task per chunk; workers create low-priority notifications at a <b>limited rate</b>.</li>
+      <li data-k="decision"><b>Local time</b> Group by timezone and schedule 10:00 local: the campaign rolls around the globe.</li>
+      <li data-k="end"><b>Checkpoint &amp; pause</b> Record progress per chunk, so a wrong template can be paused, fixed and resumed without re-sending.</li>
+    </ol>
+    <figcaption><b>A 200-million-user campaign as many small, controlled jobs.</b></figcaption>
+  </figure>
+<p>The arithmetic for chunks: 200M users in chunks of 100K is 2,000 chunks. If the coordinator releases chunks so that the campaign sends at 20K/s, each chunk takes 5 seconds and the whole campaign takes 200M ÷ 20K = 10,000 s ≈ 2.8 hours — spread out, not a spike. If one chunk's worker crashes halfway, only that chunk is retried, and the per-message dedupe check (<code>notification_id, channel</code>) stops people in the finished half from getting it twice.</p>
 
   <div class="callout warn"><div class="ico">📈</div><div class="body"><div class="title">The thundering herd you created</div><p>Send a push to 50 million people, and many of them open the app in the same minute. Warn the teams behind the landing page. Add capacity ahead of time (Chapter 21), cache the campaign content at the CDN, and spread delivery out. More than one company has taken down its own site with a notification.</p></div></div>
 
