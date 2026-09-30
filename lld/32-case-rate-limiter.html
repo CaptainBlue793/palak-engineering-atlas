@@ -6,34 +6,332 @@
 <title>Case Study: Rate Limiter</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rl-svg { width:100%; height:auto; display:block; margin-top:12px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); }
+  .rl-svg text { font-family:var(--mono); font-size:11px; fill:var(--muted); }
+  .rl-svg .rl-name { font-size:12px; font-weight:700; fill:var(--text); font-family:var(--sans, inherit); }
+  .rl-svg .rl-grid { stroke:var(--border-strong); stroke-dasharray:3 4; }
+  .rl-svg .rl-lane { stroke:var(--border); }
+  .rl-svg .rl-burst { font-size:10.5px; font-weight:700; }
+  .rl-svg .rl-t-ok { fill:var(--green); } .rl-svg .rl-t-no { fill:var(--red); }
+  .rl-svg circle.rl-ok { fill:var(--green); } .rl-svg circle.rl-no { fill:var(--red); opacity:.75; }
+  .rl-tbl td.rl-over { color:var(--red); font-weight:700; }
+</style>
 </head>
 <body data-chapter="32">
-<!-- lld:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 32</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 50 min</span></div>
     <h1>Case Study: <span class="grad">Rate Limiter</span></h1>
-    <p class="lead">Token bucket, fixed and sliding windows behind one interface, per-client state, and concurrent access.</p>
+    <p class="lead">A rate limiter decides, for each incoming request, whether this client has used up its allowance. As an LLD problem it's compact and rich: four well-known algorithms that make different trade-offs, per-client state that has to be created safely and cleaned up, time that must be injectable to test anything, and a hot path hit by every request on every thread. This case study builds a library you could put in front of an API.</p>
+    <ul class="objectives">
+      <li>Turn “limit clients to N requests per window” into an API with a useful answer</li>
+      <li>Implement fixed window, sliding log, sliding counter and token bucket behind one interface</li>
+      <li>Create per-client state safely and keep memory bounded</li>
+      <li>Test time-based behaviour exactly with an injected ticker</li>
+      <li>Keep the hot path correct and fast under concurrency</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Strategy and factories.</b> See <a href="15-strategy.html">Chapter 15</a> and <a href="10-factories.html">Chapter 10</a>.</li>
+        <li><b>Check-then-act and <code>computeIfAbsent</code>.</b> See <a href="22-thread-safe-classes.html">Chapter 22</a>.</li>
+        <li><b>Injected time in tests.</b> See <a href="28-testing-designs.html">Chapter 28</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Requirements and API</li>
-    <li>Algorithms as strategies</li>
-    <li>Per-client buckets</li>
-    <li>Clock injection for tests</li>
-    <li>Concurrency</li>
-  </ol>
+  <h2>Requirements and API</h2>
+  <p>Clarify first. Is this a library inside one service, or a shared service for a fleet? (Library, in-process; distributed limits are the follow-up.) What's the client key? (An API key; could be user id or IP.) Do all clients get the same limit? (No: free and paid tiers.) Are bursts acceptable? (Yes, briefly.) What does a rejected caller need? (Enough to send HTTP 429 with a <code>Retry-After</code> header.) So the answer to “may I?” is more than a boolean:</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">RateLimiter</span> {
+	<span class="t">Decision</span> <span class="f">tryAcquire</span>(<span class="t">ClientKey</span> client);            <span class="c">// never blocks</span>
+}
+
+<span class="k">public record</span> <span class="t">Decision</span>(<span class="k">boolean</span> allowed, <span class="k">long</span> remaining, <span class="t">Duration</span> retryAfter) {
+	<span class="k">static</span> <span class="t">Decision</span> <span class="f">allow</span>(<span class="k">long</span> remaining) { <span class="k">return new</span> <span class="t">Decision</span>(<span class="k">true</span>, remaining, <span class="t">Duration</span>.ZERO); }
+	<span class="k">static</span> <span class="t">Decision</span> <span class="f">deny</span>(<span class="t">Duration</span> retryAfter)  { <span class="k">return new</span> <span class="t">Decision</span>(<span class="k">false</span>, <span class="m">0</span>, retryAfter); }
+}
+
+<span class="k">public record</span> <span class="t">RateLimitPolicy</span>(<span class="k">int</span> permits, <span class="t">Duration</span> window, <span class="k">int</span> burst) {     <span class="c">// “100 per minute, bursts of 20”</span>
+	<span class="k">public</span> <span class="t">RateLimitPolicy</span> { <span class="k">if</span> (permits &lt;= <span class="m">0</span> || burst &lt;= <span class="m">0</span> || window.<span class="f">isNegative</span>() || window.<span class="f">isZero</span>()) <span class="k">throw new</span> <span class="t">IllegalArgumentException</span>(); }
+}</pre>
+  <p>The design splits into three roles. A <code>Limiter</code> holds <b>one client's</b> state for one algorithm. A <code>KeyedRateLimiter</code> maps client keys to limiters and implements <code>RateLimiter</code>. A <code>LimiterFactory</code> decides which algorithm and which policy each new client gets (by tier), so neither of the others knows about tiers or algorithm choice.</p>
+
+  <h2>Algorithms as strategies</h2>
+  <p>Each algorithm is a small class implementing one method, taking the current time as a parameter so it never reads a clock itself:</p>
+<pre class="code"><span class="k">interface</span> <span class="t">Limiter</span> { <span class="t">Decision</span> <span class="f">tryAcquire</span>(<span class="k">long</span> nowNanos); }</pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Algorithm</th><th>State per client</th><th>How it decides</th><th>Weakness</th></tr></thead>
+      <tbody>
+        <tr><td>Fixed window</td><td>Window start + count</td><td>Count requests in the current clock-aligned window</td><td>Up to 2× the limit around a window boundary</td></tr>
+        <tr><td>Sliding window log</td><td>A timestamp per accepted request (up to N)</td><td>Drop timestamps older than the window; allow if fewer than N remain</td><td>Memory grows with the limit</td></tr>
+        <tr><td>Sliding window counter</td><td>Current and previous window counts</td><td>Estimate = previous × (fraction of it still in the window) + current</td><td>Approximate: assumes the previous window's requests were spread evenly</td></tr>
+        <tr><td>Token bucket</td><td>Tokens + last refill time</td><td>Refill at a steady rate up to a capacity; each request spends a token</td><td>Allows a full burst, then the steady rate: two numbers to explain</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Token bucket is the usual default, because its two parameters map directly onto what product people ask for: a sustained rate and a tolerated burst. It also needs no timer thread: tokens are refilled <b>lazily</b>, computed from the elapsed time whenever a request arrives.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Request at time now</b> Look up this client's bucket.</li>
+      <li><b>Refill lazily</b> tokens = min(capacity, tokens + elapsed × rate); last = now.</li>
+      <li data-k="decision"><b>At least one token?</b></li>
+      <li><b>Yes: spend one</b> Allowed; report the whole tokens remaining.</li>
+      <li data-k="end"><b>No: compute the wait</b> Denied; retry after the time needed to refill to one token.</li>
+    </ol>
+    <figcaption><b>Token bucket, step by step.</b> Two numbers of state and a few arithmetic operations per request.</figcaption>
+  </figure>
+<pre class="code"><span class="k">final class</span> <span class="t">TokenBucket</span> <span class="k">implements</span> <span class="t">Limiter</span> {
+	<span class="k">private final double</span> capacity;
+	<span class="k">private final long</span> permits, windowNanos;              <span class="c">// refill rate = permits / window</span>
+	<span class="k">private double</span> tokens;
+	<span class="k">private long</span> last;
+
+	<span class="t">TokenBucket</span>(<span class="t">RateLimitPolicy</span> p, <span class="k">long</span> now) {
+		capacity = p.<span class="f">burst</span>(); permits = p.<span class="f">permits</span>(); windowNanos = p.<span class="f">window</span>().<span class="f">toNanos</span>();
+		tokens = capacity; last = now;                       <span class="c">// a new client starts with a full bucket</span>
+	}
+
+	<span class="k">public synchronized</span> <span class="t">Decision</span> <span class="f">tryAcquire</span>(<span class="k">long</span> now) {
+		<span class="k">long</span> elapsed = <span class="t">Math</span>.<span class="f">max</span>(<span class="m">0</span>, now - last);
+		tokens = <span class="t">Math</span>.<span class="f">min</span>(capacity, tokens + (<span class="k">double</span>) elapsed * permits / windowNanos);
+		last = now;
+		<span class="k">if</span> (tokens &gt;= <span class="m">1</span>) { tokens -= <span class="m">1</span>; <span class="k">return</span> <span class="t">Decision</span>.<span class="f">allow</span>((<span class="k">long</span>) tokens); }
+		<span class="k">long</span> wait = (<span class="k">long</span>) <span class="t">Math</span>.<span class="f">ceil</span>((<span class="m">1</span> - tokens) * windowNanos / permits);
+		<span class="k">return</span> <span class="t">Decision</span>.<span class="f">deny</span>(<span class="t">Duration</span>.<span class="f">ofNanos</span>(wait));
+	}
+}
+
+<span class="k">final class</span> <span class="t">FixedWindow</span> <span class="k">implements</span> <span class="t">Limiter</span> {
+	<span class="k">private final int</span> limit; <span class="k">private final long</span> windowNanos;
+	<span class="k">private long</span> windowStart; <span class="k">private int</span> count;
+
+	<span class="k">public synchronized</span> <span class="t">Decision</span> <span class="f">tryAcquire</span>(<span class="k">long</span> now) {
+		<span class="k">if</span> (now - windowStart &gt;= windowNanos) { windowStart = now - (now - windowStart) % windowNanos; count = <span class="m">0</span>; }
+		<span class="k">if</span> (count &lt; limit) { count++; <span class="k">return</span> <span class="t">Decision</span>.<span class="f">allow</span>(limit - count); }
+		<span class="k">return</span> <span class="t">Decision</span>.<span class="f">deny</span>(<span class="t">Duration</span>.<span class="f">ofNanos</span>(windowStart + windowNanos - now));
+	}
+}
+<span class="c">// SlidingWindowLog: an ArrayDeque&lt;Long&gt; of accepted times, trimmed from the front.
+// SlidingWindowCounter: two counts and the current window's start.</span></pre>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Four algorithms, same traffic: “10 requests per 10 s”</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="rlTraffic"><button class="active" data-v="boundary">burst across a window boundary</button><button data-v="steady">steady 1.5 req/s</button><button data-v="bursty">bursts of 6 every 4 s</button></div>
+      </div>
+      <svg class="rl-svg" id="rlSvg" viewBox="0 0 760 230" role="img" aria-label="Accepted and rejected requests per algorithm over 30 seconds"></svg>
+      <div class="table-wrap"><table class="t rl-tbl" id="rlTbl"></table></div>
+    </div>
+    <div class="panel-foot">Green dots were allowed, red were rejected. Dashed lines are the fixed window's boundaries. The token bucket here has capacity 10 and refills 1 token per second, which is a different contract (“bursts of 10, 1 per second sustained”) from “never more than 10 in any 10 s”.</div>
+  </div>
+
+  <p>The boundary pattern is the classic interview point: a fixed window lets a client send its full allowance at the end of one window and again at the start of the next, 20 requests in about two seconds. The sliding log enforces the limit exactly, over any window, at the cost of storing a timestamp per request. The sliding counter gets close with two numbers, but it assumes the previous window's traffic was spread evenly, so traffic bunched at a window's end fools it. Pick by what the requirement actually says.</p>
+
+  <h2>Per-client limiters</h2>
+  <p>The keyed limiter creates a client's limiter on first use. The creation must be atomic: a <code>get</code>, then a <code>put</code> if absent, is a check-then-act race (<a href="22-thread-safe-classes.html">Chapter 22</a>) where two threads can each create a fresh bucket for the same client and one of them hands out a second full allowance. <code>computeIfAbsent</code> on a <code>ConcurrentHashMap</code> does the check and the insert as one step.</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">KeyedRateLimiter</span> <span class="k">implements</span> <span class="t">RateLimiter</span> {
+	<span class="k">private final</span> <span class="t">ConcurrentHashMap</span>&lt;<span class="t">ClientKey</span>, <span class="t">Limiter</span>&gt; limiters = <span class="k">new</span> <span class="t">ConcurrentHashMap</span>&lt;&gt;();
+	<span class="k">private final</span> <span class="t">LimiterFactory</span> factory;                   <span class="c">// algorithm + policy for a client's tier</span>
+	<span class="k">private final</span> <span class="t">Ticker</span> ticker;                             <span class="c">// monotonic time source, injected</span>
+
+	<span class="k">public</span> <span class="t">Decision</span> <span class="f">tryAcquire</span>(<span class="t">ClientKey</span> client) {
+		<span class="k">long</span> now = ticker.<span class="f">nanos</span>();
+		<span class="k">return</span> limiters.<span class="f">computeIfAbsent</span>(client, k -&gt; factory.<span class="f">create</span>(k, now)).<span class="f">tryAcquire</span>(now);
+	}
+}
+
+<span class="t">LimiterFactory</span> tiers = (client, now) -&gt; <span class="k">new</span> <span class="t">TokenBucket</span>(policies.<span class="f">forTier</span>(accounts.<span class="f">tierOf</span>(client)), now);</pre>
+  <figure class="seq" data-actors="HTTP client|RateLimitFilter|KeyedRateLimiter|limiters map|TokenBucket">
+    <ol>
+      <li data-m="0>1">GET /v1/orders  (API key k_42)</li>
+      <li data-m="1>2">tryAcquire(k_42)</li>
+      <li data-m="2>3">computeIfAbsent(k_42): existing bucket</li>
+      <li data-m="2>4">tryAcquire(now)</li>
+      <li data-m="4>2" data-k="bad">deny(retryAfter = 400 ms)</li>
+      <li data-m="2>1" data-k="bad">Decision(false, 0, 400 ms)</li>
+      <li data-m="1>0" data-k="fail">429 Too Many Requests, Retry-After: 1</li>
+    </ol>
+    <figcaption><b>A rejected request.</b> The filter turns the decision into HTTP: 429 with <code>Retry-After</code> in whole seconds, rounded up, and usually headers showing the remaining allowance on allowed responses too.</figcaption>
+  </figure>
+  <p><b>Memory has to be bounded.</b> A limiter per API key is fine; a limiter per IP address, under a scan from millions of addresses, is a memory leak. Idle limiters must go. A token bucket that has refilled to full is indistinguishable from a brand-new one, so it's safe to drop; a periodic sweep can remove buckets idle for longer than the time to refill completely. The simpler route is to hold limiters in a cache with expire-after-access (<a href="31-case-lru-cache.html">Chapter 31</a>) and a maximum size.</p>
+
+  <h2>Clock injection for tests</h2>
+  <p>Rate limiting is all about time, so untestable time means an untestable limiter. Two decisions make it testable. First, limiters take <code>now</code> as a parameter, so unit tests of an algorithm pass numbers. Second, the keyed limiter reads time from an injected <b><code>Ticker</code></b>, a one-method interface returning nanoseconds. Production uses <code>System::nanoTime</code>, which is <b>monotonic</b>: unlike the wall clock (<code>Clock</code>, <code>currentTimeMillis</code>), it never jumps backwards when the system clock is adjusted, which would otherwise hand out tokens or lock clients out. Tests use a fake they advance by hand:</p>
+<pre class="code"><span class="k">@Test</span> <span class="k">void</span> <span class="f">burstThenOnePerSecond</span>() {
+	<span class="t">FakeTicker</span> time = <span class="k">new</span> <span class="t">FakeTicker</span>();
+	<span class="t">RateLimiter</span> limiter = <span class="k">new</span> <span class="t">KeyedRateLimiter</span>((k, now) -&gt; <span class="k">new</span> <span class="t">TokenBucket</span>(<span class="k">new</span> <span class="t">RateLimitPolicy</span>(<span class="m">10</span>, <span class="t">Duration</span>.<span class="f">ofSeconds</span>(<span class="m">10</span>), <span class="m">10</span>), now), time);
+
+	<span class="k">for</span> (<span class="k">int</span> i = <span class="m">0</span>; i &lt; <span class="m">10</span>; i++) <span class="f">assertTrue</span>(limiter.<span class="f">tryAcquire</span>(ALICE).<span class="f">allowed</span>());
+	<span class="t">Decision</span> d = limiter.<span class="f">tryAcquire</span>(ALICE);
+	<span class="f">assertFalse</span>(d.<span class="f">allowed</span>());
+	<span class="f">assertEquals</span>(<span class="t">Duration</span>.<span class="f">ofSeconds</span>(<span class="m">1</span>), d.<span class="f">retryAfter</span>());
+
+	time.<span class="f">advance</span>(<span class="t">Duration</span>.<span class="f">ofSeconds</span>(<span class="m">1</span>));
+	<span class="f">assertTrue</span>(limiter.<span class="f">tryAcquire</span>(ALICE).<span class="f">allowed</span>());         <span class="c">// exactly one token after 1 s</span>
+	<span class="f">assertFalse</span>(limiter.<span class="f">tryAcquire</span>(ALICE).<span class="f">allowed</span>());        <span class="c">// and only one</span>
+	<span class="f">assertTrue</span>(limiter.<span class="f">tryAcquire</span>(BOB).<span class="f">allowed</span>());           <span class="c">// clients are independent</span>
+}</pre>
+  <p>This is also why the refill is computed as <code>elapsed × permits / window</code> rather than multiplying by a precomputed rate: 10 tokens per 10 s as a rate is 10<sup>−9</sup> per nanosecond, which isn't exact in binary floating point, and a test that expects exactly one token after exactly one second could fail by a rounding error. Multiplying first keeps whole-second cases exact. Fractions still accumulate across many small refills, so a test that probes 999 ms and then 1 ms more may land a hair either side of one token. If exact boundaries matter, store time instead of tokens: the GCRA variant of the token bucket keeps a single integer, the “theoretical arrival time” of the next allowed request, and compares nanoseconds with no floating point at all.</p>
+
+  <h2>Concurrency</h2>
+  <p>Every request on every thread passes through here, so the design keeps contention narrow. The map is a <code>ConcurrentHashMap</code>, so lookups for different clients don't block each other. Each limiter synchronizes on itself, so threads only wait for other requests <b>from the same client</b>, and the critical section is a few arithmetic operations with no I/O. That's enough for most services. If one very hot key (a big customer's integration) makes its lock a bottleneck, a token bucket can be made lock-free by packing its state into one <code>AtomicLong</code> and updating it with a compare-and-set loop, at the cost of harder code. Measure before going there.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Follow-up</th><th>Where it lands</th></tr></thead>
+      <tbody>
+        <tr><td>“Different limits for free and paid tiers”</td><td><code>LimiterFactory</code> picks the policy per tier; nothing else changes</td></tr>
+        <tr><td>“Limit per endpoint as well as per client”</td><td>The key becomes a record <code>(client, endpoint)</code>; or chain two limiters (<a href="19-chain-template.html">Ch 19</a>)</td></tr>
+        <tr><td>“Callers should wait instead of failing”</td><td>A blocking <code>acquire()</code> decorator that sleeps for <code>retryAfter</code>, bounded by a timeout</td></tr>
+        <tr><td>“Limit across 20 servers”</td><td>A <code>Limiter</code> backed by a shared store: an atomic script in Redis per request, or local buckets with a share of the global rate each</td></tr>
+        <tr><td>“Change limits without a deploy”</td><td>Policies come from a config source; new policies apply as limiters are recreated</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Rate limiting a payments API</div><p>Stripe's 2017 engineering post “Scaling your API with rate limiters” describes running several limiters in production: a request-rate limiter per user, implemented as a token bucket stored in Redis; a limit on concurrent in-flight requests per user; and load shedders that reserve capacity for the most critical traffic when the whole fleet is under pressure. The post's advice matches this chapter's design: return 429 with clear information so well-behaved clients can back off (<a href="25-resilience.html">Chapter 25</a>), start new limiters in a dark mode that only logs what they would reject, and make it easy to adjust limits per user without a deploy.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b><code>get</code> then <code>put</code></b> to create a client's limiter: concurrent first requests get separate buckets.</li>
+      <li><b>One global lock</b> around all clients, so every request in the service waits for every other.</li>
+      <li><b>A timer thread per bucket</b> to add tokens. Refill lazily from elapsed time.</li>
+      <li><b>Wall-clock time</b> (<code>currentTimeMillis</code>) that can jump backwards; use a monotonic ticker, and inject it.</li>
+      <li><b>Unbounded per-client state</b> keyed by IP address. Expire idle limiters.</li>
+      <li><b>Returning only a boolean,</b> so the API can't tell clients when to retry.</li>
+      <li><b>Promising “never more than N per window” with a fixed window,</b> which allows 2N around boundaries.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does a token bucket work, and why is it a popular choice?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Each client has a bucket with a capacity and a refill rate. Tokens are added continuously at the rate, up to the capacity; each request takes one token, and a request with no token available is rejected with the time until the next token. It's popular because the two numbers map straight onto the requirement, a sustained rate plus an allowed burst, the state is just two numbers per client, and refilling can be computed lazily from the elapsed time, so there's no background thread.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> The service now runs on 20 instances behind a load balancer, and a client's limit must hold across all of them. What changes in your design?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The <code>RateLimiter</code> interface doesn't change; the <code>Limiter</code> implementation does. Option one: keep the state in a shared store and make each check atomic there, for example a Redis script that refills and spends a token in one step, keyed by client. It's exact, but adds a network round trip to every request and makes the store a dependency, so it needs a timeout and a fail-open or fail-closed decision (<a href="25-resilience.html">Chapter 25</a>). Option two: give each instance a local bucket with 1/20th of the rate; there's no network call, but it's only approximate, since a client whose traffic lands unevenly gets limited early. A hybrid syncs local counts to the store in the background. I'd pick based on how strict the limit is: billing-grade quotas go to the shared store, abuse protection can be local.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Return a <code>Decision</code> (allowed, remaining, retry-after), not a boolean, so the API can send a useful 429.</li>
+      <li>Algorithms are strategies behind <code>Limiter</code>; a factory picks algorithm and policy per client tier.</li>
+      <li>Fixed window is simple but allows 2× at boundaries; sliding log is exact but stores timestamps; token bucket gives burst plus rate with two numbers.</li>
+      <li>Create per-client limiters atomically with <code>computeIfAbsent</code>, and expire idle ones.</li>
+      <li>Refill lazily; take time as a parameter; inject a monotonic ticker so tests are exact.</li>
+      <li>Lock per client, not globally; distributed limits swap the <code>Limiter</code> implementation, not the API.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">With a fixed window of “10 per 10 s”, what's the most a client can get through in about two seconds?</p>
+      <div class="opts">
+        <button class="opt">10</button>
+        <button class="opt">20: ten at the end of one window and ten at the start of the next</button>
+        <button class="opt">2</button>
+        <button class="opt">Unlimited</button>
+      </div>
+      <div class="explain">The counter resets at the boundary, so two full allowances can land back to back. A sliding log prevents this.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why use <code>computeIfAbsent</code> to create a client's limiter?</p>
+      <div class="opts">
+        <button class="opt">It's faster than <code>get</code></button>
+        <button class="opt">It automatically expires idle entries</button>
+        <button class="opt">It sorts clients by key</button>
+        <button class="opt">It checks and inserts atomically, so concurrent first requests can't each create a separate full bucket</button>
+      </div>
+      <div class="explain">Get-then-put is check-then-act: two threads can both see “absent” and both create limiters, doubling the client's allowance.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">How does a token bucket add tokens without a background thread?</p>
+      <div class="opts">
+        <button class="opt">On each request, it computes the tokens earned since the last request from the elapsed time, capped at capacity</button>
+        <button class="opt">It schedules a task per client</button>
+        <button class="opt">It refills only when the service restarts</button>
+        <button class="opt">It can't; token buckets always need a timer</button>
+      </div>
+      <div class="explain">Lazy refill: tokens = min(capacity, tokens + elapsed × rate). Nothing happens between requests.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why should the rate limiter read time from an injected monotonic ticker rather than <code>System.currentTimeMillis()</code>?</p>
+      <div class="opts">
+        <button class="opt">Monotonic time is always in UTC</button>
+        <button class="opt">currentTimeMillis is deprecated</button>
+        <button class="opt">Wall-clock time can jump backwards when the clock is adjusted, and an injected source lets tests control time exactly</button>
+        <button class="opt">It uses less memory</button>
+      </div>
+      <div class="explain">Backwards jumps corrupt elapsed-time calculations; injection makes refill and retry-after behaviour testable to the millisecond.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">The limiter keys by IP address and memory grows steadily during a scan from millions of addresses. What's the fix?</p>
+      <div class="opts">
+        <button class="opt">Increase the heap size</button>
+        <button class="opt">Expire idle limiters, e.g. hold them in a size-bounded cache with expire-after-access</button>
+        <button class="opt">Use a fixed window instead of a token bucket</button>
+        <button class="opt">Stop rate limiting by IP</button>
+      </div>
+      <div class="explain">A full, idle token bucket is equivalent to a new one, so dropping it is safe. Bounding the map keeps memory under control.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  const LIMIT = 10, WIN = 10, T = 30;
+  const ALG = [
+    ['Fixed window', () => { let ws = 0, c = 0; return (t) => { if (t - ws >= WIN) { ws = t - ((t - ws) % WIN); c = 0; } if (c < LIMIT) { c++; return true; } return false; }; }, '2 numbers'],
+    ['Sliding log', () => { const q = []; return (t) => { while (q.length && q[0] <= t - WIN) q.shift(); if (q.length < LIMIT) { q.push(t); return true; } return false; }; }, 'up to 10 timestamps'],
+    ['Sliding counter', () => { let ws = 0, cur = 0, prev = 0; return (t) => { const k = Math.floor(t / WIN) * WIN; if (k !== ws) { prev = k - ws === WIN ? cur : 0; cur = 0; ws = k; } if (prev * (1 - (t - ws) / WIN) + cur < LIMIT) { cur++; return true; } return false; }; }, '3 numbers'],
+    ['Token bucket', () => { let tok = LIMIT, last = 0; return (t) => { tok = Math.min(LIMIT, tok + (t - last) * LIMIT / WIN); last = t; if (tok >= 1) { tok -= 1; return true; } return false; }; }, '2 numbers'],
+  ];
+  const r = (n) => Math.round(n * 1000) / 1000;
+  const TR = {
+    boundary: [...Array.from({ length: 10 }, (_, i) => r(9 + i * 0.1)), ...Array.from({ length: 10 }, (_, i) => r(10 + i * 0.1)), ...Array.from({ length: 18 }, (_, i) => 12 + i)],
+    steady: Array.from({ length: 45 }, (_, i) => r(i * 2 / 3)),
+    bursty: Array.from({ length: 8 }, (_, b) => Array.from({ length: 6 }, (_, i) => r(b * 4 + i * 0.1))).flat(),
+  };
+  const X0 = 130, X1 = 745, x = (t) => X0 + (t / T) * (X1 - X0);
+  function draw(kind) {
+    const reqs = TR[kind];
+    let svg = '';
+    for (let s = 0; s <= T; s += 10) svg += `<line class="rl-grid" x1="${x(s)}" x2="${x(s)}" y1="14" y2="200"/><text x="${x(s)}" y="220" text-anchor="middle">${s}s</text>`;
+    const rows = ALG.map(([name, mk, mem], i) => {
+      const f = mk(), y = 40 + i * 46, res = reqs.map((t) => [t, f(t)]);
+      svg += `<line class="rl-lane" x1="${X0}" x2="${X1}" y1="${y}" y2="${y}"/><text class="rl-name" x="12" y="${y + 4}">${name}</text>`;
+      res.forEach(([t, ok]) => { svg += `<circle class="${ok ? 'rl-ok' : 'rl-no'}" cx="${x(t)}" cy="${y}" r="4.2"><title>t=${t}s ${ok ? 'allowed' : 'rejected'}</title></circle>`; });
+      const groups = []; res.forEach((q) => { const g = groups[groups.length - 1]; if (g && q[0] - g[g.length - 1][0] < 0.5) g.push(q); else groups.push([q]); });
+      groups.filter((g) => g.length > 2).forEach((g) => {
+        const ok = g.filter((q) => q[1]).length, cx = (x(g[0][0]) + x(g[g.length - 1][0])) / 2;
+        svg += `<text class="rl-burst" x="${cx}" y="${y - 10}" text-anchor="middle"><tspan class="rl-t-ok">${ok}✓</tspan>${g.length - ok ? ` <tspan class="rl-t-no">${g.length - ok}✗</tspan>` : ''}</text>`;
+      });
+      const acc = res.filter((q) => q[1]).map((q) => q[0]);
+      let mx = 0; acc.forEach((s) => { mx = Math.max(mx, acc.filter((v) => v >= s && v < s + WIN).length); });
+      return { name, acc: acc.length, rej: reqs.length - acc.length, mx, mem };
+    });
+    $('#rlSvg').innerHTML = svg;
+    $('#rlTbl').innerHTML = `<thead><tr><th>Algorithm</th><th>Allowed</th><th>Rejected</th><th>Most allowed in any 10 s</th><th>State per client</th></tr></thead><tbody>${rows.map((q) => `<tr><td>${q.name}</td><td>${q.acc}</td><td>${q.rej}</td><td class="${q.mx > LIMIT ? 'rl-over' : ''}">${q.mx}${q.mx > LIMIT ? ' (over 10)' : ''}</td><td>${q.mem}</td></tr>`).join('')}</tbody>`;
+  }
+  $$('#rlTraffic button').forEach((b) => b.addEventListener('click', () => draw(b.dataset.v)));
+  draw('boundary');
+})();
+</script>
 </body>
 </html>
