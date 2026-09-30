@@ -63,7 +63,9 @@ window.addEventListener('load', function () { whenIndexed(function () {
     paths: q('#pathGrid .path').map(function (p) { return { id: p.dataset.path, chips: q('.pchip', p).map(chip), prog: ((p.querySelector('.pprog') || {}).textContent || '').trim() }; }),
     pathsHidden: grid ? grid.hidden : true,
     progTxt: document.getElementById('progTxt').textContent,
-    mosaic: q('#mosaic .mgroup .nm').map(function (a) { return a.textContent; }),
+    mosaic: q('#mosaic .mgroup').map(function (g) { var nm = g.querySelector('.nm'), ct = g.querySelector('.ct');
+      return { name: nm ? nm.textContent : '', soon: g.classList.contains('soon'), links: q('a[href]', g).length,
+        squares: q('.mosaic > *', g).length, done: q('.mosaic .done', g).length, ct: ct ? ct.textContent : '' }; }),
     filters: q('#palFilters [data-f]').map(function (c) { return c.dataset.f; }),
     studyScripts: q('script[src]').map(function (x) { return x.getAttribute('src'); }).filter(function (x) { return /study-data/.test(x); }),
     devopsK1: devops ? getComputedStyle(devops).getPropertyValue('--k1').trim() : '',
@@ -128,7 +130,14 @@ function checks(s) {
   check('coming-soon cards have no links', s.cards.filter((c) => c.soon).every((c) => c.links === 0), s.cards);
   check('released cards keep their links', s.cards.filter((c) => !c.soon).every((c) => c.links >= 3), s.cards);
   check('combined progress counts released courses only', s.progTxt === (3 + LLD_ALL.length) + ' of ' + TOTAL + ' chapters read', s.progTxt);
-  check('mosaic shows released courses only', eq(s.mosaic, ['System Design', 'ML & AI Systems', 'DSA', 'Low-Level Design']), s.mosaic);
+  check('tracker lists all nine courses in order', eq(s.mosaic.map((g) => g.name), ['System Design', 'ML & AI Systems', 'DSA', 'Low-Level Design',
+    'OS & Concurrency', 'Computer Networks', 'Database Internals & SQL', 'Distributed Systems', 'Cloud & DevOps']), s.mosaic.map((g) => g.name));
+  const soonRows = s.mosaic.filter((g) => g.soon);
+  check('the five upcoming rows are marked "Soon"', soonRows.length === 5 && soonRows.every((g) => g.ct === 'Soon'), soonRows);
+  check('upcoming rows have no links and one ghost square per planned chapter',
+    soonRows.every((g) => g.links === 0 && g.squares === 56), soonRows.map((g) => [g.name, g.links, g.squares]));
+  check('stale progress never fills an upcoming row (os-done is set)', soonRows.every((g) => g.done === 0), soonRows.map((g) => g.done));
+  check('released rows are unchanged', s.mosaic.filter((g) => !g.soon).every((g) => g.links === g.squares + 1), s.mosaic.filter((g) => !g.soon));
   check('search filters list released courses only', eq(s.filters, ['all', 'system-design', 'ml-ai-systems', 'dsa', 'lld']), s.filters);
   check('no study-data requested for unreleased courses',
     s.studyScripts.length === 4 && s.studyScripts.every((x) => !SOON.some((d) => x.startsWith(d + '/'))), s.studyScripts);
