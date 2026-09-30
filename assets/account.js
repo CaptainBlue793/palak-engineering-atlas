@@ -3,8 +3,8 @@
    ---------------------------------------------------------
    Progress lives in localStorage, exactly as before. When a
    visitor signs in (email + phone, then a one-time code sent
-   by email), this module mirrors every Atlas key (sd-*, ml-*,
-   dsa-*, lld-*, atlas-*) to the accounts API (api/, a
+   by email), this module mirrors every Atlas key (sd-*, ml-*, dsa-*,
+   lld-*, os-*, net-*, db-*, dist-*, ops-*, atlas-*) to the accounts API (api/, a
    Cloudflare Worker + D1) and keeps devices in step:
 
    • first sign-in on a device  -> merge local and account data
@@ -19,7 +19,7 @@
    ========================================================= */
 import { apiBase, localApiBase, defaultCountryCode } from './account-config.js';
 
-const TRACK = (k) => /^(sd|ml|dsa|lld|atlas)-/.test(k);
+const TRACK = (k) => /^(sd|ml|dsa|lld|os|net|db|dist|ops|atlas)-/.test(k);
 const META = '__acct-meta';    // { key: last-modified ms } for this browser
 const LAST = '__acct-uid';     // account this browser last synced with (email|phone)
 const TOKEN = '__acct-token';  // session token from the API

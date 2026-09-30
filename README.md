@@ -14,6 +14,10 @@ no build step.
 | **[DSA](dsa/)** | 8 prerequisites + 56 | Every structure and algorithm, in one consistent C++ house style |
 | **[Low-Level Design](lld/)** | 8 prerequisites + 46 | SOLID, design patterns, concurrency and 16 case studies in Java |
 
+**On the way:** OS & Concurrency · Computer Networks · Database Internals & SQL · Distributed Systems ·
+Cloud & DevOps — see [the plan](docs/superpowers/specs/2026-09-30-atlas-expansion-design.md). The Atlas home
+page also suggests an order through the courses for each kind of role.
+
 
 ## Optional accounts
 
@@ -42,7 +46,7 @@ entry point:
   The chapter mosaic on the home page is one square per chapter, all 228 of them.
 - **Resume** — deep-links to the next unread chapter of whichever course you're furthest into.
 - **Cross-course search** — `Ctrl+K` (or `/`) searches ~3,500 chapter, section and demo entries
-  across all four courses at once, filterable by course, deep-linking to the exact anchor.
+  across every released course at once, filterable by course, deep-linking to the exact anchor.
   The indexes load lazily after first paint, so the page opens instantly.
 - **Shared theme** — the toggle writes every course's theme key, so it carries across.
 
