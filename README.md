@@ -2,7 +2,7 @@
 
 **[captainblue793.github.io/palak-engineering-atlas](https://captainblue793.github.io/palak-engineering-atlas/)**
 
-Every interactive engineering course I've written, in one place — **174 chapters (150 main chapters plus a 24-chapter Prerequisites level), ~129 hours,
+Every interactive engineering course I've written, in one place — **228 chapters (196 main chapters plus a 32-chapter Prerequisites level), ~168 hours,
 zero dependencies**. No walls of text: every chapter has animated diagrams, simulators you can
 break, an interview drill and a quiz. It all runs in your browser, offline, with no account and
 no build step.
@@ -12,6 +12,7 @@ no build step.
 | **[System Design](system-design/)** | 8 prerequisites + 42 | Caching, sharding, queues, consensus, multi-region — plus 17 case studies |
 | **[ML & AI Systems](ml-ai-systems/)** | 8 prerequisites + 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
 | **[DSA](dsa/)** | 8 prerequisites + 56 | Every structure and algorithm, in one consistent C++ house style |
+| **[Low-Level Design](lld/)** | 8 prerequisites + 46 | SOLID, design patterns, concurrency and 16 case studies in Java *(scaffolded — chapters in progress)* |
 
 ```
 palak-engineering-atlas/
@@ -19,7 +20,8 @@ palak-engineering-atlas/
 ├── assets/atlas.js     ← the COURSES registry + hub runtime
 ├── system-design/      ← each course is a self-contained site
 ├── ml-ai-systems/
-└── dsa/
+├── dsa/
+└── lld/
 ```
 
 ## What the Atlas adds
@@ -29,11 +31,11 @@ search, progress, glossary, flashcards and mock-interview room. The Atlas joins 
 entry point:
 
 - **Combined progress** — reads each course's own `localStorage` key (`sd-done`, `ml-done`,
-  `dsa-done`), so ticking a chapter off inside a course shows up on the hub, and vice versa.
-  The chapter mosaic on the home page is one square per chapter, all 174 of them.
+  `dsa-done`, `lld-done`), so ticking a chapter off inside a course shows up on the hub, and vice versa.
+  The chapter mosaic on the home page is one square per chapter, all 228 of them.
 - **Resume** — deep-links to the next unread chapter of whichever course you're furthest into.
 - **Cross-course search** — `Ctrl+K` (or `/`) searches ~3,500 chapter, section and demo entries
-  across all three courses at once, filterable by course, deep-linking to the exact anchor.
+  across all four courses at once, filterable by course, deep-linking to the exact anchor.
   The indexes load lazily after first paint, so the page opens instantly.
 - **Shared theme** — the toggle writes every course's theme key, so it carries across.
 

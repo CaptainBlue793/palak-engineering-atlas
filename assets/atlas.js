@@ -95,6 +95,27 @@
       dist: 'dsa-course.html',
       release: null,
     },
+    {
+      id: 'lld',
+      title: 'Low-Level Design',
+      // A UML class box composed with a second class — the unit every design here is drawn in.
+      mark: '<rect x="3" y="2.5" width="12" height="11" rx="1.6"/><path d="M3 6.2h12M3 9.8h12"/>' +
+            '<path d="M9 13.5l1.4 1.6L9 16.7l-1.4-1.6z" fill="currentColor"/><path d="M9 16.7v2.3h4"/>' +
+            '<rect x="13" y="16" width="8" height="5.5" rx="1.5"/>',
+      tagline: 'From "what is a class, really" to a thread-safe booking system.',
+      blurb: 'Object-oriented design for the LLD round, in Java: SOLID, the design patterns that actually come up, concurrency and testing — then 16 case studies, each ending with the "now extend it" follow-up.',
+      topics: ['SOLID', 'Design patterns', 'Concurrency', 'UML', 'Java', '16 case studies'],
+      chapters: 54,
+      hours: 39,
+      c1: '#4f46e5',
+      c2: '#6366f1',
+      store: 'lld',
+      indexVar: 'LLD_INDEX',
+      dir: 'lld',
+      first: 'p1-classes-objects.html',
+      dist: 'lld-course.html',
+      release: null,
+    },
   ];
 
   /* Recommended orderings. `steps` holds course ids from COURSES. */
@@ -102,14 +123,14 @@
     {
       icon: '🎯',
       title: 'Cracking the interview',
-      blurb: 'Algorithms until the patterns are automatic, then design rounds. Both courses end with a playbook and a timed mock-interview room.',
-      steps: ['dsa', 'system-design'],
+      blurb: 'Algorithms until the patterns are automatic, then the class-level design round, then the architecture round. Every course ends with a playbook and a timed mock-interview room.',
+      steps: ['dsa', 'lld', 'system-design'],
     },
     {
       icon: '🛠️',
       title: 'Backend / platform engineer',
       blurb: 'Learn the components you actually wire together, keep the algorithmic base sharp, and pick up enough ML infrastructure to support a model team.',
-      steps: ['system-design', 'dsa', 'ml-ai-systems'],
+      steps: ['system-design', 'lld', 'dsa', 'ml-ai-systems'],
     },
     {
       icon: '🧠',
