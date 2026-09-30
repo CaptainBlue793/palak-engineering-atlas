@@ -6,34 +6,323 @@
 <title>Case Study: Connection Pool</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .cp-slots { display:flex; flex-wrap:wrap; gap:4px; margin-top:12px; padding:10px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); min-height:40px; }
+  .cp-slots i { width:22px; height:22px; border-radius:5px; background:var(--border); transition:background .1s; }
+  .cp-slots i.cp-act { background:var(--accent); } .cp-slots i.cp-leak { background:var(--red); }
+  .cp-row { display:grid; grid-template-columns: 150px 1fr 70px; gap:10px; align-items:center; margin-top:10px; font-size:13px; }
+  .cp-track { height:14px; border-radius:6px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; }
+  .cp-fill { height:100%; width:0; background:var(--amber); }
+  .cp-num { font-family:var(--mono); text-align:right; }
+  .cp-legend { display:flex; flex-wrap:wrap; gap:12px; font-size:12px; color:var(--muted); margin-top:6px; }
+  .cp-legend span::before { content:""; display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:5px; vertical-align:-1px; background:var(--c); }
+</style>
 </head>
 <body data-chapter="39">
-<!-- lld:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 39</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
     <h1>Case Study: <span class="grad">Connection Pool</span></h1>
-    <p class="lead">Blocking acquire with timeouts, validating idle connections, leak detection and sizing.</p>
+    <p class="lead">Opening a database connection means a TCP handshake, often TLS, authentication and session setup: milliseconds each time, far longer than many queries. A connection pool keeps a few open and lends them out. It's a small class with a lot of concurrency in it: callers block for a connection with a timeout, connections go stale and must be validated, callers forget to give them back, and the “obvious” fix of a bigger pool usually makes things slower. This case study builds one, then lets you size it under load.</p>
+    <ul class="objectives">
+      <li>Define a pool API where returning a connection can't be forgotten</li>
+      <li>Bound concurrency with a semaphore and hand out idle connections safely</li>
+      <li>Fail fast with acquire timeouts instead of hanging threads</li>
+      <li>Validate, reset and retire connections at the right moments</li>
+      <li>Detect leaks and size the pool from throughput and hold time</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Proxy.</b> See <a href="13-decorator-proxy.html">Chapter 13</a>.</li>
+        <li><b>Semaphores, bounded queues and timeouts.</b> See <a href="22-thread-safe-classes.html">Chapter 22</a> and <a href="23-producer-consumer.html">Chapter 23</a>.</li>
+        <li><b>Timeouts and bulkheads.</b> See <a href="25-resilience.html">Chapter 25</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Requirements and API</li>
-    <li>Object pool with a semaphore</li>
-    <li>Acquire timeouts</li>
-    <li>Validation and eviction</li>
-    <li>Leak detection</li>
-  </ol>
+  <h2>Requirements and API</h2>
+  <p>Clarify: a maximum number of connections (the database's limit is shared by every instance of the service); a minimum kept warm; <code>acquire</code> blocks when all are in use, but only up to a timeout; broken or stale connections are never handed out; connections are reset between borrowers; idle ones are closed after a while, and every connection is retired after a maximum lifetime; leaks are detected and reported; many threads at once. The caller-facing API is the standard JDBC one, which gives a strong design constraint: the caller returns a connection by calling <code>close()</code>.</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">ConnectionPool</span> <span class="k">extends</span> <span class="t">AutoCloseable</span> {
+	<span class="t">Connection</span> <span class="f">acquire</span>() <span class="k">throws</span> <span class="t">PoolTimeoutException</span>;          <span class="c">// waits up to config.acquireTimeout</span>
+	<span class="t">PoolStats</span> <span class="f">stats</span>();                                           <span class="c">// active, idle, waiting, created, timeouts</span>
+}
+
+<span class="k">public record</span> <span class="t">PoolConfig</span>(<span class="k">int</span> maxSize, <span class="k">int</span> minIdle, <span class="t">Duration</span> acquireTimeout, <span class="t">Duration</span> idleTimeout,
+                         <span class="t">Duration</span> maxLifetime, <span class="t">Duration</span> leakThreshold) {}
+
+<span class="c">// Callers: the connection goes back to the pool when the try block ends, even on an exception.</span>
+<span class="k">try</span> (<span class="t">Connection</span> c = pool.<span class="f">acquire</span>()) {
+	<span class="k">return</span> orders.<span class="f">findById</span>(c, id);
+}</pre>
+  <p><code>acquire</code> returns a <b>proxy</b> (<a href="13-decorator-proxy.html">Chapter 13</a>) wrapping the real connection. Its <code>close()</code> doesn't close the socket; it returns the connection to the pool. That's what makes try-with-resources work, and the proxy also guards against misuse: after <code>close()</code>, any call on it throws, so a caller that kept a reference can't use a connection that now belongs to someone else.</p>
+<pre class="code"><span class="k">final class</span> <span class="t">PooledConnection</span> <span class="k">implements</span> <span class="t">Connection</span> {
+	<span class="k">private final</span> <span class="t">Connection</span> real;
+	<span class="k">private final</span> <span class="t">DefaultPool</span> pool;
+	<span class="k">private final</span> <span class="t">AtomicBoolean</span> returned = <span class="k">new</span> <span class="t">AtomicBoolean</span>();
+	<span class="k">final</span> <span class="t">Instant</span> createdAt; <span class="t">Instant</span> lastUsed; <span class="t">Throwable</span> borrowSite;   <span class="c">// borrowSite: stack captured when leak detection is on</span>
+
+	<span class="k">public void</span> <span class="f">close</span>() { <span class="k">if</span> (returned.<span class="f">compareAndSet</span>(<span class="k">false</span>, <span class="k">true</span>)) pool.<span class="f">release</span>(<span class="k">this</span>); }   <span class="c">// double close is harmless</span>
+
+	<span class="k">public</span> <span class="t">PreparedStatement</span> <span class="f">prepareStatement</span>(<span class="t">String</span> sql) <span class="k">throws</span> <span class="t">SQLException</span> {
+		<span class="f">ensureOpen</span>();                                              <span class="c">// use after close → SQLException</span>
+		<span class="k">return</span> real.<span class="f">prepareStatement</span>(sql);
+	}
+	<span class="c">// … every other Connection method: ensureOpen(), then delegate</span>
+}</pre>
+
+  <h2>Object pool with a semaphore</h2>
+  <p>Two things need guarding: <b>how many</b> connections exist (never more than <code>maxSize</code>), and <b>which</b> idle connection a borrower gets. A <code>Semaphore</code> with <code>maxSize</code> permits answers the first: a borrower takes a permit before touching anything, and it's released when the connection comes back or is destroyed. A concurrent deque of idle connections answers the second, used as a stack, <b>last in first out</b>, so the most recently used connections stay warm and the rarely used ones age out naturally. Creating a connection is slow network I/O, so it happens <b>while holding a permit but no lock</b>: a creation in progress already counts toward the maximum, and nobody else is blocked by it.</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">DefaultPool</span> <span class="k">implements</span> <span class="t">ConnectionPool</span> {
+	<span class="k">private final</span> <span class="t">Semaphore</span> permits;                                   <span class="c">// = maxSize, fair</span>
+	<span class="k">private final</span> <span class="t">Deque</span>&lt;<span class="t">PooledConnection</span>&gt; idle = <span class="k">new</span> <span class="t">ConcurrentLinkedDeque</span>&lt;&gt;();
+	<span class="k">private final</span> <span class="t">ConnectionFactory</span> factory;                            <span class="c">// opens real connections; a fake in tests</span>
+	<span class="k">private final</span> <span class="t">PoolConfig</span> config;
+	<span class="k">private final</span> <span class="t">Clock</span> clock;
+
+	<span class="k">public</span> <span class="t">Connection</span> <span class="f">acquire</span>() <span class="k">throws</span> <span class="t">PoolTimeoutException</span> {
+		<span class="t">Instant</span> deadline = clock.<span class="f">instant</span>().<span class="f">plus</span>(config.<span class="f">acquireTimeout</span>());
+		<span class="k">if</span> (!<span class="f">tryAcquirePermit</span>(config.<span class="f">acquireTimeout</span>())) <span class="k">throw new</span> <span class="t">PoolTimeoutException</span>(<span class="f">stats</span>());
+		<span class="k">try</span> {
+			<span class="k">while</span> (<span class="k">true</span>) {
+				<span class="t">PooledConnection</span> c = idle.<span class="f">pollFirst</span>();                   <span class="c">// LIFO: warmest first</span>
+				<span class="k">if</span> (c == <span class="k">null</span>) <span class="k">return</span> <span class="f">lend</span>(<span class="f">create</span>(deadline));                <span class="c">// under the permit, outside any lock</span>
+				<span class="k">if</span> (<span class="f">usable</span>(c)) <span class="k">return</span> <span class="f">lend</span>(c);
+				<span class="f">destroy</span>(c);                                            <span class="c">// stale or broken: try the next one</span>
+			}
+		} <span class="k">catch</span> (<span class="t">RuntimeException</span> | <span class="t">Error</span> e) {
+			permits.<span class="f">release</span>();                                       <span class="c">// never leak a permit on failure</span>
+			<span class="k">throw</span> e;
+		}
+	}
+
+	<span class="k">void</span> <span class="f">release</span>(<span class="t">PooledConnection</span> c) {
+		<span class="k">try</span> {
+			<span class="k">if</span> (<span class="f">expired</span>(c) || !<span class="f">reset</span>(c)) <span class="f">destroy</span>(c);                 <span class="c">// reset: rollback, autocommit on, clear warnings</span>
+			<span class="k">else</span> { c.lastUsed = clock.<span class="f">instant</span>(); idle.<span class="f">offerFirst</span>(c.<span class="f">fresh</span>()); }   <span class="c">// a new proxy for the next borrower</span>
+		} <span class="k">finally</span> { permits.<span class="f">release</span>(); }
+	}
+}</pre>
+  <p>Note <code>c.fresh()</code>: the pool stores the real connection wrapped in a <b>new</b> proxy for each loan, so the previous borrower's proxy stays closed forever. Reusing the same proxy object would let a stale reference work again as soon as someone else borrowed it.</p>
+
+  <h2>Acquire timeouts</h2>
+  <p>When every connection is busy, a borrower waits. It must not wait forever: a slow database would otherwise pile up every request thread behind the pool, and the service would stop responding to anything, including health checks. <code>tryAcquire(timeout)</code> bounds the wait, and on timeout the caller gets a <code>PoolTimeoutException</code> carrying the pool's statistics (“10 active, 0 idle, 37 waiting”), which is exactly the context needed when it shows up in a log. This is the bulkhead of <a href="25-resilience.html">Chapter 25</a>: the pool caps how much of the service one dependency can tie up. Use a <b>fair</b> semaphore, so waiters are served in order and no request starves.</p>
+  <figure class="seq" data-actors="Request thread|DefaultPool|Semaphore|Idle deque|Database">
+    <ol>
+      <li data-m="0>1">acquire()</li>
+      <li data-m="1>2">tryAcquire(timeout 1 s)</li>
+      <li data-m="2>1" data-k="reply">permit granted after 40 ms</li>
+      <li data-m="1>3">pollFirst() → conn #3 (idle 2 s)</li>
+      <li data-m="1>4">isValid(1 s)? idle beyond 500 ms, so check</li>
+      <li data-m="4>1" data-k="reply">true</li>
+      <li data-m="1>0" data-k="reply">proxy for conn #3</li>
+      <li data-m="0>1">close() → release: reset, push to idle, release permit</li>
+    </ol>
+    <figcaption><b>One loan.</b> The permit bounds concurrency, the deque supplies the connection, validation keeps broken ones out, and close() puts everything back.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Size the pool: 20 seconds of traffic against a 4-core database</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <span class="small muted">Pool size</span><div class="seg" id="cpSize"><button data-v="2">2</button><button data-v="4">4</button><button class="active" data-v="8">8</button><button data-v="16">16</button><button data-v="50">50</button></div>
+      </div>
+      <div class="controls">
+        <div class="seg" id="cpLoad"><button class="active" data-v="150">150 req/s (normal)</button><button data-v="250">250 req/s (more than the DB can do)</button></div>
+        <label class="small"><input type="checkbox" id="cpLeak"> 0.5% of requests forget to close()</label>
+        <button class="btn sm primary" id="cpRun">▶ run</button>
+      </div>
+      <div class="cp-slots" id="cpSlots"></div>
+      <div class="cp-legend"><span style="--c:var(--accent)">in use</span><span style="--c:var(--border)">idle</span><span style="--c:var(--red)">leaked (never returned)</span></div>
+      <div class="cp-row"><span>Threads waiting</span><div class="cp-track"><div class="cp-fill" id="cpWait"></div></div><span class="cp-num" id="cpWaitN">0</span></div>
+      <div class="stats" id="cpStats"></div>
+    </div>
+    <div class="panel-foot">A model: each query needs 20 ms of database CPU; the database has 4 cores and loses efficiency when it juggles many more concurrent queries than it has cores (context switches, lock and cache contention). Acquire timeout 1 s. So the database tops out at about 200 queries per second, whatever the pool size.</div>
+  </div>
+
+  <h2>Validation and eviction</h2>
+  <p>A connection that sat idle can be dead without the pool knowing: the database restarted, a firewall silently dropped an idle TCP session, a failover moved the primary. Handing one out means the caller's first query fails. So the pool <b>validates</b> before lending, with JDBC's <code>isValid(timeout)</code> (or a trivial query on old drivers), but only if the connection has been idle for more than a short window, since validating on every borrow adds a round trip to every request. It also resets state on return, so one borrower's open transaction or changed session setting never leaks into the next borrower's work.</p>
+  <p>A background <b>housekeeper</b> (a scheduled task, <a href="35-case-task-scheduler.html">Chapter 35</a>) handles the rest every few seconds: close connections idle longer than <code>idleTimeout</code> while keeping <code>minIdle</code>; retire any connection older than <code>maxLifetime</code>, set a little shorter than any timeout the database or network imposes, so the pool closes connections on its own terms instead of discovering them dead; and top up to <code>minIdle</code>. Retiring a borrowed connection waits until it's returned: <code>release</code> checks <code>expired(c)</code> and destroys it instead of pooling it.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Check</th><th>When</th><th>Protects against</th></tr></thead>
+      <tbody>
+        <tr><td><code>isValid</code> before lending</td><td>On borrow, if idle beyond ~500 ms</td><td>Dead sockets after restarts, failovers, firewall timeouts</td></tr>
+        <tr><td>Reset on return</td><td>Every release</td><td>Open transactions, autocommit off, changed isolation or read-only mode leaking between borrowers</td></tr>
+        <tr><td>Idle timeout</td><td>Housekeeper</td><td>Holding database connections the service doesn't need</td></tr>
+        <tr><td>Max lifetime</td><td>Housekeeper and on release</td><td>Connections killed by infrastructure limits; slow memory growth on the server side</td></tr>
+        <tr><td>Leak threshold</td><td>Housekeeper, over borrowed connections</td><td>Code paths that never call <code>close()</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Leak detection</h2>
+  <p>The most common pool failure isn't the database; it's a code path that borrows a connection and never returns it: a <code>close()</code> missing on an early return, or a connection held while waiting on a slow HTTP call. Each leak permanently removes one connection, and the pool degrades quietly until it's exhausted, as the leak option in the simulation shows. Detection is cheap: when leak detection is on, record the borrower's stack trace at <code>acquire</code> (<code>new Throwable()</code>), and let the housekeeper report any connection borrowed for longer than the threshold, with that stack trace, which points straight at the line that forgot to close. Reclaiming a leaked connection automatically is risky (the borrower may still be using it), so report and fix the code instead.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>acquire()</b> Store borrowedAt and, if leak detection is on, the borrow-site stack trace.</li>
+      <li><b>Housekeeper tick</b> Scan the borrowed set.</li>
+      <li data-k="decision"><b>Borrowed longer than the threshold?</b> e.g. 30 s for a service whose queries take milliseconds.</li>
+      <li><b>Log a warning with the borrow-site stack</b> Once per loan; include the thread name and how long it's been out.</li>
+      <li data-k="end"><b>Returned later?</b> Log that it came back, so false alarms from long batch jobs are easy to spot.</li>
+    </ol>
+    <figcaption><b>Leak detection.</b> The expensive part, capturing a stack trace, is only paid when the feature is enabled.</figcaption>
+  </figure>
+
+  <h2>Sizing the pool</h2>
+  <p>Intuition says more connections means more throughput. The database disagrees: it has a fixed number of CPU cores and disks, so beyond a point more concurrent queries just take turns, each one slower, while adding context switches and lock contention. <b>Little's law</b> gives the starting estimate: connections needed ≈ throughput × time each connection is held. At 150 queries per second holding each connection for 20 ms, that's 3 connections busy on average; add headroom for bursts and you're near 8, not 50. The simulation shows the other side: under overload, a big pool doesn't raise throughput, it spreads the database across more queries at once and lowers it.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">HikariCP's advice: smaller than you think</div><p>HikariCP, the default connection pool in Spring Boot, is built on the ideas in this chapter: a bounded pool, connection timeouts, validation, idle and maximum lifetimes, and an optional <code>leakDetectionThreshold</code> that logs the stack trace of a connection held too long. Its documentation page “About Pool Sizing” argues that most pools are far too large, and quotes a starting formula from the PostgreSQL project, connections = (core count × 2) + effective spindle count, for a database server; for a 4-core database with one disk that suggests around 9 or 10. Remember too that the database's limit is shared: 20 service instances with a pool of 50 each ask for 1,000 connections, more than many databases allow.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>No acquire timeout:</b> a slow database hangs every request thread behind the pool.</li>
+      <li><b><code>close()</code> that really closes the socket,</b> or a reused proxy that lets a stale reference work again.</li>
+      <li><b>Creating connections while holding a lock,</b> blocking every borrower behind one slow handshake.</li>
+      <li><b>Losing a permit on an exception</b> during creation or validation, shrinking the pool one failure at a time.</li>
+      <li><b>No reset on return,</b> leaking an open transaction or session setting to the next borrower.</li>
+      <li><b>Validating on every borrow,</b> or never: pay the round trip only after idle time.</li>
+      <li><b>Sizing by guesswork</b> (“set it to 100”) instead of throughput × hold time and the database's limits.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does a caller return a connection, and how do you stop them using it afterwards?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The pool hands out a proxy that implements <code>Connection</code>. Its <code>close()</code> returns the underlying connection to the pool instead of closing it, so the standard try-with-resources pattern returns connections automatically. The proxy has an atomic “returned” flag: a second close does nothing, and any other call after close throws. Each loan gets a new proxy, so an old reference can never reach a connection that's now lent to someone else.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Production alerts show pool timeouts, but the database's CPU is at 30%. What could be happening, and how would you investigate?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>If the database isn't busy, connections are being held without doing database work. Likely causes: a leak (a code path that never closes), or code holding a connection across slow non-database work, like an HTTP call inside a transaction (<a href="26-persistence.html">Chapter 26</a>). I'd turn on leak detection with a threshold well above normal query time and read the borrow-site stack traces; look at the pool stats over time (active stuck at max while query rate is flat points to leaks); and check hold-time metrics per call site. It could also be lock waits in the database: queries blocked on row locks hold connections without using CPU, which the database's lock views would show. The fix is in the code, not a bigger pool; a bigger pool would just delay the same failure.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Callers return connections by calling <code>close()</code> on a per-loan proxy; closed proxies reject further use.</li>
+      <li>A fair semaphore bounds the number of connections; an idle deque used LIFO supplies them; creation happens under a permit, outside locks.</li>
+      <li>Always bound the wait with an acquire timeout, and release permits on every failure path.</li>
+      <li>Validate after idle time, reset on return, and retire by idle timeout and max lifetime in a housekeeper.</li>
+      <li>Detect leaks by recording the borrow-site stack and reporting long loans.</li>
+      <li>Size with Little's law and the database's cores; past saturation, bigger pools are slower.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why does the pool return a proxy rather than the real connection?</p>
+      <div class="opts">
+        <button class="opt">Proxies make queries faster</button>
+        <button class="opt">JDBC requires it</button>
+        <button class="opt">So <code>close()</code> returns the connection to the pool, and the pool can reject use after close</button>
+        <button class="opt">To encrypt the connection</button>
+      </div>
+      <div class="explain">The proxy intercepts close() and every other call, turning the standard JDBC lifecycle into borrow and return.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why is a slow new connection created while holding a permit but not a lock?</p>
+      <div class="opts">
+        <button class="opt">The permit keeps the total within maxSize; not holding a lock means other borrowers aren't blocked by the slow handshake</button>
+        <button class="opt">Locks can't be held during I/O in Java</button>
+        <button class="opt">Semaphores are faster than locks</button>
+        <button class="opt">It avoids the need for validation</button>
+      </div>
+      <div class="explain">Counting the creation against the limit is essential; blocking everyone else during network I/O is not.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A service handles 400 queries per second, each holding a connection for 10 ms. Roughly how many connections are busy on average?</p>
+      <div class="opts">
+        <button class="opt">400</button>
+        <button class="opt">40</button>
+        <button class="opt">100</button>
+        <button class="opt">4</button>
+      </div>
+      <div class="explain">Little's law: 400/s × 0.01 s = 4. Add headroom for bursts, and the pool is still far smaller than intuition suggests.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What should happen to a connection when it's returned to the pool?</p>
+      <div class="opts">
+        <button class="opt">Nothing; it goes straight back to idle</button>
+        <button class="opt">Roll back any open transaction and restore default settings; destroy it instead if it's broken or past its max lifetime</button>
+        <button class="opt">Close it and open a new one</button>
+        <button class="opt">Validate it with a test query every time</button>
+      </div>
+      <div class="explain">Resetting protects the next borrower; retiring expired or broken connections keeps the pool healthy without a round trip on every return.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What is the most useful information in a leak-detection warning?</p>
+      <div class="opts">
+        <button class="opt">The connection's database URL</button>
+        <button class="opt">The total number of queries run</button>
+        <button class="opt">The stack trace captured when the connection was borrowed, pointing at the code that never closed it</button>
+        <button class="opt">The pool's maximum size</button>
+      </div>
+      <div class="explain">A leak is a code bug. The borrow-site stack trace identifies the exact call path to fix.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  let size = 8, rate = 150, timer = 0;
+  function simulate(leakOn) {
+    const T = 20000, base = 20, cores = 4, timeout = 1000;
+    let s = 7; const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+    const waiting = [], active = [], frames = []; let leaked = 0, done = [], timeouts = 0, arr = 0;
+    for (let t = 0; t < T; t += 10) {
+      arr += rate / 100 * (0.5 + rnd());
+      while (arr >= 1) { waiting.push({ at: t }); arr--; }
+      while (waiting.length && waiting[0].at + timeout <= t) { waiting.shift(); timeouts++; }
+      while (waiting.length && active.length + leaked < size) { const r = waiting.shift(); r.left = base; r.leak = leakOn && rnd() < 0.005; active.push(r); }
+      const n = active.length, pen = 1 / (1 + 0.015 * Math.max(0, n - 2 * cores)), share = n ? 10 * Math.min(1, cores * pen / n) : 0;
+      for (let i = active.length - 1; i >= 0; i--) { const r = active[i]; r.left -= share; if (r.left <= 0) { active.splice(i, 1); if (r.leak) leaked++; else if (t > 2000) done.push(t + 10 - r.at); } }
+      if (t % 100 === 0) frames.push([active.length, leaked, waiting.length]);
+    }
+    done.sort((a, b) => a - b);
+    return { frames, thr: done.length / ((T - 2000) / 1000), p50: done[Math.floor(done.length * 0.5)] || 0, p95: done[Math.floor(done.length * 0.95)] || 0, timeouts, leaked };
+  }
+  function show(f) {
+    const [a, l, w] = f;
+    $('#cpSlots').innerHTML = Array.from({ length: size }, (_, i) => `<i class="${i < l ? 'cp-leak' : i < l + a ? 'cp-act' : ''}"></i>`).join('');
+    $('#cpWait').style.width = `${Math.min(100, w / 3)}%`; $('#cpWaitN').textContent = w;
+  }
+  function run() {
+    clearTimeout(timer);
+    const r = simulate($('#cpLeak').checked);
+    $('#cpStats').innerHTML = '';
+    let i = 0;
+    const step = () => {
+      show(r.frames[i]); i += 2;
+      if (i < r.frames.length) timer = setTimeout(step, 16);
+      else {
+        show(r.frames[r.frames.length - 1]);
+        $('#cpStats').innerHTML = `
+          <div class="stat ${r.thr < rate * 0.9 ? 'bad' : 'good'}"><div class="k">Throughput</div><div class="v">${r.thr.toFixed(0)}<small> /s of ${rate}</small></div></div>
+          <div class="stat ${r.p95 > 500 ? 'bad' : r.p95 > 60 ? 'warn' : 'good'}"><div class="k">p50 / p95 latency (served)</div><div class="v" style="font-size:18px">${r.p50} / ${r.p95}<small> ms</small></div></div>
+          <div class="stat ${r.timeouts ? 'bad' : 'good'}"><div class="k">Acquire timeouts</div><div class="v">${r.timeouts}</div></div>
+          <div class="stat ${r.leaked ? 'bad' : ''}"><div class="k">Leaked connections</div><div class="v">${r.leaked}<small> of ${size}</small></div></div>`;
+      }
+    };
+    step();
+  }
+  $$('#cpSize button').forEach((b) => b.addEventListener('click', () => { size = +b.dataset.v; run(); }));
+  $$('#cpLoad button').forEach((b) => b.addEventListener('click', () => { rate = +b.dataset.v; run(); }));
+  $('#cpLeak').addEventListener('change', run);
+  $('#cpRun').onclick = run;
+  run();
+})();
+</script>
 </body>
 </html>
