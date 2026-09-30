@@ -280,10 +280,7 @@
           'title="' + chShort(n) + (ch ? ' · ' + (ch.ti || ch.title || '').replace(/"/g, '') : '') + (d.has(n) ? ' ✓' : '') + '" ' +
           'aria-label="' + esc(c.title) + ' chapter ' + n + '"></a>';
       });
-      // pick a column count that fills whole rows — no ragged tail
-      var rows = Math.max(1, Math.ceil(total / 30));
-      var cols = Math.ceil(total / rows);
-      return '<div class="mgroup" style="--c1:' + c.c1 + ';--c2:' + c.c2 + ';--cols:' + cols + '">' +
+      return '<div class="mgroup" style="--c1:' + c.c1 + ';--c2:' + c.c2 + '">' +
         '<div class="gh"><a class="nm" href="' + url(c, 'index.html') + '">' + esc(c.title) + '</a>' +
         '<span class="rule"></span><span class="ct">' + doneCount(c) + '/' + total + '</span></div>' +
         '<div class="mosaic">' + sq + '</div></div>';
@@ -315,38 +312,17 @@
     // Resume = the started-but-unfinished course you are furthest into.
     var live = COURSES.filter(function (c) { return doneCount(c) > 0 && doneCount(c) < countOf(c); })
       .sort(function (a, b) { return doneCount(b) - doneCount(a); });
-    var btn = $('#resumeBtn') || document.createElement('a'), hint = $('#progHint');
-    var band = { t: $('#bandTitle'), p: $('#bandText'), b: $('#bandBtn') };
+    var hint = $('#progHint');
 
     if (live.length) {
       var c = live[0], next = nextChapter(c);
-      var href = next ? url(c, next.f) : url(c, 'index.html');
-      btn.href = href;
-      btn.textContent = 'Resume ' + c.title + (next ? ' · ' + chShort(next.n) : '') + ' →';
       hint.innerHTML = next
         ? 'Next: <b>' + chShort(next.n) + ' · ' + esc(next.ti) + '</b>'
         : 'Pick up where you left off in <b>' + esc(c.title) + '</b>';
-      band.t.textContent = "You're " + p + '% of the way through.';
-      band.p.textContent = next ? 'Next up: ' + chLong(next.n) + ' · ' + next.ti + ' — in ' + c.title + '.'
-        : 'Pick up where you left off in ' + c.title + '.';
-      band.b.textContent = 'Resume ' + c.title + ' →';
-      band.b.href = href;
     } else if (done === total && total > 0) {
-      btn.href = '#courses';
-      btn.textContent = 'Every chapter complete 🎉';
       hint.textContent = 'Nothing left to read.';
-      band.t.textContent = 'All ' + total + ' chapters done.';
-      band.p.textContent = 'The flashcard decks are built from every quiz in all three courses — that is the next move.';
-      band.b.textContent = 'Revise with flashcards →';
-      band.b.href = url(COURSES[0], 'flashcards.html');
     } else {
-      btn.href = url(COURSES[0], COURSES[0].first);
-      btn.textContent = 'Start with ' + COURSES[0].title + ' →';
       hint.innerHTML = '<span class="muted">Nothing read yet — every square below is a chapter.</span>';
-      band.t.textContent = 'Start with one chapter.';
-      band.p.textContent = 'Progress saves itself in this browser as you go — no account, nothing to install, and it works with the wifi off.';
-      band.b.textContent = 'Start ' + COURSES[0].title + ' at Prerequisite 1 →';
-      band.b.href = url(COURSES[0], COURSES[0].first);
     }
 
     var hours = COURSES.reduce(function (s, c) { return s + c.hours; }, 0);

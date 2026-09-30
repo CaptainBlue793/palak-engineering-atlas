@@ -153,7 +153,7 @@
   </div>
 
   <h2>The transactional outbox</h2>
-  <p>Write the business row <b>and</b> the event into the <b>same database, in the same transaction</b>. The event goes into an extra table called the <b>outbox</b>. Either both rows are saved or neither is. A separate <b>relay</b> process then reads the outbox and publishes each event to the broker, retrying until it succeeds. Think of it like a mail tray: you drop the letter in the tray as part of your work, and the mail carrier picks it up later.</p>
+  <p>Write the business row <b>and</b> the event into the <b>same database, in the same transaction</b>. The event goes into an extra table called the <b>outbox</b>. Either both rows are saved or neither is. A separate <b>relay</b> process then reads the outbox and publishes each event to the broker, retrying until it succeeds. It is the same trick a database uses internally with its write-ahead log (<a href="07-databases.html">Chapter 7</a>): record the intent durably first, as part of the transaction, and act on it afterwards.</p>
 <pre class="code"><span class="k">BEGIN</span>;
   <span class="k">INSERT INTO</span> orders (id, user_id, total, status) <span class="k">VALUES</span> (<span class="g">7321</span>, <span class="g">42</span>, <span class="g">89.00</span>, <span class="s">'PLACED'</span>);
   <span class="k">INSERT INTO</span> outbox (event_id, aggregate_id, type, payload, created_at)
@@ -164,7 +164,22 @@
     <div class="card"><h4 class="mt0">🔁 Relay option A: polling publisher</h4><p class="small mb0">A worker keeps running <code>SELECT … FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED</code>. It publishes the rows it gets, marks them as sent, and deletes old rows. Simple — but checking on a timer adds delay and extra database load.</p></div>
     <div class="card"><h4 class="mt0">📜 Relay option B: log tailing (CDC)</h4><p class="small mb0">Debezium reads new outbox rows straight from the database's <b>write-ahead log</b> (the internal record of every change, written before the change is applied) and publishes them. No polling, low delay, and events keep their commit order. Rows can even be deleted right after insert — the log has already captured them.</p></div>
   </div>
-  <p><b>Why the relay can send duplicates.</b> The relay publishes an event, then marks the row as sent. If it crashes between those two steps, it restarts, sees the row still unsent, and publishes it again. There's no way to make "publish to Kafka" and "update the outbox row" a single atomic step, which is the dual-write problem in miniature. The difference is that this failure gives a <i>duplicate</i>, never a <i>loss</i>, and duplicates are easy to handle with the idempotent consumers described below. That's why every outbox event carries a unique <code>event_id</code>.</p>
+    <figure class="seq" data-actors="Order service|Postgres (orders + outbox)|Relay|Kafka|Email consumer">
+    <ol>
+      <li data-m="0>1">BEGIN; INSERT order 7321; INSERT outbox evt_01J; COMMIT<small>One local transaction: the order and its event are saved together or not at all.</small></li>
+      <li data-m="1>0" data-k="reply">committed → 201 to the user</li>
+      <li data-m="2>1">read unsent outbox rows (or tail the WAL)</li>
+      <li data-m="2>3">publish OrderPlaced evt_01J (key 7321)</li>
+      <li data-m="3>2" data-k="reply">ack</li>
+      <li data-m="2>1" data-k="fail">mark evt_01J sent (relay crashes first)</li>
+      <li data-m="2>3">publish evt_01J again after restart<small>A duplicate, never a loss. Keying by order ID keeps all events for order 7321 in order on one partition.</small></li>
+      <li data-m="3>4" data-k="async">deliver evt_01J (twice)</li>
+      <li data-m="4>4">dedupe by event_id → send one email</li>
+    </ol>
+    <figcaption><b>Transactional outbox, end to end.</b> The database transaction makes the event impossible to lose; the consumer's dedupe makes the duplicate harmless.</figcaption>
+  </figure>
+
+<p><b>Why the relay can send duplicates.</b> The relay publishes an event, then marks the row as sent. If it crashes between those two steps, it restarts, sees the row still unsent, and publishes it again. There's no way to make "publish to Kafka" and "update the outbox row" a single atomic step, which is the dual-write problem in miniature. The difference is that this failure gives a <i>duplicate</i>, never a <i>loss</i>, and duplicates are easy to handle with the idempotent consumers described below. That's why every outbox event carries a unique <code>event_id</code>.</p>
   <p><b>Choosing a relay:</b> start with polling if you have modest volume (hundreds of events a second) and want no extra infrastructure; a 100–500 ms polling interval is usually fine. Move to log tailing when you need low delay, high volume, or strict ordering, and you're ready to run Debezium and Kafka Connect.</p>
 
   <h2>Change data capture (CDC)</h2>
@@ -290,7 +305,7 @@
   <div class="callout warn"><div class="ico">🧯</div><div class="body"><p><b>Don't use event sourcing + CQRS by default.</b> They shine when there are complex business rules, audit requirements and many different ways to read the data. For a simple settings page that just creates, reads, updates and deletes (CRUD), they add a lot of machinery for nothing. CQRS <i>without</i> event sourcing — a normal database plus read views fed by CDC — is a much lighter and very common middle ground.</p></div></div>
 
   <h2>Distributed locks, leases & fencing tokens</h2>
-  <p>Sometimes exactly one worker must do something: run the nightly billing job, process a given file, or act as leader. A <b>distributed lock</b> is a lock shared across many machines. It is usually a <b>lease</b>: a lock with a timeout, like a hotel key card that stops working at checkout. That way a crashed holder doesn't block everyone forever. The classic Redis version:</p>
+  <p>Sometimes exactly one worker must do something: run the nightly billing job, process a given file, or act as leader. A <b>distributed lock</b> is a lock shared across many machines. It is usually a <b>lease</b>: a lock with a timeout, like a DHCP lease on an IP address: it expires unless the holder renews it. That way a crashed holder doesn't block everyone forever. The classic Redis version:</p>
 <pre class="code"><span class="k">SET</span> lock:billing <span class="s">worker-7:uuid</span> <span class="k">NX PX</span> <span class="g">30000</span>   <span class="c"># acquire only if absent, auto-expire in 30s</span>
 <span class="c"># … do work …</span>
 <span class="c"># release only if we still own it (atomic check-and-delete via Lua)</span>
@@ -330,7 +345,21 @@
     <div class="card"><h4 class="mt0">🛡️ Locks for correctness</h4><p class="small mb0">If running twice would corrupt data or charge someone twice, use a store built on consensus — where several machines must agree before anything changes (<b>etcd, ZooKeeper, Consul</b>) — plus <b>fencing tokens</b>. Better still, avoid the lock entirely: use database constraints, conditional writes (compare-and-set: "update only if the value is still X") or idempotency keys.</p></div>
   </div>
 
-  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Lock built on</th><th>How it works</th><th>Fencing token available?</th><th>Good for</th></tr></thead>
+      <tbody>
+        <tr><td>Redis <code>SET NX PX</code></td><td>Key with a timeout on one Redis node</td><td>No (add your own counter)</td><td>Efficiency: avoiding duplicate work that is harmless if it happens</td></tr>
+        <tr><td>ZooKeeper / etcd lease</td><td>Consensus-backed session or lease; holder must keep it alive</td><td>Yes: zxid / revision number increases on every acquire</td><td>Correctness: leader election, exclusive writers</td></tr>
+        <tr><td>Database row lock</td><td><code>SELECT … FOR UPDATE</code> or advisory lock inside a transaction</td><td>Implicit: work happens in the same transaction</td><td>When the protected data lives in that same database</td></tr>
+        <tr><td>Conditional write</td><td>“Update only if version = 8” on the target itself</td><td>The version <i>is</i> the fence</td><td>Often better than any lock: no lock server at all</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase"><div class="ico">🔐</div><div class="body"><div class="title">Real-world use case: the Redlock debate</div><p>Redis's documentation proposed an algorithm called <b>Redlock</b> for locks across several independent Redis nodes. In 2016 Martin Kleppmann, author of <i>Designing Data-Intensive Applications</i>, published an analysis arguing it was unsafe for correctness: a process can pause (for garbage collection, for example) past its lease, and Redlock also depends on clocks behaving, while it provides no fencing token for the storage to check. Redis's creator responded, and the exchange became a widely read lesson. The practical takeaway most engineers adopted: use Redis locks when a rare double execution is merely wasteful, and use a consensus store with fencing tokens, or a conditional write on the data itself, when double execution would corrupt data.</p></div></div>
+
+<div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
       <li><b>Dual writes.</b> Writing to the database and then publishing to a broker will lose events sooner or later. Use the outbox.</li>
       <li><b>Assuming a lock makes you safe.</b> A process can pause past the end of its lease. Without a fencing token, the old “exclusive” holder can still write.</li>

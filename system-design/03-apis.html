@@ -64,13 +64,13 @@
   <p>An <strong>API (Application Programming Interface)</strong> is a contract, or agreement: “send me a request shaped like <em>this</em>, and I promise to answer with something shaped like <em>that</em>.” The caller doesn't need to know how the server works inside. It only needs to know the contract.</p>
   <p>A tiny example. A weather service promises: “send <code>GET /v1/weather?city=Pune</code> and you'll get back <code>{"city": "Pune", "tempC": 29, "updatedAt": "2026-09-23T10:00:00Z"}</code>”. Today the numbers might come from one database. Next year the team might switch to a different data supplier and rewrite everything in another language. As long as the same request still gets the same shape of answer, every app built on it keeps working. That freedom is why APIs matter in system design: they are the lines along which you can split work between teams and services.</p>
 
-  <div class="callout analogy">
-    <div class="ico">🍽️</div>
-    <div class="body"><div class="title">Analogy: the restaurant menu</div><p>A menu lists what you can order and what you'll get. You don't walk into the kitchen, and you don't care whether the chef cooks on gas or electric. The kitchen can be completely rebuilt. As long as the <b>menu (API) stays the same</b>, customers notice nothing. That's why good APIs let teams change the inside freely.</p></div>
+    <div class="callout usecase">
+    <div class="ico">🪣</div>
+    <div class="body"><div class="title">Real-world use case: the S3 API as a contract</div><p>Amazon S3's HTTP API (<code>PUT /bucket/key</code>, <code>GET /bucket/key</code>, multipart uploads) became so widely used that other storage systems copied it exactly. MinIO, Cloudflare R2, Backblaze B2 and Google Cloud Storage's interoperability mode all accept S3-style requests. The storage engines underneath are completely different, but backup tools, data-lake engines and SDKs written for S3 work against them by changing one endpoint URL. That is the power of a stable contract: whole ecosystems build on the interface, not the implementation.</p></div>
   </div>
 
-  <h2>REST: resources over HTTP</h2>
-  <p><strong>REST</strong> is the most common style for web APIs. Its main idea: everything is a <strong>resource</strong> — a thing, like a book or a user — with its own URL (a noun). You act on it using the standard HTTP <strong>methods</strong> (the verbs), like GET or DELETE.</p>
+<h2>REST: resources over HTTP</h2>
+  <p><a href="p5-http-rest-json.html">P5</a> introduced <strong>REST</strong>: every thing is a <strong>resource</strong> with its own URL (a noun), and you act on it with the standard HTTP <strong>methods</strong> (the verbs). Here the question is what separates a REST API that works well at scale from one that fights the infrastructure around it.</p>
 
   <div class="table-wrap">
     <table class="t">
@@ -238,7 +238,22 @@
 
   <p>The cost of polling adds up quickly. Say 1 million users have your app open, and each one polls every 5 seconds. That is 1,000,000 ÷ 5 = 200,000 requests per second, and if a typical user gets a new message once a minute, about 11 out of every 12 of those requests come back empty. Each one still pays for a round trip, headers, an auth check and maybe a database lookup. Polling every 30 seconds cuts the load 6×, but now a message can take up to 30 seconds to show up. Long polling, SSE and WebSockets escape this trade-off: they send data only when there is data. What they cost instead is open connections. Each connection holds a bit of memory on the server and must be kept alive, so 1 million users means 1 million connections spread across many servers.</p>
 
-  <div class="callout warn">
+    <p>Here is what actually happens when a browser opens a WebSocket. It starts as an ordinary HTTP request and then “upgrades” the same TCP connection into a two-way channel:</p>
+  <figure class="seq" data-actors="Browser|Load balancer|Chat server|Redis pub/sub">
+    <ol>
+      <li data-m="0>1">GET /ws  Upgrade: websocket<small>An ordinary HTTP/1.1 request with <code>Connection: Upgrade</code> and a random <code>Sec-WebSocket-Key</code>. The load balancer must be configured to allow long-lived upgraded connections.</small></li>
+      <li data-m="1>2">forward (sticky to chat-7)</li>
+      <li data-m="2>0" data-k="reply">101 Switching Protocols<small>From now on the TCP connection carries WebSocket frames, not HTTP. It stays open for minutes or hours.</small></li>
+      <li data-m="2>3">SUBSCRIBE user:42<small>chat-7 records “user 42 is connected to me” so messages for user 42 can find this server.</small></li>
+      <li data-m="0>2">frame: {"send":"hi","to":7}</li>
+      <li data-m="2>3" data-k="async">PUBLISH user:7 "hi"</li>
+      <li data-m="3>2" data-k="async">message for user:42<small>Some other user wrote to 42. Their chat server published it; Redis delivers it to chat-7, which holds 42's socket.</small></li>
+      <li data-m="2>0" data-k="async">frame: {"from":9,"msg":"yo"}<small>The server pushes without being asked. No polling, no empty responses.</small></li>
+    </ol>
+    <figcaption><b>WebSocket lifecycle.</b> One HTTP request, then a long-lived two-way channel. The pub/sub step is how a server finds messages for the users it holds (<a href="28-case-chat-system.html">Chapter 28</a>).</figcaption>
+  </figure>
+
+<div class="callout warn">
     <div class="ico">⚠️</div>
     <div class="body"><div class="title">Persistent connections change your architecture</div><p>With WebSockets, servers become <b>stateful</b>: each one holds thousands of open connections and has to remember them. Load balancers must support connections that stay open for a long time. You also need a way to find <i>which</i> server holds a given user's connection. We'll solve this in the Chat System case study (Chapter 28).</p></div>
   </div>
@@ -299,10 +314,31 @@
   <span class="k">await</span> store.<span class="f">set</span>(key, result, { ttl: <span class="s">'24h'</span> });
   <span class="k">return</span> result;
 }</pre>
-  <p class="small muted">In real systems you also lock the key while the first request is still running. That way, two retries arriving at the same time can't both get through.</p>
+  <p class="small muted">In real systems you also lock the key while the first request is still running. That way, two retries arriving at the same time can't both get through. The sequence below shows both situations.</p>
 
   <p>Walk through it once with the key. The checkout page creates a random key, say <code>8f14e45f</code>, when you press Pay, and sends it with the request. The server has never seen that key, so it charges $50 and saves “<code>8f14e45f</code> → charge #c_901, $50, success”. The response is lost on the way back, so the client retries, <b>with the same key</b>. The server finds the key, skips the charge, and returns the saved answer. The customer paid once and the app still gets a normal success reply.</p>
-  <p>Some operations are safe to repeat by nature, and need no key. “Set the quantity to 3” gives the same result however many times you send it. “Add 1 to the quantity” does not: send it three times and you get 3 extra. When you design a write, ask first whether you can phrase it as a “set” instead of an “add”. If you can't (money transfers, sending a message, creating an order), use a key.</p>
+    <figure class="seq" data-actors="Mobile app|Payments API|Idempotency store|Card network">
+    <ol>
+      <li data-m="0>1">POST /charges  Key: 8f14e45f</li>
+      <li data-m="1>2">INSERT key IF NOT EXISTS → in_progress<small>An atomic “insert if absent” claims the key. Only one request can win this race.</small></li>
+      <li data-m="1>3">authorize $50</li>
+      <li data-m="3>1" data-k="reply">approved c_901</li>
+      <li data-m="1>2">UPDATE key → done, response saved</li>
+      <li data-m="1>0" data-k="fail">200 OK (lost: phone lost signal)<small>The charge happened, but the app never heard about it. From the app's point of view, the request failed.</small></li>
+      <li data-m="0>1">POST /charges  Key: 8f14e45f (retry)</li>
+      <li data-m="1>2">lookup key</li>
+      <li data-m="2>1" data-k="reply">done → saved response</li>
+      <li data-m="1>0" data-k="reply">200 OK c_901 (replayed)<small>No second call to the card network. If the first attempt had still been <code>in_progress</code>, the API would reply <code>409 Conflict</code> and the app would retry a moment later.</small></li>
+    </ol>
+    <figcaption><b>Idempotent retry.</b> The key turns “did my request happen?” into a question the server can answer exactly.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">💳</div>
+    <div class="body"><div class="title">Real-world use case: Stripe's Idempotency-Key header</div><p>Stripe's API accepts an <code>Idempotency-Key</code> header on every <code>POST</code>. Its documentation says the first result for a key, success or failure, is saved and replayed for later requests with the same key; reusing a key with different parameters is an error; and keys can be removed after at least 24 hours. Stripe's own client libraries generate a key automatically and reuse it across their built-in retries. Many payment and cloud APIs now copy the same design.</p></div>
+  </div>
+
+<p>Some operations are safe to repeat by nature, and need no key. “Set the quantity to 3” gives the same result however many times you send it. “Add 1 to the quantity” does not: send it three times and you get 3 extra. When you design a write, ask first whether you can phrase it as a “set” instead of an “add”. If you can't (money transfers, sending a message, creating an order), use a key.</p>
   <p>Edge cases a real implementation must handle:</p>
   <ul>
     <li><b>The key is generated once per user action</b>, not once per HTTP attempt. If the client makes a new key on each retry, the server can't tell they are the same request.</li>
@@ -356,18 +392,42 @@
         <li><b>Order isn't guaranteed</b> — send a sequence number or version so receivers can ignore out-of-date events.</li>
         <li>Receivers should reply <code>2xx</code> right away and do the work later. Otherwise, their slowness becomes your timeout.</li>
       </ul>
+      <figure class="seq" data-actors="Your service|Webhook queue|Sender worker|Customer endpoint">
+        <ol>
+          <li data-m="0>1" data-k="async">enqueue evt_77 (invoice.paid)</li>
+          <li data-m="2>1">take evt_77</li>
+          <li data-m="2>2">sign: HMAC(secret, ts + body)</li>
+          <li data-m="2>3" data-k="fail">POST /hooks  (timeout 10 s)<small>The customer's server is deploying. Attempt 1 fails.</small></li>
+          <li data-m="2>1">re-queue, retry in 2 min<small>Backoff grows: 2 min, 4 min, 8 min … for up to a day or more, with jitter.</small></li>
+          <li data-m="2>3">POST /hooks  (attempt 2)</li>
+          <li data-m="3>3">verify signature, check ts &lt; 5 min, dedupe evt_77</li>
+          <li data-m="3>2" data-k="reply">200 OK (queued internally)</li>
+        </ol>
+        <figcaption><b>Webhook delivery.</b> Send from a queue, sign every attempt, back off on failure, and expect the receiver to drop duplicates by <code>event_id</code>.</figcaption>
+      </figure>
     </div>
     <div class="tab-panel">
-      <div class="grid c2" style="margin-top:0">
+<div class="grid c2" style="margin-top:0">
         <div class="card"><h4 class="mt0">📦 Batch endpoints</h4><p class="small mb0">On slow mobile networks, “chatty” APIs (many small calls) hurt. Offer <code>POST /v1/items/batch</code>, or combine calls with GraphQL or a BFF (a backend built for one front-end). Return <b>a status for each item</b>. If 3 out of 100 fail, the other 97 should still succeed — unless you've promised all-or-nothing (transactional).</p></div>
-        <div class="card"><h4 class="mt0">⏳ Long-running work</h4><p class="small mb0">Don't hold an HTTP connection open for 5 minutes. Return <code>202 Accepted</code> with a job ID and a status URL. The client checks that URL, or gets a webhook when the job is done. This is the background-job pattern from Chapter 14, offered through the API.</p></div>
+        <div class="card"><h4 class="mt0">⏳ Long-running work</h4><p class="small mb0">Don't hold an HTTP connection open for 5 minutes. Return <code>202 Accepted</code> with a job ID and a status URL. The client checks that URL, or gets a webhook when the job is done. This is the background-job pattern from Chapter 14, offered through the API. The workflow is shown below these cards.</p></div>
         <div class="card"><h4 class="mt0">🔎 Filtering & sparse fields</h4><p class="small mb0"><code>?fields=id,name&amp;include=author&amp;sort=-created_at</code> lets one endpoint serve many screens without over-fetching. It's GraphQL's big advantage, added to REST.</p></div>
         <div class="card"><h4 class="mt0">📣 Tell clients the rules</h4><p class="small mb0">Publish your usage limits and return <code>X-RateLimit-*</code> headers (Chapter 15). Document how idempotency works. Publish an OpenAPI spec (a machine-readable description of your API), so client libraries (SDKs) and fake test servers can be generated from it.</p></div>
       </div>
     </div>
   </div>
 
-  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">In an interview</div><p>After sketching the endpoints, add one sentence each about <b>auth, pagination, idempotency, errors and versioning</b>. It takes fifteen seconds, and it shows you've actually run an API, not just drawn one.</p></div></div>
+    <figure class="flow">
+    <ol>
+      <li data-k="start"><b>POST /v1/exports</b> Client asks for a 2 GB CSV export.</li>
+      <li><b>202 Accepted</b> Server stores the job, returns <code>{"job":"j_19","status_url":"/v1/jobs/j_19"}</code>.</li>
+      <li data-k="store"><b>Queue + worker</b> A background worker builds the file and uploads it to object storage.</li>
+      <li data-k="decision"><b>Done?</b> Client polls the status URL every few seconds, or waits for a webhook.</li>
+      <li data-k="end"><b>303 → download</b> Status returns a short-lived, presigned download URL.</li>
+    </ol>
+    <figcaption><b>The async job pattern.</b> No HTTP request lives longer than a second, and the heavy work runs where it can be retried safely.</figcaption>
+  </figure>
+
+<div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">In an interview</div><p>After sketching the endpoints, add one sentence each about <b>auth, pagination, idempotency, errors and versioning</b>. It takes fifteen seconds, and it shows you've actually run an API, not just drawn one.</p></div></div>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">

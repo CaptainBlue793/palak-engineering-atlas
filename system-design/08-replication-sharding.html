@@ -60,7 +60,26 @@
   <p>Why only one writer? If every write goes through one machine, there is exactly one order of events, and followers just replay it. Two machines accepting writes to the same row could each apply them in a different order and end up disagreeing. A sized example: a site doing 2,000 writes/s and 40,000 reads/s. One leader handles the writes easily; four followers each take about 10,000 reads/s. Reads scale by adding followers — writes don't, because every follower must still apply every write.</p>
   <p><b>Failover</b> is what happens when the leader dies. Something (a monitoring process, or the replicas voting among themselves) notices the leader has stopped answering, usually after a timeout of a few seconds, promotes the most up-to-date follower to leader, and points clients at it. The tricky edge cases: a timeout too short causes needless failovers during a brief slowdown; and if the old leader was only paused and comes back still thinking it's the leader, you have two leaders ("split brain") — so the old one must be fenced off.</p>
 
-  <div class="panel" id="repPanel">
+    <figure class="seq" data-actors="Old leader (L1)|Coordinator (etcd)|Follower F2|App">
+    <ol>
+      <li data-m="0>1">heartbeat, lease epoch 7</li>
+      <li data-m="0>0">stalls: 20 s GC / network blip<small>L1 is not dead, only silent. From outside, the two look identical.</small></li>
+      <li data-m="1>1">lease for epoch 7 expired</li>
+      <li data-m="1>2">promote F2 → leader, epoch 8<small>F2 is chosen because it has replayed the most of the change log.</small></li>
+      <li data-m="3>2">writes now go to F2 (epoch 8)</li>
+      <li data-m="0>3" data-k="bad">L1 wakes: "I'm leader" (epoch 7)<small>Split brain: two machines both believe they lead. Without protection, L1 would accept writes that F2 never sees.</small></li>
+      <li data-m="3>0" data-k="fail">write rejected: epoch 7 &lt; 8<small>The <b>fencing token</b>: every write carries the leader's epoch, and storage refuses anything older than the newest epoch it has seen (<a href="17-data-patterns.html">Chapter 17</a>).</small></li>
+      <li data-m="0>2">L1 steps down, rejoins as follower</li>
+    </ol>
+    <figcaption><b>Failover with fencing.</b> Detecting failure is easy; making sure the old leader can do no harm when it comes back is the hard part.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🐙</div>
+    <div class="body"><div class="title">Real-world use case: GitHub's 43-second partition (October 2018)</div><p>GitHub's post-incident report describes a 43-second loss of connectivity between its US East Coast network hub and its main East Coast data center. The automated failover system saw the primary MySQL servers as unreachable and promoted replicas in the West Coast data center. When connectivity returned, the East Coast primaries held a few seconds of writes that had never replicated west, while the West Coast primaries had accepted new writes. Neither side could simply be discarded. The team chose to protect data integrity over speed: the site ran degraded for about 24 hours while they restored from backups, replayed and reconciled the diverged writes. The failover worked exactly as designed; the design had not considered a cross-country promotion after a brief blip.</p></div>
+  </div>
+
+<div class="panel" id="repPanel">
     <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Replication lab</span><span class="p-tag">Simulator</span></div>
     <div class="panel-body">
       <div class="flex" style="justify-content:space-between">
@@ -104,7 +123,33 @@
     <div class="card feature reveal"><div class="f-ico" style="background:var(--pink-soft)">🔀</div><h4>Consistent prefix</h4><p>You see a reply before the message it answers, because different parts of the data copy at different speeds. <b>Fix:</b> keep related events that depend on each other in the same partition.</p></div>
   </div>
 
-  <h2>Multi-leader & leaderless replication</h2>
+    <figure class="seq" data-actors="User|App|Leader|Replica (1.5 s behind)">
+    <ol>
+      <li data-m="0>1">POST comment "nice!"</li>
+      <li data-m="1>2">INSERT comment</li>
+      <li data-m="2>1" data-k="reply">OK, log position 9041</li>
+      <li data-m="2>3" data-k="async">stream change (arrives in 1.5 s)</li>
+      <li data-m="0>1">refresh page (200 ms later)</li>
+      <li data-m="1>3">SELECT comments</li>
+      <li data-m="3>1" data-k="bad">old list, no "nice!"<small>The replica has only applied up to position 9030. The user thinks their comment was deleted.</small></li>
+      <li data-m="1>1">fix: session remembers position 9041<small>Read-your-writes fix: send this user's reads to the leader for a short while, or to a replica only once it has applied position 9041.</small></li>
+    </ol>
+    <figcaption><b>Replication lag seen by a user.</b> Every write succeeded and every read was “correct” for its replica; the anomaly comes from mixing them.</figcaption>
+  </figure>
+
+<h2>Multi-leader & leaderless replication</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Leader–follower</th><th>Multi-leader</th><th>Leaderless (quorum)</th></tr></thead>
+      <tbody>
+        <tr><td>Who accepts writes</td><td>One leader</td><td>One leader per region/device</td><td>Any replica (W of N must confirm)</td></tr>
+        <tr><td>Write conflicts</td><td>None: one order of events</td><td>Yes: must be resolved</td><td>Yes: versions or last-write-wins</td></tr>
+        <tr><td>Write latency across regions</td><td>High for far users</td><td>Low: write locally</td><td>Tunable with W</td></tr>
+        <tr><td>Failover</td><td>Promote a follower (seconds)</td><td>Other leaders keep going</td><td>No failover needed</td></tr>
+        <tr><td>Examples</td><td>PostgreSQL, MySQL, MongoDB</td><td>MySQL/Postgres multi-primary setups, CouchDB</td><td>Cassandra, ScyllaDB, Riak, DynamoDB's design</td></tr>
+      </tbody>
+    </table>
+  </div>
   <div class="tabs">
     <div class="tab-list"><button>👑👑 Multi-leader</button><button>🕸️ Leaderless (quorums)</button></div>
     <div class="tab-panel">
@@ -242,7 +287,12 @@
     <div class="card feature reveal"><div class="f-ico" style="background:var(--accent-2-soft)">🧮</div><h4>Pre-split into many shards</h4><p>Create, say, 1,024 <b>logical</b> shards on day one, and put many of them on each real machine. Growing then means <i>moving</i> whole logical shards to new machines — you never have to recompute where keys live. This is how Vitess, Citus and most large fleets avoid painful splits later.</p></div>
     <div class="card feature reveal"><div class="f-ico" style="background:var(--green-soft)">🧭</div><h4>Cross-shard queries</h4><p>Anything that needs data from every shard (reports, site-wide search, joins) turns into “ask them all and combine” — slow and easily broken. Serve those from a <b>separate copy of the data</b> instead: a search index or a data warehouse kept up to date by a stream of database changes (Chapters 10, 17, 18).</p></div>
   </div>
-  <div class="callout warn"><div class="ico">🧊</div><div class="body"><div class="title">Choose the shard key like it's permanent</div><p>Because it nearly is permanent. A good key spreads the load evenly, keeps data that's read together on one shard, and avoids values that only ever go up — timestamps or counting IDs send every new write to the last shard. Getting it wrong means the whole migration described above. Plan it carefully once, then live with it.</p></div></div>
+    <div class="callout usecase">
+    <div class="ico">📸</div>
+    <div class="body"><div class="title">Real-world use case: Instagram's logical shards</div><p>Instagram's engineering team described its early sharding scheme for PostgreSQL: create several thousand <b>logical</b> shards up front, each a separate Postgres schema, and map them onto a much smaller number of physical database servers. Moving load meant moving whole logical shards to a new machine, never re-hashing individual rows. Each logical shard also generated its own 64-bit IDs from a timestamp, the shard number and a per-shard sequence, so IDs were unique across the fleet and sorted by time without a central ID service.</p></div>
+  </div>
+
+<div class="callout warn"><div class="ico">🧊</div><div class="body"><div class="title">Choose the shard key like it's permanent</div><p>Because it nearly is permanent. A good key spreads the load evenly, keeps data that's read together on one shard, and avoids values that only ever go up — timestamps or counting IDs send every new write to the last shard. Getting it wrong means the whole migration described above. Plan it carefully once, then live with it.</p></div></div>
 
   <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
     <ul class="mb0">
