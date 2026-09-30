@@ -6,41 +6,464 @@
 <title>Case Study: In-Memory File System</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .fs-grid { display:grid; grid-template-columns: 1.35fr 1fr; gap:12px; margin-top:12px; }
+  @media (max-width: 760px) { .fs-grid { grid-template-columns: 1fr; } }
+  .fs-term { background:#0d1117; color:#c9d1d9; border-radius:12px; border:1px solid var(--border); font-family:var(--mono); font-size:12.5px; display:flex; flex-direction:column; min-height:300px; }
+  .fs-out { flex:1; padding:10px 12px; overflow:auto; max-height:300px; white-space:pre-wrap; word-break:break-word; line-height:1.5; }
+  .fs-out .fs-cmd { color:#7ee787; }
+  .fs-out .fs-err { color:#ff7b72; }
+  .fs-out .fs-trace { color:#8b949e; }
+  .fs-in { display:flex; gap:6px; align-items:center; border-top:1px solid #30363d; padding:8px 12px; }
+  .fs-in span { color:#7ee787; white-space:nowrap; }
+  .fs-in input { flex:1; min-width:0; background:transparent; border:0; outline:0; color:#e6edf3; font-family:var(--mono); font-size:12.5px; }
+  .fs-tree { background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:10px 12px; font-family:var(--mono); font-size:12px; line-height:1.7; overflow:auto; max-height:344px; }
+  .fs-tree .fs-meta { color:var(--muted); }
+  .fs-tree .fs-cwd { color:var(--accent); font-weight:700; }
+  .fs-tree .fs-hit { background:var(--accent-soft); border-radius:4px; }
+  .fs-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+  .fs-chips button { font-family:var(--mono); font-size:11.5px; }
+</style>
 </head>
 <body data-chapter="36">
-<!-- lld:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 36</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
     <h1>Case Study: <span class="grad">In-Memory File System</span></h1>
-    <p class="lead">Files and directories as a composite, path resolution, mkdir -p, ls and permissions.</p>
+    <p class="lead">“Design an in-memory file system” sounds like a Composite exercise, and it starts as one: <a href="14-composite-flyweight.html">Chapter 14</a> built the tree. The interview's real content is everything around the tree: turning a string like <code>../bob/./logs//today</code> into a node, <code>mkdir -p</code>, moving a directory without creating a cycle, per-user permissions checked on every step of a path, and a current directory that belongs to a session rather than to the file system. You can try all of it in a working shell below.</p>
+    <ul class="objectives">
+      <li>Split the design into a shared file system and per-user sessions</li>
+      <li>Model files and directories so rename and move are cheap</li>
+      <li>Parse and resolve paths, including . and .., relative to a working directory</li>
+      <li>Implement mkdir -p, ls, cat, write, rm -r and mv with the right errors</li>
+      <li>Check Unix-style permissions at each step, and know which bit each operation needs</li>
+    </ul>
   </section>
-
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
-    </div>
-  </div>
 
   <div class="callout analogy">
     <div class="ico">🏗️</div>
     <div class="body"><div class="title">Same problem, different zoom</div>
-      The System Design course covers the architecture of this system — services, storage and scale. This chapter zooms into the classes inside one of those services. See <a href="../system-design/33-case-file-sync.html">the high-level design</a>.
+      The System Design course covers file sync across devices: chunking, metadata services and conflict handling at scale. This chapter zooms into the classes of one in-memory file tree. See <a href="../system-design/33-case-file-sync.html">the high-level design</a>.
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Requirements and API</li>
-    <li>Composite: File and Directory</li>
-    <li>Path resolution</li>
-    <li>Operations: mkdir, ls, cat, rm</li>
-    <li>Permissions</li>
-  </ol>
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Composite.</b> See <a href="14-composite-flyweight.html">Chapter 14</a>.</li>
+        <li><b>Value objects and parsing at the boundary.</b> See <a href="p6-value-objects.html">P6</a>.</li>
+        <li><b>Read-write locks.</b> See <a href="22-thread-safe-classes.html">Chapter 22</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Requirements and API</h2>
+  <p>Clarify: absolute and relative paths; directories and files with byte contents; create, list, read, write and append, delete (recursively on request), move and rename; users with owner-and-others permissions; several users working at once, each with their own current directory. Out of scope: persistence, symbolic links and quotas, which make good follow-ups.</p>
+  <p>The first design decision is that <b>the current directory isn't part of the file system</b>. Two users can be in different directories at the same time, so the working directory and the acting user live in a <code>Session</code>, like a shell process, and every operation takes one. The file system itself is shared and knows nothing about who is “in” which directory.</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">FileSystem</span> {
+	<span class="t">Session</span> <span class="f">login</span>(<span class="t">User</span> user);                                    <span class="c">// cwd starts at the user's home</span>
+	<span class="k">void</span> <span class="f">mkdir</span>(<span class="t">Session</span> s, <span class="t">String</span> path, <span class="k">boolean</span> parents);         <span class="c">// parents = mkdir -p</span>
+	<span class="t">List</span>&lt;<span class="t">String</span>&gt; <span class="f">list</span>(<span class="t">Session</span> s, <span class="t">String</span> path);
+	<span class="k">byte</span>[] <span class="f">read</span>(<span class="t">Session</span> s, <span class="t">String</span> path);
+	<span class="k">void</span> <span class="f">write</span>(<span class="t">Session</span> s, <span class="t">String</span> path, <span class="k">byte</span>[] data, <span class="k">boolean</span> append);
+	<span class="k">void</span> <span class="f">remove</span>(<span class="t">Session</span> s, <span class="t">String</span> path, <span class="k">boolean</span> recursive);
+	<span class="k">void</span> <span class="f">move</span>(<span class="t">Session</span> s, <span class="t">String</span> from, <span class="t">String</span> to);
+	<span class="k">void</span> <span class="f">chmod</span>(<span class="t">Session</span> s, <span class="t">String</span> path, <span class="t">Mode</span> mode);
+}
+<span class="c">// Errors are specific exceptions: NoSuchFileException, NotADirectoryException, FileExistsException,
+// DirectoryNotEmptyException, AccessDeniedException — the messages a shell prints come straight from them.</span></pre>
+
+  <h2>Composite: files and directories</h2>
+  <p>The tree is the Composite from Chapter 14, with two refinements. First, <b>a node's name lives in its parent's map, not in the node</b>. That makes rename a matter of moving one map entry, and it's how Unix works too: a directory is a table from names to inodes, which is what makes hard links possible. Second, each directory keeps a <b>parent pointer</b>, which gives <code>..</code> and the cycle check for <code>mv</code> in O(depth). Directory entries sit in a <code>TreeMap</code>, so <code>ls</code> is sorted for free.</p>
+<pre class="code"><span class="k">abstract sealed class</span> <span class="t">Node</span> <span class="k">permits</span> <span class="t">FileNode</span>, <span class="t">DirNode</span> {
+	<span class="t">UserId</span> owner;
+	<span class="t">Mode</span> mode;                                              <span class="c">// value object: owner rwx + others rwx</span>
+	<span class="t">Instant</span> modified;
+}
+
+<span class="k">final class</span> <span class="t">DirNode</span> <span class="k">extends</span> <span class="t">Node</span> {
+	<span class="k">final</span> <span class="t">NavigableMap</span>&lt;<span class="t">String</span>, <span class="t">Node</span>&gt; children = <span class="k">new</span> <span class="t">TreeMap</span>&lt;&gt;();   <span class="c">// the names live here</span>
+	<span class="t">DirNode</span> parent;                                           <span class="c">// root's parent is itself</span>
+}
+
+<span class="k">final class</span> <span class="t">FileNode</span> <span class="k">extends</span> <span class="t">Node</span> {
+	<span class="k">private byte</span>[] data = <span class="k">new byte</span>[<span class="m">0</span>];
+	<span class="k">byte</span>[] <span class="f">read</span>() { <span class="k">return</span> data.<span class="f">clone</span>(); }                  <span class="c">// never hand out the internal array</span>
+	<span class="k">void</span> <span class="f">write</span>(<span class="k">byte</span>[] d, <span class="k">boolean</span> append) { data = append ? <span class="f">concat</span>(data, d) : d.<span class="f">clone</span>(); }
+}
+
+<span class="k">record</span> <span class="t">Mode</span>(<span class="k">int</span> bits) {                                    <span class="c">// e.g. 0755</span>
+	<span class="k">boolean</span> <span class="f">allows</span>(<span class="k">boolean</span> isOwner, <span class="t">Access</span> a) { <span class="k">int</span> set = isOwner ? (bits &gt;&gt; <span class="m">6</span>) &amp; <span class="m">7</span> : bits &amp; <span class="m">7</span>; <span class="k">return</span> (set &amp; a.bit) != <span class="m">0</span>; }
+}</pre>
+
+  <h2>Path resolution</h2>
+  <p>Every operation starts by turning a string into a node, so this is the heart of the design. Parse the string once into a <code>Path</code> value object (<a href="p6-value-objects.html">P6</a>): split on <code>/</code>, drop empty components (so <code>a//b</code> is <code>a/b</code>) and <code>.</code>, and remember whether it was absolute. Then <b>walk</b> it from the root or from the session's working directory, one component at a time, checking the <b>execute</b> (search) permission on every directory you pass through, following <code>..</code> through the parent pointer, and failing with the precise error.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Parse</b> "../bob/./logs//today" → components [.., bob, logs, today], relative.</li>
+      <li><b>Pick the start</b> Absolute: the root. Relative: the session's cwd.</li>
+      <li><b>For each component</b> The current node must be a directory (else NotADirectory), and the user must have x on it (else AccessDenied).</li>
+      <li data-k="decision"><b>".." or a name?</b> "..": go to the parent (the root's parent is the root). A name: look it up (else NoSuchFile).</li>
+      <li data-k="end"><b>Return the node</b> Or, for create operations, return the parent directory plus the final name.</li>
+    </ol>
+    <figcaption><b>Resolving a path.</b> One loop, used by every operation; the terminal below prints this walk for each command.</figcaption>
+  </figure>
+<pre class="code"><span class="k">private</span> <span class="t">Node</span> <span class="f">walk</span>(<span class="t">Session</span> s, <span class="t">Path</span> path) {
+	<span class="t">Node</span> cur = path.<span class="f">absolute</span>() ? root : s.<span class="f">cwd</span>();
+	<span class="k">for</span> (<span class="t">String</span> part : path.<span class="f">parts</span>()) {
+		<span class="k">if</span> (!(cur <span class="k">instanceof</span> <span class="t">DirNode</span> dir)) <span class="k">throw new</span> <span class="t">NotADirectoryException</span>(path);
+		<span class="f">check</span>(s, dir, <span class="t">Access</span>.EXECUTE);                        <span class="c">// search permission on every directory passed</span>
+		cur = part.<span class="f">equals</span>(<span class="s">".."</span>) ? dir.parent : dir.children.<span class="f">get</span>(part);
+		<span class="k">if</span> (cur == <span class="k">null</span>) <span class="k">throw new</span> <span class="t">NoSuchFileException</span>(path);
+	}
+	<span class="k">return</span> cur;
+}
+
+<span class="k">record</span> <span class="t">Target</span>(<span class="t">DirNode</span> parent, <span class="t">String</span> name) {}                     <span class="c">// for mkdir, write, rm, mv</span>
+<span class="k">private</span> <span class="t">Target</span> <span class="f">target</span>(<span class="t">Session</span> s, <span class="t">Path</span> path) {
+	<span class="k">if</span> (path.<span class="f">parts</span>().<span class="f">isEmpty</span>()) <span class="k">throw new</span> <span class="t">IllegalArgumentException</span>(<span class="s">"operation needs a name"</span>);
+	<span class="k">if</span> (!(<span class="f">walk</span>(s, path.<span class="f">parent</span>()) <span class="k">instanceof</span> <span class="t">DirNode</span> dir)) <span class="k">throw new</span> <span class="t">NotADirectoryException</span>(path.<span class="f">parent</span>());
+	<span class="k">return new</span> <span class="t">Target</span>(dir, path.<span class="f">last</span>());
+}</pre>
+  <p>This resolves <code>..</code> <b>physically</b>, through the tree. Some shells also normalise it <b>lexically</b> (<code>a/b/..</code> becomes <code>a</code> as text); the two differ once symbolic links exist, a good point to raise if the interviewer adds links as a follow-up.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A working shell over the in-memory file system</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <p class="small muted" style="margin:0">Type commands, or click one below. Supported: <code>pwd cd ls [-l] cat mkdir [-p] touch echo … &gt; / &gt;&gt; rm [-r] mv chmod su whoami help clear</code>. Users: alice, bob, root.</p>
+      <div class="fs-grid">
+        <div class="fs-term"><div class="fs-out" id="fsOut"></div><div class="fs-in"><span id="fsPrompt"></span><input id="fsIn" autocomplete="off" spellcheck="false" aria-label="Shell command"></div></div>
+        <div class="fs-tree" id="fsTree"></div>
+      </div>
+      <div class="fs-chips" id="fsChips"></div>
+    </div>
+    <div class="panel-foot">Each command prints its path walk: every directory passed needs x for the current user. Permissions are owner/others octal (the middle digit, group, is shown but not used). root bypasses checks, as on Unix.</div>
+  </div>
+
+  <h2>Operations: mkdir, ls, cat, rm, mv</h2>
+  <p>With <code>walk</code> and <code>target</code> in place, each operation is a few lines, and most of the work is choosing the right error. <code>mkdir -p</code> walks and creates missing directories, but must fail if a component exists as a <b>file</b>. <code>rm</code> refuses a directory unless recursive, and <code>rm -r</code> has to empty every directory inside it first, so it needs r, w and x on each of them, not just w on the top one's parent. And <code>mv</code> has the one genuinely tricky rule: you can't move a directory into its own subtree, or the subtree detaches into a cycle.</p>
+<pre class="code"><span class="k">public void</span> <span class="f">mkdir</span>(<span class="t">Session</span> s, <span class="t">String</span> raw, <span class="k">boolean</span> parents) {
+	lock.<span class="f">writeLock</span>().<span class="f">lock</span>();
+	<span class="k">try</span> {
+		<span class="t">Path</span> p = <span class="t">Path</span>.<span class="f">parse</span>(raw);
+		<span class="k">if</span> (!parents) { <span class="f">create</span>(s, <span class="f">target</span>(s, p), <span class="k">new</span> <span class="t">DirNode</span>(s.<span class="f">user</span>(), <span class="t">Mode</span>.DIR_DEFAULT)); <span class="k">return</span>; }
+		<span class="t">Node</span> cur = p.<span class="f">absolute</span>() ? root : s.<span class="f">cwd</span>();
+		<span class="k">for</span> (<span class="t">String</span> part : p.<span class="f">parts</span>()) {
+			<span class="k">if</span> (!(cur <span class="k">instanceof</span> <span class="t">DirNode</span> dir)) <span class="k">throw new</span> <span class="t">NotADirectoryException</span>(p);   <span class="c">// "a" exists as a file</span>
+			<span class="f">check</span>(s, dir, <span class="t">Access</span>.EXECUTE);
+			<span class="t">Node</span> next = part.<span class="f">equals</span>(<span class="s">".."</span>) ? dir.parent : dir.children.<span class="f">get</span>(part);
+			<span class="k">if</span> (next == <span class="k">null</span>) next = <span class="f">create</span>(s, <span class="k">new</span> <span class="t">Target</span>(dir, part), <span class="k">new</span> <span class="t">DirNode</span>(s.<span class="f">user</span>(), <span class="t">Mode</span>.DIR_DEFAULT));
+			cur = next;
+		}
+	} <span class="k">finally</span> { lock.<span class="f">writeLock</span>().<span class="f">unlock</span>(); }
+}
+
+<span class="k">private</span> <span class="t">Node</span> <span class="f">create</span>(<span class="t">Session</span> s, <span class="t">Target</span> t, <span class="t">Node</span> node) {
+	<span class="f">check</span>(s, t.<span class="f">parent</span>(), <span class="t">Access</span>.WRITE);                         <span class="c">// creating = changing the parent's table</span>
+	<span class="k">if</span> (t.<span class="f">parent</span>().children.<span class="f">putIfAbsent</span>(t.<span class="f">name</span>(), node) != <span class="k">null</span>) <span class="k">throw new</span> <span class="t">FileExistsException</span>(t.<span class="f">name</span>());
+	<span class="k">if</span> (node <span class="k">instanceof</span> <span class="t">DirNode</span> d) d.parent = t.<span class="f">parent</span>();
+	<span class="k">return</span> node;
+}
+
+<span class="k">public void</span> <span class="f">move</span>(<span class="t">Session</span> s, <span class="t">String</span> from, <span class="t">String</span> to) {
+	lock.<span class="f">writeLock</span>().<span class="f">lock</span>();
+	<span class="k">try</span> {
+		<span class="t">Target</span> src = <span class="f">target</span>(s, <span class="t">Path</span>.<span class="f">parse</span>(from));
+		<span class="t">Node</span> node = <span class="t">Optional</span>.<span class="f">ofNullable</span>(src.<span class="f">parent</span>().children.<span class="f">get</span>(src.<span class="f">name</span>())).<span class="f">orElseThrow</span>(() -&gt; <span class="k">new</span> <span class="t">NoSuchFileException</span>(from));
+		<span class="t">Target</span> dst = <span class="f">destination</span>(s, <span class="t">Path</span>.<span class="f">parse</span>(to), src.<span class="f">name</span>());       <span class="c">// "into dir" or "as new name"</span>
+		<span class="k">for</span> (<span class="t">DirNode</span> d = dst.<span class="f">parent</span>(); ; d = d.parent) {               <span class="c">// walk up from the destination</span>
+			<span class="k">if</span> (d == node) <span class="k">throw new</span> <span class="t">IllegalArgumentException</span>(<span class="s">"cannot move a directory into itself"</span>);
+			<span class="k">if</span> (d == root) <span class="k">break</span>;
+		}
+		<span class="f">check</span>(s, src.<span class="f">parent</span>(), <span class="t">Access</span>.WRITE); <span class="f">check</span>(s, dst.<span class="f">parent</span>(), <span class="t">Access</span>.WRITE);
+		<span class="k">if</span> (dst.<span class="f">parent</span>().children.<span class="f">containsKey</span>(dst.<span class="f">name</span>())) <span class="k">throw new</span> <span class="t">FileExistsException</span>(to);
+		src.<span class="f">parent</span>().children.<span class="f">remove</span>(src.<span class="f">name</span>());
+		dst.<span class="f">parent</span>().children.<span class="f">put</span>(dst.<span class="f">name</span>(), node);
+		<span class="k">if</span> (node <span class="k">instanceof</span> <span class="t">DirNode</span> d) d.parent = dst.<span class="f">parent</span>();           <span class="c">// O(1): no copying, whatever the subtree size</span>
+	} <span class="k">finally</span> { lock.<span class="f">writeLock</span>().<span class="f">unlock</span>(); }
+}</pre>
+  <figure class="seq" data-actors="Session (alice)|FileSystem|Path|/ (root)|home|alice|notes.txt">
+    <ol>
+      <li data-m="0>1">read("/home/alice/notes.txt")</li>
+      <li data-m="1>2">parse → [home, alice, notes.txt], absolute</li>
+      <li data-m="1>3">x for alice? yes (755) → children["home"]</li>
+      <li data-m="1>4">x? yes (755) → children["alice"]</li>
+      <li data-m="1>5">x? yes (700, alice is owner) → children["notes.txt"]</li>
+      <li data-m="1>6">r? yes (644, owner) → read()</li>
+      <li data-m="6>0" data-k="reply">copy of the bytes</li>
+    </ol>
+    <figcaption><b>cat /home/alice/notes.txt.</b> Three execute checks on the way down, one read check at the end. As bob, the walk stops at <code>alice</code>: mode 700 gives others no x.</figcaption>
+  </figure>
+
+  <h2>Permissions</h2>
+  <p>Unix permission bits mean different things on files and directories, and getting that right is what the interviewer is listening for. On a <b>directory</b>, <b>r</b> lets you list its names, <b>w</b> lets you create, delete and rename entries in it, and <b>x</b> lets you pass through it to reach what's inside. So deleting a file is an operation on its <i>directory</i>: you need w and x on the parent, and nothing at all on the file.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Operation</th><th>On every directory in the path</th><th>On the parent directory</th><th>On the node itself</th></tr></thead>
+      <tbody>
+        <tr><td><code>cd dir</code></td><td>x</td><td>–</td><td>x on dir</td></tr>
+        <tr><td><code>ls dir</code></td><td>x</td><td>–</td><td>r on dir (names); x too to see details</td></tr>
+        <tr><td><code>cat file</code></td><td>x</td><td>–</td><td>r on file</td></tr>
+        <tr><td><code>echo &gt; file</code> (exists)</td><td>x</td><td>–</td><td>w on file</td></tr>
+        <tr><td><code>touch</code> / <code>mkdir</code> new name</td><td>x</td><td>w</td><td>–</td></tr>
+        <tr><td><code>rm file</code>, <code>mv</code></td><td>x</td><td>w (on both parents for mv)</td><td>nothing</td></tr>
+        <tr><td><code>chmod</code></td><td>x</td><td>–</td><td>be the owner (or root)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Keep the check in one method, <code>check(session, node, access)</code>, so root's bypass, owner-vs-others and any later addition (groups, ACLs) change in one place. For concurrency, the simplest correct choice is one <code>ReentrantReadWriteLock</code> for the whole tree: reads (<code>ls</code>, <code>cat</code>, resolution) share it, mutations take it exclusively. Operations like <code>mv</code> touch two directories anywhere in the tree, and a single lock rules out the deadlocks that per-directory locking would have to prevent with a lock order.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Why anyone can't delete your files in /tmp</div><p>Because deletion needs only write permission on the <i>directory</i>, a world-writable directory like <code>/tmp</code> would let any user delete or rename any other user's files there. Unix solves this with one more bit, the <b>sticky bit</b> (shown as <code>t</code>, as in <code>drwxrwxrwt</code>): in a sticky directory, an entry can be deleted or renamed only by its owner, the directory's owner, or root. It's a neat example of a design that put a permission on the wrong object for one use case and fixed it with a targeted extension, and a good follow-up to offer when the interviewer asks about shared directories.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Storing the current directory in the file system,</b> so two users share one cwd. It belongs in a session.</li>
+      <li><b>Storing the name inside the node,</b> making rename and hard links awkward.</li>
+      <li><b>Splitting paths naively:</b> not handling <code>//</code>, <code>.</code>, <code>..</code> at the root, or a trailing slash.</li>
+      <li><b>Checking permissions only on the final node,</b> skipping x on the directories along the way.</li>
+      <li><b>Requiring write permission on a file to delete it;</b> deletion needs w on the parent.</li>
+      <li><b><code>mv</code> without a cycle check,</b> letting a directory move into its own subtree.</li>
+      <li><b>Returning the internal byte array,</b> letting callers change file contents without a write.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Walk me through how your file system resolves <code>../bob/logs</code>.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First I parse it into a path value: components <code>..</code>, <code>bob</code>, <code>logs</code>, relative. Relative means I start from the session's working directory. For each component the current node must be a directory and the user needs execute permission on it; <code>..</code> follows the parent pointer, anything else is a lookup in the directory's sorted map of children. Missing names throw no-such-file, a file in the middle throws not-a-directory, a missing x throws access-denied. Every operation uses this same walk.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Add symbolic links. What changes?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A third node type, <code>SymlinkNode</code>, holding a target path string; the sealed hierarchy makes every switch over node types show where it must be handled. During the walk, when a component is a symlink, I resolve its target (relative to the link's directory) and continue from there, except for the final component of operations that act on the link itself, like <code>rm</code> or <code>lstat</code>. Links can form cycles, so I cap the number of links followed per resolution, which is what Unix does with its ELOOP error. And <code>..</code> semantics now matter: physical resolution follows the real parent of where the link led, lexical normalisation doesn't, so I'd pick physical for the file system API and say so. Permission checks on the target path still apply, since a link grants nothing by itself.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>The file system is shared; the working directory and user live in a per-user session.</li>
+      <li>Names live in the parent's sorted map, and directories keep a parent pointer: rename is O(1), ls is sorted, .. is easy.</li>
+      <li>Parse paths once into a value object, then walk component by component with precise errors.</li>
+      <li>Every directory passed needs x; creating and deleting need w on the parent, not on the file.</li>
+      <li>mkdir -p fails on a file in the way; rm needs -r for directories; mv must reject moving a directory into itself.</li>
+      <li>One read-write lock over the tree is simple and deadlock-free; refine only when it's a measured bottleneck.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Where should the current working directory be stored?</p>
+      <div class="opts">
+        <button class="opt">In a field on the FileSystem</button>
+        <button class="opt">In a per-user Session passed to each operation</button>
+        <button class="opt">In each DirNode</button>
+        <button class="opt">In a static variable</button>
+      </div>
+      <div class="explain">Different users (and different shells of one user) can be in different directories simultaneously. The file system tree is shared; the cwd is per session.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Bob wants to delete <code>/shared/report.txt</code>. The file is mode 444 (read-only) and owned by alice; <code>/shared</code> is mode 777. Can bob delete it?</p>
+      <div class="opts">
+        <button class="opt">No: the file is read-only</button>
+        <button class="opt">No: only the owner can delete a file</button>
+        <button class="opt">Only as root</button>
+        <button class="opt">Yes: deleting changes the directory, which gives others w and x</button>
+      </div>
+      <div class="explain">Deletion removes an entry from the parent's table, so it needs w (and x) on the parent. The file's own bits don't matter, unless the directory has the sticky bit.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why store names in the parent's map rather than in each node?</p>
+      <div class="opts">
+        <button class="opt">Rename and move become moving one map entry, and the same node could appear under two names (hard links)</button>
+        <button class="opt">It uses less memory for long names</button>
+        <button class="opt">Nodes can't have fields</button>
+        <button class="opt">It's required for permission checks</button>
+      </div>
+      <div class="explain">A name is a property of a directory entry, not of the file. That's the Unix directory model: names map to inodes.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What must <code>mv /a /a/b/c</code> do?</p>
+      <div class="opts">
+        <button class="opt">Move /a into /a/b/c</button>
+        <button class="opt">Copy /a, then delete the original</button>
+        <button class="opt">Fail: a directory can't be moved into its own subtree</button>
+        <button class="opt">Delete /a/b/c first</button>
+      </div>
+      <div class="explain">Walking up from the destination's parent reaches /a itself, so the move would detach the subtree into a cycle. The check costs O(depth).</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does execute (x) permission mean on a directory?</p>
+      <div class="opts">
+        <button class="opt">You can run programs stored in it</button>
+        <button class="opt">You can pass through it to reach entries inside it</button>
+        <button class="opt">You can list its entries</button>
+        <button class="opt">You can delete it</button>
+      </div>
+      <div class="explain">x is “search” permission. r lists names, w changes entries, x traverses. Path resolution checks x on every directory it passes.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  const out = $('#fsOut'), inp = $('#fsIn');
+  let root, sess, hit = null;
+  const R = 4, W = 2, X = 1;
+  function dir(owner, mode, parent) { const d = { type: 'dir', owner, mode, children: new Map() }; d.parent = parent || d; return d; }
+  function file(owner, mode, data) { return { type: 'file', owner, mode, data }; }
+  function add(d, name, n) { d.children.set(name, n); if (n.type === 'dir') n.parent = d; return n; }
+  function build() {
+    root = dir('root', 0o755);
+    const home = add(root, 'home', dir('root', 0o755));
+    const alice = add(home, 'alice', dir('alice', 0o700));
+    add(alice, 'notes.txt', file('alice', 0o644, 'TODO: rotate the API keys\n'));
+    const bob = add(home, 'bob', dir('bob', 0o755));
+    add(bob, 'build.log', file('bob', 0o644, 'BUILD SUCCESS in 42s\n'));
+    const etc = add(root, 'etc', dir('root', 0o755));
+    add(etc, 'secrets.yml', file('root', 0o600, 'db_password: hunter2\n'));
+    add(root, 'shared', dir('root', 0o777));
+    sess = { user: 'alice', cwd: alice };
+  }
+  class FsError extends Error {}
+  const err = (m) => { throw new FsError(m); };
+  function allows(n, bit) { if (sess.user === 'root') return true; const set = n.owner === sess.user ? (n.mode >> 6) & 7 : n.mode & 7; return (set & bit) !== 0; }
+  function pathOf(d) { if (d === root) return '/'; const parts = []; for (let c = d; c !== root; c = c.parent) { for (const [k, v] of c.parent.children) if (v === c) parts.unshift(k); } return '/' + parts.join('/'); }
+  function parse(raw) { return { abs: raw.startsWith('/'), parts: raw.split('/').filter((p) => p && p !== '.') }; }
+  let trace = [];
+  function walk(p, upto) {
+    let cur = p.abs ? root : sess.cwd; trace = [p.abs ? '/' : pathOf(sess.cwd)];
+    const parts = upto === undefined ? p.parts : p.parts.slice(0, upto);
+    for (const part of parts) {
+      if (cur.type !== 'dir') { trace.push(`${part} ✗`); err(`Not a directory`); }
+      if (!allows(cur, X)) { trace.push(`(no x) ✗`); err('Permission denied'); }
+      const next = part === '..' ? cur.parent : cur.children.get(part);
+      if (!next) { trace.push(`${part} ✗`); err('No such file or directory'); }
+      trace.push(part + ' ✓'); cur = next;
+    }
+    return cur;
+  }
+  function target(raw) {
+    const p = parse(raw); if (!p.parts.length) err('Operation needs a name');
+    const last = p.parts[p.parts.length - 1]; if (last === '..') err('Invalid name');
+    const parent = walk(p, p.parts.length - 1); if (parent.type !== 'dir') err('Not a directory');
+    if (!allows(parent, X)) err('Permission denied');
+    return { parent, name: last };
+  }
+  function modeStr(n) { const s = (v) => `${v & 4 ? 'r' : '-'}${v & 2 ? 'w' : '-'}${v & 1 ? 'x' : '-'}`; return (n.type === 'dir' ? 'd' : '-') + s((n.mode >> 6) & 7) + s((n.mode >> 3) & 7) + s(n.mode & 7); }
+  function isAncestor(a, d) { for (let c = d; ; c = c.parent) { if (c === a) return true; if (c === root) return false; } }
+  const CMD = {
+    help: () => 'pwd, cd <dir>, ls [-l] [path], cat <file>, mkdir [-p] <dir>, touch <file>,\necho <text> > <file>, echo <text> >> <file>, rm [-r] <path>, mv <from> <to>,\nchmod <octal> <path>, su <alice|bob|root>, whoami, clear',
+    pwd: () => pathOf(sess.cwd),
+    whoami: () => sess.user,
+    clear: () => { out.innerHTML = ''; return null; },
+    su: (a) => { if (!['alice', 'bob', 'root'].includes(a[0])) err('su: unknown user'); sess.user = a[0]; const h = a[0] === 'root' ? root : root.children.get('home').children.get(a[0]); sess.cwd = h; return null; },
+    cd: (a) => { const n = walk(parse(a[0] || '/')); if (n.type !== 'dir') err('Not a directory'); if (!allows(n, X)) err('Permission denied'); sess.cwd = n; hit = n; return null; },
+    ls: (a) => {
+      const long = a[0] === '-l'; const arg = long ? a[1] : a[0];
+      const n = walk(parse(arg || '.')); hit = n;
+      if (n.type === 'file') return arg;
+      if (!allows(n, R)) err('Permission denied');
+      const names = [...n.children.keys()].sort();
+      if (!long) return names.map((k) => k + (n.children.get(k).type === 'dir' ? '/' : '')).join('  ') || '(empty)';
+      if (!allows(n, X)) err('Permission denied');
+      return names.map((k) => { const c = n.children.get(k); return `${modeStr(c)}  ${c.owner.padEnd(5)}  ${k}${c.type === 'dir' ? '/' : ''}`; }).join('\n') || '(empty)';
+    },
+    cat: (a) => { const n = walk(parse(a[0] || '')); hit = n; if (n.type === 'dir') err('Is a directory'); if (!allows(n, R)) err('Permission denied'); return n.data.replace(/\n$/, '') || '(empty file)'; },
+    mkdir: (a) => {
+      const pflag = a[0] === '-p', raw = pflag ? a[1] : a[0]; if (!raw) err('mkdir: missing operand');
+      if (!pflag) { const t = target(raw); if (t.parent.children.has(t.name)) err('File exists'); if (!allows(t.parent, W)) err('Permission denied'); hit = add(t.parent, t.name, dir(sess.user, 0o755)); return null; }
+      const p = parse(raw); let cur = p.abs ? root : sess.cwd; trace = [p.abs ? '/' : pathOf(sess.cwd)];
+      for (const part of p.parts) {
+        if (cur.type !== 'dir') err('Not a directory');
+        if (!allows(cur, X)) err('Permission denied');
+        let next = part === '..' ? cur.parent : cur.children.get(part);
+        if (!next) { if (!allows(cur, W)) { trace.push(part + ' ✗'); err('Permission denied'); } next = add(cur, part, dir(sess.user, 0o755)); trace.push(part + ' (created)'); }
+        else trace.push(part + ' ✓');
+        cur = next;
+      }
+      if (cur.type !== 'dir') err('Not a directory');
+      hit = cur; return null;
+    },
+    touch: (a) => { const t = target(a[0] || ''); const ex = t.parent.children.get(t.name); if (ex) { hit = ex; return null; } if (!allows(t.parent, W)) err('Permission denied'); hit = add(t.parent, t.name, file(sess.user, 0o644, '')); return null; },
+    echo: (a, line) => {
+      const m = line.match(/^echo\s+(.*?)\s*(>>?)\s*(\S+)\s*$/); if (!m) return line.replace(/^echo\s*/, '');
+      const text = m[1].replace(/^["']|["']$/g, ''), app = m[2] === '>>', t = target(m[3]);
+      let f = t.parent.children.get(t.name);
+      if (f && f.type === 'dir') err('Is a directory');
+      if (!f) { if (!allows(t.parent, W)) err('Permission denied'); f = add(t.parent, t.name, file(sess.user, 0o644, '')); }
+      else if (!allows(f, W)) err('Permission denied');
+      f.data = app ? f.data + text + '\n' : text + '\n'; hit = f; return null;
+    },
+    rm: (a) => {
+      const rec = a[0] === '-r', raw = rec ? a[1] : a[0]; const t = target(raw || '');
+      const n = t.parent.children.get(t.name); if (!n) err('No such file or directory');
+      if (n.type === 'dir' && !rec) err('Is a directory (use rm -r)');
+      if (n === root || isAncestor(n, sess.cwd)) err('Refusing to remove a directory you are in');
+      if (!allows(t.parent, W)) err('Permission denied');
+      const emptiable = (d) => d.type !== 'dir' || (allows(d, R | W | X) && [...d.children.values()].every(emptiable));
+      if (!emptiable(n)) err('Permission denied (rm -r must empty every directory inside it first)');
+      t.parent.children.delete(t.name); hit = t.parent; return null;
+    },
+    mv: (a) => {
+      if (a.length < 2) err('mv: missing operand');
+      const s = target(a[0]); const node = s.parent.children.get(s.name); if (!node) err('No such file or directory');
+      let dstParent, dstName;
+      let existing = null; try { existing = walk(parse(a[1])); } catch (e) { if (!(e instanceof FsError) || e.message !== 'No such file or directory') throw e; }
+      if (existing && existing.type === 'dir') { dstParent = existing; dstName = s.name; } else { const d = target(a[1]); dstParent = d.parent; dstName = d.name; }
+      if (node.type === 'dir' && isAncestor(node, dstParent)) err('Cannot move a directory into itself');
+      if (!allows(s.parent, W) || !allows(dstParent, W)) err('Permission denied');
+      if (dstParent.children.has(dstName)) err('File exists');
+      s.parent.children.delete(s.name); add(dstParent, dstName, node); hit = node; return null;
+    },
+    chmod: (a) => { if (!/^[0-7]{3}$/.test(a[0] || '')) err('chmod: mode must be three octal digits, e.g. 755'); const n = walk(parse(a[1] || '')); if (sess.user !== 'root' && n.owner !== sess.user) err('Operation not permitted (not the owner)'); n.mode = parseInt(a[0], 8); hit = n; return null; },
+  };
+  function print(html, cls) { const d = document.createElement('div'); if (cls) d.className = cls; d.innerHTML = html; out.appendChild(d); out.scrollTop = out.scrollHeight; }
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  function prompt() { $('#fsPrompt').textContent = `${sess.user}@lld:${pathOf(sess.cwd)}${sess.user === 'root' ? '#' : '$'}`; }
+  function run(line) {
+    line = line.trim(); if (!line) return;
+    print(`${esc($('#fsPrompt').textContent)} ${esc(line)}`, 'fs-cmd');
+    const [cmd, ...args] = line.split(/\s+/); trace = []; hit = null;
+    const f = CMD[cmd];
+    try {
+      if (!f) err(`${cmd}: command not found (try help)`);
+      const r = f(args, line);
+      if (trace.length > 1) print(esc('walk: ' + trace.join(' → ')), 'fs-trace');
+      if (r) print(esc(r));
+    } catch (e) {
+      if (!(e instanceof FsError)) throw e;
+      if (trace.length > 1) print(esc('walk: ' + trace.join(' → ')), 'fs-trace');
+      print(esc(`${cmd}: ${e.message}`), 'fs-err');
+    }
+    prompt(); tree();
+  }
+  function tree() {
+    const lines = [];
+    const rec = (n, name, depth) => {
+      const pad = '&nbsp;&nbsp;'.repeat(depth);
+      const cls = [n === sess.cwd ? 'fs-cwd' : '', n === hit ? 'fs-hit' : ''].join(' ');
+      lines.push(`<div>${pad}<span class="${cls}">${esc(name)}${n.type === 'dir' && name !== '/' ? '/' : ''}</span> <span class="fs-meta">${modeStr(n)} ${n.owner}${n === sess.cwd ? ' ← cwd' : ''}</span></div>`);
+      if (n.type === 'dir') [...n.children.keys()].sort().forEach((k) => rec(n.children.get(k), k, depth + 1));
+    };
+    rec(root, '/', 0);
+    $('#fsTree').innerHTML = lines.join('');
+  }
+  const CHIPS = ['ls -l', 'cat notes.txt', 'mkdir -p projects/lld/notes', 'echo hello > projects/lld/notes/a.txt', 'mv projects /shared', 'mv /shared/projects /shared/projects/lld', 'su bob', 'cat /home/alice/notes.txt', 'cat /etc/secrets.yml', 'rm /shared/projects/lld/notes/a.txt', 'touch /shared/bob.txt', 'su alice', 'chmod 755 /home/alice'];
+  $('#fsChips').innerHTML = CHIPS.map((c) => `<button class="btn sm">${esc(c)}</button>`).join('');
+  $$('#fsChips button').forEach((b) => b.addEventListener('click', () => run(b.textContent)));
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { run(inp.value); inp.value = ''; } });
+  build(); prompt(); tree();
+  print('Type help, or click a command below.', 'fs-trace');
+})();
+</script>
 </body>
 </html>
