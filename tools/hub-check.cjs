@@ -50,8 +50,10 @@ function whenIndexed(f) {
 }
 window.addEventListener('load', function () { whenIndexed(function () {
   var q = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
-  var chip = function (ch) { return { id: ch.dataset.course, link: ch.tagName === 'A', soon: ch.classList.contains('soon'),
-    opt: ch.classList.contains('opt'), done: ch.classList.contains('done') }; };
+  var chip = function (ch) { var cs = getComputedStyle(ch);
+    return { id: ch.dataset.course, link: ch.tagName === 'A', soon: ch.classList.contains('soon'),
+    opt: ch.classList.contains('opt'), done: ch.classList.contains('done'),
+    fg: cs.color, k1: cs.getPropertyValue('--k1').trim(), k2: cs.getPropertyValue('--k2').trim() }; };
   var grid = document.getElementById('pathGrid');
   var devops = document.querySelector('#courseGrid [data-course="cloud-devops"]');
   var s = {
@@ -146,6 +148,25 @@ function checks(s) {
     !P.interview.chips.find((c) => c.id === 'dsa').done, P.interview);
   check('progress counts released required steps', P.campus && P.campus.prog === '1 of 2 courses complete · 3 coming soon', P.campus && P.campus.prog);
   check('progress with everything released', P.interview && P.interview.prog === '1 of 3 courses complete', P.interview && P.interview.prog);
+
+  // Filled chips put text on the course gradient: it must stay readable at both ends of it.
+  // Dark mode: 4.5:1 (WCAG AA). Light mode: 3:1 (AA for bold UI labels), since some light-mode
+  // hues (amber, cyan, orange) can't reach 4.5:1 with any single text colour.
+  const MIN = THEME === 'dark' ? 4.5 : 3;
+  const weak = s.featured.filter((c) => !c.opt).map((c) => [c.id, Math.min(contrast(c.fg, c.k1), contrast(c.fg, c.k2))])
+    .filter(([, r]) => r < MIN).map(([id, r]) => id + ' ' + r.toFixed(2));
+  check('path chip text contrast ≥ ' + MIN + ':1 (' + THEME + ')', weak.length === 0, weak);
+}
+
+function rgb(c) {
+  const h = c.match(/^#([0-9a-f]{6})$/i);
+  if (h) return [0, 2, 4].map((i) => parseInt(h[1].slice(i, i + 2), 16));
+  const m = c.match(/rgba?\(([^)]+)\)/); return m ? m[1].split(',').slice(0, 3).map(Number) : [0, 0, 0];
+}
+function contrast(a, b) {
+  const L = (c) => { const [r, g, bl] = rgb(c).map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl; };
+  const [x, y] = [L(a), L(b)].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05);
 }
 
 checks(s);
