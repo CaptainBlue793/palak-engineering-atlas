@@ -205,7 +205,8 @@ engine (a rewrite).
   `SESSIONS.md` entry per session, a course is only listed as released when complete.
 - **Shared-origin localStorage:** all of `captainblue793.github.io` shares storage, so
   prefixes must stay distinctive; `db-`/`net-`/`ops-` are only read by Atlas code.
-- **Worker redeploy is manual** (the auto-mode classifier blocks it); the hub isn't merged
-  until the owner has redeployed and the new prefix test passes against the live Worker.
+- **Worker redeploy is manual** (the auto-mode classifier blocks it). The new prefix test runs
+  against local dev (the live Worker never returns sign-in codes, so the end-to-end test can't run
+  there); the hub isn't merged until the owner has redeployed and Wrangler confirms the upload.
 - **Line endings:** `install.cjs` and rebuilds flip CRLF; restore files whose content
   didn't change before committing.
