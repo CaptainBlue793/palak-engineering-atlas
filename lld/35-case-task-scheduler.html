@@ -6,41 +6,371 @@
 <title>Case Study: Task Scheduler</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ts-svg { width:100%; height:auto; display:block; margin-top:12px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); }
+  .ts-svg text { font-family:var(--mono); font-size:10.5px; fill:var(--muted); }
+  .ts-svg .ts-lane { font-size:12px; font-weight:700; fill:var(--text); }
+  .ts-svg .ts-bar text { fill:#fff; font-size:10px; font-weight:700; }
+  .ts-legend { display:flex; flex-wrap:wrap; gap:12px; font-size:12px; color:var(--muted); margin-top:6px; }
+  .ts-legend span::before { content:""; display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:5px; vertical-align:-1px; background:var(--c); }
+</style>
 </head>
 <body data-chapter="35">
-<!-- lld:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 35</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 50 min</span></div>
     <h1>Case Study: <span class="grad">Task Scheduler</span></h1>
-    <p class="lead">One-off, delayed and recurring jobs on a priority queue, a worker pool, retries and cancellation.</p>
+    <p class="lead">Send the digest email at 08:00, retry the webhook in 30 seconds, clean expired sessions every five minutes. A task scheduler runs work at a time rather than on a request, and designing one touches almost everything in the Advanced level: jobs as commands, triggers as strategies, a priority queue ordered by run time, a dispatcher thread that sleeps exactly as long as it should, a worker pool, retries with backoff, and cancellation that works whether a job is waiting, retrying or running.</p>
+    <ul class="objectives">
+      <li>Model jobs as commands and schedules as trigger strategies</li>
+      <li>Order pending runs in a priority queue and wake the dispatcher correctly</li>
+      <li>Separate dispatching from execution with a worker pool</li>
+      <li>Get fixed-rate vs fixed-delay semantics, and overlap, right</li>
+      <li>Add retries, dead-lettering and cancellation with a small state machine</li>
+    </ul>
   </section>
-
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
-    </div>
-  </div>
 
   <div class="callout analogy">
     <div class="ico">🏗️</div>
     <div class="body"><div class="title">Same problem, different zoom</div>
-      The System Design course covers the architecture of this system — services, storage and scale. This chapter zooms into the classes inside one of those services. See <a href="../system-design/38-case-job-scheduler.html">the high-level design</a>.
+      The System Design course covers a distributed job scheduler: storing jobs durably, leader election, and running millions of jobs across machines. This chapter zooms into the classes of the scheduler inside one process. See <a href="../system-design/38-case-job-scheduler.html">the high-level design</a>.
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Requirements and API</li>
-    <li>DelayQueue / priority queue by run time</li>
-    <li>Jobs as Commands</li>
-    <li>Worker pool</li>
-    <li>Retries and cancellation</li>
-  </ol>
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Command and State.</b> See <a href="17-command-memento.html">Chapter 17</a> and <a href="18-state.html">Chapter 18</a>.</li>
+        <li><b>Thread pools and futures.</b> See <a href="23-producer-consumer.html">Chapter 23</a>.</li>
+        <li><b>Retry policies with backoff.</b> See <a href="25-resilience.html">Chapter 25</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Requirements and API</h2>
+  <p>Clarify: jobs can run <b>once</b> at a time, after a <b>delay</b>, or <b>repeatedly</b> (every N seconds, or on a calendar expression like “08:00 on weekdays”); several jobs run in parallel on a bounded pool; one slow job mustn't delay the others; a recurring job never overlaps with itself; failures retry with backoff, then go to a dead-letter list; jobs can be cancelled; time is injectable; shutdown lets running jobs finish. Out of scope: durability across restarts and running on many machines, which is the System Design problem.</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">Scheduler</span> {
+	<span class="t">JobHandle</span> <span class="f">schedule</span>(<span class="t">Job</span> job, <span class="t">Trigger</span> trigger, <span class="t">RetryPolicy</span> retries);
+	<span class="k">void</span> <span class="f">shutdown</span>(<span class="t">Duration</span> grace);
+}
+
+<span class="k">public interface</span> <span class="t">Job</span> { <span class="k">void</span> <span class="f">run</span>(<span class="t">JobContext</span> ctx) <span class="k">throws</span> <span class="t">Exception</span>; }        <span class="c">// Command</span>
+
+<span class="k">public interface</span> <span class="t">Trigger</span> {                                                  <span class="c">// Strategy: when's the next run?</span>
+	<span class="t">Optional</span>&lt;<span class="t">Instant</span>&gt; <span class="f">nextRun</span>(<span class="t">Instant</span> now, <span class="t">Optional</span>&lt;<span class="t">Instant</span>&gt; lastScheduled);   <span class="c">// empty = no more runs</span>
+}
+
+<span class="k">public interface</span> <span class="t">JobHandle</span> { <span class="k">boolean</span> <span class="f">cancel</span>(); <span class="t">JobStatus</span> <span class="f">status</span>(); }
+
+<span class="k">public record</span> <span class="t">JobContext</span>(<span class="k">int</span> attempt, <span class="t">BooleanSupplier</span> cancelled) {}       <span class="c">// long jobs check cancelled() between steps</span></pre>
+  <p>A <code>Job</code> is a <b>command</b> (<a href="17-command-memento.html">Chapter 17</a>): a request packaged as an object that can be queued, run later, retried and cancelled. A <code>Trigger</code> is a <b>strategy</b> that answers one question, when's the next run, so “once”, “every 5 minutes” and a cron expression are three small classes, and the scheduler never switches on a schedule type.</p>
+<pre class="code"><span class="k">record</span> <span class="t">Once</span>(<span class="t">Instant</span> at) <span class="k">implements</span> <span class="t">Trigger</span> {
+	<span class="k">public</span> <span class="t">Optional</span>&lt;<span class="t">Instant</span>&gt; <span class="f">nextRun</span>(<span class="t">Instant</span> now, <span class="t">Optional</span>&lt;<span class="t">Instant</span>&gt; last) { <span class="k">return</span> last.<span class="f">isEmpty</span>() ? <span class="t">Optional</span>.<span class="f">of</span>(at) : <span class="t">Optional</span>.<span class="f">empty</span>(); }
+}
+<span class="k">record</span> <span class="t">FixedRate</span>(<span class="t">Instant</span> first, <span class="t">Duration</span> period) <span class="k">implements</span> <span class="t">Trigger</span> {         <span class="c">// anchored to the schedule</span>
+	<span class="k">public</span> <span class="t">Optional</span>&lt;<span class="t">Instant</span>&gt; <span class="f">nextRun</span>(<span class="t">Instant</span> now, <span class="t">Optional</span>&lt;<span class="t">Instant</span>&gt; last) { <span class="k">return</span> <span class="t">Optional</span>.<span class="f">of</span>(last.<span class="f">map</span>(l -&gt; l.<span class="f">plus</span>(period)).<span class="f">orElse</span>(first)); }
+}
+<span class="k">record</span> <span class="t">FixedDelay</span>(<span class="t">Duration</span> initial, <span class="t">Duration</span> delay) <span class="k">implements</span> <span class="t">Trigger</span> {     <span class="c">// anchored to the previous finish</span>
+	<span class="k">public</span> <span class="t">Optional</span>&lt;<span class="t">Instant</span>&gt; <span class="f">nextRun</span>(<span class="t">Instant</span> now, <span class="t">Optional</span>&lt;<span class="t">Instant</span>&gt; last) { <span class="k">return</span> <span class="t">Optional</span>.<span class="f">of</span>(now.<span class="f">plus</span>(last.<span class="f">isEmpty</span>() ? initial : delay)); }
+}
+<span class="c">// CronTrigger: parses "0 8 * * MON-FRI" and computes the next matching minute after 'now' in a given ZoneId.</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Trigger</th><th>Next run</th><th>If a run takes longer than the period</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td>Fixed rate</td><td>Previous <i>scheduled</i> time + period</td><td>Next starts late, right after; runs catch up</td><td>Metrics every minute, on the minute</td></tr>
+        <tr><td>Fixed delay</td><td>Previous <i>finish</i> + delay</td><td>Gap stays constant; drifts over time</td><td>Polling, cleanup: “rest between runs”</td></tr>
+        <tr><td>Cron</td><td>Next calendar match</td><td>Usually skip the missed slot (a misfire policy)</td><td>Business times: 08:00 on weekdays</td></tr>
+        <tr><td>Once</td><td>The given instant, then never</td><td>n/a</td><td>Reminders, delayed retries, “send in 30 s”</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>A priority queue ordered by run time</h2>
+  <p>Pending runs live in a <b>priority queue</b> (a min-heap) ordered by due time, with a sequence number to keep ties in submission order. One <b>dispatcher thread</b> looks at the head: if it's due, remove it and hand it to the pool; if not, sleep until it is. The subtle part is the sleep. If the dispatcher sleeps until 08:00 and someone schedules a job for 07:59, the sleep must end early, so the wait is on a <code>Condition</code> that <code>schedule</code> signals, and after every wake-up the loop <b>re-checks</b> the head instead of assuming.</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">DefaultScheduler</span> <span class="k">implements</span> <span class="t">Scheduler</span> {
+	<span class="k">private final</span> <span class="t">PriorityQueue</span>&lt;<span class="t">ScheduledRun</span>&gt; queue =
+		<span class="k">new</span> <span class="t">PriorityQueue</span>&lt;&gt;(<span class="t">Comparator</span>.<span class="f">comparing</span>(<span class="t">ScheduledRun</span>::<span class="f">due</span>).<span class="f">thenComparingLong</span>(<span class="t">ScheduledRun</span>::<span class="f">seq</span>));
+	<span class="k">private final</span> <span class="t">ReentrantLock</span> lock = <span class="k">new</span> <span class="t">ReentrantLock</span>();
+	<span class="k">private final</span> <span class="t">Condition</span> changed = lock.<span class="f">newCondition</span>();
+	<span class="k">private final</span> <span class="t">ExecutorService</span> workers;                 <span class="c">// bounded pool: jobs run here, never on the dispatcher</span>
+	<span class="k">private final</span> <span class="t">Clock</span> clock;
+	<span class="k">private final</span> <span class="t">AtomicLong</span> seq = <span class="k">new</span> <span class="t">AtomicLong</span>();
+
+	<span class="k">public</span> <span class="t">JobHandle</span> <span class="f">schedule</span>(<span class="t">Job</span> job, <span class="t">Trigger</span> trigger, <span class="t">RetryPolicy</span> retries) {
+		<span class="t">JobRecord</span> rec = <span class="k">new</span> <span class="t">JobRecord</span>(job, trigger, retries);
+		<span class="t">Instant</span> first = trigger.<span class="f">nextRun</span>(clock.<span class="f">instant</span>(), <span class="t">Optional</span>.<span class="f">empty</span>()).<span class="f">orElseThrow</span>();
+		<span class="f">enqueue</span>(<span class="k">new</span> <span class="t">ScheduledRun</span>(rec, first, first, <span class="m">1</span>, seq.<span class="f">incrementAndGet</span>()));
+		<span class="k">return</span> rec;
+	}
+
+	<span class="k">private void</span> <span class="f">enqueue</span>(<span class="t">ScheduledRun</span> run) {
+		lock.<span class="f">lock</span>();
+		<span class="k">try</span> { queue.<span class="f">add</span>(run); changed.<span class="f">signal</span>(); }       <span class="c">// the new run may be earlier than the one being waited for</span>
+		<span class="k">finally</span> { lock.<span class="f">unlock</span>(); }
+	}
+
+	<span class="k">private void</span> <span class="f">dispatchLoop</span>() {                             <span class="c">// runs on the single dispatcher thread</span>
+		lock.<span class="f">lock</span>();
+		<span class="k">try</span> {
+			<span class="k">while</span> (running) {
+				<span class="t">ScheduledRun</span> head = queue.<span class="f">peek</span>();
+				<span class="k">if</span> (head == <span class="k">null</span>) { changed.<span class="f">await</span>(); <span class="k">continue</span>; }
+				<span class="k">long</span> wait = <span class="t">Duration</span>.<span class="f">between</span>(clock.<span class="f">instant</span>(), head.<span class="f">due</span>()).<span class="f">toNanos</span>();
+				<span class="k">if</span> (wait &gt; <span class="m">0</span>) { changed.<span class="f">awaitNanos</span>(wait); <span class="k">continue</span>; }   <span class="c">// woken early? loop and re-check the head</span>
+				queue.<span class="f">poll</span>();
+				<span class="k">if</span> (!head.<span class="f">record</span>().<span class="f">isCancelled</span>()) workers.<span class="f">execute</span>(() -&gt; <span class="f">runAttempt</span>(head));
+			}
+		} <span class="k">catch</span> (<span class="t">InterruptedException</span> e) { <span class="t">Thread</span>.<span class="f">currentThread</span>().<span class="f">interrupt</span>(); }
+		<span class="k">finally</span> { lock.<span class="f">unlock</span>(); }
+	}
+}</pre>
+  <p>Two design notes to say out loud. Cancelled runs are <b>skipped lazily</b> when they reach the head, rather than searched for and removed (O(n) in a heap). And the dispatcher only dispatches: running a job on the dispatcher thread would let one slow job delay every other job's start, which is exactly what the simulation below shows with one worker. Java's <code>DelayQueue</code> packages the same wait-for-the-head logic; writing it with an injected <code>Clock</code> keeps it testable, and tests can skip the thread entirely by calling a <code>runDue(now)</code> step directly with a fake clock and a same-thread executor.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Four jobs on a worker pool, first 20 seconds</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <span class="small muted">Workers</span><div class="seg" id="tsW"><button data-v="1">1</button><button class="active" data-v="2">2</button><button data-v="3">3</button></div>
+        <div class="seg" id="tsMode"><button class="active" data-v="rate">recurring = fixed rate</button><button data-v="delay">recurring = fixed delay</button></div>
+        <label class="small"><input type="checkbox" id="tsCancel"> cancel “cleanup” at t = 9 s</label>
+      </div>
+      <svg class="ts-svg" id="tsSvg" viewBox="0 0 760 180" role="img" aria-label="Gantt chart of job runs per worker"></svg>
+      <div class="ts-legend"><span style="--c:#6366f1">report: every 5 s, takes 3 s</span><span style="--c:#10b981">cleanup: every 2 s, 0.5 s</span><span style="--c:#f59e0b">email: once at 4 s; fails twice, retry after 1 s, 2 s</span><span style="--c:#ec4899">export: once at 1 s, takes 8 s</span><span style="--c:var(--red)">failed attempt</span></div>
+      <div class="stats" id="tsStats"></div>
+    </div>
+    <div class="panel-foot">Thin dashed lines above a bar show waiting, in the job's colour: from when the run was due (dot) to when a worker picked it up. A recurring job never overlaps with itself: its next run is queued only after the current one finishes.</div>
+  </div>
+
+  <h2>Jobs as commands on a worker pool</h2>
+  <p>When a run reaches a worker, <code>runAttempt</code> executes it and then decides what happens next: schedule the next occurrence, schedule a retry, or give up. Queuing the next occurrence <b>after</b> the current run finishes is what prevents a recurring job overlapping with itself; with fixed rate, a late next run simply starts immediately.</p>
+<pre class="code"><span class="k">private void</span> <span class="f">runAttempt</span>(<span class="t">ScheduledRun</span> run) {
+	<span class="t">JobRecord</span> rec = run.<span class="f">record</span>();
+	<span class="k">if</span> (!rec.<span class="f">transition</span>(<span class="t">JobStatus</span>.SCHEDULED, <span class="t">JobStatus</span>.RUNNING)) <span class="k">return</span>;   <span class="c">// cancelled in the meantime</span>
+	<span class="k">try</span> {
+		rec.<span class="f">job</span>().<span class="f">run</span>(<span class="k">new</span> <span class="t">JobContext</span>(run.<span class="f">attempt</span>(), rec::<span class="f">cancelRequested</span>));
+		<span class="f">scheduleNext</span>(rec, run.<span class="f">occurrence</span>());
+	} <span class="k">catch</span> (<span class="t">Exception</span> e) {
+		<span class="t">Optional</span>&lt;<span class="t">Duration</span>&gt; backoff = rec.<span class="f">retries</span>().<span class="f">delayFor</span>(run.<span class="f">attempt</span>(), e);   <span class="c">// Chapter 25's policy</span>
+		<span class="k">if</span> (backoff.<span class="f">isPresent</span>() &amp;&amp; rec.<span class="f">transition</span>(<span class="t">JobStatus</span>.RUNNING, <span class="t">JobStatus</span>.SCHEDULED)) {
+			<span class="f">enqueue</span>(run.<span class="f">retryAt</span>(clock.<span class="f">instant</span>().<span class="f">plus</span>(backoff.<span class="f">get</span>()), seq.<span class="f">incrementAndGet</span>()));
+		} <span class="k">else</span> {
+			deadLetters.<span class="f">record</span>(run, e);                                          <span class="c">// visible, not swallowed</span>
+			<span class="f">scheduleNext</span>(rec, run.<span class="f">occurrence</span>());                               <span class="c">// a failed occurrence doesn't kill a recurring job</span>
+		}
+	}
+}
+
+<span class="k">private void</span> <span class="f">scheduleNext</span>(<span class="t">JobRecord</span> rec, <span class="t">Instant</span> occurrence) {
+	<span class="t">Optional</span>&lt;<span class="t">Instant</span>&gt; next = rec.<span class="f">trigger</span>().<span class="f">nextRun</span>(clock.<span class="f">instant</span>(), <span class="t">Optional</span>.<span class="f">of</span>(occurrence));
+	<span class="k">if</span> (next.<span class="f">isEmpty</span>()) { rec.<span class="f">transition</span>(<span class="t">JobStatus</span>.RUNNING, <span class="t">JobStatus</span>.DONE); <span class="k">return</span>; }
+	<span class="k">if</span> (rec.<span class="f">transition</span>(<span class="t">JobStatus</span>.RUNNING, <span class="t">JobStatus</span>.SCHEDULED))                 <span class="c">// fails if cancel() won the race</span>
+		<span class="f">enqueue</span>(<span class="k">new</span> <span class="t">ScheduledRun</span>(rec, next.<span class="f">get</span>(), next.<span class="f">get</span>(), <span class="m">1</span>, seq.<span class="f">incrementAndGet</span>()));
+}</pre>
+  <figure class="seq" data-actors="Dispatcher|Worker|EmailJob|RetryPolicy|Queue">
+    <ol>
+      <li data-m="0>1">execute(email, attempt 1, due 4.0 s)</li>
+      <li data-m="1>2">run(ctx)</li>
+      <li data-m="2>1" data-k="fail">throws SmtpTimeoutException</li>
+      <li data-m="1>3">delayFor(attempt 1, e)</li>
+      <li data-m="3>1" data-k="reply">1 s</li>
+      <li data-m="1>4">add(email, attempt 2, due now + 1 s)</li>
+      <li data-m="4>0">signal: head may have changed</li>
+      <li data-m="0>1">execute(email, attempt 2)</li>
+    </ol>
+    <figcaption><b>A retry is just another scheduled run.</b> Same record, attempt number + 1, due after the backoff; the dispatcher doesn't know it's a retry.</figcaption>
+  </figure>
+
+  <h2>Retries and cancellation</h2>
+  <p>Each job has a small state machine (<a href="18-state.html">Chapter 18</a>), held in an <code>AtomicReference&lt;JobStatus&gt;</code> so that the worker and a cancelling thread can race safely: every change is a compare-and-set from an expected state, and exactly one side wins.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>SCHEDULED</b> In the queue: waiting for its first run, its next occurrence, or a retry.</li>
+      <li><b>RUNNING</b> A worker won the SCHEDULED → RUNNING transition.</li>
+      <li data-k="decision"><b>Finished?</b> Success or exhausted retries → SCHEDULED (next occurrence) or DONE; failure with retries left → SCHEDULED at the backoff.</li>
+      <li><b>cancel() while SCHEDULED</b> CAS to CANCELLED: the run is skipped when it reaches the head of the queue.</li>
+      <li><b>cancel() while RUNNING</b> Set a cancel-requested flag: the job checks <code>ctx.cancelled()</code>, and the RUNNING → SCHEDULED transition fails, so it never recurs.</li>
+      <li data-k="end"><b>DONE, CANCELLED</b> Terminal. Failed attempts are recorded in the dead-letter list either way.</li>
+    </ol>
+    <figcaption><b>The job's lifecycle.</b> Compare-and-set transitions make cancel-vs-run races safe without a lock around the job.</figcaption>
+  </figure>
+  <p>Cancellation of a <b>running</b> job is cooperative: Java can't safely stop a thread, so the scheduler sets a flag the job polls between steps (and may interrupt the worker, which unblocks sleeps and interruptible I/O). A job that never checks can't be stopped early, which is worth stating in the interview. <b>Shutdown</b> is the same idea at scale: stop the dispatcher, stop accepting new runs, let running jobs finish within a grace period, then interrupt what's left and report which scheduled runs never ran.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">The recurring job that silently stopped</div><p>Java's own <code>ScheduledThreadPoolExecutor</code> is built from the same parts: a delay queue ordered by run time (a heap), and a worker pool. Its <code>scheduleAtFixedRate</code> documentation contains a line many teams discover in production: if any execution of the task throws an exception, subsequent executions are suppressed. An unhandled exception in a nightly cleanup job doesn't crash anything or log anything by itself; the job just never runs again, and the <code>Future</code> nobody checks holds the exception. The usual fix is to catch and log everything inside the task. This chapter's design makes that the scheduler's job instead: failures go to retries and a dead-letter list, and a failed occurrence never cancels the next one.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Running jobs on the dispatcher thread:</b> one slow job delays every start.</li>
+      <li><b>Sleeping until the head's time without waking on new, earlier jobs.</b> Wait on a condition that <code>schedule</code> signals, and re-check after waking.</li>
+      <li><b>A timer thread per job</b> instead of one queue and one dispatcher.</li>
+      <li><b>Scheduling the next occurrence when a run starts,</b> so slow runs overlap with themselves.</li>
+      <li><b>Letting an exception end a recurring job</b> silently.</li>
+      <li><b>Cancelling with a plain boolean</b> that races with the worker; use compare-and-set transitions.</li>
+      <li><b>Reading the system clock directly,</b> making timing untestable.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does a scheduler know when to run the next job without checking every job constantly?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Pending runs are kept in a priority queue ordered by due time, so the earliest is always at the head in O(1) and insertion is O(log n). One dispatcher thread sleeps until the head is due, on a condition variable. Scheduling a new job signals the condition, so if the new job is earlier the dispatcher wakes and re-checks. Due runs are handed to a worker pool, so the dispatcher never runs job code itself.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A job scheduled every minute sometimes takes three minutes. What happens with fixed rate, with fixed delay, and what would you want?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>In both, the next occurrence is only queued when the current one finishes, so it never overlaps with itself. With fixed rate the next run is anchored to the schedule: the 12:01 and 12:02 occurrences are already overdue, so they run back to back immediately, catching up. With fixed delay the next run is one minute after the finish, so it runs at 12:04 and the schedule drifts. Which is right depends on the job: for “aggregate the last minute's metrics” you want every occurrence; for “poll for new files” catching up is wasted work, so I'd use fixed delay, or fixed rate with a misfire policy that skips missed occurrences and runs once. I'd also alert when a run takes longer than its period, since that's usually the real problem.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Jobs are commands; triggers are strategies that compute the next run (once, fixed rate, fixed delay, cron).</li>
+      <li>Pending runs sit in a min-heap by due time; one dispatcher waits on a condition that new schedules signal.</li>
+      <li>The dispatcher only dispatches; a bounded worker pool runs jobs.</li>
+      <li>Queue the next occurrence after a run finishes to prevent overlap; fixed rate catches up, fixed delay drifts.</li>
+      <li>Failures retry through a backoff policy, then dead-letter; a failed occurrence never kills a recurring job.</li>
+      <li>A compare-and-set state machine makes cancellation safe; cancelling a running job is cooperative.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">The dispatcher is sleeping until a job due at 08:00. A new job is scheduled for 07:59. What must happen?</p>
+      <div class="opts">
+        <button class="opt">The new job waits until 08:00</button>
+        <button class="opt">The new job runs immediately</button>
+        <button class="opt"><code>schedule</code> signals the condition; the dispatcher wakes, re-checks the head, and sleeps until 07:59</button>
+        <button class="opt">A new dispatcher thread is started for it</button>
+      </div>
+      <div class="explain">Waking on every insert and re-checking the head is what keeps an earlier job from being delayed by a sleep that started before it existed.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why does the dispatcher hand jobs to a worker pool instead of running them itself?</p>
+      <div class="opts">
+        <button class="opt">So a slow job doesn't delay the start of every other due job</button>
+        <button class="opt">Because the dispatcher can't catch exceptions</button>
+        <button class="opt">Worker threads are faster</button>
+        <button class="opt">To make jobs run in a random order</button>
+      </div>
+      <div class="explain">With one thread doing both, an 8-second export makes everything behind it 8 seconds late, as the simulation shows with one worker.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A job runs every 60 s at a fixed delay and takes 20 s. Roughly how far apart are the starts of consecutive runs?</p>
+      <div class="opts">
+        <button class="opt">40 s</button>
+        <button class="opt">60 s</button>
+        <button class="opt">20 s</button>
+        <button class="opt">80 s: the delay counts from the previous finish</button>
+      </div>
+      <div class="explain">Fixed delay = finish + delay, so start-to-start is duration + delay. Fixed rate would keep starts 60 s apart.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How does the scheduler prevent a recurring job from overlapping with itself?</p>
+      <div class="opts">
+        <button class="opt">By running each recurring job on its own dedicated thread</button>
+        <button class="opt">By queuing the next occurrence only after the current run finishes</button>
+        <button class="opt">By using a larger worker pool</button>
+        <button class="opt">It can't; overlap is unavoidable</button>
+      </div>
+      <div class="explain">Only one run of a job is ever in the queue or running at a time. A late next run starts right after, never alongside.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why are job status changes done with compare-and-set?</p>
+      <div class="opts">
+        <button class="opt">It's faster than reading a field</button>
+        <button class="opt">It serialises status to JSON</button>
+        <button class="opt">A worker and a cancelling thread can race; CAS from an expected state guarantees exactly one wins</button>
+        <button class="opt">It's required by <code>PriorityQueue</code></button>
+      </div>
+      <div class="explain">With a plain field, cancel could be overwritten by a worker rescheduling the job. Each transition succeeding only from its expected state removes the race.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  const T = 20, DT = 0.05;
+  const COL = { report: '#6366f1', cleanup: '#10b981', email: '#f59e0b', export: '#ec4899' };
+  let W = 2, mode = 'rate';
+  function simulate() {
+    const jobs = {
+      report: { period: 5, dur: 3, first: 0, recurring: true },
+      cleanup: { period: 2, dur: 0.5, first: 0, recurring: true },
+      email: { at: 4, dur: 1, failFirst: 2, backoff: [1, 2] },
+      export: { at: 1, dur: 8 },
+    };
+    const cancelAt = $('#tsCancel').checked ? 9 : Infinity;
+    let seq = 0; const queue = []; const runs = []; const workers = Array.from({ length: W }, () => null);
+    const cancelled = {};
+    const push = (job, due, occ, attempt) => queue.push({ job, due, occ, attempt, seq: seq++ });
+    push('report', 0, 0, 1); push('cleanup', 0, 0, 1); push('email', 4, 4, 1); push('export', 1, 1, 1);
+    for (let step = 0; step * DT < T + 30; step++) {
+      const t = +(step * DT).toFixed(2);
+      if (t >= cancelAt) cancelled.cleanup = true;
+      workers.forEach((w, i) => {
+        if (w && t >= w.end - 1e-9) {
+          const j = jobs[w.job]; workers[i] = null;
+          if (w.fail) { push(w.job, +(t + j.backoff[w.attempt - 1]).toFixed(2), w.occ, w.attempt + 1); }
+          else if (j.recurring && !cancelled[w.job]) {
+            const next = mode === 'rate' ? w.occ + j.period : +(t + j.period).toFixed(2);
+            push(w.job, next, next, 1);
+          }
+        }
+      });
+      queue.sort((a, b) => a.due - b.due || a.seq - b.seq);
+      for (let i = 0; i < W; i++) {
+        if (workers[i]) continue;
+        const k = queue.findIndex((q) => q.due <= t + 1e-9);
+        if (k < 0) break;
+        const q = queue.splice(k, 1)[0];
+        if (cancelled[q.job]) { i--; continue; }
+        const j = jobs[q.job], fail = !!j.failFirst && q.attempt <= j.failFirst;
+        const r = { job: q.job, worker: i, due: q.due, start: t, end: +(t + j.dur).toFixed(2), attempt: q.attempt, fail, occ: q.occ };
+        workers[i] = r; runs.push(r);
+      }
+      if (t > T && workers.every((w) => !w)) break;
+    }
+    return runs.filter((r) => r.start < T);
+  }
+  function draw() {
+    const runs = simulate();
+    const L = 84, R = 745, top = 18, laneH = 34, X = (t) => L + (Math.min(t, T) / T) * (R - L);
+    let svg = '';
+    for (let s = 0; s <= T; s += 2) svg += `<line x1="${X(s)}" x2="${X(s)}" y1="${top - 6}" y2="${top + W * laneH}" stroke="var(--border)"/><text x="${X(s)}" y="${top + W * laneH + 16}" text-anchor="middle">${s}s</text>`;
+    for (let i = 0; i < W; i++) svg += `<text class="ts-lane" x="10" y="${top + i * laneH + 20}">worker ${i + 1}</text>`;
+    runs.forEach((r) => {
+      const y = top + r.worker * laneH + 4, h = laneH - 10;
+      if (r.start - r.due > 0.01) svg += `<line x1="${X(r.due)}" x2="${X(r.start)}" y1="${y - 2}" y2="${y - 2}" stroke="${COL[r.job]}" stroke-width="1.5" stroke-dasharray="3 2" opacity=".8"/><circle cx="${X(r.due)}" cy="${y - 2}" r="2.5" fill="${COL[r.job]}"/>`;
+      const w = Math.max(3, X(r.end) - X(r.start));
+      const label = w > 34 ? `${r.job}${r.attempt > 1 ? ' #' + r.attempt : ''}` : '';
+      svg += `<g class="ts-bar"><rect x="${X(r.start)}" y="${y}" width="${w}" height="${h}" rx="4" fill="${r.fail ? 'var(--red)' : COL[r.job]}" stroke="${COL[r.job]}" stroke-width="${r.fail ? 2 : 0}"><title>${r.job} attempt ${r.attempt}: due ${r.due}s, ran ${r.start}–${r.end}s${r.fail ? ' (failed)' : ''}</title></rect><text x="${X(r.start) + 4}" y="${y + h / 2 + 4}">${label}</text></g>`;
+    });
+    const H = top + W * laneH + 26;
+    $('#tsSvg').setAttribute('viewBox', `0 0 760 ${H}`);
+    $('#tsSvg').innerHTML = svg;
+    const late = runs.reduce((m, r) => Math.max(m, r.start - r.due), 0);
+    const count = (j) => runs.filter((r) => r.job === j && !r.fail).length;
+    const emailDone = runs.find((r) => r.job === 'email' && !r.fail);
+    $('#tsStats').innerHTML = `
+      <div class="stat ${late > 3 ? 'bad' : late > 1 ? 'warn' : 'good'}"><div class="k">Worst start delay</div><div class="v">${late.toFixed(1)}<small> s</small></div></div>
+      <div class="stat"><div class="k">Report runs</div><div class="v">${count('report')}</div></div>
+      <div class="stat"><div class="k">Cleanup runs</div><div class="v">${count('cleanup')}</div></div>
+      <div class="stat ${emailDone ? 'good' : 'warn'}"><div class="k">Email delivered</div><div class="v" style="font-size:16px">${emailDone ? `at ${emailDone.end.toFixed(1)} s (attempt 3)` : 'not yet'}</div></div>`;
+  }
+  $$('#tsW button').forEach((b) => b.addEventListener('click', () => { W = +b.dataset.v; draw(); }));
+  $$('#tsMode button').forEach((b) => b.addEventListener('click', () => { mode = b.dataset.v; draw(); }));
+  $('#tsCancel').addEventListener('change', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
