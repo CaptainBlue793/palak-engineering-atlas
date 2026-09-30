@@ -469,6 +469,13 @@
         '<div class="gh"><a class="nm" href="' + url(c, 'index.html') + '">' + esc(c.title) + '</a>' +
         '<span class="rule"></span><span class="ct">' + doneCount(c) + '/' + total + '</span></div>' +
         '<div class="mosaic">' + sq + '</div></div>';
+    }).join('') +
+    // Upcoming courses: one faded square per planned chapter, never filled, never counted.
+    SOON.map(function (c) {
+      return '<div class="mgroup tint soon" style="' + tintVars(c) + '" role="group" aria-label="' + esc(c.title) + ', coming soon">' +
+        '<div class="gh"><span class="nm">' + esc(c.title) + '</span>' +
+        '<span class="rule"></span><span class="ct">Soon</span></div>' +
+        '<div class="mosaic" aria-hidden="true">' + new Array(c.chapters + 1).join('<i></i>') + '</div></div>';
     }).join('');
   }
 
