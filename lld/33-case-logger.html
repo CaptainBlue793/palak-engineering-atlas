@@ -6,34 +6,398 @@
 <title>Case Study: Logging Framework</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .lg-ctl { display:flex; flex-wrap:wrap; gap:16px; align-items:center; margin-top:12px; font-size:13.5px; }
+  .lg-ctl input[type=range] { width:180px; accent-color:var(--accent); }
+  .lg-ctl .v { font-family:var(--mono); font-weight:700; }
+  .lg-gauge { margin-top:14px; display:grid; grid-template-columns: 130px 1fr 90px; gap:8px 12px; align-items:center; font-size:13px; }
+  .lg-track { height:16px; border-radius:6px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; position:relative; }
+  .lg-fill { height:100%; width:0; background:var(--accent); transition:width .06s linear; }
+  .lg-fill.lg-block { background:var(--red); }
+  .lg-mark { position:absolute; top:0; bottom:0; width:0; border-left:1.5px dashed var(--amber); }
+  .lg-num { font-family:var(--mono); text-align:right; }
+  .lg-spark { width:100%; height:auto; display:block; margin-top:12px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); }
+  .lg-spark text { font-family:var(--mono); font-size:10.5px; fill:var(--muted); }
+</style>
 </head>
 <body data-chapter="33">
-<!-- lld:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 33</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
     <h1>Case Study: <span class="grad">Logging Framework</span></h1>
-    <p class="lead">Levels, appenders and formatters; a chain of handlers; async logging without losing messages.</p>
+    <p class="lead">Every service logs, and most engineers have used SLF4J with Logback or Log4j without looking inside. Designing one is a favourite LLD question because it's a tour of patterns that genuinely belong: a facade for callers, a hierarchy of named loggers, filters as a chain, layouts as strategies, appenders as pluggable outputs, and an asynchronous appender that must never lose the error you'll need at 3 a.m. It also has a hard constraint most designs ignore: logging must be nearly free when it's turned off, and must never take the application down when it's turned on.</p>
+    <ul class="objectives">
+      <li>Design the caller-facing API so disabled log calls cost almost nothing</li>
+      <li>Resolve effective levels through a hierarchy of logger names</li>
+      <li>Separate appenders, layouts and filters, each behind its own interface</li>
+      <li>Build an async appender with a bounded queue and an explicit overflow policy</li>
+      <li>Make configuration swappable at runtime without locks on the hot path</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Decorator and Chain of Responsibility.</b> See <a href="13-decorator-proxy.html">Chapter 13</a> and <a href="19-chain-template.html">Chapter 19</a>.</li>
+        <li><b>Bounded queues and queue policies.</b> See <a href="23-producer-consumer.html">Chapter 23</a>.</li>
+        <li><b>Appenders and dynamic dispatch.</b> See <a href="p3-inheritance-dispatch.html">P3</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Requirements and API</li>
-    <li>Levels and filtering</li>
-    <li>Appenders and formatters</li>
-    <li>Async logging with a queue</li>
-    <li>Configuration</li>
-  </ol>
+  <h2>Requirements and API</h2>
+  <p>Clarify: levels TRACE, DEBUG, INFO, WARN, ERROR; per-package levels (DEBUG for payments only); several outputs at once (console, file, JSON for the log pipeline), each with its own format and filters; asynchronous writing so a slow disk doesn't slow requests; levels changeable at runtime without a restart; thread-safe. Out of scope: shipping logs to a remote store (that's another appender), rotation details.</p>
+  <p>The API callers see should be tiny and cheap. The key constraint is that a <b>disabled</b> call must do almost no work: no string building, no timestamp, no allocation beyond the argument array. That's why log calls take a template with <code>{}</code> placeholders instead of a concatenated string: <code>"Order " + id + " paid"</code> builds the string even when INFO is off; <code>log.info("Order {} paid", id)</code> doesn't.</p>
+<pre class="code"><span class="k">public enum</span> <span class="t">Level</span> {
+	TRACE, DEBUG, INFO, WARN, ERROR;
+	<span class="k">public boolean</span> <span class="f">isAtLeast</span>(<span class="t">Level</span> other) { <span class="k">return</span> <span class="f">compareTo</span>(other) &gt;= <span class="m">0</span>; }
+}
+
+<span class="k">public record</span> <span class="t">LogEvent</span>(<span class="t">Instant</span> time, <span class="t">Level</span> level, <span class="t">String</span> logger, <span class="t">String</span> thread,
+                       <span class="t">String</span> message, <span class="t">Throwable</span> error, <span class="t">Map</span>&lt;<span class="t">String</span>, <span class="t">String</span>&gt; context) {}   <span class="c">// immutable: safe to hand to another thread</span>
+
+<span class="k">public final class</span> <span class="t">Logger</span> {
+	<span class="k">private final</span> <span class="t">String</span> name;
+	<span class="k">private final</span> <span class="t">LoggerContext</span> ctx;
+
+	<span class="k">public void</span> <span class="f">info</span>(<span class="t">String</span> template, <span class="t">Object</span>... args) { <span class="f">log</span>(<span class="t">Level</span>.INFO, template, args, <span class="k">null</span>); }
+	<span class="k">public void</span> <span class="f">error</span>(<span class="t">String</span> message, <span class="t">Throwable</span> t)      { <span class="f">log</span>(<span class="t">Level</span>.ERROR, message, NO_ARGS, t); }
+	<span class="c">// trace, debug, warn: same shape</span>
+
+	<span class="k">private void</span> <span class="f">log</span>(<span class="t">Level</span> level, <span class="t">String</span> template, <span class="t">Object</span>[] args, <span class="t">Throwable</span> t) {
+		<span class="k">if</span> (!ctx.<span class="f">isEnabled</span>(name, level)) <span class="k">return</span>;                           <span class="c">// the hot path for disabled calls</span>
+		<span class="t">LogEvent</span> e = <span class="k">new</span> <span class="t">LogEvent</span>(ctx.<span class="f">clock</span>().<span class="f">instant</span>(), level, name, <span class="t">Thread</span>.<span class="f">currentThread</span>().<span class="f">getName</span>(),
+			<span class="t">MessageFormatter</span>.<span class="f">format</span>(template, args), t, <span class="t">Mdc</span>.<span class="f">snapshot</span>());      <span class="c">// captured on the caller's thread</span>
+		ctx.<span class="f">dispatch</span>(e);
+	}
+}
+
+<span class="c">// Callers never construct loggers: a static facade hands out one per name.</span>
+<span class="k">private static final</span> <span class="t">Logger</span> log = <span class="t">LoggerFactory</span>.<span class="f">getLogger</span>(<span class="t">OrderService</span>.<span class="k">class</span>);</pre>
+  <p><code>LoggerFactory</code> is one of the few places a static access point is justified (<a href="09-singleton.html">Chapter 9</a>): logging is used from every class, including ones created long before any dependency injection runs. The facade stays thin; everything behind it is ordinary injected objects, which is also how SLF4J separates the API that application code compiles against from the backend (Logback, Log4j) chosen at deploy time.</p>
+
+  <h2>Levels and filtering</h2>
+  <p>Loggers are named after classes, and the dots form a <b>hierarchy</b>: <code>com.shop.payments.StripeClient</code> is a child of <code>com.shop.payments</code>, which is a child of <code>com.shop</code>, and so on up to the root. Configuration sets levels on a few names; every other logger inherits the level of its nearest configured ancestor. That's how one line (“payments at DEBUG”) turns on detail for a whole package.</p>
+<pre class="code"><span class="t">Level</span> <span class="f">effectiveLevel</span>(<span class="t">String</span> name) {
+	<span class="k">return</span> cache.<span class="f">computeIfAbsent</span>(name, n -&gt; {
+		<span class="k">for</span> (<span class="t">String</span> cur = n; !cur.<span class="f">isEmpty</span>(); cur = <span class="f">parent</span>(cur)) {        <span class="c">// "a.b.C" → "a.b" → "a" → ""</span>
+			<span class="t">Level</span> l = config.<span class="f">levels</span>().<span class="f">get</span>(cur);
+			<span class="k">if</span> (l != <span class="k">null</span>) <span class="k">return</span> l;
+		}
+		<span class="k">return</span> config.<span class="f">rootLevel</span>();
+	});                                                                  <span class="c">// cache cleared when config changes</span>
+}</pre>
+  <p>The level check is the coarse, fast filter. Finer decisions (“drop health-check noise”, “only ERRORs to the pager appender”, “sample 1% of DEBUG”) belong to <b>filters</b>, run as a chain (<a href="19-chain-template.html">Chapter 19</a>). Each filter answers ACCEPT, DENY or NEUTRAL; the first non-neutral answer wins, and if every filter is neutral the event passes. This is the model Logback and Log4j 2 both use.</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">Filter</span> {
+	<span class="k">enum</span> <span class="t">Verdict</span> { ACCEPT, DENY, NEUTRAL }
+	<span class="t">Verdict</span> <span class="f">decide</span>(<span class="t">LogEvent</span> e);
+}
+
+<span class="k">static boolean</span> <span class="f">passes</span>(<span class="t">List</span>&lt;<span class="t">Filter</span>&gt; chain, <span class="t">LogEvent</span> e) {
+	<span class="k">for</span> (<span class="t">Filter</span> f : chain) {
+		<span class="k">switch</span> (f.<span class="f">decide</span>(e)) { <span class="k">case</span> ACCEPT: <span class="k">return true</span>; <span class="k">case</span> DENY: <span class="k">return false</span>; <span class="k">default</span>: <span class="k">continue</span>; }
+	}
+	<span class="k">return true</span>;
+}</pre>
+
+  <h2>Appenders and formatters</h2>
+  <p>Three concerns that are easy to tangle: <b>where</b> an event goes (appender), <b>what it looks like</b> (layout), and <b>whether</b> this output wants it (filters). Keep them separate and every combination is configuration: a console appender with a coloured pattern layout and a WARN threshold, a file appender with a JSON layout and no filters. Adding a Kafka appender or a logfmt layout never touches the others.</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">Appender</span> { <span class="k">void</span> <span class="f">append</span>(<span class="t">LogEvent</span> e); <span class="k">default void</span> <span class="f">close</span>() {} }
+<span class="k">public interface</span> <span class="t">Layout</span>   { <span class="t">String</span> <span class="f">format</span>(<span class="t">LogEvent</span> e); }       <span class="c">// Strategy: pattern, JSON, logfmt</span>
+
+<span class="k">public final class</span> <span class="t">FileAppender</span> <span class="k">implements</span> <span class="t">Appender</span> {
+	<span class="k">private final</span> <span class="t">Layout</span> layout;
+	<span class="k">private final</span> <span class="t">List</span>&lt;<span class="t">Filter</span>&gt; filters;
+	<span class="k">private final</span> <span class="t">Writer</span> out;
+
+	<span class="k">public synchronized void</span> <span class="f">append</span>(<span class="t">LogEvent</span> e) {                     <span class="c">// one writer: lines never interleave</span>
+		<span class="k">if</span> (!<span class="f">passes</span>(filters, e)) <span class="k">return</span>;
+		<span class="k">try</span> { out.<span class="f">write</span>(layout.<span class="f">format</span>(e)); out.<span class="f">write</span>(<span class="s">'\n'</span>); }
+		<span class="k">catch</span> (<span class="t">IOException</span> ex) { <span class="t">ErrorReporter</span>.<span class="f">once</span>(<span class="s">"file appender failed"</span>, ex); }   <span class="c">// never throw into the app</span>
+	}
+}</pre>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>log.info("Order {} paid", id)</b> Called on a request thread.</li>
+      <li data-k="decision"><b>Level enabled for this logger?</b> No: return immediately. This is most calls in production.</li>
+      <li><b>Build the event</b> Timestamp, thread name, formatted message and context, all captured now, on this thread.</li>
+      <li><b>Route to appenders</b> The logger's own appenders plus its ancestors' (“additivity”), usually just the root's.</li>
+      <li><b>Each appender: filters, then layout, then write</b> Filters may deny; the layout turns the event into text.</li>
+      <li data-k="end"><b>Async appender: enqueue and return</b> A worker thread does the slow write later.</li>
+    </ol>
+    <figcaption><b>The life of a log call.</b> The expensive parts happen only after the cheap level check, and the slowest part (I/O) can move off the caller's thread.</figcaption>
+  </figure>
+
+  <h2>Async logging with a queue</h2>
+  <p>Writing to disk takes microseconds when things are fine and much longer when the disk is busy or a network log agent is backed up. With synchronous appenders, that latency lands on every request thread that logs. An <b>async appender</b> is a decorator (<a href="13-decorator-proxy.html">Chapter 13</a>) around any appender: <code>append</code> puts the event on a <b>bounded</b> queue and returns; one worker thread takes events off and calls the real appender. That's producer-consumer (<a href="23-producer-consumer.html">Chapter 23</a>), and the design question is the same one: what happens when the queue is full?</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">An incident: 2,000 log events in one second</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="lgMode"><button data-v="sync">synchronous appender</button><button class="active" data-v="block">async: block when full</button><button data-v="drop">async: shed INFO when 80% full</button></div>
+      </div>
+      <div class="lg-ctl">
+        <label>Disk can write <input type="range" id="lgRate" min="0" max="3" step="1" value="1"> <span class="v" id="lgRateV"></span></label>
+        <span class="small muted">Queue capacity 256. Mix: 80% INFO, 15% WARN, 5% ERROR.</span>
+        <button class="btn sm primary" id="lgRun">▶ run the incident</button>
+      </div>
+      <div class="lg-gauge">
+        <span>Queue</span><div class="lg-track"><div class="lg-fill" id="lgQ"></div><div class="lg-mark" id="lgMark"></div></div><span class="lg-num" id="lgQn">0</span>
+        <span>Threads blocked</span><div class="lg-track"><div class="lg-fill lg-block" id="lgB"></div></div><span class="lg-num" id="lgBn">0</span>
+      </div>
+      <svg class="lg-spark" id="lgSpark" viewBox="0 0 760 110" role="img" aria-label="Queue length and blocked callers over time"></svg>
+      <div class="stats" id="lgStats"></div>
+    </div>
+    <div class="panel-foot">A simplified model: 2,000 events arrive from request threads within one second, half of them in the first 250 ms; the disk writes at a fixed rate. “Caller time spent waiting” adds up how long request threads were stuck in a log call instead of serving requests.</div>
+  </div>
+
+<pre class="code"><span class="k">public final class</span> <span class="t">AsyncAppender</span> <span class="k">implements</span> <span class="t">Appender</span> {
+	<span class="k">private final</span> <span class="t">Appender</span> delegate;
+	<span class="k">private final</span> <span class="t">BlockingQueue</span>&lt;<span class="t">LogEvent</span>&gt; queue;             <span class="c">// bounded, e.g. ArrayBlockingQueue(256)</span>
+	<span class="k">private final int</span> discardBelow;                           <span class="c">// remaining capacity that triggers shedding</span>
+	<span class="k">private final</span> <span class="t">LongAdder</span> dropped = <span class="k">new</span> <span class="t">LongAdder</span>();
+	<span class="k">private final</span> <span class="t">Thread</span> worker = <span class="t">Thread</span>.<span class="f">ofPlatform</span>().<span class="f">daemon</span>().<span class="f">name</span>(<span class="s">"log-writer"</span>).<span class="f">unstarted</span>(<span class="k">this</span>::<span class="f">drain</span>);   <span class="c">// started by the constructor</span>
+
+	<span class="k">public void</span> <span class="f">append</span>(<span class="t">LogEvent</span> e) {
+		<span class="k">if</span> (queue.<span class="f">remainingCapacity</span>() &lt; discardBelow &amp;&amp; !e.<span class="f">level</span>().<span class="f">isAtLeast</span>(<span class="t">Level</span>.WARN)) {
+			dropped.<span class="f">increment</span>(); <span class="k">return</span>;                              <span class="c">// shed the least important events first</span>
+		}
+		<span class="k">try</span> { queue.<span class="f">put</span>(e); }                                       <span class="c">// WARN/ERROR wait rather than vanish</span>
+		<span class="k">catch</span> (<span class="t">InterruptedException</span> ie) { <span class="t">Thread</span>.<span class="f">currentThread</span>().<span class="f">interrupt</span>(); }
+	}
+
+	<span class="k">private void</span> <span class="f">drain</span>() {
+		<span class="k">try</span> {
+			<span class="k">while</span> (<span class="k">true</span>) {
+				<span class="t">LogEvent</span> e = queue.<span class="f">take</span>();
+				<span class="k">if</span> (e == POISON) <span class="k">break</span>;
+				delegate.<span class="f">append</span>(e);
+			}
+		} <span class="k">catch</span> (<span class="t">InterruptedException</span> ie) { <span class="t">Thread</span>.<span class="f">currentThread</span>().<span class="f">interrupt</span>(); }
+	}
+
+	<span class="k">public void</span> <span class="f">close</span>() {                                           <span class="c">// from a shutdown hook</span>
+		<span class="k">try</span> { queue.<span class="f">put</span>(POISON); worker.<span class="f">join</span>(<span class="m">5_000</span>); }            <span class="c">// flush what's queued, but don't hang shutdown</span>
+		<span class="k">catch</span> (<span class="t">InterruptedException</span> ie) { <span class="t">Thread</span>.<span class="f">currentThread</span>().<span class="f">interrupt</span>(); }
+		delegate.<span class="f">close</span>();
+	}
+}</pre>
+  <p>This overflow policy is not invented for the example: Logback&#39;s <code>AsyncAppender</code> behaves this way by default, with a queue of 256 events, and once less than a fifth of the queue remains it discards TRACE, DEBUG and INFO events while keeping WARN and ERROR. Three details decide whether async logging helps or hurts. <b>Capture caller data on the caller's thread:</b> the thread name, the timestamp and the MDC context (request id, user id) must go into the event before it's queued; a worker that reads them later records its own thread and an empty context. <b>Make the event immutable:</b> if the message is formatted later from a mutable argument, the log may show the object's state from after the call. And <b>flush on shutdown</b>, with a time limit, or the last seconds before a crash, the ones you need, never reach the file.</p>
+  <figure class="seq" data-actors="OrderService|Logger|AsyncAppender|log-writer thread|FileAppender">
+    <ol>
+      <li data-m="0>1">error("Charge failed for {}", orderId, ex)</li>
+      <li data-m="1>1">level check; capture time, thread, MDC; format message</li>
+      <li data-m="1>2">append(event)</li>
+      <li data-m="2>2">queue.put(event)</li>
+      <li data-m="2>0" data-k="reply">returns in microseconds</li>
+      <li data-m="3>2">take()</li>
+      <li data-m="3>4">append(event)</li>
+      <li data-m="4>4">filters, JSON layout, write + flush</li>
+    </ol>
+    <figcaption><b>Async logging.</b> The request thread pays for the level check, the event and an enqueue; the disk write happens on the log-writer thread.</figcaption>
+  </figure>
+
+  <h2>Configuration</h2>
+  <p>Configuration is an <b>immutable object</b>: levels per logger name, appenders with their layouts and filters, the root level. Build it with a builder (<a href="11-builder-prototype.html">Chapter 11</a>) in code, or parse it from a file into the same object. To change levels at runtime (“turn on DEBUG for payments for ten minutes”) build a new configuration and swap it in one atomic step; loggers read the current configuration through a <code>volatile</code> field, so the hot path never takes a lock, and no thread ever sees half a configuration.</p>
+<pre class="code"><span class="t">LoggingConfig</span> cfg = <span class="t">LoggingConfig</span>.<span class="f">builder</span>()
+	.<span class="f">root</span>(<span class="t">Level</span>.INFO)
+	.<span class="f">level</span>(<span class="s">"com.shop.payments"</span>, <span class="t">Level</span>.DEBUG)
+	.<span class="f">appender</span>(<span class="k">new</span> <span class="t">AsyncAppender</span>(<span class="k">new</span> <span class="t">FileAppender</span>(path, <span class="k">new</span> <span class="t">JsonLayout</span>(), <span class="t">List</span>.<span class="f">of</span>()), <span class="m">256</span>))
+	.<span class="f">appender</span>(<span class="k">new</span> <span class="t">ConsoleAppender</span>(<span class="k">new</span> <span class="t">PatternLayout</span>(<span class="s">"%time %level %logger - %msg"</span>), <span class="t">List</span>.<span class="f">of</span>(<span class="k">new</span> <span class="t">ThresholdFilter</span>(<span class="t">Level</span>.WARN))))
+	.<span class="f">build</span>();
+
+context.<span class="f">reconfigure</span>(cfg);      <span class="c">// volatile write of the new config + clear the effective-level cache</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Part of the design</th><th>Pattern</th><th>Why it fits</th></tr></thead>
+      <tbody>
+        <tr><td><code>LoggerFactory.getLogger</code></td><td>Facade (+ one static access point)</td><td>Used everywhere, before DI exists; hides the backend</td></tr>
+        <tr><td>Dotted logger names</td><td>Hierarchy with inheritance</td><td>One setting controls a whole package</td></tr>
+        <tr><td>Filters</td><td>Chain of Responsibility</td><td>Independent rules; first decisive answer wins</td></tr>
+        <tr><td>Layouts</td><td>Strategy</td><td>Format varies independently of destination</td></tr>
+        <tr><td>Appenders</td><td>Plug-in interface (Open/Closed)</td><td>New destinations without changing the core</td></tr>
+        <tr><td><code>AsyncAppender</code></td><td>Decorator + producer-consumer</td><td>Adds asynchrony to any appender</td></tr>
+        <tr><td><code>LoggingConfig</code></td><td>Builder + immutable snapshot</td><td>Safe atomic runtime reconfiguration</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Log4Shell: when a layout interprets data</div><p>In December 2021, CVE-2021-44228, “Log4Shell”, was disclosed in Log4j 2. Its message formatting supported <i>lookups</i>: a <code>${…}</code> expression in a message could be evaluated, including JNDI lookups that fetched and loaded remote code. Since applications routinely log attacker-controlled strings (a user agent, a username), an attacker only had to get the string <code>${jndi:ldap://…}</code> logged to run code on the server. Patches first disabled message lookups by default and then removed them. The design lesson is general: a logging framework must treat the content of messages as <b>inert data</b>. Formatting substitutes arguments into placeholders; it must never interpret what those arguments contain.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>String concatenation in log calls,</b> paying for formatting even when the level is off. Use placeholders.</li>
+      <li><b>An unbounded async queue:</b> during an incident it grows until the JVM runs out of memory.</li>
+      <li><b>Dropping everything when full,</b> including the ERROR that explains the incident. Shed low levels first.</li>
+      <li><b>Reading thread name or MDC on the worker thread.</b> Capture them at the call site.</li>
+      <li><b>Appenders that throw into application code.</b> A full disk must not fail a checkout.</li>
+      <li><b>No flush on shutdown,</b> losing the final events before a crash.</li>
+      <li><b>Interpreting message content</b> (lookups, expressions) in formatting.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What are the main classes in a logging framework, and what does each do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A <code>Logger</code> per name, which callers get from a <code>LoggerFactory</code>; it checks the level first and, if enabled, builds an immutable <code>LogEvent</code>. Levels come from a hierarchy of dotted names, inherited from the nearest configured ancestor. The event goes to <code>Appender</code>s, which decide where it's written; each has a <code>Layout</code> strategy for the format and a chain of <code>Filter</code>s that can accept or deny it. An <code>AsyncAppender</code> decorator moves writing to a background thread through a bounded queue. All of it is described by an immutable configuration object that can be swapped at runtime.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> During an outage, the log volume spikes tenfold and the disk slows down. What does your design do, and what would you tune?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>With a synchronous appender, request threads would stall on writes and the outage would spread. With the async appender, the bounded queue absorbs the first part of the spike. When remaining capacity drops below the threshold, DEBUG and INFO events are shed and counted, while WARN and ERROR still go into the queue, blocking briefly if it's completely full; that's a deliberate choice that the errors matter more than a few milliseconds. I'd expose the dropped count as a metric and log a summary of it, so the drop is visible. Tuning: a larger queue, a faster layout, batching writes in the worker, and a rate-limiting filter on the noisiest logger. If blocking on ERROR is unacceptable for a latency-critical service, the alternative is never-block mode, which drops even errors, and I'd make that choice explicitly per service.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Disabled log calls must be nearly free: check the level first, and use placeholders instead of concatenation.</li>
+      <li>Dotted logger names form a hierarchy; effective levels are inherited and cached.</li>
+      <li>Appenders (where), layouts (format) and filters (whether) are separate interfaces.</li>
+      <li>An async appender is a decorator over a bounded queue; choose the overflow policy explicitly and shed low levels first.</li>
+      <li>Capture time, thread and context on the caller's thread, and make events immutable.</li>
+      <li>Configuration is an immutable snapshot swapped atomically; message content is never interpreted.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why is <code>log.debug("Cart {} has {} items", id, n)</code> preferred to <code>log.debug("Cart " + id + " has " + n + " items")</code>?</p>
+      <div class="opts">
+        <button class="opt">It produces a different message</button>
+        <button class="opt">It's required for JSON output</button>
+        <button class="opt">When DEBUG is disabled, no string is built; concatenation builds it before the level check</button>
+        <button class="opt">It's thread-safe and concatenation isn't</button>
+      </div>
+      <div class="explain">Arguments to a method are evaluated before the call. Placeholders defer formatting until after the level check.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Only <code>com.shop</code> is configured, at WARN. What's the effective level of <code>com.shop.payments.StripeClient</code>?</p>
+      <div class="opts">
+        <button class="opt">WARN, inherited from its nearest configured ancestor</button>
+        <button class="opt">The root level</button>
+        <button class="opt">DEBUG, the default for new loggers</button>
+        <button class="opt">None: it logs nothing</button>
+      </div>
+      <div class="explain">The lookup walks up the dotted name: com.shop.payments.StripeClient → com.shop.payments → com.shop, which is configured.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">An async appender's worker thread reads the MDC request id when it writes each event. What goes wrong?</p>
+      <div class="opts">
+        <button class="opt">Nothing; MDC is global</button>
+        <button class="opt">Events are written twice</button>
+        <button class="opt">The queue overflows</button>
+        <button class="opt">MDC is per thread, so the worker sees its own (empty) context, not the request's</button>
+      </div>
+      <div class="explain">Thread-scoped data must be captured into the event on the calling thread, before it's queued.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What should an async appender do when its bounded queue is nearly full during an incident?</p>
+      <div class="opts">
+        <button class="opt">Grow the queue without limit</button>
+        <button class="opt">Shed low-level events (DEBUG, INFO) and count them, while still accepting WARN and ERROR</button>
+        <button class="opt">Throw an exception to the calling code</button>
+        <button class="opt">Drop events at random</button>
+      </div>
+      <div class="explain">Unbounded growth risks running out of memory; throwing breaks the application; shedding by importance keeps the events that explain the incident.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which pattern best describes filters that each return ACCEPT, DENY or NEUTRAL, evaluated in order until one decides?</p>
+      <div class="opts">
+        <button class="opt">Singleton</button>
+        <button class="opt">Builder</button>
+        <button class="opt">Chain of Responsibility</button>
+        <button class="opt">Visitor</button>
+      </div>
+      <div class="explain">Each handler either decides or passes the event to the next, and new rules are added without changing the others.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  const RATES = [500, 1000, 2500, 10000], Q = 256, N = 2000, DISCARD = Math.floor(Q / 5);
+  let mode = 'block', raf = 0;
+  function simulate(rate) {
+    let rnd = 11; const next = () => { rnd = (rnd * 1664525 + 1013904223) >>> 0; return rnd / 4294967296; };
+    const lv = () => { const r = next(); return r < 0.8 ? 'INFO' : r < 0.95 ? 'WARN' : 'ERROR'; };
+    const blocked = [], queue = [], frames = [];
+    let credit = 0, written = 0, wait = 0, arrived = 0, t = 0, maxQ = 0, maxB = 0, arr = 0;
+    const dropped = { INFO: 0, WARN: 0, ERROR: 0 };
+    while (t < 8000 && (arrived < N || blocked.length || queue.length)) {
+      arr += t < 250 ? 4 : t < 1000 ? 4 / 3 : 0;          // a spike: half the events in the first 250 ms
+      while ((arr >= 1 || t === 999) && arrived < N) { blocked.push(lv()); arrived++; arr -= 1; }
+      credit += rate / 1000;
+      if (mode === 'sync') {
+        while (credit >= 1 && blocked.length) { blocked.shift(); written++; credit -= 1; wait += 1000 / rate; }   // the caller pays for its own write
+      } else {
+        const still = [];
+        for (const l of blocked) {                 // each waiting event is a different request thread
+          if (mode === 'drop' && Q - queue.length < DISCARD && l === 'INFO') dropped.INFO++;
+          else if (queue.length < Q) queue.push(l);
+          else still.push(l);
+        }
+        blocked.length = 0; blocked.push(...still);
+        while (credit >= 1 && queue.length) { queue.shift(); written++; credit -= 1; }
+      }
+      if (!blocked.length && !queue.length) credit = Math.min(credit, 1);
+      wait += blocked.length;
+      maxQ = Math.max(maxQ, queue.length); maxB = Math.max(maxB, blocked.length);
+      frames.push([queue.length, blocked.length]);
+      t++;
+    }
+    return { frames, written, dropped, wait: wait / 1000, done: t, maxQ, maxB };
+  }
+  function spark(fr, upto) {
+    const W = 760, H = 110, L = 40, R = 750, T = 10, B = 88, n = fr.length, maxY = Math.max(Q, ...fr.map((f) => f[1]));
+    const X = (i) => L + (i / Math.max(n - 1, 1)) * (R - L), Y = (v) => B - (v / maxY) * (B - T);
+    const path = (k) => fr.slice(0, upto).map((f, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(f[k]).toFixed(1)}`).join('');
+    return `<line x1="${L}" x2="${R}" y1="${B}" y2="${B}" stroke="var(--border-strong)"/>
+      <line x1="${L}" x2="${R}" y1="${Y(Q)}" y2="${Y(Q)}" stroke="var(--border-strong)" stroke-dasharray="3 4"/><text x="${L - 4}" y="${Y(Q) + 4}" text-anchor="end">${Q}</text>
+      <path d="${path(0)}" fill="none" stroke="var(--accent)" stroke-width="2"/><path d="${path(1)}" fill="none" stroke="var(--red)" stroke-width="2"/>
+      <text x="${L}" y="104">0 s</text><text x="${R}" y="104" text-anchor="end">${(n / 1000).toFixed(1)} s</text>
+      <text x="${(L + R) / 2}" y="104" text-anchor="middle"><tspan fill="var(--accent)">— queue length</tspan>   <tspan fill="var(--red)">— threads blocked in a log call</tspan></text>`;
+  }
+  function stats(s) {
+    const d = s.dropped.INFO + s.dropped.WARN + s.dropped.ERROR;
+    $('#lgStats').innerHTML = `
+      <div class="stat good"><div class="k">Written</div><div class="v">${s.written}</div></div>
+      <div class="stat ${d ? 'warn' : ''}"><div class="k">Dropped (INFO / WARN / ERROR)</div><div class="v" style="font-size:16px">${s.dropped.INFO} / ${s.dropped.WARN} / ${s.dropped.ERROR}</div></div>
+      <div class="stat ${s.wait > 20 ? 'bad' : s.wait > 1 ? 'warn' : 'good'}"><div class="k">Caller time spent waiting</div><div class="v">${s.wait.toFixed(1)}<small> thread-s</small></div></div>
+      <div class="stat"><div class="k">Last event written at</div><div class="v">${(s.done / 1000).toFixed(2)}<small> s</small></div></div>`;
+  }
+  function run() {
+    clearTimeout(raf);
+    const rate = RATES[+$('#lgRate').value], s = simulate(rate), fr = s.frames;
+    const maxB = Math.max(1, s.maxB);
+    let i = 0;
+    const step = () => {
+      i = Math.min(fr.length, i + Math.ceil(fr.length / 90));
+      const [q, b] = fr[i - 1] || [0, 0];
+      $('#lgQ').style.width = `${q / Q * 100}%`; $('#lgQn').textContent = mode === 'sync' ? '–' : q;
+      $('#lgB').style.width = `${Math.min(100, b / Math.max(maxB, 50) * 100)}%`; $('#lgBn').textContent = b;
+      $('#lgSpark').innerHTML = spark(fr, i);
+      if (i < fr.length) raf = setTimeout(step, 20); else stats(s);
+    };
+    $('#lgStats').innerHTML = '';
+    step();
+  }
+  function label() { $('#lgRateV').textContent = `${RATES[+$('#lgRate').value].toLocaleString()} events/s`; }
+  $('#lgMark').style.left = `${(Q - DISCARD) / Q * 100}%`;
+  $$('#lgMode button').forEach((b) => b.addEventListener('click', () => { mode = b.dataset.v; run(); }));
+  $('#lgRate').addEventListener('input', () => { label(); run(); });
+  $('#lgRun').onclick = run;
+  label(); run();
+})();
+</script>
 </body>
 </html>
