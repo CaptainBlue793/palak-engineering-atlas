@@ -6,33 +6,293 @@
 <title>Producer-Consumer, Thread Pools &amp; Futures</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pq-ctl { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:12px; }
+  @media (max-width:760px) { .pq-ctl { grid-template-columns:1fr; } }
+  .pq-ctl label { font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); display:block; }
+  .pq-ctl input { width:100%; accent-color:var(--accent); margin-top:6px; }
+  .pq-ctl .v { font-family:var(--mono); font-size:13px; color:var(--text); text-transform:none; letter-spacing:0; float:right; }
+  .pq-chart { width:100%; height:auto; display:block; margin-top:12px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; }
+  .pq-chart .ax { stroke:var(--border-strong); stroke-width:1; }
+  .pq-chart .depth { fill:none; stroke:var(--accent); stroke-width:2; }
+  .pq-chart .cap { stroke:var(--red); stroke-dasharray:5 4; stroke-width:1.2; }
+  .pq-chart text { font-family:var(--mono); font-size:10.5px; fill:var(--muted); }
+  .pq-res { margin-top:10px; padding:10px 14px; border-radius:12px; font-size:14px; }
+  .pq-res.pq-ok { background:var(--green-soft); } .pq-res.pq-bad { background:var(--red-soft); } .pq-res.pq-warn { background:var(--amber-soft); }
+</style>
 </head>
 <body data-chapter="23">
-<!-- lld:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 23</span><span class="pill">Advanced LLD</span><span class="pill">⏱ 50 min</span></div>
     <h1>Producer-Consumer, Thread Pools &amp; <span class="grad">Futures</span></h1>
-    <p class="lead">BlockingQueue with backpressure, ExecutorService sizing, and CompletableFuture pipelines.</p>
+    <p class="lead">Most systems have some work that shouldn't happen on the request thread: sending email, resizing images, writing audit logs, calling slow partners. The standard shape is <b>producer-consumer</b>: something puts work on a queue, a pool of worker threads takes it off. It's simple until the producers are faster than the consumers, at which point the one design decision that matters is what the queue does when it fills. This chapter covers that decision, how many threads to run, how to compose asynchronous results with futures, and how to shut it all down without losing work.</p>
+    <ul class="objectives">
+      <li>Build producer-consumer with a <code>BlockingQueue</code>, and explain backpressure</li>
+      <li>Predict what unbounded, blocking and rejecting queues do under overload</li>
+      <li>Size a thread pool for CPU-bound and I/O-bound work</li>
+      <li>Configure a <code>ThreadPoolExecutor</code> with a bounded queue and a rejection policy</li>
+      <li>Compose parallel calls with <code>CompletableFuture</code>, with timeouts, and shut executors down gracefully</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Thread safety and the concurrent building blocks.</b> See <a href="22-thread-safe-classes.html">Chapter 22</a>.</li>
+        <li><b>Commands:</b> a <code>Runnable</code> is a unit of work as an object. See <a href="17-command-memento.html">Chapter 17</a>.</li>
+        <li><b>Async event delivery</b> and its trade-offs. See <a href="16-observer-mediator.html">Chapter 16</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>BlockingQueue and backpressure</li>
-    <li>ExecutorService and pool sizing</li>
-    <li>Futures and CompletableFuture</li>
-    <li>Graceful shutdown</li>
-  </ol>
+  <h2>Producer-consumer with a BlockingQueue</h2>
+  <p>A <code>BlockingQueue</code> is a thread-safe queue with two extra behaviours: <code>take()</code> waits when the queue is empty, and <code>put()</code> waits when a bounded queue is full. That's all you need to connect producers and consumers running at different speeds without busy-waiting or extra locks:</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">ThumbnailWorker</span> <span class="k">implements</span> <span class="t">Runnable</span> {
+	<span class="k">private final</span> <span class="t">BlockingQueue</span>&lt;<span class="t">ImageJob</span>&gt; jobs;
+	<span class="k">private final</span> <span class="t">Thumbnailer</span> thumbnailer;
+
+	<span class="k">@Override public void</span> <span class="f">run</span>() {
+		<span class="k">try</span> {
+			<span class="k">while</span> (!<span class="t">Thread</span>.<span class="f">currentThread</span>().<span class="f">isInterrupted</span>()) {
+				<span class="t">ImageJob</span> job = jobs.<span class="f">take</span>();                       <span class="c">// waits while there's nothing to do</span>
+				<span class="k">try</span> { thumbnailer.<span class="f">create</span>(job); }
+				<span class="k">catch</span> (<span class="t">RuntimeException</span> e) { <span class="f">recordFailure</span>(job, e); }   <span class="c">// one bad job can't kill the worker</span>
+			}
+		} <span class="k">catch</span> (<span class="t">InterruptedException</span> e) {
+			<span class="t">Thread</span>.<span class="f">currentThread</span>().<span class="f">interrupt</span>();                   <span class="c">// shutdown asked us to stop</span>
+		}
+	}
+}
+
+<span class="t">BlockingQueue</span>&lt;<span class="t">ImageJob</span>&gt; jobs = <span class="k">new</span> <span class="t">ArrayBlockingQueue</span>&lt;&gt;(<span class="m">1_000</span>);   <span class="c">// bounded: the key decision</span>
+<span class="c">// producer, in the upload handler:</span>
+<span class="k">if</span> (!jobs.<span class="f">offer</span>(job, <span class="m">100</span>, <span class="t">TimeUnit</span>.MILLISECONDS)) <span class="k">return</span> <span class="t">Response</span>.<span class="f">status</span>(<span class="m">503</span>);</pre>
+  <p>The producer's choice of method is the backpressure policy. <code>put()</code> blocks until there's room, slowing the producer to the consumers' pace. <code>offer(job, timeout)</code> waits briefly, then gives up, so the caller can reject. <code>add()</code> throws immediately when full. An unbounded queue never pushes back at all, which sounds friendly and is usually a bug.</p>
+
+  <h2>What happens under overload</h2>
+  <p>If producers are faster than consumers for long enough, something has to give. The only question is <i>what</i>: memory, the producers, or some of the work. Set the rates and try each policy:</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Producer-consumer simulator: where does the overload go?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls"><div class="seg" id="pqPol"><button class="active" data-v="unb">Unbounded queue</button><button data-v="block">Bounded + block (put)</button><button data-v="rej">Bounded + reject (offer)</button></div><button class="btn sm primary" id="pqRun">▶ run 60 s</button></div>
+      <div class="pq-ctl">
+        <label>Arrivals per second <span class="v" id="pqArrV"></span><input type="range" id="pqArr" min="10" max="120" value="60"></label>
+        <label>Worker threads <span class="v" id="pqWrkV"></span><input type="range" id="pqWrk" min="1" max="16" value="4"></label>
+        <label>Time per job (ms) <span class="v" id="pqJobV"></span><input type="range" id="pqJob" min="20" max="200" step="10" value="80"></label>
+      </div>
+      <svg class="pq-chart" id="pqChart" viewBox="0 0 600 150" role="img" aria-label="Queue depth over time"></svg>
+      <div class="stats" id="pqStats"></div>
+      <div class="pq-res" id="pqRes"></div>
+    </div>
+    <div class="panel-foot">Capacity is workers ÷ time per job: 4 workers at 80 ms each finish 50 jobs a second. The bounded queue holds 200 jobs. The chart shows queue depth over the 60 seconds; latency includes time waiting in the queue.</div>
+  </div>
+
+  <p>Read the results as three different failure modes. <b>Unbounded</b>: nothing is rejected, and queue depth and latency grow without limit. Users wait minutes for work that no longer matters, and eventually the heap fills and the process dies with every queued job lost. <b>Bounded + block</b>: memory stays bounded, and the overload moves to the producers, which wait; end-to-end latency still grows, it's just spent waiting to get into the queue. That's right for a batch pipeline, and dangerous on a request thread, where blocking ties up the web server. <b>Bounded + reject</b>: some requests fail fast with a clear error, the rest are served within a bounded time (queue size ÷ throughput), and clients can retry later. For online services this is usually the right answer: <b>shed load explicitly rather than accepting work you can't do.</b></p>
+
+  <h2>Thread pools: how many threads?</h2>
+  <p>An <code>ExecutorService</code> is a queue plus a set of reusable worker threads: you submit tasks, it runs them. The number of threads is a real design decision, and the answer depends on what the tasks spend their time doing:</p>
+  <ul>
+    <li><b>CPU-bound work</b> (image resizing, compression, parsing): about one thread per core. More threads just take turns on the same cores and add switching overhead.</li>
+    <li><b>I/O-bound work</b> (HTTP calls, database queries): threads spend most of their time waiting, so you need more of them. Brian Goetz's rule of thumb: <b>threads ≈ cores × (1 + wait time ÷ compute time)</b>. With 8 cores and calls that wait 90 ms for every 10 ms of work, that's 8 × (1 + 9) = 80 threads.</li>
+    <li><b>Little's law</b> checks the result: work in flight = arrival rate × time per item. 400 requests a second at 200 ms each means 80 requests in progress at once, so you need about 80 threads (or connections) to keep up.</li>
+  </ul>
+  <p>Then there's the trap. The convenient <code>Executors.newFixedThreadPool(n)</code> uses an <b>unbounded</b> <code>LinkedBlockingQueue</code> internally: exactly the policy that failed in the simulator. For anything that can be overloaded, build the executor explicitly:</p>
+<pre class="code"><span class="t">ThreadPoolExecutor</span> pool = <span class="k">new</span> <span class="t">ThreadPoolExecutor</span>(
+	<span class="m">16</span>, <span class="m">16</span>,                                               <span class="c">// core and max threads</span>
+	<span class="m">0</span>, <span class="t">TimeUnit</span>.MILLISECONDS,
+	<span class="k">new</span> <span class="t">ArrayBlockingQueue</span>&lt;&gt;(<span class="m">500</span>),                          <span class="c">// bounded queue</span>
+	<span class="k">new</span> <span class="t">NamedThreadFactory</span>(<span class="s">"thumbnail-"</span>),                     <span class="c">// names make thread dumps readable</span>
+	<span class="k">new</span> <span class="t">ThreadPoolExecutor.AbortPolicy</span>());                    <span class="c">// full? throw RejectedExecutionException</span></pre>
+  <p>The last argument is the rejection policy: <code>AbortPolicy</code> throws, so the caller can return 503; <code>CallerRunsPolicy</code> runs the task on the submitting thread, which slows the producer down (backpressure without a separate mechanism); <code>DiscardPolicy</code> and <code>DiscardOldestPolicy</code> silently drop work, which is only acceptable for work that truly doesn't matter, like best-effort metrics.</p>
+
+  <h2>Futures: waiting for results without blocking everything</h2>
+  <p>Submitting a task returns a <code>Future</code>, a handle to a result that isn't ready yet. <code>CompletableFuture</code> adds composition: run several calls in parallel, combine their results, add timeouts and fallbacks, all without a thread sitting in a blocking <code>get()</code> for each step. A product page that needs three independent backend calls is the classic case:</p>
+<pre class="code"><span class="t">CompletableFuture</span>&lt;<span class="t">Product</span>&gt; product = <span class="t">CompletableFuture</span>.<span class="f">supplyAsync</span>(() -&gt; catalog.<span class="f">get</span>(id), io);
+<span class="t">CompletableFuture</span>&lt;<span class="t">Price</span>&gt; price = <span class="t">CompletableFuture</span>.<span class="f">supplyAsync</span>(() -&gt; pricing.<span class="f">quote</span>(id, user), io)
+	.<span class="f">orTimeout</span>(<span class="m">300</span>, <span class="t">TimeUnit</span>.MILLISECONDS);                     <span class="c">// required: fail after 300 ms</span>
+<span class="t">CompletableFuture</span>&lt;<span class="t">List</span>&lt;<span class="t">Review</span>&gt;&gt; reviews = <span class="t">CompletableFuture</span>.<span class="f">supplyAsync</span>(() -&gt; reviewsApi.<span class="f">top</span>(id), io)
+	.<span class="f">completeOnTimeout</span>(<span class="t">List</span>.<span class="f">of</span>(), <span class="m">200</span>, <span class="t">TimeUnit</span>.MILLISECONDS);   <span class="c">// optional: empty after 200 ms</span>
+
+<span class="t">ProductPage</span> page = product
+	.<span class="f">thenCombine</span>(price, <span class="t">ProductPage</span>::<span class="f">new</span>)
+	.<span class="f">thenCombine</span>(reviews, <span class="t">ProductPage</span>::<span class="f">withReviews</span>)
+	.<span class="f">join</span>();                                                   <span class="c">// ~max of the three, not their sum</span></pre>
+  <p>Three details make this production-grade. Pass your own executor (<code>io</code>): the default common pool is sized for CPU work and shared by the whole JVM, so blocking I/O in it starves everyone else. Give <b>every</b> remote call a timeout, and decide per call whether a timeout fails the page (price) or degrades it (reviews). And remember that <code>join()</code> rethrows failures wrapped in <code>CompletionException</code>, so the caller still needs a plan for errors.</p>
+  <figure class="seq" data-actors="ProductController|io pool|Catalog|Pricing|Reviews">
+    <ol>
+      <li data-m="0>1">supplyAsync ×3 (returns immediately)</li>
+      <li data-m="1>2">get(id): 40 ms</li>
+      <li data-m="1>3">quote(id, user): 120 ms</li>
+      <li data-m="1>4">top(id): slow…</li>
+      <li data-m="4>1" data-k="fail">200 ms passed → completeOnTimeout: []</li>
+      <li data-m="1>0" data-k="reply">page ready at ~200 ms, without reviews</li>
+    </ol>
+    <figcaption><b>Parallel fan-out with a budget.</b> Sequential calls would take 40 + 120 + (slow) ms. In parallel, the page takes about as long as its slowest required part, and optional parts can't hold it hostage.</figcaption>
+  </figure>
+
+  <h2>Shutting down without losing work</h2>
+  <p>Executors don't stop on their own; their threads keep the JVM alive. A graceful shutdown stops accepting work, lets queued and running tasks finish for a bounded time, and only then interrupts what's left:</p>
+<pre class="code">pool.<span class="f">shutdown</span>();                                              <span class="c">// no new tasks; queued ones still run</span>
+<span class="k">if</span> (!pool.<span class="f">awaitTermination</span>(<span class="m">30</span>, <span class="t">TimeUnit</span>.SECONDS)) {
+	<span class="t">List</span>&lt;<span class="t">Runnable</span>&gt; dropped = pool.<span class="f">shutdownNow</span>();                  <span class="c">// interrupt workers, return unstarted tasks</span>
+	log.<span class="f">warn</span>(<span class="s">"{} tasks not run at shutdown"</span>, dropped.<span class="f">size</span>());     <span class="c">// or persist them for the next start</span>
+}</pre>
+  <p>That's why workers must respond to interruption (the <code>InterruptedException</code> handling in the first listing), and why work that must not be lost belongs in a durable queue, not only in memory (<a href="17-command-memento.html">Chapter 17</a>).</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Virtual threads change the sizing, not the need for limits</div><p>Java 21's virtual threads are cheap: a server can run hundreds of thousands of them, one per request, and blocking I/O no longer ties up an OS thread. That removes most of the reason for hand-sized I/O thread pools. It doesn't remove the need for limits. Every virtual thread still calls the same database with its 20 connections and the same partner API with its rate limit. Without a bound, like a <code>Semaphore</code> around the partner call or a bounded connection pool (<a href="39-case-connection-pool.html">Case Study 39</a>), a traffic spike becomes 50,000 simultaneous calls to a downstream that can handle 200. Backpressure moves from the thread pool to the resource itself.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Unbounded queues</b>, including the one hidden in <code>Executors.newFixedThreadPool</code>. Bound them and pick a rejection policy.</li>
+      <li><b>Blocking I/O on the common ForkJoinPool</b> via <code>supplyAsync</code> without an executor. Pass a dedicated I/O executor.</li>
+      <li><b>Remote calls without timeouts.</b> One slow dependency then holds threads, and eventually the whole pool, forever.</li>
+      <li><b>Swallowing <code>InterruptedException</code>.</b> Restore the flag and stop, or shutdown can't stop your workers.</li>
+      <li><b>Letting one failing task kill a worker thread.</b> Catch per task inside the loop.</li>
+      <li><b>Never shutting executors down,</b> or shutting down without waiting, silently dropping queued work.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is backpressure, and why does an unbounded queue break it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Backpressure is how a slow consumer tells a fast producer to slow down or stop. A bounded queue provides it: when it's full, the producer blocks, waits briefly, or is rejected, so overload shows up at the edge where it can be handled. An unbounded queue never says no, so under sustained overload it grows until latency is useless and the heap runs out, losing everything queued. For online requests I'd use a bounded queue and reject with 503 when full; for batch pipelines, blocking the producer is fine.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A page calls three backends sequentially and takes 900 ms. How would you get it under 400 ms, and what can go wrong?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>If the calls are independent, fan them out in parallel with <code>CompletableFuture.supplyAsync</code> on a dedicated, bounded I/O executor and combine them with <code>thenCombine</code>, so the page takes roughly the slowest call rather than the sum. Every call gets a timeout: <code>orTimeout</code> for required parts, <code>completeOnTimeout</code> with a fallback for optional ones like reviews. What can go wrong: running blocking calls on the common pool, missing timeouts so one slow backend pins every thread, an unbounded executor queue under load, and forgetting that <code>join()</code> rethrows failures as <code>CompletionException</code>.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Producer-consumer: a <code>BlockingQueue</code> between producers and a pool of worker threads.</li>
+      <li>The queue's full-queue behaviour is your backpressure policy: block, reject, or (unbounded) run out of memory.</li>
+      <li>Online services should usually bound queues and shed load fast; batch pipelines can block producers.</li>
+      <li>Size pools by workload: about one thread per core for CPU work; cores × (1 + wait/compute) for I/O, checked with Little's law.</li>
+      <li>Build <code>ThreadPoolExecutor</code> explicitly with a bounded queue, named threads and a rejection policy.</li>
+      <li><code>CompletableFuture</code> fans out calls on your own executor, with a timeout on every call; shut executors down with <code>shutdown</code>, <code>awaitTermination</code>, then <code>shutdownNow</code>.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Jobs arrive at 60 per second and workers can finish 50 per second. With an unbounded queue, what happens over the next hour?</p>
+      <div class="opts">
+        <button class="opt">Nothing: the queue absorbs the difference</button>
+        <button class="opt">Extra jobs are rejected</button>
+        <button class="opt">The queue grows by about 10 jobs a second, so latency keeps rising and memory eventually runs out</button>
+        <button class="opt">Producers slow down automatically</button>
+      </div>
+      <div class="explain">An unbounded queue never pushes back. A sustained 10 jobs/s surplus is 36,000 queued jobs after an hour, each waiting longer than the last, until the heap is exhausted.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What's the hidden risk in <code>Executors.newFixedThreadPool(16)</code> for a request-handling path?</p>
+      <div class="opts">
+        <button class="opt">Its internal task queue is unbounded, so overload turns into unbounded latency and memory use</button>
+        <button class="opt">It can only run 16 tasks ever</button>
+        <button class="opt">Its threads aren't reused</button>
+        <button class="opt">It isn't thread-safe</button>
+      </div>
+      <div class="explain">The fixed pool is backed by an unbounded <code>LinkedBlockingQueue</code>. Building a <code>ThreadPoolExecutor</code> with an <code>ArrayBlockingQueue</code> and a rejection policy gives you a bound.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">An 8-core service makes HTTP calls that wait about 90 ms for every 10 ms of CPU work. Roughly how many threads should the I/O pool have?</p>
+      <div class="opts">
+        <button class="opt">8</button>
+        <button class="opt">9</button>
+        <button class="opt">16</button>
+        <button class="opt">About 80: cores × (1 + wait/compute) = 8 × (1 + 9)</button>
+      </div>
+      <div class="explain">I/O-bound threads spend most of their time waiting, so more threads are needed to keep the cores busy. The rule of thumb gives 80; measure and adjust from there.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does <code>ThreadPoolExecutor.CallerRunsPolicy</code> do when the pool and its queue are full?</p>
+      <div class="opts">
+        <button class="opt">Throws RejectedExecutionException</button>
+        <button class="opt">Runs the task on the thread that submitted it, which slows the producer down</button>
+        <button class="opt">Silently drops the task</button>
+        <button class="opt">Grows the queue</button>
+      </div>
+      <div class="explain">Running the task on the caller's thread means the producer can't submit more until it finishes: a simple form of backpressure. AbortPolicy throws; the discard policies drop.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why pass a dedicated executor to <code>CompletableFuture.supplyAsync</code> for blocking HTTP calls?</p>
+      <div class="opts">
+        <button class="opt">supplyAsync requires an executor</button>
+        <button class="opt">It makes the calls faster</button>
+        <button class="opt">The default common pool is small, sized for CPU work and shared by the whole JVM, so blocking calls on it starve other work</button>
+        <button class="opt">Futures can't time out otherwise</button>
+      </div>
+      <div class="explain">Without an executor argument, tasks run on <code>ForkJoinPool.commonPool()</code>, typically cores − 1 threads shared by parallel streams and other async code. Blocking I/O belongs on its own bounded pool.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  const CAP = 200, SECS = 60, DT = 0.1;
+  let pol = 'unb';
+  function sim() {
+    const arr = +$('#pqArr').value, W = +$('#pqWrk').value, job = +$('#pqJob').value / 1000;
+    const rate = W / job;                                  // jobs per second of capacity
+    let q = [], done = 0, rejected = 0, blocked = 0, lat = [], depth = [], credit = 0, arrCredit = 0, t = 0, maxQ = 0;
+    const blockedProducers = [];
+    for (let step = 0; step < SECS / DT; step++, t += DT) {
+      arrCredit += arr * DT;
+      while (arrCredit >= 1) {
+        arrCredit -= 1;
+        if (pol === 'unb' || q.length < CAP) q.push(t);
+        else if (pol === 'rej') rejected++;
+        else { blocked++; blockedProducers.push(t); }            // producer waits; job enqueued later
+      }
+      credit += rate * DT;
+      while (credit >= 1 && q.length) { credit -= 1; const at = q.shift(); lat.push(t - at + job); done++; }
+      if (!q.length) credit = Math.min(credit, 1);
+      while (pol === 'block' && q.length < CAP && blockedProducers.length) q.push(blockedProducers.shift());
+      maxQ = Math.max(maxQ, q.length); depth.push(q.length);
+    }
+    lat.sort((a, b) => a - b);
+    const p = (x) => lat.length ? lat[Math.min(lat.length - 1, Math.floor(lat.length * x))] : 0;
+    return { arr, W, job, rate, done, rejected, blocked, waitingProducers: blockedProducers.length, p50: p(0.5), p99: p(0.99), depth, maxQ, mem: q.length };
+  }
+  function draw() {
+    $('#pqArrV').textContent = $('#pqArr').value + '/s';
+    $('#pqWrkV').textContent = $('#pqWrk').value;
+    $('#pqJobV').textContent = $('#pqJob').value + ' ms';
+    const r = sim();
+    const top = Math.max(r.maxQ, pol === 'unb' ? 10 : CAP) * 1.1, n = r.depth.length;
+    const pts = r.depth.map((d, i) => `${(i / (n - 1) * 580 + 10).toFixed(1)},${(140 - d / top * 125).toFixed(1)}`).join(' ');
+    const capY = 140 - CAP / top * 125;
+    $('#pqChart').innerHTML = `<line class="ax" x1="10" y1="140" x2="590" y2="140"/>` + (pol !== 'unb' ? `<line class="cap" x1="10" y1="${capY}" x2="590" y2="${capY}"/><text x="586" y="${capY - 4}" text-anchor="end">capacity 200</text>` : '') + `<polyline class="depth" points="${pts}"/><text x="14" y="14">queue depth (max ${r.maxQ})</text><text x="560" y="136">60 s</text>`;
+    const fmt = (s) => s >= 1 ? s.toFixed(1) + ' s' : Math.round(s * 1000) + ' ms';
+    $('#pqStats').innerHTML = `
+      <div class="stat"><div class="k">Capacity</div><div class="v">${Math.round(r.rate)}<small> jobs/s</small></div></div>
+      <div class="stat good"><div class="k">Completed</div><div class="v">${r.done}</div></div>
+      <div class="stat ${r.p99 > 2 ? 'bad' : 'good'}"><div class="k">p99 latency</div><div class="v">${fmt(r.p99)}</div></div>
+      <div class="stat ${r.rejected ? 'warn' : ''}"><div class="k">${pol === 'block' ? 'Producer waits' : 'Rejected (503)'}</div><div class="v">${pol === 'block' ? r.blocked : r.rejected}</div></div>`;
+    const over = r.arr > r.rate + 0.5, res = $('#pqRes');
+    if (!over) { res.className = 'pq-res pq-ok'; res.innerHTML = `Arrivals (${r.arr}/s) are below capacity (${Math.round(r.rate)}/s): the queue stays short and every policy behaves the same. Raise the arrival rate or make jobs slower.`; }
+    else if (pol === 'unb') { res.className = 'pq-res pq-bad'; res.innerHTML = `<b>Unbounded:</b> ${r.mem} jobs still queued after 60 s and growing by ~${Math.round(r.arr - r.rate)}/s. p99 latency is ${fmt(r.p99)} and climbing. Nothing is rejected, so nothing warns you until the heap runs out.`; }
+    else if (pol === 'block') { res.className = 'pq-res pq-warn'; res.innerHTML = `<b>Bounded + block:</b> the queue is capped at ${CAP}, so memory stays bounded, but the waiting moved to the producers: ${r.blocked} submissions blocked and ${r.waitingProducers} are still stuck, so end-to-end latency keeps growing (p99 ${fmt(r.p99)}). Fine for a batch pipeline; on request threads, it's the web server stalling.`; }
+    else { res.className = 'pq-res pq-ok'; res.innerHTML = `<b>Bounded + reject:</b> ${r.rejected} jobs got an immediate 503 (clients can retry), and latency for accepted jobs is capped at about queue size ÷ throughput = ${CAP} ÷ ${Math.round(r.rate)} ≈ ${fmt(CAP / r.rate)} (p99 ${fmt(r.p99)}). Load was shed at the edge. A smaller queue caps latency lower, at the price of more rejections.`; }
+  }
+  $$('#pqPol button').forEach((b) => b.addEventListener('click', () => { pol = b.dataset.v; draw(); }));
+  ['#pqArr', '#pqWrk', '#pqJob'].forEach((s) => $(s).addEventListener('input', draw));
+  $('#pqRun').onclick = draw;
+  draw();
+})();
+</script>
 </body>
 </html>
