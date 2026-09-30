@@ -6,7 +6,7 @@
    address is not a secret; the Worker only accepts requests
    from the sites listed in api/wrangler.toml (ALLOWED_ORIGINS).
    ========================================================= */
-export const apiBase = null;
+export const apiBase = 'https://atlas-accounts-api.atlas-accounts-api.workers.dev';
 // e.g. export const apiBase = 'https://atlas-accounts-api.<your-subdomain>.workers.dev';
 
 /* For local testing only: when the site is served from localhost / 127.0.0.1 and this is
