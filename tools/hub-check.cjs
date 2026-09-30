@@ -81,7 +81,7 @@ try {
   fs.rmSync(tmp, { force: true });
 }
 
-const m = dom.match(/<pre id="hub-probe">([\s\S]*?)<\/pre>/);
+const m = dom.match(/<pre id="hub-probe"[^>]*>([\s\S]*?)<\/pre>/);
 if (!m) { console.error('The probe never ran (no #hub-probe in the DOM).'); process.exit(1); }
 const s = JSON.parse(m[1].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
 
