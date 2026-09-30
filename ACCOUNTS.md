@@ -1,101 +1,96 @@
-# Accounts & progress sync
+# Accounts — optional progress sync
 
-Learners can create an account with **email + password** or **phone number + SMS code** and
-have their progress follow them across devices. Everything is optional: without an account the
-Atlas works exactly as before, saving progress in the browser.
+Learners can sign in to keep their progress in step across devices. Everything is optional:
+without an account the Atlas works exactly as before, saving progress in the browser. Accounts are
+**off** until you deploy the API and set its address in `assets/account-config.js`. Everything
+runs on free tiers.
 
 ## How it works
 
 ```
- browser (localStorage)  ⇄  assets/account.js  ⇄  Firebase Auth  +  Firestore users/{uid}
+ browser (localStorage)  ⇄  assets/account.js  ⇄  Cloudflare Worker (api/)  ⇄  D1 database
+                                                        │
+                                                        └──▶ Resend (sign-in code email)
 ```
 
-- **Progress still lives in the browser first.** Every page keeps reading and writing
-  `localStorage` as it always has. `assets/account.js` watches writes to the Atlas keys
-  (`sd-*`, `ml-*`, `dsa-*`, `atlas-*`) and mirrors them to one Firestore document per user.
-- **What is synced:** chapters completed, best quiz scores, flashcard schedules, mock-interview
-  history and notes, readiness checklists, and the light/dark theme — every course and the Atlas.
-- **First sign-in on a device merges** what that browser already has with the account:
-  completed chapters are combined, the best quiz score per chapter is kept, flashcards keep the
-  more-reviewed schedule, mock-interview history is combined; anything else keeps the newest copy.
-  The page reloads once to show the merged progress.
-- **After that, the newest change wins, key by key**, live across open tabs and devices
-  (un-ticking a chapter on one device un-ticks it everywhere).
-- **Email and phone can belong to the same account.** Signed in with email, a learner can add a
-  phone number (and vice versa), then sign in with either.
-- **Sign out** offers “keep progress here” or “clear this browser” (for shared computers).
-  **Delete account** removes the user and their synced data; the browser keeps its own copy.
-- **Dormant by default.** Nothing appears until a Firebase config is added (below). The offline
-  single-file editions and pages opened from disk (`file://`) never load it.
+- **Sign in:** the learner enters **email + phone**; the API emails a **6-digit code**; entering it
+  signs them in. The account is the email + phone pair, so the same pair must be used every time.
+  (SMS is not sent yet; the phone number is stored on the account. See *Adding SMS later*.)
+- **Sync:** progress still lives in `localStorage`. `assets/account.js` mirrors every course key
+  (`sd-*`, `ml-*`, `dsa-*`, `lld-*`, `atlas-*`) to the API. The first sign-in on a device merges
+  (chapters unioned, best quiz scores kept, most-reviewed flashcards kept, otherwise newest wins);
+  after that the newest write wins, and other devices pick up changes every 30 s and on tab focus.
+- **Never in the offline editions:** the loader only runs over http(s), not from `file://`.
 
-What is stored per user: their email and/or phone number (in Firebase Auth), and one document
-`users/{uid}` with `progress` (the key/value pairs above with timestamps), `profile` (email/phone)
-and `updatedAt`. Nothing else — no names, no analytics.
+| Part | Technology | Where |
+|---|---|---|
+| Frontend | Vanilla JS dialog | `assets/account.js`, `assets/account-config.js` |
+| API | Cloudflare Worker | `api/src/index.js` |
+| Database | Cloudflare D1 (SQLite) | `api/schema.sql` |
+| Email | Resend | called from the Worker |
 
-## Setup (about 10 minutes)
+**Security:** codes expire after 5 minutes, allow 5 wrong tries, and are single-use; codes and
+session tokens are stored only as HMAC-SHA256 hashes; sending is limited to 5 codes per email and
+per phone per hour (plus per-IP limits); only the origins in `ALLOWED_ORIGINS` may call the API;
+sessions last 30 days. A daily cron job deletes expired codes and sessions.
 
-1. **Create a Firebase project** at <https://console.firebase.google.com> (Analytics not needed).
-2. **Add a web app**: Project settings → *Your apps* → `</>` → register. Copy the `firebaseConfig`
-   object it shows.
-3. **Paste it into `assets/account-config.js`**, replacing `null`:
-   ```js
-   export const firebaseConfig = {
-     apiKey: "…", authDomain: "your-project.firebaseapp.com",
-     projectId: "your-project", appId: "…",
-   };
+## One-time setup (about 15 minutes)
+
+Run these from the `api/` folder. You need free **Cloudflare** and **Resend** accounts.
+
+1. **Install and log in**
+   ```bash
+   cd api
+   npm install
+   npx wrangler login              # opens the browser once
    ```
-   These values are public by design; security comes from steps 5–6.
-4. **Turn on sign-in methods**: Authentication → *Sign-in method* → enable **Email/Password** and
-   **Phone**.
-5. **Authorise your domains**: Authentication → *Settings* → *Authorized domains* → add
-   `captainblue793.github.io` (and any custom domain). `localhost` is there by default.
-6. **Create the database and lock it down**: Firestore Database → *Create database* (production
-   mode, a region near your users). Then Rules → paste `firestore.rules` from this repo → Publish.
-   (Or with the Firebase CLI: `firebase deploy --only firestore:rules`.)
-7. Commit and deploy. A **👤 Sign in** button appears in the header of every page.
+2. **Create the database** and paste the printed `database_id` into `api/wrangler.toml`
+   ```bash
+   npx wrangler d1 create atlas-accounts
+   npm run db:remote               # creates the tables in Cloudflare
+   ```
+3. **Add the secrets** (you type them in; they are never stored in the repo)
+   ```bash
+   npx wrangler secret put RESEND_API_KEY     # from resend.com → API Keys
+   npx wrangler secret put SERVER_SECRET      # any long random string, e.g. from a password manager
+   ```
+4. **Choose the email sender.** In `api/wrangler.toml`, `EMAIL_FROM` defaults to Resend's test
+   sender `onboarding@resend.dev`, which **only delivers to your own Resend account email**. To
+   email everyone, verify a domain you own in Resend (Domains → Add) and set, for example,
+   `EMAIL_FROM = "Engineering Atlas <login@yourdomain.com>"`.
+5. **Check the allowed sites.** `ALLOWED_ORIGINS` in `api/wrangler.toml` must contain the exact
+   address the site is served from (default: `https://captainblue793.github.io`).
+6. **Deploy**
+   ```bash
+   npm run deploy                  # prints https://atlas-accounts-api.<you>.workers.dev
+   ```
+7. **Switch accounts on:** in `assets/account-config.js` set
+   `export const apiBase = 'https://atlas-accounts-api.<you>.workers.dev';`, commit and publish.
+   A **Sign in** button appears next to the theme toggle on every page.
 
-### Phone sign-in notes
+Check it: `curl https://atlas-accounts-api.<you>.workers.dev/health` should print `{"ok":true}`.
 
-- Firebase bills SMS beyond a small free allowance and needs the **Blaze (pay-as-you-go)** plan
-  for production phone auth. Set a budget alert in Google Cloud, or switch phone off in
-  `assets/account-config.js` (`signInMethods.phone = false`) to offer email only.
-- Under Authentication → Settings → *SMS region policy*, allow only the countries you expect
-  (reduces SMS-fraud risk).
-- For development, add **test phone numbers** (Authentication → Sign-in method → Phone) with a fixed
-  code; they don't send real SMS.
-- Phone verification uses an invisible reCAPTCHA; nothing extra to configure on the page.
-
-### Optional hardening
-
-- **App Check** (reCAPTCHA Enterprise) stops other sites from using your Firebase project.
-- **Email enumeration protection** (Authentication → Settings) is on by default for new projects;
-  keep it on.
-
-## Trying it locally
-
-Sign-in needs `http(s)`, not `file://`. From the repo root:
+## Local development and tests
 
 ```bash
-python -m http.server 8000      # then open http://localhost:8000/
+cd api
+cp .dev.vars.example .dev.vars     # DEV_MODE=1: codes are returned by the API instead of emailed
+npm install
+npm run db:local
+npm run dev                        # API on http://127.0.0.1:8787
+npm test                           # 24 end-to-end API checks against the running dev server
 ```
+To try the dialog locally, serve the site (`python -m http.server 8080` from the repo root) and
+set `localApiBase = 'http://127.0.0.1:8787'` in `assets/account-config.js`; set it back to `null`
+before committing. Never set `DEV_MODE` on the deployed Worker.
 
-## Files
+## Free-tier limits (check current numbers)
 
-| File | Role |
-|---|---|
-| `assets/account-config.js` | Your Firebase config and which sign-in methods to offer |
-| `assets/account.js` | The whole feature: storage watcher, merge + sync engine, sign-in UI |
-| `*/assets/app.js` (last lines) | Loads `../assets/account.js` on course pages when served over http(s) |
-| `index.html` | Loads `assets/account.js` on the Atlas home |
-| `firestore.rules` | Each user can read/write only `users/{their uid}`; everything else is closed |
-| `firebase.json` | Lets `firebase deploy --only firestore:rules` find the rules |
+Cloudflare Workers ≈ 100,000 requests/day, D1 several GB, Resend ≈ 100 emails/day. Plenty for
+thousands of learners; the Resend daily cap is the first limit you would meet.
 
-## Testing
+## Adding SMS later
 
-The feature was exercised end to end against a local stand-in for Firebase (same function
-signatures as the Firebase SDK, same ownership rule as `firestore.rules`) with three separate
-Chrome profiles acting as three devices: sign-up, wrong password and weak password, first-sign-in
-merge, live sync both ways, un-ticking without resurrection, linking a phone to an email account
-and an email to a phone account, phone sign-in with a wrong and right code, sign-out with clear,
-account deletion, and the offline/`file://` cases staying account-free — 33/33 checks passed.
-Before launch, repeat a short manual pass against your real Firebase project.
+Add an SMS provider call next to `sendEmail` in `api/src/index.js` (`requestCode`) so the same code
+is also texted. SMS costs money per message, and Indian numbers need DLT registration first. Keep
+the per-phone rate limit, and add a hard daily cap so the bill can't run away.

@@ -16,8 +16,9 @@ no build step.
 
 ## Optional accounts
 
-Learners can sign in with **email + password** or **phone + SMS code** to sync progress across devices.
-It stays switched off until a Firebase project is configured — see **[ACCOUNTS.md](ACCOUNTS.md)** for how it works and the setup steps.
+Learners can sign in with **email + phone** and a one-time code (sent by email) to sync progress across
+devices. It runs on a small Cloudflare Worker + D1 backend in `api/` and stays switched off until that is
+deployed — see **[ACCOUNTS.md](ACCOUNTS.md)** for how it works and the setup steps.
 
 ```
 palak-engineering-atlas/
