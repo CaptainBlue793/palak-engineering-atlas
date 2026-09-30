@@ -2,7 +2,7 @@
 /* Headless check of the Atlas home page.
      node tools/hub-check.cjs [--width 1440] [--height 2600] [--theme light|dark] [--shot out.png]
    Copies index.html to .hub-check.html with a probe injected into <head>. The probe seeds
-   localStorage with a fixture, and 4 s after load writes a JSON summary of the page into
+   localStorage with a fixture and, once the chapter indexes have loaded, writes a JSON summary into
    <pre id="hub-probe">. Chrome's --dump-dom returns the DOM; the checks run on that summary. */
 'use strict';
 const fs = require('fs'), path = require('path'), os = require('os');
@@ -40,7 +40,15 @@ const FIXTURE = {
 const PROBE = `<script>
 localStorage.clear();
 Object.entries(${JSON.stringify(FIXTURE)}).forEach(function (e) { localStorage.setItem(e[0], e[1]); });
-window.addEventListener('load', function () { setTimeout(function () {
+/* The page loads each released course's chapter index when the browser is idle; summarise only once
+   all four have arrived (plus one tick for the repaint), or after 12 s so a broken load still reports. */
+var INDEXES = ['SD_INDEX', 'ML_INDEX', 'DSA_INDEX', 'LLD_INDEX'], waited = 0;
+function whenIndexed(f) {
+  var ready = INDEXES.every(function (k) { return window[k]; });
+  if (ready || waited >= 12000) return setTimeout(f, 100);
+  waited += 200; setTimeout(function () { whenIndexed(f); }, 200);
+}
+window.addEventListener('load', function () { whenIndexed(function () {
   var q = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
   var chip = function (ch) { return { id: ch.dataset.course, link: ch.tagName === 'A', soon: ch.classList.contains('soon'),
     opt: ch.classList.contains('opt'), done: ch.classList.contains('done') }; };
@@ -61,17 +69,27 @@ window.addEventListener('load', function () { setTimeout(function () {
   };
   var pre = document.createElement('pre'); pre.id = 'hub-probe'; pre.hidden = true; pre.textContent = JSON.stringify(s);
   document.body.appendChild(pre);
-}, 4000); });
+  if (window.parent !== window) window.parent.postMessage(pre.textContent, '*');   // phone-width runs (see FRAME)
+}); });
 </script>`;
 
 const src = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
 const tmp = path.join(ROOT, '.hub-check.html');
 fs.writeFileSync(tmp, src.replace('<meta charset="utf-8">', '<meta charset="utf-8">\n' + PROBE));
-const fileUrl = 'file:///' + tmp.replace(/\\/g, '/');
+
+/* Headless Chrome won't make a window narrower than ~500 px, so phone widths load the page
+   in an iframe of exactly WIDTH px; the probe posts its summary up to this wrapper. */
+const FRAME = WIDTH < 520;
+const frameFile = path.join(ROOT, '.hub-check-frame.html');
+if (FRAME) fs.writeFileSync(frameFile, '<!doctype html><meta charset="utf-8"><body style="margin:0">' +
+  '<iframe src=".hub-check.html" style="width:' + WIDTH + 'px;height:' + HEIGHT + 'px;border:0;display:block"></iframe>' +
+  '<script>addEventListener("message", function (e) { var p = document.createElement("pre"); p.id = "hub-probe"; ' +
+  'p.hidden = true; p.textContent = e.data; document.body.appendChild(p); });</script>');
+const fileUrl = 'file:///' + (FRAME ? frameFile : tmp).replace(/\\/g, '/');
 const userDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-check-'));
 const common = ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
   '--user-data-dir=' + userDir, '--allow-file-access-from-files',
-  '--window-size=' + WIDTH + ',' + HEIGHT, '--virtual-time-budget=15000'];
+  '--window-size=' + Math.max(WIDTH, 520) + ',' + HEIGHT, '--virtual-time-budget=15000'];
 
 let dom;
 try {
@@ -79,6 +97,7 @@ try {
   if (SHOT) execFileSync(CHROME, [...common, '--screenshot=' + path.resolve(SHOT), fileUrl], { stdio: 'ignore' });
 } finally {
   fs.rmSync(tmp, { force: true });
+  fs.rmSync(frameFile, { force: true });
 }
 
 const m = dom.match(/<pre id="hub-probe"[^>]*>([\s\S]*?)<\/pre>/);
@@ -108,7 +127,25 @@ function checks(s) {
     s.studyScripts.length === 4 && s.studyScripts.every((x) => !SOON.some((d) => x.startsWith(d + '/'))), s.studyScripts);
   check('theme colours: Cloud & DevOps uses its ' + THEME + ' pair',
     s.devopsK1.toLowerCase() === (THEME === 'dark' ? '#94a3b8' : '#334155'), s.devopsK1);
+  check('viewport is ' + WIDTH + 'px wide', s.innerW === WIDTH, s.innerW);
   check('no horizontal scroll', s.scrollW <= s.innerW, [s.scrollW, s.innerW]);
+  console.log('paths');
+  const GENERAL = ['dsa', 'os', 'networks', 'databases', 'lld', 'system-design', 'distributed-systems', 'cloud-devops', 'ml-ai-systems'];
+  check('paths section is visible', !s.pathsHidden);
+  check('featured path is the complete order', eq(s.featured.map((c) => c.id), GENERAL), s.featured.map((c) => c.id));
+  check('featured: released steps link, unreleased ones are faded spans',
+    s.featured.every((c) => c.link === !SOON.includes(c.id) && c.soon === SOON.includes(c.id)), s.featured);
+  check('nine role paths in order', eq(s.paths.map((p) => p.id),
+    ['campus', 'interview', 'backend', 'sre', 'data', 'ml', 'mlops', 'fundamentals', 'architect']), s.paths.map((p) => p.id));
+  const P = Object.fromEntries(s.paths.map((p) => [p.id, p]));
+  const ids = (p) => (P[p] ? P[p].chips.map((c) => c.id) : null);
+  check('campus path steps', eq(ids('campus'), ['dsa', 'os', 'databases', 'networks', 'lld']), ids('campus'));
+  check('backend path steps', eq(ids('backend'), ['databases', 'networks', 'os', 'lld', 'system-design', 'distributed-systems']), ids('backend'));
+  check('optional steps are marked', P.interview && eq(P.interview.chips.filter((c) => c.opt).map((c) => c.id), ['distributed-systems']));
+  check('a completed course shows a tick', P.interview && P.interview.chips.find((c) => c.id === 'lld').done &&
+    !P.interview.chips.find((c) => c.id === 'dsa').done, P.interview);
+  check('progress counts released required steps', P.campus && P.campus.prog === '1 of 2 courses complete · 3 coming soon', P.campus && P.campus.prog);
+  check('progress with everything released', P.interview && P.interview.prog === '1 of 3 courses complete', P.interview && P.interview.prog);
 }
 
 checks(s);

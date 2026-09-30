@@ -9,7 +9,7 @@
    Everything on the page (cards, progress, paths, tools,
    search, reset) is derived from this array.
 
-     id        unique slug, used by PATHS
+     id        unique slug, used by FEATURED and PATHS
      title     course name as it should appear
      mark      inner SVG of the course's logo, drawn on a 24x24 viewBox
                (stroked paths; it inherits the course's two colours)
@@ -249,26 +249,44 @@
   var LIVE = COURSES.filter(function (c) { return !c.soon; });
   var SOON = COURSES.filter(function (c) { return c.soon; });
 
-  /* Recommended orderings. `steps` holds course ids from COURSES. */
+  /* The general order for the whole Atlas, shown as a featured strip. */
+  var FEATURED = {
+    icon: '🧭',
+    title: 'The complete Atlas',
+    blurb: 'Fundamentals first (algorithms, the machine, the network, storage), then design at class and system level, then scale and operations. ML comes last because it builds on all of it, but it also stands on its own.',
+    steps: ['dsa', 'os', 'networks', 'databases', 'lld', 'system-design', 'distributed-systems', 'cloud-devops', 'ml-ai-systems'],
+    optional: [],
+  };
+
+  /* Role paths: `steps` in order, then `optional` "go further" courses. */
   var PATHS = [
-    {
-      icon: '🎯',
-      title: 'Cracking the interview',
-      blurb: 'Algorithms until the patterns are automatic, then the class-level design round, then the architecture round. Every course ends with a playbook and a timed mock-interview room.',
-      steps: ['dsa', 'lld', 'system-design'],
-    },
-    {
-      icon: '🛠️',
-      title: 'Backend / platform engineer',
-      blurb: 'Learn the components you actually wire together, keep the algorithmic base sharp, and pick up enough ML infrastructure to support a model team.',
-      steps: ['system-design', 'lld', 'dsa', 'ml-ai-systems'],
-    },
-    {
-      icon: '🧠',
-      title: 'ML / AI engineer',
-      blurb: 'Models first, then the distributed systems underneath them — training clusters and serving stacks are system-design problems wearing a hat.',
-      steps: ['ml-ai-systems', 'system-design'],
-    },
+    { id: 'campus', icon: '🎓', title: 'Campus placements / SDE-1',
+      blurb: 'The fresher loop: coding rounds, then the core-CS viva (OS, DBMS, networks), then a light class-design round.',
+      steps: ['dsa', 'os', 'databases', 'networks', 'lld'], optional: [] },
+    { id: 'interview', icon: '🎯', title: 'Cracking the SDE-2+ interview',
+      blurb: 'Coding, then the class-level design round, then the architecture round. Distributed Systems for senior and staff loops.',
+      steps: ['dsa', 'lld', 'system-design'], optional: ['distributed-systems'] },
+    { id: 'backend', icon: '🛠️', title: 'Backend engineer',
+      blurb: 'What your service sits on (the database, the network, the OS), then how to structure it and how to scale it.',
+      steps: ['databases', 'networks', 'os', 'lld', 'system-design'], optional: ['distributed-systems'] },
+    { id: 'sre', icon: '🚦', title: 'SRE / platform / DevOps',
+      blurb: 'Linux and networking first, then containers, Kubernetes, CI/CD and observability, then designing for reliability.',
+      steps: ['os', 'networks', 'cloud-devops', 'system-design'], optional: ['distributed-systems'] },
+    { id: 'data', icon: '🗄️', title: 'Data engineer',
+      blurb: 'Storage engines and SQL, then replication, partitioning and streams, then running pipelines in the cloud.',
+      steps: ['databases', 'distributed-systems', 'cloud-devops', 'system-design'], optional: ['ml-ai-systems'] },
+    { id: 'ml', icon: '🧠', title: 'ML / AI engineer',
+      blurb: 'Models first, then the systems around them. Add Distributed Systems and DevOps for training clusters and serving.',
+      steps: ['ml-ai-systems', 'system-design'], optional: ['distributed-systems', 'cloud-devops'] },
+    { id: 'mlops', icon: '⚙️', title: 'ML infrastructure / MLOps',
+      blurb: 'GPUs, memory and processes, then the ML stack, then the distributed training and deployment it runs on.',
+      steps: ['os', 'ml-ai-systems', 'distributed-systems', 'cloud-devops'], optional: ['system-design'] },
+    { id: 'fundamentals', icon: '🧱', title: 'CS fundamentals (self-taught / career switch)',
+      blurb: 'The four subjects everything else assumes, in the order they build on each other.',
+      steps: ['dsa', 'os', 'networks', 'databases'], optional: ['lld'] },
+    { id: 'architect', icon: '🏛️', title: 'Senior / staff / architect',
+      blurb: 'Trade-offs at scale: architecture, consensus and consistency, storage internals, and running it all in production.',
+      steps: ['system-design', 'distributed-systems', 'databases', 'cloud-devops'], optional: ['lld'] },
   ];
 
   /* The three tools every course ships. */
@@ -500,6 +518,8 @@
       [LIVE.reduce(function (s, c) { return s + preCount(c); }, 0), 'prerequisites'],
       ['~' + hours, 'hours'],
     ].map(function (s) { return '<div class="stat"><b>' + s[0] + '</b><span>' + s[1] + '</span></div>'; }).join('');
+
+    renderPaths();
   }
 
   /* ---------------------------------------------------------
@@ -507,22 +527,48 @@
      --------------------------------------------------------- */
   function byId(id) { return COURSES.filter(function (c) { return c.id === id; })[0]; }
 
-  function renderStatic() {
+  function isComplete(c) { var t = countOf(c); return t > 0 && doneCount(c) >= t; }
+
+  /* One course as a chip: a link when released, a faded span while it is being written. */
+  function pathChip(id, optional) {
+    var c = byId(id); if (!c) return '';
+    var done = !c.soon && isComplete(c);
+    var cls = 'pchip tint' + (optional ? ' opt' : '') + (c.soon ? ' soon' : '') + (done ? ' done' : '');
+    var attrs = ' class="' + cls + '" data-course="' + c.id + '" style="' + tintVars(c) + '"';
+    var label = esc(c.short || c.title) + (done ? ' ✓' : '');
+    return c.soon
+      ? '<span' + attrs + ' title="' + esc(c.title) + ' (coming soon)">' + label + '</span>'
+      : '<a' + attrs + ' href="' + url(c, 'index.html') + '" title="' + esc(c.title) + '">' + label + '</a>';
+  }
+  function pathFlow(p) {
+    var chips = p.steps.map(function (id) { return pathChip(id, false); })
+      .concat(p.optional.map(function (id) { return pathChip(id, true); }));
+    return '<div class="pflow">' + chips.join('<span class="arr" aria-hidden="true">→</span>') + '</div>';
+  }
+  /* "N of M courses complete" over the released required steps; unreleased ones are counted separately. */
+  function pathProgress(p) {
+    var req = p.steps.map(byId).filter(Boolean);
+    var live = req.filter(function (c) { return !c.soon; });
+    var soon = req.length - live.length;
+    if (!live.length) return 'Coming soon';
+    return live.filter(isComplete).length + ' of ' + live.length + ' courses complete' +
+      (soon ? ' · ' + soon + ' coming soon' : '');
+  }
+  function renderPaths() {
+    $('#pathFeatured').innerHTML =
+      '<div class="pf-head"><span class="ico" aria-hidden="true">' + FEATURED.icon + '</span>' +
+      '<div><h4>' + esc(FEATURED.title) + '</h4><p>' + esc(FEATURED.blurb) + '</p></div>' +
+      '<span class="pprog">' + pathProgress(FEATURED) + '</span></div>' + pathFlow(FEATURED);
     $('#pathGrid').innerHTML = PATHS.map(function (p, pi) {
-      var steps = p.steps.map(function (id) { return byId(id); }).filter(Boolean);
-      return '<div class="path reveal">' +
+      return '<div class="path reveal in" data-path="' + p.id + '">' +
         '<div class="num">' + String(pi + 1).padStart(2, '0') + '</div>' +
         '<div class="ico" aria-hidden="true">' + p.icon + '</div>' +
-        '<h4>' + esc(p.title) + '</h4>' +
-        '<p>' + esc(p.blurb) + '</p>' +
-        '<div class="steps">' + steps.map(function (c, i) {
-          return '<a class="step" href="' + url(c, 'index.html') + '">' +
-            '<span class="i">' + (i + 1) + '</span>' +
-            '<span class="dot" style="background:' + c.c1 + '"></span>' + esc(c.title) +
-            '<span class="ch">' + countOf(c) + ' ch</span></a>';
-        }).join('') + '</div>' +
-      '</div>';
+        '<h4>' + esc(p.title) + '</h4><p>' + esc(p.blurb) + '</p>' +
+        pathFlow(p) + '<div class="pprog">' + pathProgress(p) + '</div></div>';
     }).join('');
+  }
+
+  function renderStatic() {
 
     function tool(icon, title, blurb, links) {
       return '<div class="tool reveal"><div class="ico" aria-hidden="true">' + icon + '</div><div>' +
@@ -769,6 +815,9 @@
 
   // Pull in the chapter indexes once the page is idle: they power the level
   // bars, the "next up" lines and the search palette.
-  var idle = window.requestIdleCallback || function (f) { return setTimeout(f, 700); };
+  // The timeout makes sure a page that never goes idle still gets its indexes.
+  var idle = window.requestIdleCallback
+    ? function (f) { return window.requestIdleCallback(f, { timeout: 2000 }); }
+    : function (f) { return setTimeout(f, 700); };
   window.addEventListener('load', function () { idle(function () { loadIndexes(); }); });
 })();
