@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Thread-Safe Class Design</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .tl-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,.8fr); gap:12px; margin-top:12px; }
+  @media (max-width:900px) { .tl-grid { grid-template-columns:1fr; } }
+  .tl-col h4 { margin:0 0 6px; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+  .tl-code { margin:0; font-size:12px; }
+  .tl-code .ln { display:block; padding:0 6px; margin:0 -6px; border-radius:4px; }
+  .tl-code .ln.tl-cur { background:rgba(129,140,248,.25); box-shadow:inset 3px 0 0 #818cf8; }
+  .tl-code.tl-b .ln.tl-cur { background:rgba(251,191,36,.2); box-shadow:inset 3px 0 0 #f59e0b; }
+  .tl-code .ln.tl-block { background:var(--red-soft); box-shadow:inset 3px 0 0 var(--red); }
+  .tl-state { font-family:var(--mono); font-size:12.5px; padding:10px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); line-height:1.7; }
+  .tl-state b { color:var(--accent); }
+  .tl-verdict { margin-top:10px; padding:10px 14px; border-radius:12px; font-size:14px; }
+  .tl-verdict.tl-ok { background:var(--green-soft); } .tl-verdict.tl-bad { background:var(--red-soft); } .tl-verdict.tl-idle { background:var(--surface-2); border:1px solid var(--border); }
+</style>
+</head>
+<body data-chapter="22">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 22</span><span class="pill">Advanced LLD</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Thread-Safe Class <span class="grad">Design</span></h1>
+    <p class="lead">Almost every LLD question ends with the same follow-up: “now two requests arrive at once.” A web server runs each request on its own thread, so any object shared between requests, like a rate limiter, a seat map or a cache, is being used by many threads at the same moment. A class is <b>thread-safe</b> when its invariants hold no matter how those threads interleave, without callers having to coordinate. This chapter is the toolkit for that, from the cheapest option (don't share) to the most expensive (a lock), and the two classic bugs you'll be asked to spot: lost updates and deadlock.</p>
+    <ul class="objectives">
+      <li>Explain the three root problems: atomicity, visibility and ordering</li>
+      <li>Choose the cheapest safe strategy: confinement, immutability, concurrent building blocks, then locks</li>
+      <li>Use <code>synchronized</code>, <code>ReentrantLock</code>, atomics and <code>volatile</code> for what each is for</li>
+      <li>Make compound actions atomic, including on concurrent collections</li>
+      <li>Prevent deadlock with a global lock order and timeouts</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Check-then-act and atomic operations that return answers.</b> See <a href="07-class-contracts.html">Chapter 7: Class APIs &amp; Contracts</a>.</li>
+        <li><b>Why double-checked locking needs <code>volatile</code>.</b> See <a href="09-singleton.html">Chapter 9: Singleton</a>.</li>
+        <li><b>Immutability.</b> See <a href="p6-value-objects.html">P6</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Three ways shared state goes wrong</h2>
+  <p>Every concurrency bug in ordinary application code comes from one of three problems:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Problem</th><th>What happens</th><th>Example</th><th>Fixed by</th></tr></thead>
+      <tbody>
+        <tr><td><b>Atomicity</b></td><td>A multi-step operation is interrupted halfway by another thread</td><td><code>balance += amount</code> is read, add, write: two threads can both read 100 and both write their own result</td><td>Locks, atomics, single atomic operations</td></tr>
+        <tr><td><b>Visibility</b></td><td>A write by one thread is never seen, or seen late, by another</td><td>A <code>running = false</code> flag that a worker thread keeps reading as <code>true</code> from a cached value</td><td><code>volatile</code>, locks, atomics, immutable publication</td></tr>
+        <tr><td><b>Ordering</b></td><td>The compiler or CPU reorders writes, and another thread sees them in the wrong order</td><td>A reference published before the object's fields are set (<a href="09-singleton.html">Chapter 9</a>)</td><td>The same tools: they all create “happens-before” edges</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The Java Memory Model defines the rules with one idea, <b>happens-before</b>: if action A happens-before action B, B sees A's effects. Releasing a lock happens-before the next acquisition of the same lock; a write to a <code>volatile</code> field happens-before every later read of it; <code>Thread.start()</code> happens-before everything in the started thread. Without such an edge, the JVM is free to let threads disagree about what memory contains.</p>
+
+  <h2>The cheapest safe strategy first</h2>
+  <p>Locks are the most expensive and the most error-prone tool, so reach for them last. Work down this ladder and stop at the first rung that fits:</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Don't share</b> Confine state to one thread: locals, per-request objects. Nothing to protect.</li>
+      <li><b>Share immutable data</b> Records and final fields are safe to share freely once published.</li>
+      <li><b>Use thread-safe building blocks</b> <code>ConcurrentHashMap</code>, <code>AtomicLong</code>, <code>LongAdder</code>, <code>BlockingQueue</code>.</li>
+      <li data-k="decision"><b>Does an invariant span several fields?</b> Then a building block per field isn't enough.</li>
+      <li data-k="end"><b>Lock around the invariant</b> One lock guards all the fields in the invariant, held briefly.</li>
+    </ol>
+    <figcaption><b>The thread-safety ladder.</b> Most of a well-designed service lives on the first two rungs; locks appear only in a few small classes that own shared mutable state.</figcaption>
+  </figure>
+  <p><b>Confinement</b> is underrated. In a web service, the request object, the parsed body, the list you build while handling the request and the response all belong to one request thread. None of them needs any synchronisation. The shared parts are usually few: caches, rate limiters, connection pools, in-memory stores. Those are the classes to design carefully.</p>
+
+  <h2>The tools, and what each one is for</h2>
+  <div class="codebox">
+    <div class="cb-head"><span class="cb-name">A per-client rate limiter: building blocks plus one small lock</span><span class="cb-sp"></span></div>
+<pre class="code"><span class="k">public final class</span> <span class="t">RateLimiter</span> {
+	<span class="k">private final</span> <span class="t">ConcurrentHashMap</span>&lt;<span class="t">ClientId</span>, <span class="t">TokenBucket</span>&gt; buckets = <span class="k">new</span> <span class="t">ConcurrentHashMap</span>&lt;&gt;();
+	<span class="k">private final</span> <span class="t">LongAdder</span> rejected = <span class="k">new</span> <span class="t">LongAdder</span>();              <span class="c">// a hot counter many threads bump</span>
+	<span class="k">private final</span> <span class="t">Clock</span> clock;
+	<span class="k">private final int</span> capacity, refillPerSecond;
+
+	<span class="k">public boolean</span> <span class="f">tryAcquire</span>(<span class="t">ClientId</span> client) {
+		<span class="t">TokenBucket</span> b = buckets.<span class="f">computeIfAbsent</span>(client,                  <span class="c">// atomic: exactly one bucket per client</span>
+			c -&gt; <span class="k">new</span> <span class="t">TokenBucket</span>(capacity, refillPerSecond, clock.<span class="f">millis</span>()));
+		<span class="k">boolean</span> ok = b.<span class="f">tryAcquire</span>(clock.<span class="f">millis</span>());
+		<span class="k">if</span> (!ok) rejected.<span class="f">increment</span>();
+		<span class="k">return</span> ok;
+	}
+	<span class="k">public long</span> <span class="f">rejectedCount</span>() { <span class="k">return</span> rejected.<span class="f">sum</span>(); }
+}
+
+<span class="k">final class</span> <span class="t">TokenBucket</span> {                                                  <span class="c">// from P2, now thread-safe</span>
+	<span class="k">private final</span> <span class="t">Object</span> lock = <span class="k">new</span> <span class="t">Object</span>();                              <span class="c">// private lock: no outsider can hold it</span>
+	<span class="k">private int</span> tokens;              <span class="c">// guarded by lock</span>
+	<span class="k">private long</span> lastRefillMillis;    <span class="c">// guarded by lock: one invariant, two fields, one lock</span>
+
+	<span class="k">boolean</span> <span class="f">tryAcquire</span>(<span class="k">long</span> now) {
+		<span class="k">synchronized</span> (lock) {                                               <span class="c">// refill + check + decrement as one step</span>
+			<span class="f">refill</span>(now);
+			<span class="k">if</span> (tokens == <span class="m">0</span>) <span class="k">return false</span>;
+			tokens--;
+			<span class="k">return true</span>;
+		}
+	}
+}</pre>
+    <div class="cb-foot"><b>Each tool doing its job:</b> <code>ConcurrentHashMap.computeIfAbsent</code> creates each client's bucket exactly once; each bucket's two fields form one invariant, so one small lock guards both; the lock is per bucket, so different clients never wait for each other; and the rejection counter, bumped by every thread, uses <code>LongAdder</code>, which spreads contention across cells.</div>
+  </div>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Tool</th><th>Gives you</th><th>Use it for</th><th>Not enough for</th></tr></thead>
+      <tbody>
+        <tr><td><code>volatile</code></td><td>Visibility and ordering of one field</td><td>A stop flag; publishing an immutable object reference</td><td>Any read-modify-write, like <code>count++</code></td></tr>
+        <tr><td><code>AtomicInteger/Long/Reference</code></td><td>Atomic single-variable updates (CAS)</td><td>Counters, sequence numbers, swapping one reference</td><td>Invariants across two or more fields</td></tr>
+        <tr><td><code>LongAdder</code></td><td>A counter that scales under heavy contention</td><td>Metrics bumped by many threads, read rarely</td><td>Reading an exact value on every update</td></tr>
+        <tr><td><code>ConcurrentHashMap</code></td><td>Thread-safe map with atomic per-key ops (<code>compute</code>, <code>merge</code>, <code>putIfAbsent</code>)</td><td>Shared lookups, per-key state</td><td>Invariants across several keys</td></tr>
+        <tr><td><code>synchronized</code></td><td>Mutual exclusion + visibility, block-scoped</td><td>Guarding a multi-field invariant; the default lock</td><td>Timeouts, try-lock, interruptible waits</td></tr>
+        <tr><td><code>ReentrantLock</code></td><td>Everything <code>synchronized</code> does, plus <code>tryLock(timeout)</code>, fairness, interruptible locking</td><td>Avoiding deadlock with timeouts; lock-and-wait with conditions</td><td>Must be unlocked in <code>finally</code>, or it leaks</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Compound actions are the trap</h2>
+  <p>Using thread-safe parts doesn't make their combination thread-safe. Each call to a <code>ConcurrentHashMap</code> is atomic; two calls in a row are not:</p>
+<pre class="code"><span class="c">// Racy even on a ConcurrentHashMap: two threads can both see "absent" and both put</span>
+<span class="k">if</span> (!sessions.<span class="f">containsKey</span>(token)) sessions.<span class="f">put</span>(token, <span class="k">new</span> <span class="t">Session</span>(user));
+
+<span class="c">// Atomic: the map runs the check and the insert as one operation per key</span>
+sessions.<span class="f">computeIfAbsent</span>(token, t -&gt; <span class="k">new</span> <span class="t">Session</span>(user));
+viewCounts.<span class="f">merge</span>(pageId, <span class="m">1L</span>, <span class="t">Long</span>::<span class="f">sum</span>);                             <span class="c">// atomic increment per key</span></pre>
+  <p>The same rule applies to your own classes: every operation that reads state and then acts on it (check-then-act) or reads, computes and writes (read-modify-write) must happen inside one lock or one atomic call. That's why <a href="07-class-contracts.html">Chapter 7</a> preferred <code>tryHold(seat)</code> over <code>isFree(seat)</code> followed by <code>hold(seat)</code>. And keep locked sections short. Never do network or disk I/O while holding a lock: every other thread that needs it waits for the slowest call in the system.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Two threads, you choose the interleaving</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="tlScen"><button class="active" data-v="lost">Lost update</button><button data-v="dead">Deadlock</button></div>
+        <div class="seg" id="tlMode"></div>
+      </div>
+      <div class="controls" style="margin-top:10px">
+        <button class="btn sm primary" id="tlA" style="background:#818cf8;border-color:#818cf8">step thread A</button>
+        <button class="btn sm primary" id="tlB" style="background:#f59e0b;border-color:#f59e0b;color:#111">step thread B</button>
+        <button class="btn sm" id="tlWorst">▶ play the bad interleaving</button>
+        <button class="btn sm" id="tlReset">↺ reset</button>
+      </div>
+      <div class="tl-grid">
+        <div class="tl-col"><h4 id="tlAh">Thread A</h4><pre class="code tl-code" id="tlCodeA"></pre></div>
+        <div class="tl-col"><h4 id="tlBh">Thread B</h4><pre class="code tl-code tl-b" id="tlCodeB"></pre></div>
+        <div class="tl-col"><h4>Shared state</h4><div class="tl-state" id="tlState"></div></div>
+      </div>
+      <div class="tl-verdict tl-idle" id="tlVerdict"></div>
+      <div class="log" id="tlLog" style="height:78px;margin-top:10px"></div>
+    </div>
+    <div class="panel-foot">Real schedulers switch threads at any instruction, so any interleaving you can click here can happen in production, usually under load and rarely enough to escape testing.</div>
+  </div>
+
+  <h2>Deadlock, and how lock ordering prevents it</h2>
+  <p>A <b>deadlock</b> is two or more threads each holding a lock the other needs, waiting forever. The classic case is a bank transfer that locks the source account and then the destination: one thread transfers A→B while another transfers B→A. Deadlock needs four conditions at once (named by Coffman in 1971): mutual exclusion, holding one lock while waiting for another, no forced release, and a circular wait. Break any one and deadlock is impossible. The practical ones to break:</p>
+  <ul>
+    <li><b>Circular wait, with a global lock order.</b> Always acquire locks in the same order, for example by account id. Then two transfers between the same accounts lock in the same order, and a cycle can't form.</li>
+    <li><b>No forced release, with timeouts.</b> <code>ReentrantLock.tryLock(50, MILLISECONDS)</code> gives up and releases what it holds, so the transfer can retry or fail cleanly.</li>
+    <li><b>Hold-and-wait, with one lock.</b> If the invariant allows it, guard both accounts with a single coarser lock. Simpler, less concurrent.</li>
+  </ul>
+<pre class="code"><span class="k">public void</span> <span class="f">transfer</span>(<span class="t">Account</span> from, <span class="t">Account</span> to, <span class="t">Money</span> amount) {
+	<span class="t">Account</span> first = from.<span class="f">id</span>().<span class="f">compareTo</span>(to.<span class="f">id</span>()) &lt; <span class="m">0</span> ? from : to;       <span class="c">// global order: lower id first</span>
+	<span class="t">Account</span> second = first == from ? to : from;
+	<span class="k">synchronized</span> (first.<span class="f">lock</span>()) {
+		<span class="k">synchronized</span> (second.<span class="f">lock</span>()) {
+			from.<span class="f">withdraw</span>(amount);                                              <span class="c">// the invariant (total money) holds under both locks</span>
+			to.<span class="f">deposit</span>(amount);
+		}
+	}
+}</pre>
+  <figure class="seq" data-actors="Thread A: transfer(1→2)|Account 1 lock|Account 2 lock|Thread B: transfer(2→1)">
+    <ol>
+      <li data-m="0>1">lock(1) ✓</li>
+      <li data-m="3>2">lock(2) ✓ (naive: B locks its source first)</li>
+      <li data-m="0>2" data-k="bad">lock(2): held by B, waits</li>
+      <li data-m="3>1" data-k="bad">lock(1): held by A, waits: deadlock</li>
+    </ol>
+    <figcaption><b>A circular wait.</b> With ordering by id, B would also lock account 1 first; it would wait for A to finish, then proceed. No cycle, no deadlock.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Finding a deadlock in production</div><p>When a Java service stops responding but its CPU is idle, take a thread dump: <code>jstack &lt;pid&gt;</code> or <code>jcmd &lt;pid&gt; Thread.print</code>. The JVM detects deadlocks among intrinsic and <code>java.util.concurrent</code> locks and prints a section headed “Found one Java-level deadlock”, listing each thread, the lock it holds and the lock it's waiting for. It's the fastest way to turn “the site is hung” into two stack traces pointing at the code that locks in inconsistent order. Thread dumps also show the more common production problem: hundreds of threads all <code>BLOCKED</code> on one lock that someone holds while making a slow network call.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b><code>count++</code> on a shared field, even a <code>volatile</code> one.</b> It's three steps. Use an atomic or a lock.</li>
+      <li><b>Check-then-act across two thread-safe calls</b> (<code>containsKey</code> then <code>put</code>). Use <code>computeIfAbsent</code>, <code>putIfAbsent</code>, <code>merge</code>.</li>
+      <li><b>Separate locks for fields in one invariant.</b> Tokens and last-refill time must change together, under one lock.</li>
+      <li><b>I/O while holding a lock.</b> Every waiting thread inherits the slowest call.</li>
+      <li><b>Locking on <code>this</code> or a public object.</b> Outside code can take the same lock. Use a private final lock object.</li>
+      <li><b>Nested locks in inconsistent order.</b> Pick a global order, or use <code>tryLock</code> with a timeout.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What does it take to make a class thread-safe?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First I find which state is actually shared and mutable; everything confined to a request or immutable is already safe. For the rest, every invariant must hold under any interleaving, which means each check-then-act or read-modify-write happens atomically, and writes are visible to other threads. I use thread-safe building blocks where one variable or one map key is involved, like <code>ConcurrentHashMap.computeIfAbsent</code>, <code>AtomicLong</code> or <code>LongAdder</code>, and a small private lock where an invariant spans several fields, held briefly with no I/O inside.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your transfer method locks the source account then the destination, and the service occasionally hangs. What's happening and how do you fix it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Two concurrent transfers in opposite directions each hold one account's lock and wait for the other's: a circular wait, so a deadlock. A thread dump would show it. The fix is a global lock order: always lock the account with the lower id first, regardless of direction, so both transfers try the same lock first and one simply waits. Alternatively, <code>ReentrantLock.tryLock</code> with a timeout lets a transfer back off and retry. I'd also keep the critical section to the two balance updates, with no I/O inside.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Thread-safe means invariants hold under any interleaving without callers coordinating.</li>
+      <li>Three root problems: atomicity, visibility and ordering; the tools work by creating happens-before edges.</li>
+      <li>Climb the ladder: confine, then share immutable, then concurrent building blocks, then locks around multi-field invariants.</li>
+      <li><code>volatile</code> is visibility only; atomics are single-variable; locks cover invariants across fields.</li>
+      <li>Compound actions must be one atomic step: <code>computeIfAbsent</code>, <code>merge</code>, <code>tryAcquire</code>; no I/O inside locks.</li>
+      <li>Prevent deadlock with a global lock order or <code>tryLock</code> timeouts; diagnose it with a thread dump.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Two threads run <code>balance += 50</code> on a shared <code>long balance</code> that starts at 100. What can the final balance be?</p>
+      <div class="opts">
+        <button class="opt">Always 200</button>
+        <button class="opt">Always 150</button>
+        <button class="opt">200 or 150: if both read 100 before either writes, one update is lost</button>
+        <button class="opt">It throws ConcurrentModificationException</button>
+      </div>
+      <div class="explain"><code>+=</code> is read, add, write. An interleaving where both threads read 100 makes both write 150. A lock or <code>AtomicLong.addAndGet</code> makes it one step.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does declaring a field <code>volatile</code> guarantee?</p>
+      <div class="opts">
+        <button class="opt">Writes are visible to other threads and aren't reordered around it, but compound operations like <code>count++</code> are still not atomic</button>
+        <button class="opt">All operations on the field are atomic</button>
+        <button class="opt">Only one thread can access the field at a time</button>
+        <button class="opt">The field can't be changed</button>
+      </div>
+      <div class="explain">volatile fixes visibility and ordering for one field. It doesn't make read-modify-write sequences atomic; that needs an atomic class or a lock.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why is <code>if (!map.containsKey(k)) map.put(k, v);</code> unsafe even with a <code>ConcurrentHashMap</code>?</p>
+      <div class="opts">
+        <button class="opt">ConcurrentHashMap doesn't support containsKey</button>
+        <button class="opt">It throws under contention</button>
+        <button class="opt">put isn't thread-safe</button>
+        <button class="opt">Each call is atomic, but the pair isn't: two threads can both see the key absent and both put</button>
+      </div>
+      <div class="explain">Thread-safe parts don't make a thread-safe sequence. <code>putIfAbsent</code> or <code>computeIfAbsent</code> do the check and the insert as one atomic operation.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A token bucket has <code>tokens</code> and <code>lastRefillMillis</code>, which must change together. What's the right protection?</p>
+      <div class="opts">
+        <button class="opt">Make each field an AtomicLong</button>
+        <button class="opt">One lock guarding both fields for the whole refill-check-decrement step</button>
+        <button class="opt">Make both fields volatile</button>
+        <button class="opt">A separate lock per field</button>
+      </div>
+      <div class="explain">Atomics and volatile protect single variables. An invariant spanning two fields needs both updated inside one critical section.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Transfers lock the source account, then the destination. Two opposite transfers sometimes hang forever. Which fix removes the deadlock?</p>
+      <div class="opts">
+        <button class="opt">Add <code>volatile</code> to the balances</button>
+        <button class="opt">Retry the transfer in a loop</button>
+        <button class="opt">Always acquire the two locks in a global order, such as lower account id first</button>
+        <button class="opt">Use more threads</button>
+      </div>
+      <div class="explain">Deadlock needs a circular wait. A consistent lock order makes every transfer between two accounts try the same lock first, so a cycle can't form.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, sleep } = LLD;
+  const log = $('#tlLog');
+  const MODES = {
+    lost: [['plain', 'plain field'], ['sync', 'synchronized'], ['atomic', 'AtomicLong']],
+    dead: [['naive', 'lock source first'], ['ordered', 'lock lower id first']],
+  };
+  let scen = 'lost', mode = 'plain', S, A, B;
+
+  // Each program: code lines + step(t) that returns { goto, done, blocked, msg, cls }.
+  function programs() {
+    if (scen === 'lost') {
+      if (mode === 'plain') return {
+        code: ['long r = balance;      // read', 'r = r + 50;            // add', 'balance = r;           // write'],
+        step: (t) => {
+          if (t.pc === 0) { t.r = S.balance; return { goto: 1, msg: `reads balance = ${t.r}` }; }
+          if (t.pc === 1) { t.r += 50; return { goto: 2, msg: `computes ${t.r} in a register` }; }
+          S.balance = t.r; return { done: true, msg: `writes balance = ${t.r}` };
+        }, worst: 'ABABAB' };
+      if (mode === 'sync') return {
+        code: ['synchronized (lock) {', '  long r = balance;', '  balance = r + 50;', '}                      // release'],
+        step: (t) => {
+          if (t.pc === 0) { if (S.lock && S.lock !== t.n) return { blocked: true, msg: 'blocked: the other thread holds the lock' }; S.lock = t.n; return { goto: 1, msg: 'acquires the lock' }; }
+          if (t.pc === 1) { t.r = S.balance; return { goto: 2, msg: `reads balance = ${t.r}` }; }
+          if (t.pc === 2) { S.balance = t.r + 50; return { goto: 3, msg: `writes balance = ${S.balance}` }; }
+          S.lock = null; return { done: true, msg: 'releases the lock' };
+        }, worst: 'ABABABAB' };
+      return {
+        code: ['balance.addAndGet(50);  // one atomic CAS step'],
+        step: (t) => { S.balance += 50; return { done: true, msg: `atomically adds 50 → ${S.balance}` }; }, worst: 'AB' };
+    }
+    // deadlock
+    const aOrder = ['1', '2'], bOrder = mode === 'naive' ? ['2', '1'] : ['1', '2'];
+    const mk = (order, name) => ({
+      code: [`synchronized (account${order[0]}) {`, `  synchronized (account${order[1]}) {`, `    ${name}  // move the money`, '  }', '}'],
+      order,
+    });
+    const P = { A: mk(aOrder, 'from.withdraw; to.deposit'), B: mk(bOrder, 'from.withdraw; to.deposit') };
+    return {
+      code: null, per: P,
+      step: (t) => {
+        const o = P[t.n].order;
+        if (t.pc < 2) {
+          const want = o[t.pc];
+          if (S.locks[want] && S.locks[want] !== t.n) { t.waitFor = want; return { blocked: true, msg: `waits for account ${want}'s lock (held by ${S.locks[want]})` }; }
+          S.locks[want] = t.n; t.waitFor = null; return { goto: t.pc + 1, msg: `locks account ${want}` };
+        }
+        if (t.pc === 2) { return { goto: 3, msg: 'moves 50 between the accounts' }; }
+        if (t.pc === 3) { delete S.locks[o[1]]; return { goto: 4, msg: `unlocks account ${o[1]}` }; }
+        delete S.locks[o[0]]; return { done: true, msg: `unlocks account ${o[0]}` };
+      }, worst: 'ABAB' };
+  }
+  let P;
+  function reset() {
+    P = programs();
+    S = { balance: 100, lock: null, locks: {} };
+    A = { n: 'A', pc: 0, done: false, blocked: false }; B = { n: 'B', pc: 0, done: false, blocked: false };
+    log.innerHTML = ''; draw();
+  }
+  function step(t) {
+    if (t.done) return;
+    const r = P.step(t);
+    t.blocked = !!r.blocked;
+    LLD.log(log, `Thread ${t.n}: ${r.msg}`, r.blocked ? 'warn' : '');
+    if (r.done) t.done = true; else if (!r.blocked) t.pc = r.goto;
+    draw();
+  }
+  function codeFor(t) { return scen === 'dead' ? P.per[t.n].code : P.code; }
+  function draw() {
+    [[A, '#tlCodeA'], [B, '#tlCodeB']].forEach(([t, id]) => {
+      $(id).innerHTML = codeFor(t).map((l, k) => `<span class="ln${!t.done && t.pc === k ? (t.blocked ? ' tl-block' : ' tl-cur') : ''}">${l.replace(/</g, '&lt;')}</span>`).join('');
+    });
+    $('#tlAh').textContent = scen === 'dead' ? 'Thread A: transfer(1 → 2)' : 'Thread A: deposit 50';
+    $('#tlBh').textContent = scen === 'dead' ? 'Thread B: transfer(2 → 1)' : 'Thread B: deposit 50';
+    const st = scen === 'lost'
+      ? `balance = <b>${S.balance}</b><br>${mode === 'sync' ? 'lock held by: ' + (S.lock || 'nobody') + '<br>' : ''}A: ${A.done ? 'done' : 'at line ' + (A.pc + 1)}${A.r != null && mode === 'plain' ? ' (r = ' + A.r + ')' : ''}<br>B: ${B.done ? 'done' : 'at line ' + (B.pc + 1)}${B.r != null && mode === 'plain' ? ' (r = ' + B.r + ')' : ''}`
+      : `account 1 lock: <b>${S.locks['1'] || 'free'}</b><br>account 2 lock: <b>${S.locks['2'] || 'free'}</b><br>A: ${A.done ? 'done' : A.blocked ? 'waiting' : 'running'}<br>B: ${B.done ? 'done' : B.blocked ? 'waiting' : 'running'}`;
+    $('#tlState').innerHTML = st;
+    const v = $('#tlVerdict');
+    if (scen === 'dead' && A.blocked && B.blocked) { v.className = 'tl-verdict tl-bad'; v.innerHTML = '<b>Deadlock.</b> Each thread holds one lock and waits for the other. Neither step button can make progress, forever.'; return; }
+    if (!A.done || !B.done) { v.className = 'tl-verdict tl-idle'; v.textContent = 'Step the threads in any order, or play the interleaving that breaks the naive version.'; return; }
+    if (scen === 'lost') { const ok = S.balance === 200; v.className = 'tl-verdict ' + (ok ? 'tl-ok' : 'tl-bad'); v.innerHTML = ok ? '<b>Correct:</b> 100 + 50 + 50 = 200.' : `<b>Lost update:</b> the balance is ${S.balance}, not 200. Both threads read 100 before either wrote.`; }
+    else { v.className = 'tl-verdict tl-ok'; v.innerHTML = '<b>Both transfers completed.</b> With a global lock order, one thread waited briefly instead of forming a cycle.'; }
+  }
+  function modes() {
+    $('#tlMode').innerHTML = MODES[scen].map(([k, l], i) => `<button class="${i === 0 ? 'active' : ''}" data-v="${k}">${l}</button>`).join('');
+    mode = MODES[scen][0][0];
+    $$('#tlMode button').forEach((b) => b.addEventListener('click', () => { $$('#tlMode button').forEach((x) => x.classList.toggle('active', x === b)); mode = b.dataset.v; reset(); }));
+  }
+  $$('#tlScen button').forEach((b) => b.addEventListener('click', () => { scen = b.dataset.v; modes(); reset(); }));
+  $('#tlA').onclick = () => step(A);
+  $('#tlB').onclick = () => step(B);
+  $('#tlReset').onclick = reset;
+  $('#tlWorst').onclick = async () => {
+    reset();
+    for (const c of P.worst) { const t = c === 'A' ? A : B; if (!t.done) step(t); await sleep(350); if (scen === 'dead' && A.blocked && B.blocked) return; }
+    for (let g = 0; g < 20 && (!A.done || !B.done); g++) { const t = !A.done && !(A.blocked && !B.done) ? A : B; step(t.done ? (t === A ? B : A) : t); await sleep(350); if (scen === 'dead' && A.blocked && B.blocked) return; }
+  };
+  modes(); reset();
+})();
+</script>
+</body>
+</html>

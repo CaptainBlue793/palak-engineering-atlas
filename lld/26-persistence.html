@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Persistence: Repository, DAO &amp; Unit of Work</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pv-db { display:grid; grid-template-columns: 1fr 1.5fr; gap:12px; margin-top:12px; }
+  @media (max-width: 720px) { .pv-db { grid-template-columns: 1fr; } }
+  .pv-tbl { border:1px solid var(--border); border-radius:12px; overflow:hidden; background:var(--surface-2); }
+  .pv-tbl h4 { margin:0; padding:8px 12px; font-family:var(--mono); font-size:12.5px; border-bottom:1px solid var(--border); color:var(--text-2); }
+  .pv-tbl table { width:100%; border-collapse:collapse; font-family:var(--mono); font-size:12px; }
+  .pv-tbl th, .pv-tbl td { padding:5px 10px; text-align:left; border-bottom:1px solid var(--border); }
+  .pv-tbl th { color:var(--muted); font-weight:600; }
+  .pv-tbl tr:last-child td { border-bottom:0; }
+  .pv-tbl tr.pv-chg td { background:var(--accent-soft); }
+  .pv-tbl tr.pv-new td { background:color-mix(in srgb, var(--green) 16%, transparent); }
+  .pv-tbl tr.pv-other td { background:color-mix(in srgb, var(--amber) 16%, transparent); }
+  .pv-note { font-size:12.5px; color:var(--muted); margin-top:8px; }
+</style>
+</head>
+<body data-chapter="26">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 26</span><span class="pill">Advanced LLD</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Persistence: <span class="grad">Repository, DAO &amp; Unit of Work</span></h1>
+    <p class="lead">Your domain classes enforce the rules: an order's total matches its lines, a paid order can't be edited. The database has to store those objects without breaking the rules on the way in or out. This chapter is about the seam between the two: repositories that let the domain pretend it lives in a collection, mappers that turn aggregates into rows, and transactions that make a whole change land or none of it.</p>
+    <ul class="objectives">
+      <li>Tell a DAO from a repository, and know which one the domain should see</li>
+      <li>Map an aggregate with child rows and value objects onto tables</li>
+      <li>Explain what a Unit of Work tracks and why it writes in one transaction</li>
+      <li>Place the transaction boundary on the use case, and prevent lost updates with a version column</li>
+      <li>Write an in-memory repository that tests can trust</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>A repository as an interface.</b> <a href="02-requirements-to-classes.html">Chapter 2</a> introduced <code>LinkRepository</code>.</li>
+        <li><b>Value objects and aggregates' invariants.</b> See <a href="p6-value-objects.html">P6</a> and <a href="07-class-contracts.html">Chapter 7</a>.</li>
+        <li><b>Lost updates.</b> <a href="22-thread-safe-classes.html">Chapter 22</a> showed them between threads; here they happen between requests.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>DAO vs Repository</h2>
+  <p>Both hide SQL behind an interface, but they face different ways. A <b>DAO</b> (Data Access Object) is shaped like the database: one per table, with methods that insert, update and delete rows. A <b>repository</b> is shaped like the domain: one per <b>aggregate</b> (a cluster of objects that change together, like an order and its lines), with methods that read like a collection: find this order, save this order. The domain and the application services talk to repositories; DAOs, if you have them at all, sit underneath a repository's implementation.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>DAO</th><th>Repository</th></tr></thead>
+      <tbody>
+        <tr><td>Shaped like</td><td>A table: <code>OrderDao</code>, <code>OrderLineDao</code></td><td>An aggregate: <code>OrderRepository</code> covers the order and its lines</td></tr>
+        <tr><td>Methods</td><td><code>insert(row)</code>, <code>update(row)</code>, <code>delete(id)</code>, <code>findByOrderId(id)</code></td><td><code>findById(OrderId)</code>, <code>save(Order)</code>, a few named queries</td></tr>
+        <tr><td>Deals in</td><td>Row records, primitive ids</td><td>Domain objects and value types</td></tr>
+        <tr><td>Who calls it</td><td>The repository implementation</td><td>Application services and use cases</td></tr>
+        <tr><td>Consistency</td><td>Caller must remember to write every table, in order</td><td>Saves the whole aggregate, so invariants arrive intact</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c">// Domain-facing: no SQL types, no table names, one per aggregate.</span>
+<span class="k">public interface</span> <span class="t">OrderRepository</span> {
+	<span class="t">Optional</span>&lt;<span class="t">Order</span>&gt; <span class="f">findById</span>(<span class="t">OrderId</span> id);
+	<span class="t">List</span>&lt;<span class="t">Order</span>&gt; <span class="f">findOpenFor</span>(<span class="t">CustomerId</span> customer);   <span class="c">// named queries, not a generic filter language</span>
+	<span class="k">void</span> <span class="f">save</span>(<span class="t">Order</span> order);                          <span class="c">// insert or update the whole aggregate</span>
+}</pre>
+  <p>Notice what's missing: no <code>updateTotal</code>, no <code>deleteLine</code>. Those would let a caller change part of an order behind the domain's back and store a total that doesn't match the lines. The only way to change an order is through <code>Order</code>'s own methods, and the only way to persist it is to save all of it.</p>
+
+  <h2>Mapping objects to tables</h2>
+  <p>An aggregate rarely fits one table. An <code>Order</code> with a list of <code>OrderLine</code>s becomes an <code>orders</code> row plus <code>order_lines</code> rows keyed by <code>order_id</code>. Value objects usually become columns: <code>Money</code> becomes <code>total_cents</code> and <code>currency</code>, an enum becomes a string (not its ordinal, which breaks when someone reorders the constants). Put this translation in a mapper next to the repository implementation, so the domain classes carry no annotations and no knowledge of column names:</p>
+<pre class="code"><span class="k">record</span> <span class="t">OrderRow</span>(<span class="k">long</span> id, <span class="t">String</span> status, <span class="k">long</span> totalCents, <span class="t">String</span> currency, <span class="k">long</span> version) {}
+<span class="k">record</span> <span class="t">LineRow</span>(<span class="k">long</span> orderId, <span class="t">String</span> sku, <span class="k">int</span> qty, <span class="k">long</span> unitCents) {}
+
+<span class="k">final class</span> <span class="t">OrderMapper</span> {
+	<span class="t">OrderRow</span> <span class="f">toRow</span>(<span class="t">Order</span> o) {
+		<span class="k">return new</span> <span class="t">OrderRow</span>(o.<span class="f">id</span>().<span class="f">value</span>(), o.<span class="f">status</span>().<span class="f">name</span>(), o.<span class="f">total</span>().<span class="f">cents</span>(), o.<span class="f">total</span>().<span class="f">currency</span>().<span class="f">getCurrencyCode</span>(), o.<span class="f">version</span>());
+	}
+	<span class="t">Order</span> <span class="f">toDomain</span>(<span class="t">OrderRow</span> r, <span class="t">List</span>&lt;<span class="t">LineRow</span>&gt; lines) {
+		<span class="k">return</span> <span class="t">Order</span>.<span class="f">rehydrate</span>(<span class="k">new</span> <span class="t">OrderId</span>(r.<span class="f">id</span>()), <span class="t">OrderStatus</span>.<span class="f">valueOf</span>(r.<span class="f">status</span>()),
+			lines.<span class="f">stream</span>().<span class="f">map</span>(<span class="k">this</span>::<span class="f">toLine</span>).<span class="f">toList</span>(), r.<span class="f">version</span>());   <span class="c">// rehydrate re-checks invariants</span>
+	}
+}</pre>
+  <p><code>Order.rehydrate</code> is a factory (<a href="10-factories.html">Chapter 10</a>) for rebuilding an existing order from storage: unlike the “place a new order” constructor it takes an id and a version, and it still validates, so corrupt rows fail loudly on load rather than spreading. The cost of this separation is some boilerplate; the benefit is that you can change a column, or the whole database, without touching the domain.</p>
+
+  <h2>Unit of Work and transactions</h2>
+  <p>A use case often changes several rows: edit one line, remove another, add a third, update the total. If each change is written the moment it's made, a failure halfway leaves the database holding a mix of old and new: lines that no longer add up to the stored total. A <b>Unit of Work</b> keeps a list of what the use case created, changed and removed, and at the end writes it all inside one database transaction, so either every change lands or none does.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Begin the use case</b> Open a Unit of Work (and, at commit time, a transaction).</li>
+      <li><b>Load through repositories</b> Loaded aggregates are registered, with the version they were read at.</li>
+      <li><b>Change the domain objects</b> Call methods on <code>Order</code>; the domain enforces its rules. Nothing is written yet.</li>
+      <li><b>Commit: work out the changes</b> New, dirty and removed objects become an ordered list of statements.</li>
+      <li data-k="decision"><b>Did every statement succeed, and every version still match?</b></li>
+      <li data-k="end"><b>COMMIT, or ROLLBACK everything</b> On failure the database is exactly as it was before the use case started.</li>
+    </ol>
+    <figcaption><b>A Unit of Work's life.</b> Changes collect in memory and reach the database together, inside one transaction.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Saving “edit order 8412”: per-change writes vs a Unit of Work</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <p class="small muted" style="margin:0">The use case: change the USB hub to 3 units, remove the keyboard, add a mouse at 18.00, and set the total to 33.00. Pick how it's saved and what goes wrong.</p>
+      <div class="controls">
+        <div class="seg" id="pvMode"><button class="active" data-v="auto">write each change immediately</button><button data-v="uow">Unit of Work + version check</button></div>
+      </div>
+      <div class="controls">
+        <div class="seg" id="pvFault"><button class="active" data-v="none">nothing fails</button><button data-v="drop">connection drops on statement 3</button><button data-v="race">another user edited it first</button></div>
+        <button class="btn sm primary" id="pvRun">▶ save</button>
+        <button class="btn sm" id="pvReset">↺</button>
+      </div>
+      <div class="pv-db" id="pvDb"></div>
+      <div class="pv-note">Blue rows changed in this run, green rows inserted, amber rows written by the other user.</div>
+      <div class="stats" id="pvStats"></div>
+      <div class="log" id="pvLog" style="height:120px;margin-top:10px"></div>
+    </div>
+    <div class="panel-foot">The invariant the domain enforces: <code>orders.total</code> equals the sum of the order's lines. Watch whether it still holds in the database after each run.</div>
+  </div>
+
+  <p>You rarely write a Unit of Work by hand in Java. JPA's persistence context is one: every entity loaded through an <code>EntityManager</code> is tracked, changes are detected at flush time, and the SQL runs inside the surrounding transaction. What you do decide is <b>where the transaction starts and ends</b>. The right place is the application service method that runs one use case, not each repository call:</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">EditOrderService</span> {
+	<span class="k">private final</span> <span class="t">OrderRepository</span> orders;
+	<span class="k">private final</span> <span class="t">Transactions</span> tx;                 <span class="c">// or @Transactional on the method in Spring</span>
+
+	<span class="k">public void</span> <span class="f">edit</span>(<span class="t">OrderId</span> id, <span class="t">OrderEdit</span> edit) {
+		tx.<span class="f">run</span>(() -&gt; {                                 <span class="c">// one use case = one transaction</span>
+			<span class="t">Order</span> order = orders.<span class="f">findById</span>(id).<span class="f">orElseThrow</span>(() -&gt; <span class="k">new</span> <span class="t">OrderNotFound</span>(id));
+			order.<span class="f">apply</span>(edit);                           <span class="c">// domain rules: status, quantities, total</span>
+			orders.<span class="f">save</span>(order);                         <span class="c">// version-checked update</span>
+		});
+		<span class="c">// Emails, payment calls and other remote work go after the commit, never inside it.</span>
+	}
+}</pre>
+  <p>Two rules follow. Keep remote calls out of the transaction: holding row locks and a pooled connection while waiting for a payment provider (<a href="25-resilience.html">Chapter 25</a>) turns a slow partner into a stalled database. And prefer one aggregate per transaction; if a use case must change two aggregates, that's a signal to reconsider the boundaries, which is where <a href="27-domain-modeling.html">Chapter 27</a> picks up.</p>
+
+  <h2>Optimistic locking: lost updates between requests</h2>
+  <p>A transaction protects one use case from its own partial failure. It doesn't stop two users from each loading version 3 of an order, editing it in their browsers for a minute, and saving in turn, with the second save quietly overwriting the first. Holding a database lock for that minute isn't an option. Instead, add a <code>version</code> column and make every update conditional on it:</p>
+<pre class="code"><span class="k">UPDATE</span> orders <span class="k">SET</span> total_cents = ?, status = ?, version = version + <span class="m">1</span>
+<span class="k">WHERE</span> id = ? <span class="k">AND</span> version = ?      <span class="c">-- the version this request loaded</span>
+<span class="c">-- 0 rows updated → someone saved in between: roll back, throw ConcurrentUpdateException</span></pre>
+  <figure class="seq" data-actors="Alice|Bob|EditOrderService|Database">
+    <ol>
+      <li data-m="0>2">load order 8412</li>
+      <li data-m="2>3">SELECT … → version 3</li>
+      <li data-m="1>2">load order 8412</li>
+      <li data-m="2>3">SELECT … → version 3</li>
+      <li data-m="1>2">save: add a cable</li>
+      <li data-m="2>3" data-k="reply">UPDATE … WHERE version = 3 → 1 row, now version 4</li>
+      <li data-m="0>2">save: swap keyboard for mouse</li>
+      <li data-m="2>3" data-k="bad">UPDATE … WHERE version = 3 → 0 rows</li>
+      <li data-m="2>0" data-k="fail">409: order changed, reload and reapply</li>
+    </ol>
+    <figcaption><b>Optimistic locking.</b> Nobody waits on a lock; the second writer finds out at save time and retries on fresh data instead of erasing Bob's cable.</figcaption>
+  </figure>
+  <p>JPA does this for you when an entity has a field annotated <code>@Version</code>: the update includes the version in its <code>WHERE</code> clause and a mismatch throws <code>OptimisticLockException</code>. It's the right default whenever conflicts are rare; pessimistic locking (<code>SELECT … FOR UPDATE</code>) is for short, hot, high-conflict rows, and even then only inside a short transaction.</p>
+
+  <h2>In-memory repositories for tests</h2>
+  <p>Because the domain only knows the <code>OrderRepository</code> interface, tests of services can use an in-memory implementation and run in milliseconds. The trap is aliasing (<a href="p1-classes-objects.html">P1</a>): if the fake stores the very object you passed in, a test that forgets to call <code>save</code> still passes, because the “stored” order is the one you mutated. Copy on the way in and on the way out, as a database effectively does:</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">InMemoryOrderRepository</span> <span class="k">implements</span> <span class="t">OrderRepository</span> {
+	<span class="k">private final</span> <span class="t">Map</span>&lt;<span class="t">OrderId</span>, <span class="t">Order</span>&gt; store = <span class="k">new</span> <span class="t">ConcurrentHashMap</span>&lt;&gt;();
+
+	<span class="k">public</span> <span class="t">Optional</span>&lt;<span class="t">Order</span>&gt; <span class="f">findById</span>(<span class="t">OrderId</span> id) { <span class="k">return</span> <span class="t">Optional</span>.<span class="f">ofNullable</span>(store.<span class="f">get</span>(id)).<span class="f">map</span>(<span class="t">Order</span>::<span class="f">copy</span>); }
+
+	<span class="k">public void</span> <span class="f">save</span>(<span class="t">Order</span> o) {
+		store.<span class="f">compute</span>(o.<span class="f">id</span>(), (id, cur) -&gt; {                                  <span class="c">// same version rule as the database</span>
+			<span class="k">if</span> (cur != <span class="k">null</span> &amp;&amp; cur.<span class="f">version</span>() != o.<span class="f">version</span>()) <span class="k">throw new</span> <span class="t">ConcurrentUpdateException</span>(id);
+			<span class="k">return</span> o.<span class="f">copyWithVersion</span>(o.<span class="f">version</span>() + <span class="m">1</span>);
+		});
+	}
+	<span class="c">// findOpenFor: filter store.values(), copying each result</span>
+}</pre>
+  <p>To keep the fake honest, write the repository's tests once as an abstract <b>contract test</b> and run it against both implementations: the in-memory one, and the JDBC one against a real database in a container. If the fake passes the same tests as the real thing, service tests that use it are trustworthy. <a href="28-testing-designs.html">Chapter 28</a> covers fakes in more depth.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">JPA is these patterns, packaged</div><p>In a typical Spring Boot service, <code>interface OrderRepository extends JpaRepository&lt;OrderEntity, Long&gt;</code> gets its implementation generated at startup; the <code>EntityManager</code>'s persistence context is the Unit of Work, comparing loaded entities against a snapshot to find dirty ones; <code>@Transactional</code> on a service method draws the transaction boundary; and <code>@Version</code> adds optimistic locking. Knowing the patterns underneath explains its classic surprises: a change to a loaded entity is saved even though nobody called <code>save</code> (dirty checking), and looping over orders to read each one's lazy lines issues one query per order (the “N+1 queries” problem), which a fetch join or a dedicated query fixes.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>A repository per table.</b> <code>OrderLineRepository</code> lets callers edit lines without the order checking its total. One repository per aggregate.</li>
+      <li><b>Persistence leaking into the domain:</b> <code>ResultSet</code>, table names or SQL exceptions in service or domain code. Translate at the repository.</li>
+      <li><b>Transactions per repository call</b> instead of per use case, so a multi-step change can half-succeed.</li>
+      <li><b>Remote calls inside a transaction,</b> holding locks and a connection while a partner is slow.</li>
+      <li><b>No version column,</b> so concurrent edits silently overwrite each other.</li>
+      <li><b>A generic <code>Repository&lt;T&gt;</code> with <code>findAll(Predicate)</code></b> that loads the table into memory, or a query-builder that exposes SQL shape to callers. Add named query methods instead.</li>
+      <li><b>An in-memory fake that stores references,</b> so tests pass without ever saving.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What's the difference between a DAO and a repository?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A DAO mirrors the database: one per table, with row-level insert, update and delete. A repository mirrors the domain: one per aggregate, with collection-like methods such as <code>findById</code> and <code>save</code> that take and return whole domain objects. The domain talks to repositories, so it can only persist a complete, valid aggregate; DAOs, if used, are an implementation detail underneath.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> In your parking-lot design, two requests try to take the last spot at the same time. How does the persistence layer stop both succeeding?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Each request runs as one transaction in the application service: load the lot or spot, call the domain method that assigns it, save. The save is a conditional update: either a version column (<code>WHERE id = ? AND version = ?</code>) or a state check (<code>WHERE id = ? AND status = 'FREE'</code>). The first commit updates one row; the second updates zero, so its repository throws a conflict, the transaction rolls back, and the service reports “lot full” or retries on fresh data. A unique constraint on active assignments per spot is a good safety net. And the in-memory repository used in tests enforces the same version rule, so the race is testable without a database.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>DAOs are shaped like tables; repositories are shaped like aggregates. The domain sees only repositories.</li>
+      <li>A repository saves and loads whole aggregates, so invariants can't be bypassed through storage.</li>
+      <li>Mappers translate aggregates to rows and back; domain classes stay free of SQL and annotations, and rehydration still validates.</li>
+      <li>A Unit of Work collects changes and writes them in one transaction: all or nothing.</li>
+      <li>Draw the transaction around the use case in the application service, with no remote calls inside it.</li>
+      <li>A version column turns silent lost updates between requests into detectable conflicts.</li>
+      <li>In-memory repositories must copy objects and share a contract test with the real implementation.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">An order has lines stored in a separate table. How many repositories should the domain see?</p>
+      <div class="opts">
+        <button class="opt">Two: <code>OrderRepository</code> and <code>OrderLineRepository</code></button>
+        <button class="opt">One, <code>OrderRepository</code>, which loads and saves the order with its lines</button>
+        <button class="opt">None: the service should run the SQL itself</button>
+        <button class="opt">One generic <code>Repository&lt;Object&gt;</code> for everything</button>
+      </div>
+      <div class="explain">Repositories are per aggregate. A separate line repository would let callers change lines without the order recomputing and checking its total.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A use case runs four UPDATE/INSERT/DELETE statements, each auto-committed. The connection drops after the second. What's in the database?</p>
+      <div class="opts">
+        <button class="opt">Nothing changed: the database undoes it automatically</button>
+        <button class="opt">All four changes: the driver retries them</button>
+        <button class="opt">The last two changes only</button>
+        <button class="opt">The first two changes, leaving data that may break the domain's invariants</button>
+      </div>
+      <div class="explain">Auto-commit makes each statement its own transaction. Only wrapping all four in one transaction, as a Unit of Work does, gives all-or-nothing.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Where should the transaction boundary usually be?</p>
+      <div class="opts">
+        <button class="opt">Around the application service method that runs one use case</button>
+        <button class="opt">Around each repository method</button>
+        <button class="opt">Around each SQL statement</button>
+        <button class="opt">Around the whole HTTP server's lifetime</button>
+      </div>
+      <div class="explain">The use case is the unit that must succeed or fail as a whole. Per-repository transactions let a multi-step use case half-succeed.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does <code>UPDATE … WHERE id = ? AND version = ?</code> updating 0 rows tell you?</p>
+      <div class="opts">
+        <button class="opt">The row was deleted, always</button>
+        <button class="opt">The database is down</button>
+        <button class="opt">Someone else saved this aggregate after you loaded it, so your save must not overwrite theirs</button>
+        <button class="opt">The update succeeded but returned no data</button>
+      </div>
+      <div class="explain">That's optimistic locking: the version moved on since you read it. Roll back and report a conflict, or reload and reapply the change.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why should an in-memory repository copy objects in <code>save</code> and <code>findById</code>?</p>
+      <div class="opts">
+        <button class="opt">To use less memory</button>
+        <button class="opt">So a test that mutates an object but forgets to save it fails, as it would against a real database</button>
+        <button class="opt">Because <code>HashMap</code> can't store domain objects</button>
+        <button class="opt">To make it thread-safe</button>
+      </div>
+      <div class="explain">Storing references lets later mutations appear “saved” without a save call, hiding bugs the real database would expose.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, sleep } = LLD;
+  const log = $('#pvLog');
+  let mode = 'auto', fault = 'none', busy = false, db, mark;
+  const money = (c) => (c / 100).toFixed(2);
+  function fresh() {
+    db = { order: { id: 8412, status: 'OPEN', total: 3000, version: 3 },
+      lines: [ { id: 'L1', sku: 'KEYBOARD', qty: 1, unit: 2000 }, { id: 'L2', sku: 'USB-HUB', qty: 2, unit: 500 } ] };
+    mark = {}; log.innerHTML = ''; draw(null);
+  }
+  function otherUser() {
+    db.lines.push({ id: 'L4', sku: 'CABLE', qty: 1, unit: 800 });
+    db.order.total = 3800; db.order.version = 4; mark.L4 = 'pv-other'; mark.order = 'pv-other';
+    LLD.log(log, 'Bob saved first: added a cable, total 38.00, version 3 → 4', 'warn');
+  }
+  const ours = [
+    { sql: 'UPDATE order_lines SET qty = 3 WHERE id = \'L2\'', run: () => { db.lines.find((l) => l.id === 'L2').qty = 3; mark.L2 = 'pv-chg'; } },
+    { sql: 'DELETE FROM order_lines WHERE id = \'L1\'', run: () => { db.lines = db.lines.filter((l) => l.id !== 'L1'); } },
+    { sql: 'INSERT INTO order_lines VALUES (\'L3\', \'MOUSE\', 1, 1800)', run: () => { db.lines.push({ id: 'L3', sku: 'MOUSE', qty: 1, unit: 1800 }); mark.L3 = 'pv-new'; } },
+  ];
+  const setTotal = (versioned) => ({ sql: versioned ? 'UPDATE orders SET total = 3300, version = 4 WHERE id = 8412 AND version = 3' : 'UPDATE orders SET total = 3300 WHERE id = 8412', versioned,
+    run: () => { db.order.total = 3300; if (versioned) db.order.version = 4; mark.order = 'pv-chg'; } });
+  function draw(outcome) {
+    const sum = db.lines.reduce((s, l) => s + l.qty * l.unit, 0), ok = sum === db.order.total, o = db.order;
+    $('#pvDb').innerHTML = `
+      <div class="pv-tbl"><h4>orders</h4><table><tr><th>id</th><th>total</th><th>version</th></tr>
+        <tr class="${mark.order || ''}"><td>${o.id}</td><td>${money(o.total)}</td><td>${o.version}</td></tr></table></div>
+      <div class="pv-tbl"><h4>order_lines (order 8412)</h4><table><tr><th>id</th><th>sku</th><th>qty</th><th>unit</th></tr>
+        ${db.lines.map((l) => `<tr class="${mark[l.id] || ''}"><td>${l.id}</td><td>${l.sku}</td><td>${l.qty}</td><td>${money(l.unit)}</td></tr>`).join('')}</table></div>`;
+    $('#pvStats').innerHTML = `
+      <div class="stat"><div class="k">Sum of lines</div><div class="v">${money(sum)}</div></div>
+      <div class="stat"><div class="k">Stored total</div><div class="v">${money(o.total)}</div></div>
+      <div class="stat ${ok ? 'good' : 'bad'}"><div class="k">Invariant holds?</div><div class="v">${ok ? 'yes' : 'no'}</div></div>
+      <div class="stat ${outcome === null ? '' : outcome.cls}"><div class="k">Result</div><div class="v" style="font-size:15px">${outcome === null ? '–' : outcome.text}</div></div>`;
+  }
+  async function run() {
+    busy = true; fresh();
+    if (fault === 'race') { otherUser(); draw(null); await sleep(500); }
+    const snapshot = JSON.parse(JSON.stringify(db)), markSnap = { ...mark };
+    const stmts = mode === 'auto' ? [...ours, setTotal(false)] : [setTotal(true), ...ours];
+    if (mode === 'uow') { LLD.log(log, 'BEGIN', ''); await sleep(250); }
+    let outcome = { text: 'saved', cls: 'good' };
+    for (let i = 0; i < stmts.length; i++) {
+      const s = stmts[i];
+      if (fault === 'drop' && i === 2) { LLD.log(log, `✗ connection lost before: ${s.sql}`, 'bad'); outcome = null; break; }
+      if (s.versioned && db.order.version !== 3) { LLD.log(log, `${s.sql} → 0 rows (version is ${db.order.version})`, 'bad'); outcome = null; break; }
+      s.run(); LLD.log(log, `${s.sql}${mode === 'auto' ? '  (auto-committed)' : ''}`, ''); draw(null); await sleep(420);
+    }
+    if (outcome === null) {
+      if (mode === 'uow') {
+        db = snapshot; mark = markSnap; LLD.log(log, 'ROLLBACK: every change in this use case is undone', 'warn');
+        outcome = fault === 'drop' ? { text: 'rolled back', cls: 'warn' } : { text: '409 conflict', cls: 'warn' };
+      } else outcome = { text: 'half-saved', cls: 'bad' };
+    } else if (mode === 'uow') LLD.log(log, 'COMMIT', 'ok');
+    const sum = db.lines.reduce((s, l) => s + l.qty * l.unit, 0);
+    if (sum !== db.order.total) { outcome = { text: 'corrupt', cls: 'bad' }; LLD.log(log, `Stored total ${money(db.order.total)} ≠ lines ${money(sum)}: the database now breaks a rule the domain never would`, 'bad'); }
+    else if (outcome.text === '409 conflict') LLD.log(log, 'Bob\'s cable is kept; Alice reloads version 4 and reapplies her edit', 'ok');
+    else if (outcome.text === 'rolled back') LLD.log(log, 'Database is unchanged and consistent; the whole use case can be retried', 'ok');
+    draw(outcome); busy = false;
+  }
+  function seg(id, set) { $$(`#${id} button`).forEach((b) => b.addEventListener('click', () => { if (busy) return; $$(`#${id} button`).forEach((x) => x.classList.toggle('active', x === b)); set(b.dataset.v); fresh(); })); }
+  seg('pvMode', (v) => { mode = v; }); seg('pvFault', (v) => { fault = v; });
+  $('#pvRun').onclick = () => { if (!busy) run(); };
+  $('#pvReset').onclick = () => { if (!busy) fresh(); };
+  fresh();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: In-Memory Pub-Sub Broker</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ps-parts { margin-top:12px; padding:12px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); }
+  .ps-row { display:grid; grid-template-columns: 150px 1fr; gap:10px; align-items:start; margin:6px 0 14px; }
+  .ps-lbl { font-family:var(--mono); font-size:12px; color:var(--text-2); padding-top:6px; }
+  .ps-lbl small { display:block; color:var(--muted); }
+  .ps-log { display:flex; flex-wrap:wrap; gap:4px; }
+  .ps-cell { position:relative; width:40px; height:34px; border-radius:7px; display:flex; flex-direction:column; align-items:center; justify-content:center; font-family:var(--mono); font-size:10px; color:#fff; font-weight:700; }
+  .ps-cell small { font-weight:500; opacity:.85; font-size:9px; }
+  .ps-cell.ps-gap { background:transparent; border:1.5px dashed var(--border-strong); color:var(--muted); }
+  .ps-tags { position:absolute; bottom:-14px; left:0; right:0; display:flex; justify-content:center; gap:2px; }
+  .ps-tags b { font-size:9px; line-height:12px; padding:0 3px; border-radius:3px; color:#fff; }
+  .ps-tags b.ps-a { background:var(--accent); } .ps-tags b.ps-b { background:var(--amber); }
+  .ps-legend { display:flex; flex-wrap:wrap; gap:12px; font-size:12px; color:var(--muted); margin-top:6px; }
+  .ps-legend span::before { content:""; display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:5px; vertical-align:-1px; background:var(--c); }
+</style>
+</head>
+<body data-chapter="34">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 34</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Case Study: <span class="grad">In-Memory Pub-Sub Broker</span></h1>
+    <p class="lead">Chapter 16's event bus called listeners directly: fast, simple, and gone the moment a listener is slow or the process restarts. A broker puts a buffer between publishers and subscribers, and the most useful buffer is the one Kafka popularised: an append-only <b>log</b> per partition, which consumers read at their own pace by remembering an <b>offset</b>. This case study builds that design inside one JVM: topics and partitions, consumer groups that share work, offsets that make replay trivial, and the thread model that holds it together.</p>
+    <ul class="objectives">
+      <li>Specify a broker API with publish, subscribe-as-a-group, poll and commit</li>
+      <li>Partition topics by key so per-key order is preserved while work spreads out</li>
+      <li>Track consumer offsets to get at-least-once delivery and replay</li>
+      <li>Handle slow consumers with retention and lag, instead of blocking publishers</li>
+      <li>Choose locks and long-polling for a correct, simple thread model</li>
+    </ul>
+  </section>
+
+  <div class="callout analogy">
+    <div class="ico">🏗️</div>
+    <div class="body"><div class="title">Same problem, different zoom</div>
+      The System Design course covers message queues as infrastructure: brokers, replication, delivery guarantees across machines. This chapter zooms into the classes of a broker running in one process. See <a href="../system-design/14-message-queues.html">the high-level design</a>.
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Observer and an in-process event bus.</b> See <a href="16-observer-mediator.html">Chapter 16</a>.</li>
+        <li><b>Producer-consumer and blocking queues.</b> See <a href="23-producer-consumer.html">Chapter 23</a>.</li>
+        <li><b>Locks and conditions.</b> See <a href="22-thread-safe-classes.html">Chapter 22</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Requirements and API</h2>
+  <p>Clarify: many publishers and many subscribers on named topics; each subscriber <b>group</b> receives every message (billing and analytics both see every <code>OrderPlaced</code>), while consumers <b>within</b> a group share the work; messages with the same key (an order id) must be processed in order; a slow subscriber must not slow publishers; subscribers can replay from an earlier point; delivery is at least once. Out of scope: persistence to disk and replication, which is where a single process stops and the System Design course starts.</p>
+  <p>The biggest decision is <b>push or pull</b>. Push, as in the event bus, hands each message to subscriber callbacks or per-subscriber queues; the broker must then decide what to do when a subscriber falls behind. Pull stores messages in a log and lets each group read from its own position; the broker keeps one copy, and a slow group just has a larger <b>lag</b>. Pull is the design Kafka uses, and it makes replay and multiple groups nearly free.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Push (a queue per subscriber)</th><th>Pull (a shared log + offsets)</th></tr></thead>
+      <tbody>
+        <tr><td>Storage</td><td>One copy per subscriber queue</td><td>One copy per partition, shared by all groups</td></tr>
+        <tr><td>Slow subscriber</td><td>Its queue fills: block the publisher, drop, or grow</td><td>Its lag grows; others unaffected until retention removes unread messages</td></tr>
+        <tr><td>Replay</td><td>Gone once delivered</td><td>Move the offset back</td></tr>
+        <tr><td>Adding a group later</td><td>Sees only new messages</td><td>Can start from the earliest retained message</td></tr>
+        <tr><td>Latency</td><td>Lowest; delivered immediately</td><td>Poll interval, or near-zero with long polling</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="k">public interface</span> <span class="t">Broker</span> {
+	<span class="t">RecordMetadata</span> <span class="f">publish</span>(<span class="t">String</span> topic, <span class="t">String</span> key, <span class="k">byte</span>[] value);   <span class="c">// → (partition, offset)</span>
+	<span class="t">Consumer</span> <span class="f">subscribe</span>(<span class="t">String</span> topic, <span class="t">String</span> group);                  <span class="c">// joins the group; triggers a rebalance</span>
+}
+
+<span class="k">public interface</span> <span class="t">Consumer</span> <span class="k">extends</span> <span class="t">AutoCloseable</span> {
+	<span class="t">List</span>&lt;<span class="t">Record</span>&gt; <span class="f">poll</span>(<span class="t">Duration</span> maxWait, <span class="k">int</span> maxRecords);   <span class="c">// from this consumer's partitions</span>
+	<span class="k">void</span> <span class="f">commit</span>();                                          <span class="c">// “processed up to here”</span>
+	<span class="k">void</span> <span class="f">seek</span>(<span class="k">int</span> partition, <span class="k">long</span> offset);                  <span class="c">// replay</span>
+}
+
+<span class="k">public record</span> <span class="t">Record</span>(<span class="k">long</span> offset, <span class="t">String</span> key, <span class="k">byte</span>[] value, <span class="t">Instant</span> time) {}</pre>
+
+  <h2>Topics and partitions</h2>
+  <p>A topic with a single log would be one ordered sequence consumed by one reader per group, so a group couldn't scale past one thread. A topic therefore has several <b>partitions</b>, each its own log. The publisher's key picks the partition, <code>hash(key) mod partitions</code>, so every message about order 8412 lands in the same partition in the order it was published. That's the whole ordering guarantee: <b>per key, not per topic</b>. Messages with different keys in different partitions can be processed in any relative order, which is exactly what lets the work spread out.</p>
+<pre class="code"><span class="k">final class</span> <span class="t">Topic</span> {
+	<span class="k">private final</span> <span class="t">String</span> name;
+	<span class="k">private final</span> <span class="t">List</span>&lt;<span class="t">Partition</span>&gt; partitions;
+	<span class="k">private final</span> <span class="t">Clock</span> clock;
+
+	<span class="t">RecordMetadata</span> <span class="f">publish</span>(<span class="t">String</span> key, <span class="k">byte</span>[] value) {
+		<span class="k">int</span> p = <span class="t">Math</span>.<span class="f">floorMod</span>(key.<span class="f">hashCode</span>(), partitions.<span class="f">size</span>());    <span class="c">// same key → same partition → ordered</span>
+		<span class="k">long</span> offset = partitions.<span class="f">get</span>(p).<span class="f">append</span>(key, value, clock.<span class="f">instant</span>());
+		<span class="k">return new</span> <span class="t">RecordMetadata</span>(name, p, offset);
+	}
+}
+
+<span class="k">final class</span> <span class="t">Partition</span> {
+	<span class="k">private final</span> <span class="t">ArrayList</span>&lt;<span class="t">Record</span>&gt; log = <span class="k">new</span> <span class="t">ArrayList</span>&lt;&gt;();       <span class="c">// a ring buffer or segments in practice</span>
+	<span class="k">private long</span> startOffset;                                     <span class="c">// offset of log.get(0); rises as retention trims</span>
+	<span class="k">private final int</span> retention;
+	<span class="k">private final</span> <span class="t">ReentrantLock</span> lock = <span class="k">new</span> <span class="t">ReentrantLock</span>();
+	<span class="k">private final</span> <span class="t">Condition</span> appended = lock.<span class="f">newCondition</span>();
+
+	<span class="k">long</span> <span class="f">append</span>(<span class="t">String</span> key, <span class="k">byte</span>[] value, <span class="t">Instant</span> now) {
+		lock.<span class="f">lock</span>();
+		<span class="k">try</span> {
+			<span class="k">long</span> offset = startOffset + log.<span class="f">size</span>();
+			log.<span class="f">add</span>(<span class="k">new</span> <span class="t">Record</span>(offset, key, value.<span class="f">clone</span>(), now));    <span class="c">// defensive copy: callers can't mutate history</span>
+			<span class="k">if</span> (log.<span class="f">size</span>() &gt; retention) { log.<span class="f">remove</span>(<span class="m">0</span>); startOffset++; }
+			appended.<span class="f">signalAll</span>();                                    <span class="c">// wake long-polling consumers</span>
+			<span class="k">return</span> offset;
+		} <span class="k">finally</span> { lock.<span class="f">unlock</span>(); }
+	}
+
+	<span class="t">List</span>&lt;<span class="t">Record</span>&gt; <span class="f">read</span>(<span class="k">long</span> from, <span class="k">int</span> max, <span class="t">Duration</span> maxWait) <span class="k">throws</span> <span class="t">InterruptedException</span> {
+		lock.<span class="f">lock</span>();
+		<span class="k">try</span> {
+			<span class="k">if</span> (from &lt; startOffset) <span class="k">throw new</span> <span class="t">OffsetOutOfRangeException</span>(from, startOffset);   <span class="c">// fell off the log</span>
+			<span class="k">long</span> nanos = maxWait.<span class="f">toNanos</span>();
+			<span class="k">while</span> (from &gt;= startOffset + log.<span class="f">size</span>() &amp;&amp; nanos &gt; <span class="m">0</span>) nanos = appended.<span class="f">awaitNanos</span>(nanos);   <span class="c">// long poll</span>
+			<span class="k">int</span> i = (<span class="k">int</span>) (from - startOffset);
+			<span class="k">return</span> <span class="t">List</span>.<span class="f">copyOf</span>(log.<span class="f">subList</span>(<span class="t">Math</span>.<span class="f">min</span>(i, log.<span class="f">size</span>()), <span class="t">Math</span>.<span class="f">min</span>(log.<span class="f">size</span>(), i + max)));
+		} <span class="k">finally</span> { lock.<span class="f">unlock</span>(); }
+	}
+}</pre>
+  <p>A <code>Record</code> is immutable and the log is append-only, so a record, once written, never changes: many consumers can read the same record with no coordination beyond the partition lock. <b>Offsets</b> are just positions in the log, stable forever, even after retention removes older entries. The <code>while</code> loop around <code>awaitNanos</code> handles spurious wake-ups and wakes for other offsets, the standard condition-variable idiom from <a href="22-thread-safe-classes.html">Chapter 22</a>.</p>
+
+  <h2>Consumer offsets and replay</h2>
+  <p>A <b>consumer group</b> has two pieces of state: which consumer owns which partition (the <b>assignment</b>), and for each partition the <b>committed offset</b>, the next offset the group has yet to process. Within a group each partition has exactly one owner, which keeps per-key order; a consumer can own several partitions; and a group with more consumers than partitions leaves some consumers idle. When members join or leave, the group <b>rebalances</b>: it recomputes the assignment with a pluggable strategy, and new owners resume from the committed offsets.</p>
+<pre class="code"><span class="k">final class</span> <span class="t">ConsumerGroup</span> {
+	<span class="k">private final</span> <span class="t">Map</span>&lt;<span class="t">Integer</span>, <span class="t">Long</span>&gt; committed = <span class="k">new</span> <span class="t">ConcurrentHashMap</span>&lt;&gt;();   <span class="c">// partition → next offset</span>
+	<span class="k">private final</span> <span class="t">List</span>&lt;<span class="t">String</span>&gt; members = <span class="k">new</span> <span class="t">ArrayList</span>&lt;&gt;();
+	<span class="k">private final</span> <span class="t">PartitionAssignor</span> assignor;                                   <span class="c">// Strategy: range, round-robin, sticky</span>
+	<span class="k">private volatile</span> <span class="t">Map</span>&lt;<span class="t">String</span>, <span class="t">List</span>&lt;<span class="t">Integer</span>&gt;&gt; assignment = <span class="t">Map</span>.<span class="f">of</span>();
+	<span class="k">private volatile int</span> generation;
+
+	<span class="k">synchronized void</span> <span class="f">join</span>(<span class="t">String</span> member)  { members.<span class="f">add</span>(member);    <span class="f">rebalance</span>(); }
+	<span class="k">synchronized void</span> <span class="f">leave</span>(<span class="t">String</span> member) { members.<span class="f">remove</span>(member); <span class="f">rebalance</span>(); }
+
+	<span class="k">private void</span> <span class="f">rebalance</span>() {
+		assignment = assignor.<span class="f">assign</span>(<span class="t">List</span>.<span class="f">copyOf</span>(members), partitionCount);      <span class="c">// immutable map, swapped in one write</span>
+		generation++;
+	}
+
+	<span class="k">long</span> <span class="f">committed</span>(<span class="k">int</span> p) { <span class="k">return</span> committed.<span class="f">getOrDefault</span>(p, <span class="m">0L</span>); }
+	<span class="k">void</span> <span class="f">commit</span>(<span class="k">int</span> p, <span class="k">long</span> next, <span class="k">int</span> gen) {
+		<span class="k">if</span> (gen != generation) <span class="k">throw new</span> <span class="t">RebalanceInProgressException</span>();              <span class="c">// a stale owner can't overwrite the new one</span>
+		committed.<span class="f">merge</span>(p, next, <span class="t">Math</span>::<span class="f">max</span>);                                      <span class="c">// offsets only move forward (seek is separate)</span>
+	}
+}</pre>
+  <p>When the consumer commits decides the delivery guarantee. <b>Process, then commit:</b> a crash between the two means the next owner re-reads those records, so each record is processed <b>at least once</b>, and handlers must be idempotent (<a href="25-resilience.html">Chapter 25</a>). <b>Commit, then process:</b> a crash loses the records, so <b>at most once</b>. Exactly-once processing needs the side effect and the offset to be stored atomically together, for example in the same database transaction, which is the outbox idea (<a href="27-domain-modeling.html">Chapter 27</a>) in reverse. <b>Replay</b> is <code>seek</code>: set the position back and reprocess, useful after fixing a bug in a consumer.</p>
+  <figure class="seq" data-actors="Publisher|Topic|Partition 1|Consumer A2|Group A">
+    <ol>
+      <li data-m="0>1">publish("orders", key "order-8412", OrderPaid)</li>
+      <li data-m="1>1">hash(key) mod 3 = 1</li>
+      <li data-m="1>2">append → offset 57</li>
+      <li data-m="1>0" data-k="reply">(partition 1, offset 57)</li>
+      <li data-m="3>2">read(from 57, max 50, wait 500 ms)</li>
+      <li data-m="2>3" data-k="reply">[57]</li>
+      <li data-m="3>3">handle OrderPaid (idempotent by order id)</li>
+      <li data-m="3>4">commit(partition 1, next 58, generation 7)</li>
+    </ol>
+    <figcaption><b>One message, end to end.</b> The publisher learns exactly where its message landed; the consumer commits only after the handler succeeds, so a crash before step 8 means a redelivery, not a loss.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Topic “orders”: 3 partitions, retention 10 per partition</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <button class="btn sm primary" id="psPub">＋ publish 5</button>
+        <button class="btn sm" id="psTick">▶ poll + commit once</button>
+        <button class="btn sm" id="psCrash">💥 A1 crashes before committing</button>
+        <button class="btn sm" id="psReset">↺</button>
+      </div>
+      <div class="controls"><span class="small muted">Group A (billing) consumers:</span><div class="seg" id="psN"><button data-v="1">1</button><button class="active" data-v="2">2</button><button data-v="3">3</button><button data-v="4">4</button></div><span class="small muted">Group B (analytics) is one slow consumer: 1 record per poll.</span></div>
+      <div class="ps-parts" id="psParts"></div>
+      <div class="ps-legend"><span style="--c:#6366f1">user-1</span><span style="--c:#10b981">user-2</span><span style="--c:#f59e0b">user-3</span><span style="--c:#ec4899">user-4</span><span style="--c:var(--accent)">A = group A's committed offset</span><span style="--c:var(--amber)">B = group B's</span></div>
+      <div class="stats" id="psStats"></div>
+      <div class="log" id="psLog" style="height:90px;margin-top:10px"></div>
+    </div>
+    <div class="panel-foot">Keys pick partitions with hash(key) mod 3 (here user-1 and user-4 share partition 0). Each A consumer reads up to 2 records per partition it owns per poll. Offsets never change; retention only moves the start of the log.</div>
+  </div>
+
+  <h2>Bounded queues and backpressure</h2>
+  <p>In the pull design, publishers never wait for consumers: the log absorbs the difference, and each group's <b>lag</b> (end offset minus committed offset) measures how far behind it is. Lag is the broker's key health metric. But memory is finite, so the log is bounded by <b>retention</b> (a count, a byte size or an age). If a group lags past retention, the records it hadn't read are gone: its next read throws <code>OffsetOutOfRangeException</code>, and the group needs a policy: reset to the earliest retained record (accept the loss, keep going) or to the latest (skip ahead), and alert either way.</p>
+  <p>Where you do need <b>backpressure</b> is inside a consumer that hands records to a worker pool: a consumer that polls faster than its workers finish must stop polling, or its in-memory queue grows without bound. The rule from <a href="23-producer-consumer.html">Chapter 23</a> applies: a bounded queue between the poller and the workers, and a poller that blocks (or pauses its partitions) when it's full. And an in-process broker that must never lose messages would add the opposite policy on publish: a maximum lag after which <code>publish</code> blocks or fails, making the slowest group slow down the producers. Both are legitimate; the design should make the choice explicit.</p>
+
+  <h2>Thread model</h2>
+  <p>Keep it as simple as the guarantees allow. Each <b>partition</b> has one lock: appends are serialised (they have to be, to assign offsets), and reads hold it briefly to copy a slice. Long polling uses the partition's <code>Condition</code>, so idle consumers sleep instead of spinning and wake as soon as a record arrives. Each <b>consumer</b> is used by one thread, like a Kafka consumer, so its positions need no locking. The <b>group</b> synchronizes membership changes and publishes each new assignment as an immutable map through a <code>volatile</code> field, with a generation number that stops a consumer that lost a partition in a rebalance from committing over the new owner.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Consumer thread loop</b> One thread per consumer; the consumer object isn't shared.</li>
+      <li><b>Refresh assignment</b> If the group's generation changed, drop positions for lost partitions and load committed offsets for new ones.</li>
+      <li><b>poll(maxWait)</b> Read from each owned partition; sleep on the condition if nothing is new.</li>
+      <li><b>Process the batch</b> Idempotent handler, per record, in offset order within each partition.</li>
+      <li data-k="decision"><b>All processed?</b> Commit the next offsets with the current generation.</li>
+      <li data-k="end"><b>Loop, or close()</b> Close leaves the group, triggering a rebalance so its partitions move.</li>
+    </ol>
+    <figcaption><b>The consumer loop.</b> At-least-once delivery comes from committing after processing, and correctness across rebalances from the generation check.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Kafka's model, in one JVM</div><p>Apache Kafka is built around exactly these ideas. A topic is split into partitions, each an ordered, append-only log; producers choose partitions by key hash by default, so ordering is guaranteed only within a partition. Consumers form consumer groups, each partition is consumed by at most one member of a group, and groups rebalance as members come and go. Committed offsets are themselves stored in an internal Kafka topic, <code>__consumer_offsets</code>, and retention is configured per topic by time or size. What Kafka adds on top of this chapter is what one JVM can't give you: partitions stored on disk in segment files, replicated across brokers, with leaders and followers.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Promising topic-wide ordering</b> while spreading work across partitions. Order is per key.</li>
+      <li><b>Committing before processing</b> without meaning to: silent message loss on a crash.</li>
+      <li><b>Non-idempotent handlers</b> under at-least-once delivery: duplicates after every rebalance.</li>
+      <li><b>More consumers than partitions,</b> expecting more throughput; the extras sit idle.</li>
+      <li><b>A per-subscriber unbounded queue</b> in a push design; one slow subscriber exhausts memory.</li>
+      <li><b>Mutable records</b> or shared byte arrays, so one consumer's changes appear in another's view.</li>
+      <li><b>Busy-polling</b> an empty partition in a loop instead of waiting on a condition.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How can two services both receive every message, while three instances of one service share the work?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Consumer groups. Each service is a group, and every group reads the whole topic independently from its own committed offsets, so both get every message. Within a group, the topic's partitions are divided among the instances, one owner per partition, so the three instances each process a share. Since the key decides the partition, all messages for one key go to the same instance, in order.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A consumer processes a batch, then its process is killed before it commits. Walk through what happens, and what the handler must guarantee.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The group notices the member is gone (a heartbeat timeout, or in-process a closed session) and rebalances, incrementing the generation. The partitions it owned are assigned to other members, which start from the last committed offsets, before the lost batch, so they process those records again. That's at-least-once delivery. If the dead consumer somehow comes back and tries to commit, its old generation is rejected. So the handler must be idempotent: for example, record processed message ids or use the business key (the order id) with an upsert or a unique constraint, so a second application is a no-op. If duplicates are unacceptable, store the effect and the offset in the same transaction.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A pull-based broker stores one append-only log per partition; each group tracks its own offsets.</li>
+      <li>Keys choose partitions, so ordering is per key; partitions are the unit of parallelism.</li>
+      <li>Within a group each partition has one owner; rebalances move ownership, and a generation check blocks stale commits.</li>
+      <li>Process then commit gives at-least-once delivery; handlers must be idempotent. Replay is a seek.</li>
+      <li>Slow groups show up as lag; retention bounds memory and defines when unread records are lost.</li>
+      <li>One lock and condition per partition, one thread per consumer, immutable assignments swapped atomically.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A topic has 4 partitions. What ordering does key-based partitioning guarantee?</p>
+      <div class="opts">
+        <button class="opt">All messages in the topic are processed in publish order</button>
+        <button class="opt">Messages with the same key are processed in the order they were published</button>
+        <button class="opt">No ordering at all</button>
+        <button class="opt">Messages are ordered by timestamp across partitions</button>
+      </div>
+      <div class="explain">Same key → same partition → one ordered log with one owner per group. Across partitions there's no ordering.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A group has 5 consumers reading a topic with 3 partitions. What happens?</p>
+      <div class="opts">
+        <button class="opt">Each partition is split between consumers</button>
+        <button class="opt">All 5 read every message</button>
+        <button class="opt">The broker creates 2 more partitions</button>
+        <button class="opt">3 consumers each own a partition; 2 sit idle as standbys</button>
+      </div>
+      <div class="explain">A partition has at most one owner per group, so parallelism within a group is capped by the partition count.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Which commit order gives at-least-once delivery?</p>
+      <div class="opts">
+        <button class="opt">Process the records, then commit the offsets</button>
+        <button class="opt">Commit the offsets, then process the records</button>
+        <button class="opt">Never commit</button>
+        <button class="opt">Commit before polling</button>
+      </div>
+      <div class="explain">If the consumer dies after processing but before committing, the records are processed again by the next owner: duplicates, but no loss.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Group B's committed offset on a partition is 40, but retention has trimmed the log so it now starts at 52. What happens on B's next read?</p>
+      <div class="opts">
+        <button class="opt">It reads offset 40 from a backup</button>
+        <button class="opt">The publisher is blocked until B catches up</button>
+        <button class="opt">An offset-out-of-range error; B must reset to the earliest (or latest) offset, and records 40–51 are lost to it</button>
+        <button class="opt">Offsets are renumbered so 52 becomes 40</button>
+      </div>
+      <div class="explain">Offsets are permanent positions. Once retention passes a lagging group, those records are gone for that group; lag monitoring exists to prevent this.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why does <code>commit</code> check the group's generation number?</p>
+      <div class="opts">
+        <button class="opt">To count how many commits happened</button>
+        <button class="opt">So a consumer that lost a partition in a rebalance can't overwrite the new owner's committed offset</button>
+        <button class="opt">To encrypt offsets</button>
+        <button class="opt">It isn't needed with ConcurrentHashMap</button>
+      </div>
+      <div class="explain">After a rebalance a slow, stale consumer might still try to commit. Rejecting commits from an old generation keeps ownership unambiguous.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  const P = 3, RET = 10, KEYS = ['user-1', 'user-2', 'user-3', 'user-4'], KP = { 'user-1': 0, 'user-2': 1, 'user-3': 2, 'user-4': 0 };
+  const COL = { 'user-1': '#6366f1', 'user-2': '#10b981', 'user-3': '#f59e0b', 'user-4': '#ec4899' };
+  let st, seed;
+  const log = $('#psLog');
+  function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+  function fresh() {
+    seed = 5; log.innerHTML = '';
+    st = { parts: Array.from({ length: P }, () => ({ start: 0, recs: [] })), n: 2, A: [0, 0, 0], B: [0, 0, 0], bNext: 0,
+      processedA: 0, dupA: 0, lostB: 0, uncommitted: null };
+    $$('#psN button').forEach((b) => b.classList.toggle('active', b.dataset.v === '2'));
+    draw();
+  }
+  const end = (p) => st.parts[p].start + st.parts[p].recs.length;
+  function owner(p) { return p % st.n; }
+  function publish() {
+    for (let i = 0; i < 5; i++) {
+      const key = KEYS[Math.floor(rnd() * 4)], p = KP[key], part = st.parts[p];
+      part.recs.push({ off: end(p), key });
+      if (part.recs.length > RET) { part.recs.shift(); part.start++; }
+    }
+    LLD.log(log, 'published 5 records; each went to hash(key) mod 3', '');
+    draw();
+  }
+  function checkB(p) { if (st.B[p] < st.parts[p].start) { const lost = st.parts[p].start - st.B[p]; st.lostB += lost; LLD.log(log, `B: offset ${st.B[p]} on P${p} was trimmed by retention → reset to earliest (${st.parts[p].start}); ${lost} records never seen`, 'bad'); st.B[p] = st.parts[p].start; } }
+  function readA(p) { const avail = end(p) - st.A[p]; return Math.min(2, Math.max(0, avail)); }
+  function tick() {
+    let a = 0;
+    for (let p = 0; p < P; p++) {
+      if (st.A[p] < st.parts[p].start) { LLD.log(log, `A: offset ${st.A[p]} on P${p} was trimmed by retention → reset to earliest; ${st.parts[p].start - st.A[p]} records lost to A`, "bad"); st.A[p] = st.parts[p].start; }
+      const k = readA(p); if (k) { st.A[p] += k; st.processedA += k; a += k; }
+    }
+    if (st.uncommitted) st.uncommitted = null;
+    for (let tries = 0; tries < P; tries++) {
+      const p = st.bNext; st.bNext = (st.bNext + 1) % P; checkB(p);
+      if (end(p) > st.B[p]) { st.B[p]++; break; }
+    }
+    LLD.log(log, a ? `A: ${Array.from({ length: P }, (_, p) => `A${owner(p) + 1}←P${p}`).join(', ')}; processed and committed ${a}` : 'A: nothing new to read', a ? 'ok' : '');
+    draw();
+  }
+  function crash() {
+    if (st.n === 1) { LLD.log(log, 'Group A needs at least 2 consumers for the crash demo', 'warn'); return; }
+    const mine = [...Array(P).keys()].filter((p) => owner(p) === 0);
+    let k = 0; mine.forEach((p) => { const r = readA(p); k += r; });
+    st.processedA += k; st.dupA += k;
+    LLD.log(log, `A1 read ${k} records from ${mine.map((p) => 'P' + p).join(', ')}, processed them, then crashed before commit()`, 'bad');
+    st.n -= 1;
+    $$('#psN button').forEach((b) => b.classList.toggle('active', +b.dataset.v === st.n));
+    LLD.log(log, `rebalance (generation +1): ${Array.from({ length: P }, (_, p) => `P${p}→A${owner(p) + 1}`).join(', ')}; new owners resume from committed offsets, so those ${k} will be processed again`, 'warn');
+    draw();
+  }
+  function draw() {
+    $('#psParts').innerHTML = st.parts.map((part, p) => {
+      const cells = part.recs.map((r) => {
+        const tags = `${st.A[p] === r.off ? '<b class="ps-a">A</b>' : ''}${st.B[p] === r.off ? '<b class="ps-b">B</b>' : ''}`;
+        return `<div class="ps-cell" style="background:${COL[r.key]}">${r.off}<small>${r.key.slice(5)}</small>${tags ? `<div class="ps-tags">${tags}</div>` : ''}</div>`;
+      }).join('');
+      const e = end(p), tail = `${st.A[p] >= e ? '<b class="ps-a">A</b>' : ''}${st.B[p] >= e ? '<b class="ps-b">B</b>' : ''}`;
+      return `<div class="ps-row"><div class="ps-lbl">P${p} → A${owner(p) + 1}<small>log ${part.start}–${e - 1 < part.start ? '∅' : e - 1}</small></div><div class="ps-log">${cells}<div class="ps-cell ps-gap">${e}${tail ? `<div class="ps-tags">${tail}</div>` : ''}</div></div></div>`;
+    }).join('');
+    const lagA = [...Array(P).keys()].reduce((s, p) => s + end(p) - Math.max(st.A[p], st.parts[p].start), 0);
+    const lagB = [...Array(P).keys()].reduce((s, p) => s + end(p) - Math.max(st.B[p], st.parts[p].start), 0);
+    const idle = Math.max(0, st.n - P);
+    $('#psStats').innerHTML = `
+      <div class="stat ${lagA > 6 ? 'warn' : 'good'}"><div class="k">Group A lag</div><div class="v">${lagA}</div></div>
+      <div class="stat ${lagB > 12 ? 'bad' : lagB > 6 ? 'warn' : ''}"><div class="k">Group B lag</div><div class="v">${lagB}</div></div>
+      <div class="stat ${st.dupA ? 'warn' : ''}"><div class="k">A: processed twice</div><div class="v">${st.dupA}</div></div>
+      <div class="stat ${st.lostB ? 'bad' : ''}"><div class="k">B: lost to retention</div><div class="v">${st.lostB}</div></div>
+      ${idle ? `<div class="stat warn"><div class="k">Idle A consumers</div><div class="v">${idle}</div></div>` : ''}`;
+  }
+  $('#psPub').onclick = publish;
+  $('#psTick').onclick = tick;
+  $('#psCrash').onclick = crash;
+  $('#psReset').onclick = fresh;
+  $$('#psN button').forEach((b) => b.addEventListener('click', () => { st.n = +b.dataset.v; LLD.log(log, `group A now has ${st.n} consumer${st.n > 1 ? 's' : ''}: rebalance → ${Array.from({ length: P }, (_, p) => `P${p}→A${owner(p) + 1}`).join(', ')}${st.n > P ? `; A${P + 1}${st.n > P + 1 ? '–A' + st.n : ''} idle (no partition left)` : ''}`, 'warn'); draw(); }));
+  fresh();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: LRU &amp; LFU Cache</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .lc-keys { display:flex; flex-wrap:wrap; gap:6px; }
+  .lc-keys button { font-family:var(--mono); min-width:36px; }
+  .lc-view { margin-top:12px; padding:14px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); min-height:96px; }
+  .lc-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:4px 0 18px; }
+  .lc-lbl { font-family:var(--mono); font-size:12px; color:var(--muted); min-width:92px; }
+  .lc-node { font-family:var(--mono); font-weight:700; font-size:15px; width:42px; height:38px; display:flex; align-items:center; justify-content:center; border-radius:9px; border:1.5px solid var(--border-strong); background:var(--surface); transition:all .25s; position:relative; }
+  .lc-node.lc-hit { border-color:var(--green); box-shadow:0 0 0 3px color-mix(in srgb, var(--green) 25%, transparent); }
+  .lc-node.lc-new { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .lc-node.lc-victim::after { content:"next out"; position:absolute; bottom:-17px; font-size:10px; font-weight:500; color:var(--red); white-space:nowrap; }
+  .lc-arrow { color:var(--muted); font-size:13px; }
+  .lc-end { font-size:11px; color:var(--muted); font-family:var(--mono); }
+  .lc-row.lc-min .lc-lbl { color:var(--red); }
+  .lc-trace { font-family:var(--mono); font-size:13px; margin-top:10px; display:flex; flex-wrap:wrap; gap:4px; }
+  .lc-trace span { padding:1px 6px; border-radius:5px; border:1px solid var(--border); }
+  .lc-trace span.lc-h { border-color:var(--green); color:var(--green); }
+  .lc-trace span.lc-m { border-color:var(--red); color:var(--red); }
+</style>
+</head>
+<body data-chapter="31">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 31</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Case Study: <span class="grad">LRU &amp; LFU Cache</span></h1>
+    <p class="lead">“Design an LRU cache” is the most common LLD warm-up, and it's a good one: it has a hard complexity requirement (O(1) get and put), a data-structure trick that satisfies it, a natural extension point (the eviction policy), and a concurrency twist that catches people out, because in an LRU cache even a read is a write. This case study goes through it the way the interview does: requirements, model, core code, the follow-up to LFU, and thread safety.</p>
+    <ul class="objectives">
+      <li>Pin down the cache's requirements and a small generic API</li>
+      <li>Build O(1) LRU from a hash map and a doubly linked list</li>
+      <li>Pull eviction out into a Strategy so LRU, LFU and FIFO are interchangeable</li>
+      <li>Implement O(1) LFU with frequency buckets, and know when it loses to LRU</li>
+      <li>Make the cache thread-safe, knowing why a read-write lock doesn't help</li>
+    </ul>
+  </section>
+
+  <div class="callout analogy">
+    <div class="ico">🏗️</div>
+    <div class="body"><div class="title">Same problem, different zoom</div>
+      The System Design course covers caching as architecture: where caches sit, invalidation, and distributed caches. This chapter zooms into the classes inside one in-process cache. See <a href="../system-design/06-caching.html">the high-level design</a>.
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Generics.</b> See <a href="p4-interfaces-generics.html">P4</a>.</li>
+        <li><b>Strategy.</b> See <a href="15-strategy.html">Chapter 15</a>.</li>
+        <li><b>Thread-safe class design.</b> See <a href="22-thread-safe-classes.html">Chapter 22</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Requirements and API</h2>
+  <p>Clarify the few things that change the design, and propose defaults for the rest: capacity is a <b>number of entries</b> (not bytes); <code>get</code> and <code>put</code> must be <b>O(1)</b>; when full, <code>put</code> evicts the least recently used entry; the <b>eviction policy should be swappable</b> (LFU is the likely follow-up); many threads will use it; null keys and values are rejected. Out of scope for now: expiry (TTL), loading on a miss, and statistics, which make good follow-ups.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Requirement</th><th>Design consequence</th></tr></thead>
+      <tbody>
+        <tr><td>O(1) lookup by key</td><td>A <code>HashMap</code> from key to entry</td></tr>
+        <tr><td>O(1) “which entry is least recently used?”</td><td>Entries kept in recency order, with O(1) move-to-front: a doubly linked list</td></tr>
+        <tr><td>Swappable eviction policy</td><td>An <code>EvictionPolicy</code> interface; the cache asks it for a victim (Strategy)</td></tr>
+        <tr><td>Many threads</td><td>A lock around every operation, including <code>get</code>, or a design that buffers access records</td></tr>
+        <tr><td>No nulls</td><td><code>get</code> returns <code>Optional</code>; <code>put</code> fails fast on null</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="k">public interface</span> <span class="t">Cache</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; {
+	<span class="t">Optional</span>&lt;<span class="t">V</span>&gt; <span class="f">get</span>(<span class="t">K</span> key);          <span class="c">// a hit also counts as a use</span>
+	<span class="k">void</span> <span class="f">put</span>(<span class="t">K</span> key, <span class="t">V</span> value);        <span class="c">// may evict one entry</span>
+	<span class="k">boolean</span> <span class="f">remove</span>(<span class="t">K</span> key);
+	<span class="k">int</span> <span class="f">size</span>();
+}</pre>
+
+  <h2>HashMap + doubly linked list</h2>
+  <p>A hash map alone finds entries in O(1) but has no order. A list alone keeps order but finds entries in O(n). Together they cover each other: the map goes from key to <b>list node</b>, and the list keeps nodes from most to least recently used. On a hit, the map gives you the node, and you unlink it and relink it at the front, both O(1) because the node knows its neighbours. The list has to be <b>doubly</b> linked: unlinking a node from a singly linked list needs its predecessor, which you'd have to search for. Two <b>sentinel</b> nodes at the head and tail mean there's always a neighbour, so no null checks for the first or last entry.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>put(k, v)</b> Look up k in the map.</li>
+      <li data-k="decision"><b>Already present?</b> Update the value and move its node to the front. Done.</li>
+      <li data-k="decision"><b>Full?</b> The node before the tail sentinel is the least recently used: unlink it and remove its key from the map.</li>
+      <li><b>Insert</b> Create a node, put it in the map, link it right after the head sentinel.</li>
+      <li data-k="end"><b>get(k)</b> Map lookup; on a hit, move the node to the front and return its value.</li>
+    </ol>
+    <figcaption><b>Every step is O(1).</b> The map finds, the list orders, and each node carries the key so eviction can clean up the map.</figcaption>
+  </figure>
+<pre class="code"><span class="k">public final class</span> <span class="t">LruCache</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; <span class="k">implements</span> <span class="t">Cache</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; {
+	<span class="k">private static final class</span> <span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; {
+		<span class="k">final</span> <span class="t">K</span> key; <span class="t">V</span> value; <span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; prev, next;
+		<span class="t">Node</span>(<span class="t">K</span> key, <span class="t">V</span> value) { <span class="k">this</span>.key = key; <span class="k">this</span>.value = value; }
+	}
+	<span class="k">private final int</span> capacity;
+	<span class="k">private final</span> <span class="t">Map</span>&lt;<span class="t">K</span>, <span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt;&gt; index = <span class="k">new</span> <span class="t">HashMap</span>&lt;&gt;();
+	<span class="k">private final</span> <span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; head = <span class="k">new</span> <span class="t">Node</span>&lt;&gt;(<span class="k">null</span>, <span class="k">null</span>), tail = <span class="k">new</span> <span class="t">Node</span>&lt;&gt;(<span class="k">null</span>, <span class="k">null</span>);   <span class="c">// sentinels</span>
+
+	<span class="k">public</span> <span class="f">LruCache</span>(<span class="k">int</span> capacity) {
+		<span class="k">if</span> (capacity &lt;= <span class="m">0</span>) <span class="k">throw new</span> <span class="t">IllegalArgumentException</span>(<span class="s">"capacity must be positive"</span>);
+		<span class="k">this</span>.capacity = capacity;
+		head.next = tail; tail.prev = head;
+	}
+
+	<span class="k">public</span> <span class="t">Optional</span>&lt;<span class="t">V</span>&gt; <span class="f">get</span>(<span class="t">K</span> key) {
+		<span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; n = index.<span class="f">get</span>(key);
+		<span class="k">if</span> (n == <span class="k">null</span>) <span class="k">return</span> <span class="t">Optional</span>.<span class="f">empty</span>();
+		<span class="f">moveToFront</span>(n);
+		<span class="k">return</span> <span class="t">Optional</span>.<span class="f">of</span>(n.value);
+	}
+
+	<span class="k">public void</span> <span class="f">put</span>(<span class="t">K</span> key, <span class="t">V</span> value) {
+		<span class="t">Objects</span>.<span class="f">requireNonNull</span>(key); <span class="t">Objects</span>.<span class="f">requireNonNull</span>(value);
+		<span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; n = index.<span class="f">get</span>(key);
+		<span class="k">if</span> (n != <span class="k">null</span>) { n.value = value; <span class="f">moveToFront</span>(n); <span class="k">return</span>; }
+		<span class="k">if</span> (index.<span class="f">size</span>() == capacity) {
+			<span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; lru = tail.prev;
+			<span class="f">unlink</span>(lru);
+			index.<span class="f">remove</span>(lru.key);                  <span class="c">// why the node stores its key</span>
+		}
+		n = <span class="k">new</span> <span class="t">Node</span>&lt;&gt;(key, value);
+		index.<span class="f">put</span>(key, n);
+		<span class="f">linkFront</span>(n);
+	}
+
+	<span class="k">private void</span> <span class="f">moveToFront</span>(<span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; n) { <span class="f">unlink</span>(n); <span class="f">linkFront</span>(n); }
+	<span class="k">private void</span> <span class="f">unlink</span>(<span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; n) { n.prev.next = n.next; n.next.prev = n.prev; }
+	<span class="k">private void</span> <span class="f">linkFront</span>(<span class="t">Node</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; n) { n.next = head.next; n.prev = head; head.next.prev = n; head.next = n; }
+	<span class="c">// remove(k): unlink + index.remove; size(): index.size()</span>
+}</pre>
+  <p>Worth saying in the interview: Java already ships this. <code>new LinkedHashMap&lt;&gt;(16, 0.75f, true)</code> keeps entries in <b>access order</b>, and overriding <code>removeEldestEntry</code> to return <code>size() &gt; capacity</code> turns it into an LRU cache in a few lines. Mention it, then build the explicit version, because the interviewer wants to see that you understand the structure, and because the next requirement needs it opened up.</p>
+
+  <h2>Eviction policy as Strategy</h2>
+  <p>The follow-up is almost always “now support LFU” (or FIFO, or “let callers choose”). If recency order is welded into the cache, that's a rewrite. Split the two jobs instead: the <b>cache</b> owns storage and capacity; an <b>eviction policy</b> watches accesses and names the victim when space is needed (<a href="15-strategy.html">Strategy</a>). The cache never knows which policy it has.</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">EvictionPolicy</span>&lt;<span class="t">K</span>&gt; {
+	<span class="k">void</span> <span class="f">recordInsert</span>(<span class="t">K</span> key);
+	<span class="k">void</span> <span class="f">recordAccess</span>(<span class="t">K</span> key);      <span class="c">// a hit, or an update of an existing key</span>
+	<span class="k">void</span> <span class="f">recordRemove</span>(<span class="t">K</span> key);
+	<span class="t">K</span> <span class="f">victim</span>();                     <span class="c">// the key to evict; only called when the cache is non-empty</span>
+}
+
+<span class="k">public final class</span> <span class="t">BoundedCache</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; <span class="k">implements</span> <span class="t">Cache</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; {
+	<span class="k">private final int</span> capacity;
+	<span class="k">private final</span> <span class="t">Map</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; values = <span class="k">new</span> <span class="t">HashMap</span>&lt;&gt;();
+	<span class="k">private final</span> <span class="t">EvictionPolicy</span>&lt;<span class="t">K</span>&gt; policy;               <span class="c">// injected</span>
+
+	<span class="k">public</span> <span class="t">Optional</span>&lt;<span class="t">V</span>&gt; <span class="f">get</span>(<span class="t">K</span> key) {
+		<span class="t">V</span> v = values.<span class="f">get</span>(key);
+		<span class="k">if</span> (v != <span class="k">null</span>) policy.<span class="f">recordAccess</span>(key);
+		<span class="k">return</span> <span class="t">Optional</span>.<span class="f">ofNullable</span>(v);
+	}
+
+	<span class="k">public void</span> <span class="f">put</span>(<span class="t">K</span> key, <span class="t">V</span> value) {
+		<span class="k">if</span> (values.<span class="f">containsKey</span>(key)) { values.<span class="f">put</span>(key, value); policy.<span class="f">recordAccess</span>(key); <span class="k">return</span>; }
+		<span class="k">if</span> (values.<span class="f">size</span>() == capacity) {
+			<span class="t">K</span> out = policy.<span class="f">victim</span>();
+			values.<span class="f">remove</span>(out);
+			policy.<span class="f">recordRemove</span>(out);
+		}
+		values.<span class="f">put</span>(key, value);
+		policy.<span class="f">recordInsert</span>(key);
+	}
+}
+
+<span class="k">public final class</span> <span class="t">LruPolicy</span>&lt;<span class="t">K</span>&gt; <span class="k">implements</span> <span class="t">EvictionPolicy</span>&lt;<span class="t">K</span>&gt; {
+	<span class="k">private final</span> <span class="t">LinkedHashSet</span>&lt;<span class="t">K</span>&gt; order = <span class="k">new</span> <span class="t">LinkedHashSet</span>&lt;&gt;();     <span class="c">// oldest use first</span>
+	<span class="k">public void</span> <span class="f">recordInsert</span>(<span class="t">K</span> k) { order.<span class="f">add</span>(k); }
+	<span class="k">public void</span> <span class="f">recordAccess</span>(<span class="t">K</span> k) { order.<span class="f">remove</span>(k); order.<span class="f">add</span>(k); }   <span class="c">// both O(1): re-append at the end</span>
+	<span class="k">public void</span> <span class="f">recordRemove</span>(<span class="t">K</span> k) { order.<span class="f">remove</span>(k); }
+	<span class="k">public</span> <span class="t">K</span> <span class="f">victim</span>() { <span class="k">return</span> order.<span class="f">iterator</span>().<span class="f">next</span>(); }
+}
+<span class="c">// FifoPolicy: identical, except recordAccess does nothing.</span></pre>
+  <p><code>LinkedHashSet</code> is a hash table threaded with a doubly linked list, the same structure as before, so removing a key and re-adding it at the end are both O(1). The policy stores only keys; the cache stores values. That costs a second hash lookup per operation compared with the fused <code>LruCache</code>, which is the price of pluggability, and a fair trade-off to state out loud.</p>
+  <figure class="seq" data-actors="Client|BoundedCache|values: HashMap|EvictionPolicy">
+    <ol>
+      <li data-m="0>1">put("D", d)  (cache full: A, B, C)</li>
+      <li data-m="1>2">containsKey(D)? no; size == capacity</li>
+      <li data-m="1>3">victim()</li>
+      <li data-m="3>1" data-k="reply">"B"  (least recently used)</li>
+      <li data-m="1>2">remove(B)</li>
+      <li data-m="1>3">recordRemove(B)</li>
+      <li data-m="1>2">put(D, d)</li>
+      <li data-m="1>3">recordInsert(D)</li>
+    </ol>
+    <figcaption><b>A put that evicts.</b> The cache decides <i>when</i> to evict (it's full); the policy decides <i>what</i>. Swap the policy object and the same sequence evicts by frequency instead.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Cache lab: capacity 3, one policy at a time</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="lcPol"><button class="active" data-v="lru">LRU</button><button data-v="lfu">LFU</button><button data-v="fifo">FIFO</button></div>
+        <button class="btn sm" id="lcScan">▶ trace: hot keys + a scan</button>
+        <button class="btn sm" id="lcShift">▶ trace: hot set shifts</button>
+        <button class="btn sm" id="lcReset">↺</button>
+      </div>
+      <div class="controls"><span class="small muted">Read key (get; on a miss, load and put):</span><div class="lc-keys" id="lcKeys"></div></div>
+      <div class="lc-view" id="lcView"></div>
+      <div class="lc-trace" id="lcTrace"></div>
+      <div class="stats" id="lcStats"></div>
+      <div class="log" id="lcLog" style="height:70px;margin-top:10px"></div>
+    </div>
+    <div class="panel-foot">The “same history” numbers replay every read so far through all three policies, so you can compare them on identical traffic.</div>
+  </div>
+
+  <h2>LFU with frequency buckets</h2>
+  <p>LFU evicts the key used <b>least often</b>, breaking ties by recency. A heap ordered by count would make every access O(log n). The O(1) version, described by Shah, Mitra and Matani in 2010, groups keys into <b>buckets by frequency</b> and remembers the smallest non-empty frequency. An access moves a key from bucket <i>f</i> to bucket <i>f + 1</i>; the victim is the oldest key in the minimum bucket; a new key always starts at frequency 1, which resets the minimum.</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">LfuPolicy</span>&lt;<span class="t">K</span>&gt; <span class="k">implements</span> <span class="t">EvictionPolicy</span>&lt;<span class="t">K</span>&gt; {
+	<span class="k">private final</span> <span class="t">Map</span>&lt;<span class="t">K</span>, <span class="t">Integer</span>&gt; freq = <span class="k">new</span> <span class="t">HashMap</span>&lt;&gt;();
+	<span class="k">private final</span> <span class="t">Map</span>&lt;<span class="t">Integer</span>, <span class="t">LinkedHashSet</span>&lt;<span class="t">K</span>&gt;&gt; buckets = <span class="k">new</span> <span class="t">HashMap</span>&lt;&gt;();   <span class="c">// each bucket in recency order</span>
+	<span class="k">private int</span> minFreq;
+
+	<span class="k">public void</span> <span class="f">recordInsert</span>(<span class="t">K</span> k) { freq.<span class="f">put</span>(k, <span class="m">1</span>); <span class="f">bucket</span>(<span class="m">1</span>).<span class="f">add</span>(k); minFreq = <span class="m">1</span>; }
+
+	<span class="k">public void</span> <span class="f">recordAccess</span>(<span class="t">K</span> k) {
+		<span class="k">int</span> f = freq.<span class="f">get</span>(k);
+		<span class="f">leave</span>(k, f);
+		<span class="k">if</span> (!buckets.<span class="f">containsKey</span>(f) &amp;&amp; minFreq == f) minFreq = f + <span class="m">1</span>;   <span class="c">// emptied the minimum bucket</span>
+		freq.<span class="f">put</span>(k, f + <span class="m">1</span>);
+		<span class="f">bucket</span>(f + <span class="m">1</span>).<span class="f">add</span>(k);
+	}
+
+	<span class="k">public void</span> <span class="f">recordRemove</span>(<span class="t">K</span> k) {
+		<span class="k">int</span> f = freq.<span class="f">remove</span>(k);
+		<span class="f">leave</span>(k, f);
+		<span class="k">if</span> (f == minFreq &amp;&amp; !buckets.<span class="f">containsKey</span>(f) &amp;&amp; !buckets.<span class="f">isEmpty</span>())
+			minFreq = <span class="t">Collections</span>.<span class="f">min</span>(buckets.<span class="f">keySet</span>());   <span class="c">// only on explicit remove(); an eviction is always followed by an insert</span>
+	}
+
+	<span class="k">public</span> <span class="t">K</span> <span class="f">victim</span>() { <span class="k">return</span> buckets.<span class="f">get</span>(minFreq).<span class="f">iterator</span>().<span class="f">next</span>(); }   <span class="c">// least frequent, oldest among ties</span>
+
+	<span class="k">private void</span> <span class="f">leave</span>(<span class="t">K</span> k, <span class="k">int</span> f) { <span class="t">LinkedHashSet</span>&lt;<span class="t">K</span>&gt; b = buckets.<span class="f">get</span>(f); b.<span class="f">remove</span>(k); <span class="k">if</span> (b.<span class="f">isEmpty</span>()) buckets.<span class="f">remove</span>(f); }
+	<span class="k">private</span> <span class="t">LinkedHashSet</span>&lt;<span class="t">K</span>&gt; <span class="f">bucket</span>(<span class="k">int</span> f) { <span class="k">return</span> buckets.<span class="f">computeIfAbsent</span>(f, x -&gt; <span class="k">new</span> <span class="t">LinkedHashSet</span>&lt;&gt;()); }
+}</pre>
+  <p>Which is better depends on the traffic, and the lab above shows both sides. LFU protects genuinely popular keys from a one-off scan (a report reading every row once flushes an LRU cache). But LFU has long memory: keys that were popular yesterday keep high counts and squat in the cache while today's hot keys evict each other. Real LFU implementations therefore <b>age</b> counts, halving them periodically or decaying them over time, and modern caches combine both ideas.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Policy</th><th>Evicts</th><th>Good at</th><th>Bad at</th></tr></thead>
+      <tbody>
+        <tr><td>LRU</td><td>Least recently used</td><td>Recency-heavy traffic; shifting hot sets</td><td>One-off scans flush the cache</td></tr>
+        <tr><td>LFU</td><td>Least frequently used (ties by recency)</td><td>Stable popularity; resisting scans</td><td>Stale popular keys without aging</td></tr>
+        <tr><td>FIFO</td><td>Oldest inserted</td><td>Simplicity; no work on hits (easy to make concurrent)</td><td>Evicts hot keys just for being old</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Making it thread-safe</h2>
+  <p>The trap: <code>get</code> looks like a read, so a <code>ReadWriteLock</code> seems natural. But every hit <b>changes the recency list</b> (or the frequency buckets), so two concurrent “reads” race on the same pointers and can corrupt the list. Every operation needs exclusive access. The simplest correct answer is a lock around the whole cache, most cleanly as a decorator (<a href="13-decorator-proxy.html">Chapter 13</a>) so the single-threaded class stays simple and testable:</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">SynchronizedCache</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; <span class="k">implements</span> <span class="t">Cache</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; {
+	<span class="k">private final</span> <span class="t">Cache</span>&lt;<span class="t">K</span>, <span class="t">V</span>&gt; inner;
+	<span class="k">private final</span> <span class="t">ReentrantLock</span> lock = <span class="k">new</span> <span class="t">ReentrantLock</span>();
+
+	<span class="k">public</span> <span class="t">Optional</span>&lt;<span class="t">V</span>&gt; <span class="f">get</span>(<span class="t">K</span> key) { lock.<span class="f">lock</span>(); <span class="k">try</span> { <span class="k">return</span> inner.<span class="f">get</span>(key); } <span class="k">finally</span> { lock.<span class="f">unlock</span>(); } }   <span class="c">// yes, get too</span>
+	<span class="k">public void</span> <span class="f">put</span>(<span class="t">K</span> key, <span class="t">V</span> value) { lock.<span class="f">lock</span>(); <span class="k">try</span> { inner.<span class="f">put</span>(key, value); } <span class="k">finally</span> { lock.<span class="f">unlock</span>(); } }
+	<span class="c">// remove, size: same pattern</span>
+}</pre>
+  <p>One lock is correct and fast enough for many services, since each operation is a few pointer updates. When it becomes a bottleneck, there are two classic next steps. <b>Lock striping:</b> split the cache into N segments by key hash, each an independent LRU with its own lock; contention drops by roughly N, at the cost of eviction being LRU per segment rather than globally. <b>Buffered access records:</b> serve reads from a concurrent hash map without locking, append “key was read” to a buffer, and replay the buffer into the policy in batches under a lock; recency becomes slightly delayed, which barely matters for hit rate.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">How production caches bend the textbook</div><p><b>Caffeine</b>, the widely used Java caching library, uses the buffered approach: reads hit a concurrent hash map, and access events go into striped ring buffers that are drained into the eviction policy under a lock, so reads rarely contend. Its policy, W-TinyLFU, pairs a small LRU window with a frequency-based main area and admits a new key only if an approximate frequency sketch says it's more popular than the would-be victim, combining LRU's responsiveness with LFU's scan resistance. <b>Redis</b>, with <code>maxmemory</code> set, offers LRU and LFU eviction policies (<code>allkeys-lru</code>, <code>allkeys-lfu</code> and others), but approximates both by sampling a handful of keys and evicting the best candidate among them, rather than maintaining an exact list; its LFU uses a small probabilistic counter per key that decays over time. Exact O(1) structures are the right interview answer; approximations are what scale buys you.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>A singly linked list,</b> or an <code>ArrayList</code> for order: removal becomes O(n).</li>
+      <li><b>Forgetting to store the key in the node,</b> so eviction can't remove the map entry and the map leaks.</li>
+      <li><b>Updating an existing key without moving it,</b> or treating an update as an insert and evicting unnecessarily.</li>
+      <li><b>A read-write lock</b> with <code>get</code> under the read lock: concurrent hits corrupt the list.</li>
+      <li><b>Welding recency into the cache</b> so LFU needs a rewrite. Keep eviction behind an interface.</li>
+      <li><b>LFU without tie-breaking or aging,</b> so eviction order is arbitrary and old favourites never leave.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you get O(1) get and put in an LRU cache?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A hash map from key to a node in a doubly linked list ordered by recency. <code>get</code> finds the node through the map and moves it to the front, which is O(1) because the node has prev and next pointers. <code>put</code> either updates and moves an existing node, or, if full, removes the node before the tail sentinel, deletes its key from the map (the node stores the key for this), and inserts the new node at the front. Sentinels remove edge cases. In Java, <code>LinkedHashMap</code> in access order with <code>removeEldestEntry</code> gives the same thing.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Now add a loader: <code>get(key, loader)</code> computes missing values, and 200 threads miss the same key at once. What happens, and how do you fix it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Naively all 200 threads miss, all call the loader, and the database gets 200 identical queries: a cache stampede. Fix it by caching the in-flight computation, not just the result: keep a <code>ConcurrentHashMap&lt;K, CompletableFuture&lt;V&gt;&gt;</code> of pending loads, and use <code>computeIfAbsent</code> so exactly one thread creates the future and runs the loader while the others wait on the same future. When it completes, store the value in the cache and remove the pending entry; if it fails, remove the pending entry so a later call retries, rather than caching the failure forever. The loader runs outside the cache's lock, so a slow database doesn't block hits on other keys. This is what Caffeine's <code>LoadingCache</code> does.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>O(1) LRU = hash map to nodes + doubly linked list in recency order, with sentinels, and keys stored in nodes.</li>
+      <li><code>LinkedHashMap</code> in access order is the built-in version; build the explicit one in the interview.</li>
+      <li>Split storage from eviction: <code>BoundedCache</code> plus an <code>EvictionPolicy</code> strategy makes LRU, LFU and FIFO interchangeable.</li>
+      <li>O(1) LFU uses frequency buckets and a minimum-frequency pointer; it resists scans but needs aging.</li>
+      <li>In LRU even <code>get</code> mutates state, so every operation needs the lock; a read-write lock doesn't help.</li>
+      <li>Beyond one lock: striping by key, or buffering access records as production caches do.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why must the LRU list be doubly linked?</p>
+      <div class="opts">
+        <button class="opt">To iterate in both directions for debugging</button>
+        <button class="opt">Because <code>HashMap</code> requires it</button>
+        <button class="opt">So a node found through the map can be unlinked in O(1) without searching for its predecessor</button>
+        <button class="opt">To use less memory</button>
+      </div>
+      <div class="explain">Unlinking needs the previous node. With a prev pointer that's O(1); in a singly linked list it's a search.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why does each list node store its key as well as its value?</p>
+      <div class="opts">
+        <button class="opt">So evicting the tail node can also remove its entry from the map</button>
+        <button class="opt">So nodes can be sorted</button>
+        <button class="opt">For <code>equals</code> and <code>hashCode</code></button>
+        <button class="opt">It doesn't need to</button>
+      </div>
+      <div class="explain">Eviction starts from the list, not the map. Without the key, the map entry for the evicted node would leak.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why doesn't a <code>ReadWriteLock</code>, with <code>get</code> under the read lock, make an LRU cache thread-safe?</p>
+      <div class="opts">
+        <button class="opt">Read locks are slower than exclusive locks</button>
+        <button class="opt">Java's read locks don't allow <code>Optional</code> returns</button>
+        <button class="opt">It is thread-safe; that's the standard design</button>
+        <button class="opt">A hit moves the node in the recency list, so concurrent “reads” mutate shared pointers</button>
+      </div>
+      <div class="explain">In LRU, get is a write to the ordering. Every operation needs exclusive access, or reads must be recorded and applied later under a lock.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A nightly report reads every product once. Which policy best protects the cache's usual hot keys?</p>
+      <div class="opts">
+        <button class="opt">LRU</button>
+        <button class="opt">LFU: the scanned keys each have frequency 1 and are evicted before popular keys</button>
+        <button class="opt">FIFO</button>
+        <button class="opt">None; all policies behave the same on scans</button>
+      </div>
+      <div class="explain">A scan makes every scanned key “most recently used”, flushing LRU. LFU sees each scanned key used once and keeps the frequently used ones.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In the Strategy-based design, what does <code>BoundedCache</code> decide, and what does the <code>EvictionPolicy</code> decide?</p>
+      <div class="opts">
+        <button class="opt">The cache decides which key to evict; the policy decides when</button>
+        <button class="opt">The policy stores the values; the cache stores the keys</button>
+        <button class="opt">The cache decides when to evict (it's full); the policy decides which key</button>
+        <button class="opt">Both decide together through a shared lock</button>
+      </div>
+      <div class="explain">Storage and capacity belong to the cache; ordering and victim choice belong to the policy. Swapping policies never touches the cache.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, sleep } = LLD;
+  const CAP = 3, KEYS = 'ABCDEFGH'.split('');
+  const TRACES = { scan: 'A B A B A B C D E F G H A B A B'.split(' '), shift: 'A B C A B C A B C D E F D E F D E F D E F'.split(' ') };
+  let pol = 'lru', busy = false, hist = [], st, flash = {};
+  const log = $('#lcLog');
+  function fresh(kind) { return { kind, keys: [], freq: {}, last: {}, tick: 0, hits: 0, misses: 0 }; }
+  function victim(s) {
+    if (s.kind === 'lfu') return [...s.keys].sort((a, b) => s.freq[a] - s.freq[b] || s.last[a] - s.last[b])[0];
+    return s.keys[0];   // lru: keys kept oldest-use first; fifo: oldest insert first
+  }
+  function access(s, k) {
+    s.tick++;
+    if (s.keys.includes(k)) {
+      s.hits++;
+      if (s.kind === 'lru') { s.keys = s.keys.filter((x) => x !== k); s.keys.push(k); }
+      if (s.kind === 'lfu') { s.freq[k]++; s.last[k] = s.tick; }
+      return { hit: true };
+    }
+    s.misses++;
+    let ev = null;
+    if (s.keys.length === CAP) { ev = victim(s); s.keys = s.keys.filter((x) => x !== ev); delete s.freq[ev]; }
+    s.keys.push(k); s.freq[k] = 1; s.last[k] = s.tick;
+    return { hit: false, ev };
+  }
+  function node(k, cls) { return `<div class="lc-node ${cls || ''}">${k}</div>`; }
+  function draw() {
+    const v = st.keys.length === CAP ? victim(st) : null, fl = (k) => (flash[k] || '') + (k === v ? ' lc-victim' : '');
+    let html = '';
+    if (!st.keys.length) html = '<span class="small muted">Empty. Read a key, or play a trace.</span>';
+    else if (pol === 'lfu') {
+      const fs = [...new Set(st.keys.map((k) => st.freq[k]))].sort((a, b) => a - b);
+      html = fs.map((f, i) => `<div class="lc-row${i === 0 ? ' lc-min' : ''}"><span class="lc-lbl">freq ${f}${i === 0 ? ' (min)' : ''}</span>${st.keys.filter((k) => st.freq[k] === f).sort((a, b) => st.last[a] - st.last[b]).map((k) => node(k, fl(k))).join('<span class="lc-arrow">→</span>')}</div>`).join('');
+    } else {
+      const ordered = [...st.keys].reverse();
+      html = `<div class="lc-row"><span class="lc-lbl">${pol === 'lru' ? 'MRU (head)' : 'newest'}</span>${ordered.map((k) => node(k, fl(k))).join('<span class="lc-arrow">⇄</span>')}<span class="lc-end">${pol === 'lru' ? '(tail) LRU' : 'oldest'}</span></div>`;
+    }
+    $('#lcView').innerHTML = html;
+    $('#lcTrace').innerHTML = hist.map((h) => `<span class="${h.hit ? 'lc-h' : 'lc-m'}">${h.k}</span>`).join('');
+    const same = ['lru', 'lfu', 'fifo'].map((kind) => { const s = fresh(kind); hist.forEach((h) => access(s, h.k)); return `${kind.toUpperCase()} ${s.hits}`; });
+    $('#lcStats').innerHTML = `
+      <div class="stat good"><div class="k">Hits</div><div class="v">${st.hits}</div></div>
+      <div class="stat bad"><div class="k">Misses (loads)</div><div class="v">${st.misses}</div></div>
+      <div class="stat"><div class="k">Hit rate</div><div class="v">${hist.length ? Math.round(st.hits / hist.length * 100) : 0}<small>%</small></div></div>
+      <div class="stat"><div class="k">Same history: hits</div><div class="v" style="font-size:14px">${hist.length ? same.join(' · ') : '–'}</div></div>`;
+  }
+  function read(k) {
+    const r = access(st, k); hist.push({ k, hit: r.hit }); flash = { [k]: r.hit ? 'lc-hit' : 'lc-new' };
+    LLD.log(log, r.hit ? `get(${k}) → hit${pol === 'lfu' ? `, freq now ${st.freq[k]}` : pol === 'lru' ? ', moved to head' : ''}` : `get(${k}) → miss, load${r.ev ? `, evict ${r.ev}` : ''}, put(${k})`, r.hit ? 'ok' : 'bad');
+    draw();
+  }
+  function reset() { st = fresh(pol); hist = []; flash = {}; log.innerHTML = ''; draw(); }
+  function replayAs(kind) { pol = kind; const h = hist; st = fresh(kind); hist = []; flash = {}; h.forEach((x) => { const r = access(st, x.k); hist.push({ k: x.k, hit: r.hit }); }); draw(); }
+  async function play(t) { if (busy) return; busy = true; reset(); for (const k of TRACES[t]) { read(k); await sleep(260); } busy = false; }
+  $('#lcKeys').innerHTML = KEYS.map((k) => `<button class="btn sm" data-k="${k}">${k}</button>`).join('');
+  $$('#lcKeys button').forEach((b) => b.addEventListener('click', () => { if (!busy) read(b.dataset.k); }));
+  $$('#lcPol button').forEach((b) => b.addEventListener('click', () => { if (busy) return; replayAs(b.dataset.v); LLD.log(log, `switched to ${b.dataset.v.toUpperCase()}: replayed the same ${hist.length} reads`, 'warn'); }));
+  $('#lcScan').onclick = () => play('scan');
+  $('#lcShift').onclick = () => play('shift');
+  $('#lcReset').onclick = () => { if (!busy) reset(); };
+  reset();
+})();
+</script>
+</body>
+</html>
