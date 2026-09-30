@@ -53,7 +53,8 @@ window.addEventListener('load', function () { whenIndexed(function () {
   var chip = function (ch) { var cs = getComputedStyle(ch);
     return { id: ch.dataset.course, link: ch.tagName === 'A', soon: ch.classList.contains('soon'),
     opt: ch.classList.contains('opt'), done: ch.classList.contains('done'),
-    fg: cs.color, k1: cs.getPropertyValue('--k1').trim(), k2: cs.getPropertyValue('--k2').trim() }; };
+    fg: cs.color, k1: cs.getPropertyValue('--k1').trim(), k2: cs.getPropertyValue('--k2').trim(),
+    text: ch.textContent.replace(/[ \\t\\n]+/g, ' ').trim() }; };
   var grid = document.getElementById('pathGrid');
   var devops = document.querySelector('#courseGrid [data-course="cloud-devops"]');
   var s = {
@@ -68,6 +69,8 @@ window.addEventListener('load', function () { whenIndexed(function () {
     devopsK1: devops ? getComputedStyle(devops).getPropertyValue('--k1').trim() : '',
     scrollW: document.documentElement.scrollWidth, innerW: window.innerWidth,
     theme: document.documentElement.getAttribute('data-theme'),
+    lead: ((document.getElementById('leadCount') || {}).textContent || '').trim(),
+    stats: q('#stats .stat').map(function (x) { return q('b, span', x).map(function (e) { return e.textContent; }).join(' '); }),
   };
   var pre = document.createElement('pre'); pre.id = 'hub-probe'; pre.hidden = true; pre.textContent = JSON.stringify(s);
   document.body.appendChild(pre);
@@ -100,6 +103,8 @@ try {
 } finally {
   fs.rmSync(tmp, { force: true });
   fs.rmSync(frameFile, { force: true });
+  // Chrome can hold the profile for a moment after exiting; retry, then give up quietly.
+  try { fs.rmSync(userDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch (e) {}
 }
 
 const m = dom.match(/<pre id="hub-probe"[^>]*>([\s\S]*?)<\/pre>/);
@@ -156,6 +161,18 @@ function checks(s) {
   const weak = s.featured.filter((c) => !c.opt).map((c) => [c.id, Math.min(contrast(c.fg, c.k1), contrast(c.fg, c.k2))])
     .filter(([, r]) => r < MIN).map(([id, r]) => id + ' ' + r.toFixed(2));
   check('path chip text contrast ≥ ' + MIN + ':1 (' + THEME + ')', weak.length === 0, weak);
+
+  // Chip states must be in the text, not only in fading and dashes, so screen readers announce them.
+  const F = Object.fromEntries(s.featured.map((c) => [c.id, c.text]));
+  check('unreleased chips say "coming soon"', /\(coming soon\)/.test(F.os || ''), F.os);
+  check('completed chips say "complete"', /\(complete\)/.test(F.lld || ''), F.lld);
+  const dist = P.interview && P.interview.chips.find((c) => c.id === 'distributed-systems');
+  check('optional chips say "optional"', dist && /\(optional/.test(dist.text), dist && dist.text);
+
+  console.log('copy');
+  // Derived from the registry, so releasing a course (removing `soon`) updates it.
+  check('hero lead counts courses from the registry', s.lead === 'Nine courses, four out now and five on the way,', s.lead);
+  check('stats show released and upcoming courses', s.stats[0] === '4 courses' && s.stats[1] === '5 on the way', s.stats);
 }
 
 function rgb(c) {

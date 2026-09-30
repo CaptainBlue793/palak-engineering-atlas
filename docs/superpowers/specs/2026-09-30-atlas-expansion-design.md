@@ -55,9 +55,12 @@ Light-mode first colours are dark enough for link text on white; ML's teal is ke
 | Distributed Systems | purple → pink | `#9333ea` · `#db2777` | `#c084fc` · `#f472b6` | new |
 | Cloud & DevOps | slate → orange | `#334155` · `#ea580c` | `#94a3b8` · `#fb923c` | new |
 
-In each course's `assets/style.css`: `--accent` = c1, `--accent-2` = c2 (and their `-soft`
-rgba variants at the same alpha the file already uses), for both themes. In `assets/atlas.js`:
-`c1`/`c2` = the light values.
+For the **five new courses**, each course's `assets/style.css` sets `--accent` = c1 and
+`--accent-2` = c2 (light), and `--accent` = d1, `--accent-2` = d2 (both dark blocks), with their
+`-soft` rgba variants at the alpha the file already uses. For the **existing courses** only
+`--accent-2` changes (System Design, DSA, LLD); their `--accent` keeps its current value, which
+may differ slightly from the hub's `c1`/`d1` (e.g. DSA `#b5179e`). In `assets/atlas.js`: `c1`/`c2`
+are the light values and `d1`/`d2` the dark values; `tools/palette-check.cjs` checks each course.
 
 ## 4. Learning paths
 

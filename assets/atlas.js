@@ -513,13 +513,25 @@
     var hours = LIVE.reduce(function (s, c) { return s + c.hours; }, 0);
     $('#stats').innerHTML = [
       [LIVE.length, 'courses'],
-      [SOON.length, 'on the way'],
+      SOON.length ? [SOON.length, 'on the way'] : null,
       [total, 'chapters'],
       [LIVE.reduce(function (s, c) { return s + preCount(c); }, 0), 'prerequisites'],
       ['~' + hours, 'hours'],
-    ].map(function (s) { return '<div class="stat"><b>' + s[0] + '</b><span>' + s[1] + '</span></div>'; }).join('');
+    ].filter(Boolean).map(function (s) { return '<div class="stat"><b>' + s[0] + '</b><span>' + s[1] + '</span></div>'; }).join('');
 
+    renderLead();
     renderPaths();
+  }
+
+  /* "Nine courses, four out now and five on the way," from the registry, so releasing a
+     course (removing `soon`) needs no copy change. */
+  function renderLead() {
+    var el = $('#leadCount'); if (!el) return;
+    var W = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve'];
+    var w = function (n) { return W[n] || String(n); };
+    var all = w(COURSES.length);
+    el.textContent = all.charAt(0).toUpperCase() + all.slice(1) + ' courses' +
+      (SOON.length ? ', ' + w(LIVE.length) + ' out now and ' + w(SOON.length) + ' on the way,' : ',');
   }
 
   /* ---------------------------------------------------------
@@ -535,7 +547,10 @@
     var done = !c.soon && isComplete(c);
     var cls = 'pchip tint' + (optional ? ' opt' : '') + (c.soon ? ' soon' : '') + (done ? ' done' : '');
     var attrs = ' class="' + cls + '" data-course="' + c.id + '" style="' + tintVars(c) + '"';
-    var label = esc(c.short || c.title) + (done ? ' ✓' : '');
+    // Fading, dashes and the tick are visual only; screen readers get the same states as words.
+    var states = [optional && 'optional', c.soon && 'coming soon', done && 'complete'].filter(Boolean);
+    var label = esc(c.short || c.title) + (done ? '<span aria-hidden="true"> ✓</span>' : '') +
+      (states.length ? '<span class="sr-only"> (' + states.join(', ') + ')</span>' : '');
     return c.soon
       ? '<span' + attrs + ' title="' + esc(c.title) + ' (coming soon)">' + label + '</span>'
       : '<a' + attrs + ' href="' + url(c, 'index.html') + '" title="' + esc(c.title) + '">' + label + '</a>';
