@@ -6,34 +6,382 @@
 <title>Case Study: Elevator System</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .el-wrap { display:grid; grid-template-columns: minmax(0, 1fr) 260px; gap:12px; margin-top:12px; }
+  @media (max-width: 760px) { .el-wrap { grid-template-columns: 1fr; } }
+  .el-bld { border-radius:12px; background:var(--surface-2); border:1px solid var(--border); padding:8px 10px; }
+  .el-floor { display:grid; grid-template-columns: 34px 1fr 1fr 90px; gap:6px; align-items:center; height:28px; border-bottom:1px dashed var(--border); font-family:var(--mono); font-size:12px; }
+  .el-floor:last-child { border-bottom:0; }
+  .el-num { color:var(--muted); text-align:right; }
+  .el-shaft { height:22px; border-left:1px solid var(--border); border-right:1px solid var(--border); position:relative; }
+  .el-car { position:absolute; inset:1px 6px; border-radius:5px; background:var(--accent); color:#fff; font-weight:700; font-size:11px; display:flex; align-items:center; justify-content:center; gap:3px; }
+  .el-car.el-open { background:var(--green); }
+  .el-stop { position:absolute; left:50%; top:50%; width:6px; height:6px; margin:-3px; border-radius:50%; background:var(--amber); }
+  .el-wait { color:var(--amber); white-space:nowrap; overflow:hidden; }
+  .el-side { display:flex; flex-direction:column; gap:10px; }
+</style>
 </head>
 <body data-chapter="41">
-<!-- lld:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 41</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 50 min</span></div>
     <h1>Case Study: <span class="grad">Elevator System</span></h1>
-    <p class="lead">Car state machines, SCAN/LOOK dispatch as a strategy, and a live simulator of requests.</p>
+    <p class="lead">An elevator bank looks like a scheduling puzzle, and it is one, but the LLD interview is really checking two design skills. First, can you model each car as a small state machine with clear transitions, so doors never open while moving and a car in maintenance never gets calls? Second, can you separate the two decisions, <b>which car</b> answers a hall call and <b>in what order</b> a car visits its stops, into strategies you can compare? The simulator below runs a 10-floor, 2-car building with three algorithms on the same passengers.</p>
+    <ul class="objectives">
+      <li>Separate hall calls, car calls, cars, and the controller that assigns work</li>
+      <li>Model a car as a state machine driven by a tick</li>
+      <li>Order a car's stops with LOOK using two sorted sets</li>
+      <li>Make dispatch a strategy, from nearest car to an ETA cost function</li>
+      <li>Drive the whole system from a simulation loop with an injectable clock</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>State machines.</b> See <a href="18-state.html">Chapter 18</a>.</li>
+        <li><b>Strategy.</b> See <a href="15-strategy.html">Chapter 15</a>.</li>
+        <li><b>Sorted sets and navigation methods.</b> <code>TreeSet.ceiling</code> and <code>floor</code>, from <a href="p4-interfaces-generics.html">P4</a>'s collections.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Requirements and API</li>
-    <li>Elevator car as a State machine</li>
-    <li>Dispatch strategies: nearest car, SCAN, LOOK</li>
-    <li>Request queues</li>
-    <li>Simulation loop</li>
-  </ol>
+  <h2>Requirements and API</h2>
+  <p>Clarify: F floors and N cars; a <b>hall call</b> is a button pressed on a floor, with a direction (“I'm on 3 and want to go up”); a <b>car call</b> is a floor button pressed inside a car; each car has doors that stay open for a few seconds per stop; a car can be taken out of service; the goal is short waits without starving anyone. Out of scope for the base design: weight limits, fire mode and VIP priority, which make good follow-ups because the state machine absorbs them.</p>
+<pre class="code"><span class="k">public enum</span> <span class="t">Direction</span> { UP, DOWN, IDLE }
+<span class="k">public record</span> <span class="t">HallCall</span>(<span class="k">int</span> floor, <span class="t">Direction</span> direction) {}      <span class="c">// pressed on a landing</span>
+
+<span class="k">public interface</span> <span class="t">ElevatorSystem</span> {
+	<span class="k">void</span> <span class="f">requestPickup</span>(<span class="t">HallCall</span> call);                          <span class="c">// the controller chooses a car</span>
+	<span class="k">void</span> <span class="f">requestFloor</span>(<span class="t">CarId</span> car, <span class="k">int</span> floor);                   <span class="c">// pressed inside a car</span>
+	<span class="k">void</span> <span class="f">tick</span>();                                                <span class="c">// advance the simulation one step</span>
+	<span class="t">List</span>&lt;<span class="t">CarStatus</span>&gt; <span class="f">status</span>();                                 <span class="c">// floor, direction, state, stops: for displays</span>
+}</pre>
+  <p>Two decisions, two owners. The <b>controller</b> decides which car takes a hall call (dispatch). Each <b>car</b> decides the order it visits its own stops (scheduling). Mixing them into one big loop is the usual way this design becomes unreadable; keeping them apart makes each a strategy you can swap and test on its own.</p>
+
+  <h2>Elevator car as a State machine</h2>
+  <p>A car is always in exactly one state, and each state allows only some actions: doors only open when stopped at a floor, a moving car can't take on a fresh direction mid-floor, an out-of-service car ignores dispatch. Model the states explicitly (<a href="18-state.html">Chapter 18</a>) and advance them on a <code>tick</code>, so time is a parameter rather than a sleeping thread, and the whole system can be tested and simulated deterministically.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>State</th><th>On tick</th><th>Leaves to</th></tr></thead>
+      <tbody>
+        <tr><td><code>IDLE</code></td><td>If there's a stop, pick a direction toward it</td><td><code>MOVING</code>, or <code>DOORS_OPEN</code> if the stop is this floor</td></tr>
+        <tr><td><code>MOVING</code></td><td>Move one floor; if this floor is a stop to serve now, stop</td><td><code>DOORS_OPEN</code></td></tr>
+        <tr><td><code>DOORS_OPEN</code></td><td>Count down the dwell time; passengers board and press floors</td><td><code>MOVING</code> if stops remain, else <code>IDLE</code></td></tr>
+        <tr><td><code>OUT_OF_SERVICE</code></td><td>Nothing; its pending hall calls are reassigned</td><td><code>IDLE</code> when returned to service</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="k">public final class</span> <span class="t">ElevatorCar</span> {
+	<span class="k">enum</span> <span class="t">State</span> { IDLE, MOVING, DOORS_OPEN, OUT_OF_SERVICE }
+
+	<span class="k">private int</span> floor;
+	<span class="k">private</span> <span class="t">Direction</span> dir = <span class="t">Direction</span>.IDLE;
+	<span class="k">private</span> <span class="t">State</span> state = <span class="t">State</span>.IDLE;
+	<span class="k">private int</span> dwell;
+	<span class="k">private final</span> <span class="t">NavigableSet</span>&lt;<span class="t">Integer</span>&gt; up = <span class="k">new</span> <span class="t">TreeSet</span>&lt;&gt;(), down = <span class="k">new</span> <span class="t">TreeSet</span>&lt;&gt;();
+
+	<span class="k">void</span> <span class="f">tick</span>() {
+		<span class="k">switch</span> (state) {
+			<span class="k">case</span> OUT_OF_SERVICE -&gt; { }
+			<span class="k">case</span> DOORS_OPEN -&gt; { <span class="k">if</span> (--dwell == <span class="m">0</span>) state = <span class="f">nextStop</span>() == <span class="k">null</span> ? <span class="t">State</span>.IDLE : <span class="t">State</span>.MOVING; }
+			<span class="k">case</span> IDLE, MOVING -&gt; {
+				<span class="t">Integer</span> target = <span class="f">nextStop</span>();
+				<span class="k">if</span> (target == <span class="k">null</span>) { state = <span class="t">State</span>.IDLE; <span class="k">return</span>; }
+				<span class="k">if</span> (target == floor) { <span class="f">arrive</span>(); <span class="k">return</span>; }
+				floor += target &gt; floor ? <span class="m">1</span> : -<span class="m">1</span>;
+				state = <span class="t">State</span>.MOVING;
+				<span class="k">if</span> (floor == target) <span class="f">arrive</span>();
+			}
+		}
+	}
+
+	<span class="k">private void</span> <span class="f">arrive</span>() {
+		<span class="k">if</span> (!(dir == <span class="t">Direction</span>.DOWN ? down : up).<span class="f">remove</span>(floor))   <span class="c">// serve the call for our direction…</span>
+			(dir == <span class="t">Direction</span>.DOWN ? up : down).<span class="f">remove</span>(floor);    <span class="c">// …or the turnaround call at the end of a sweep</span>
+		state = <span class="t">State</span>.DOORS_OPEN; dwell = DOOR_TICKS;
+		listeners.<span class="f">forEach</span>(l -&gt; l.<span class="f">onArrived</span>(id, floor, dir));   <span class="c">// hall lanterns, displays, passengers</span>
+	}
+}</pre>
+
+  <h2>Request queues: LOOK with two sorted sets</h2>
+  <p>A car's stops aren't a FIFO queue. Visiting them in arrival order sends a car from 2 to 9 to 3 to 8, crossing the building repeatedly. Elevators use the same idea as disk-arm scheduling: <b>SCAN</b> sweeps to the end of the building and back, serving stops on the way; <b>LOOK</b> is the practical variant that turns around at the last stop instead of the top floor. Two sorted sets make LOOK simple: <code>up</code> holds stops to serve while travelling up, <code>down</code> while travelling down. The next stop is a <code>ceiling</code> or <code>floor</code> query, O(log n). Car calls go into the set for their side of the car; a hall call goes into the set for its direction, so a car going up doesn't stop for someone who wants to go down.</p>
+<pre class="code"><span class="k">void</span> <span class="f">addHallCall</span>(<span class="k">int</span> f, <span class="t">Direction</span> d) { (d == <span class="t">Direction</span>.UP ? up : down).<span class="f">add</span>(f); }
+<span class="k">void</span> <span class="f">addCarCall</span>(<span class="k">int</span> f)              { <span class="k">if</span> (f &gt; floor) up.<span class="f">add</span>(f); <span class="k">else if</span> (f &lt; floor) down.<span class="f">add</span>(f); }
+
+<span class="t">Integer</span> <span class="f">nextStop</span>() {
+	<span class="k">if</span> (dir == <span class="t">Direction</span>.IDLE) dir = <span class="f">directionToNearest</span>();         <span class="c">// IDLE again if both sets are empty</span>
+	<span class="k">for</span> (<span class="k">int</span> turns = <span class="m">0</span>; turns &lt; <span class="m">2</span> &amp;&amp; dir != <span class="t">Direction</span>.IDLE; turns++) {
+		<span class="t">Integer</span> f = dir == <span class="t">Direction</span>.UP
+			? <span class="f">first</span>(up.<span class="f">ceiling</span>(floor), down.<span class="f">isEmpty</span>() || down.<span class="f">last</span>() &lt;= floor ? <span class="k">null</span> : down.<span class="f">last</span>())    <span class="c">// up-stops ahead, else the highest down-call above us</span>
+			: <span class="f">first</span>(down.<span class="f">floor</span>(floor), up.<span class="f">isEmpty</span>() || up.<span class="f">first</span>() &gt;= floor ? <span class="k">null</span> : up.<span class="f">first</span>());       <span class="c">// down-stops ahead, else the lowest up-call below us</span>
+		<span class="k">if</span> (f != <span class="k">null</span>) <span class="k">return</span> f;
+		dir = dir == <span class="t">Direction</span>.UP ? <span class="t">Direction</span>.DOWN : <span class="t">Direction</span>.UP;         <span class="c">// nothing ahead: turn around (LOOK)</span>
+	}
+	dir = <span class="t">Direction</span>.IDLE;
+	<span class="k">return null</span>;
+}</pre>
+  <p>The two-turn limit is what stops LOOK from looping when the only remaining stops are behind the car in both sets. And because the car keeps its direction while there's work ahead, a passenger can wait at most one sweep up and one down: LOOK can't starve anyone, which a “nearest stop next” rule can (a busy middle of the building would keep pulling the car back and away from the top floor).</p>
+
+  <h2>Dispatch strategies: nearest car, SCAN, LOOK</h2>
+  <p>The controller answers “which car?” through a strategy. <b>Nearest car</b> by distance is the obvious first answer and is decent, but it ignores direction: the nearest car might be moving away, or be full of stops. An <b>ETA cost</b> estimates when each car could actually arrive: straight there if it's idle or approaching in the right direction; otherwise to the end of its current sweep and back; plus a few seconds for each stop it has already promised.</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">Dispatcher</span> { <span class="t">ElevatorCar</span> <span class="f">choose</span>(<span class="t">HallCall</span> call, <span class="t">List</span>&lt;<span class="t">ElevatorCar</span>&gt; available); }
+
+<span class="k">final class</span> <span class="t">EtaDispatcher</span> <span class="k">implements</span> <span class="t">Dispatcher</span> {
+	<span class="k">public</span> <span class="t">ElevatorCar</span> <span class="f">choose</span>(<span class="t">HallCall</span> call, <span class="t">List</span>&lt;<span class="t">ElevatorCar</span>&gt; cars) {
+		<span class="k">return</span> cars.<span class="f">stream</span>().<span class="f">min</span>(<span class="t">Comparator</span>.<span class="f">comparingInt</span>(c -&gt; <span class="f">eta</span>(c, call))).<span class="f">orElseThrow</span>();
+	}
+
+	<span class="k">static int</span> <span class="f">eta</span>(<span class="t">ElevatorCar</span> c, <span class="t">HallCall</span> call) {
+		<span class="k">int</span> d = <span class="t">Math</span>.<span class="f">abs</span>(c.<span class="f">floor</span>() - call.<span class="f">floor</span>());
+		<span class="k">boolean</span> onTheWay = c.<span class="f">direction</span>() == call.<span class="f">direction</span>()
+			&amp;&amp; (c.<span class="f">direction</span>() == <span class="t">Direction</span>.UP ? call.<span class="f">floor</span>() &gt;= c.<span class="f">floor</span>() : call.<span class="f">floor</span>() &lt;= c.<span class="f">floor</span>());
+		<span class="k">int</span> travel = c.<span class="f">direction</span>() == <span class="t">Direction</span>.IDLE || onTheWay ? d
+			: <span class="t">Math</span>.<span class="f">abs</span>(c.<span class="f">sweepEnd</span>() - c.<span class="f">floor</span>()) + <span class="t">Math</span>.<span class="f">abs</span>(c.<span class="f">sweepEnd</span>() - call.<span class="f">floor</span>());
+		<span class="k">return</span> travel * FLOOR_TICKS + c.<span class="f">stopCount</span>() * DOOR_TICKS;        <span class="c">// promised stops cost time too</span>
+	}
+}</pre>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">10 floors, 2 cars, the same passengers under three algorithms</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="elAlgo"><button data-v="fcfs">FCFS (round-robin, request order)</button><button data-v="nearest">nearest car + LOOK</button><button class="active" data-v="eta">ETA cost + LOOK</button></div>
+      </div>
+      <div class="controls">
+        <div class="seg" id="elPat"><button class="active" data-v="random">random trips</button><button data-v="morning">morning rush (from the lobby)</button></div>
+        <button class="btn sm primary" id="elPlay">⏸ pause</button>
+        <button class="btn sm" id="elFast">⏩ run 10 minutes instantly</button>
+        <button class="btn sm" id="elReset">↺</button>
+      </div>
+      <div class="el-wrap">
+        <div class="el-bld" id="elBld"></div>
+        <div class="el-side"><div class="stats" id="elStats" style="grid-template-columns:1fr 1fr;margin:0"></div><div class="log" id="elLog" style="height:150px;margin:0"></div></div>
+      </div>
+    </div>
+    <div class="panel-foot">One tick = one second: a car moves one floor per tick and keeps its doors open for 2 ticks per stop. Blue car = moving (arrow and rider count), green = doors open; amber dots are that car's pending stops; ▲▼ at the right are people waiting. The passenger stream is seeded, so each algorithm sees identical demand.</div>
+  </div>
+
+  <h2>Simulation loop</h2>
+  <p>The system has no threads inside it. A driver calls <code>tick()</code> at a fixed rate in production (from a scheduler, <a href="35-case-task-scheduler.html">Chapter 35</a>) or as fast as possible in a simulation or a test. Each tick, pending hall calls are dispatched, then every car advances one step. Button presses arrive between ticks and are queued. That single-threaded core means cars and the controller need no locks; only the inbound request queue is shared with the threads that handle button presses, and a <code>ConcurrentLinkedQueue</code> covers it.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Button presses</b> Hall and car calls from I/O threads go into a concurrent inbound queue.</li>
+      <li><b>tick(): drain the queue</b> Car calls go to their car; each hall call goes to the dispatcher.</li>
+      <li><b>Dispatch</b> The strategy picks among cars not OUT_OF_SERVICE; the call joins that car's up or down set.</li>
+      <li><b>Advance every car</b> Each car's state machine moves, stops or counts down its doors.</li>
+      <li data-k="decision"><b>A car went out of service?</b> Its unserved hall calls go back through the dispatcher.</li>
+      <li data-k="end"><b>Publish status</b> Displays and hall lanterns observe arrivals and positions.</li>
+    </ol>
+    <figcaption><b>One tick.</b> Deterministic, single-threaded, and driven by a clock you control: the property that makes the simulator above and your unit tests possible.</figcaption>
+  </figure>
+  <figure class="seq" data-actors="Passenger|Hall panel (floor 3)|ElevatorSystem|EtaDispatcher|Car B">
+    <ol>
+      <li data-m="0>1">press ▲</li>
+      <li data-m="1>2">requestPickup(HallCall(3, UP))</li>
+      <li data-m="2>3">choose(call, [A, B])</li>
+      <li data-m="3>2" data-k="reply">B: ETA 4 ticks (A: 11, moving away)</li>
+      <li data-m="2>4">addHallCall(3, UP)</li>
+      <li data-m="4>0" data-k="reply">tick… arrive(3): doors open, lantern ▲</li>
+      <li data-m="0>4">press 8 inside</li>
+      <li data-m="4>4">addCarCall(8) → up set; continue the sweep</li>
+    </ol>
+    <figcaption><b>A pickup, end to end.</b> The controller only chooses the car; from then on the car's own LOOK ordering decides when it arrives.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Destination dispatch</div><p>In many modern office towers you don't press ▲ at all: you enter your floor on a keypad in the lobby and the screen tells you which car to take. The major elevator manufacturers all sell these <b>destination dispatch</b> systems. The change is exactly the kind of extension this design should absorb: the hall call gains a destination (<code>HallCall(floor, destination)</code> instead of a direction), and the dispatcher can now group people going to nearby floors into the same car, so each car makes fewer stops. The car state machine and its LOOK ordering don't change at all; only the dispatch strategy and the call type do.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>One god class</b> that dispatches, moves cars and opens doors in one loop.</li>
+      <li><b>Serving stops in arrival order</b> (FCFS): the car crosses the building again and again.</li>
+      <li><b>“Nearest stop next”</b> scheduling, which can starve the ends of the building.</li>
+      <li><b>No explicit states,</b> so doors can open while moving or a broken car keeps receiving calls.</li>
+      <li><b>Ignoring direction on hall calls:</b> stopping for someone going the other way.</li>
+      <li><b>A thread per car with sleeps,</b> making the system nondeterministic and untestable. Tick it.</li>
+      <li><b>Forgetting to reassign calls</b> when a car goes out of service.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does a car decide which floor to go to next?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It uses LOOK. The car keeps two sorted sets: stops to serve going up and stops to serve going down. While it's moving up, the next stop is the smallest up-stop at or above its floor (a <code>ceiling</code> query), or failing that the highest down-call above it; when nothing is left ahead, it turns around and does the mirror image going down. When both sets are empty it goes idle. That serves everything on the way, never starves the top or bottom floors, and each lookup is O(log n).</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Add fire service mode: on an alarm, every car must go to the lobby, open its doors and stop taking calls. Where does it go?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It's a new state and a controller command, not a scattering of <code>if (fire)</code> checks. The controller, on an alarm, stops dispatching new hall calls and tells each car to recall. Each car moves to a <code>RECALL</code> state: it clears its up and down sets, and heads to the lobby, and a moving car finishes to the nearest floor in its current direction without opening its doors first if that's the rule. On arrival it enters <code>FIRE_SERVICE</code>: doors open, and it ignores hall and car calls except from a firefighter key, which is its own small set of transitions. Because states are explicit, I can list exactly which events each state accepts, and tests can drive the alarm with the tick loop and assert every car ends at the lobby with doors open.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Separate dispatch (which car) from scheduling (the order a car visits stops); each is a strategy.</li>
+      <li>Model each car as an explicit state machine advanced by a tick: IDLE, MOVING, DOORS_OPEN, OUT_OF_SERVICE.</li>
+      <li>LOOK with two sorted sets serves stops in sweeps, respects hall-call direction and can't starve anyone.</li>
+      <li>Dispatch by estimated arrival time, not just distance: direction and promised stops matter.</li>
+      <li>A single-threaded tick loop with a concurrent inbound queue makes the system deterministic and testable.</li>
+      <li>New modes (fire service, destination dispatch) land as new states or strategies, not scattered conditionals.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What's the difference between SCAN and LOOK?</p>
+      <div class="opts">
+        <button class="opt">SCAN serves requests in arrival order</button>
+        <button class="opt">LOOK only moves up</button>
+        <button class="opt">SCAN always travels to the end of the building before turning; LOOK turns around at the last pending stop</button>
+        <button class="opt">They're identical</button>
+      </div>
+      <div class="explain">LOOK “looks” ahead and skips the empty travel to the top or bottom floor, which is why real elevators behave like LOOK.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A car on floor 5 is moving up with an up-stop at 8. Someone on floor 6 presses ▼. Should the car stop at 6 on the way up?</p>
+      <div class="opts">
+        <button class="opt">No: the call is in the down set, served when the car sweeps back down</button>
+        <button class="opt">Yes: 6 is on the way</button>
+        <button class="opt">Only if the car is empty</button>
+        <button class="opt">The call is rejected</button>
+      </div>
+      <div class="explain">Stopping would pick up someone who wants to go down while the car is going up. Hall calls go into the set for their direction.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why can a nearest-car dispatcher make poor choices?</p>
+      <div class="opts">
+        <button class="opt">It's slower to compute</button>
+        <button class="opt">It ignores idle cars</button>
+        <button class="opt">It always picks the same car</button>
+        <button class="opt">The nearest car may be moving away or already have many stops, so it arrives later than a farther car</button>
+      </div>
+      <div class="explain">An ETA estimate accounts for direction and promised stops; distance alone doesn't.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why drive the system with <code>tick()</code> instead of one thread per car?</p>
+      <div class="opts">
+        <button class="opt">Threads can't move elevators</button>
+        <button class="opt">A single-threaded, clock-driven loop is deterministic: no locks inside, and tests and simulations can run many ticks instantly</button>
+        <button class="opt">It uses more CPU</button>
+        <button class="opt">It makes doors open faster</button>
+      </div>
+      <div class="explain">Time becomes an input. Only the inbound request queue is shared with I/O threads.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A car goes out of service with three hall calls assigned. What should happen?</p>
+      <div class="opts">
+        <button class="opt">The calls wait until it's repaired</button>
+        <button class="opt">The calls are discarded</button>
+        <button class="opt">The controller sends them back through the dispatcher to the remaining cars</button>
+        <button class="opt">The car serves them before stopping</button>
+      </div>
+      <div class="explain">Hall calls belong to passengers, not to a car. Reassigning them is part of the OUT_OF_SERVICE transition.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  const F = 10, NC = 2;
+  let algo = 'eta', pattern = 'random', sim, timer = 0, playing = true;
+  const log = $('#elLog');
+  function makeSim(seed0) {
+    let s = seed0; const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+    const cars = Array.from({ length: NC }, (_, i) => ({ id: i, floor: 0, dir: 0, dwell: 0, stops: [], riders: [], moved: 0, queue: [] }));
+    const waiting = [], done = []; let t = 0, rr = 0;
+    function eta(c, p) {
+      const d = Math.abs(c.floor - p.a);
+      if (c.dir === 0) return d;
+      const ahead = c.dir > 0 ? p.a >= c.floor : p.a <= c.floor;
+      const far = c.dir > 0 ? Math.max(c.floor, ...c.stops.map((x) => x.floor)) : Math.min(c.floor, ...c.stops.map((x) => x.floor));
+      return (ahead && c.dir === p.dir ? d : Math.abs(far - c.floor) + Math.abs(far - p.a)) + 2 * c.stops.length;
+    }
+    function assign(p) {
+      if (algo === 'fcfs') return rr++ % NC;
+      if (algo === 'nearest') return cars.reduce((b, c) => Math.abs(c.floor - p.a) < Math.abs(b.floor - p.a) ? c : b).id;
+      return cars.reduce((b, c) => eta(c, p) < eta(b, p) ? c : b).id;
+    }
+    function spawn(quiet) {
+      let a, b;
+      if (pattern === 'morning') { if (rnd() < 0.8) { a = 0; b = 1 + Math.floor(rnd() * (F - 1)); } else { a = 1 + Math.floor(rnd() * (F - 1)); b = 0; } }
+      else { a = Math.floor(rnd() * F); do { b = Math.floor(rnd() * F); } while (b === a); }
+      const p = { a, b, dir: Math.sign(b - a), t0: t };
+      p.car = assign(p); waiting.push(p);
+      const c = cars[p.car];
+      if (algo === 'fcfs') c.queue.push({ floor: a, p, kind: 'pick' }); else c.stops.push({ floor: a, dir: p.dir, p });
+      if (!quiet) LLD.log(log, `t${t}: floor ${a} ${p.dir > 0 ? '▲' : '▼'} (to ${b}) → car ${'AB'[p.car]}`, '');
+    }
+    function stepCar(c) {
+      if (c.dwell > 0) { c.dwell--; return; }
+      if (algo === 'fcfs') {
+        const job = c.queue[0]; if (!job) { c.dir = 0; return; }
+        if (job.floor === c.floor) {
+          c.queue.shift(); c.dwell = 2; const p = job.p;
+          if (job.kind === 'pick') { waiting.splice(waiting.indexOf(p), 1); p.tb = t; c.riders.push(p); c.queue.push({ floor: p.b, p, kind: 'drop' }); }
+          else { c.riders.splice(c.riders.indexOf(p), 1); p.t1 = t; done.push(p); }
+          return;
+        }
+        c.dir = Math.sign(job.floor - c.floor); c.floor += c.dir; c.moved++; return;
+      }
+      const here = c.stops.filter((x) => x.floor === c.floor);
+      const ahead = (d) => c.stops.some((x) => d > 0 ? x.floor > c.floor : x.floor < c.floor);
+      if (c.dir === 0 && c.stops.length) { const x = c.stops[0]; c.dir = x.floor === c.floor ? (x.dir || 1) : Math.sign(x.floor - c.floor); }
+      const serve = here.filter((x) => x.dir === undefined || x.dir === c.dir || !ahead(c.dir));
+      if (serve.length) {
+        c.dwell = 2;
+        serve.forEach((x) => {
+          c.stops.splice(c.stops.indexOf(x), 1);
+          if (x.dir === undefined) { c.riders.splice(c.riders.indexOf(x.p), 1); x.p.t1 = t; done.push(x.p); }
+          else { waiting.splice(waiting.indexOf(x.p), 1); x.p.tb = t; c.riders.push(x.p); c.stops.push({ floor: x.p.b, p: x.p }); if (!ahead(c.dir) && c.dir !== x.p.dir) c.dir = x.p.dir; }
+        });
+        return;
+      }
+      if (!c.stops.length) { c.dir = 0; return; }
+      if (!ahead(c.dir)) { c.dir = -c.dir; return; }
+      c.floor += c.dir; c.moved++;
+    }
+    return { cars, waiting, done, get t() { return t; }, tick(quiet) { if (rnd() < 0.18) spawn(quiet); cars.forEach(stepCar); t++; } };
+  }
+  function draw() {
+    const rows = [];
+    for (let f = F - 1; f >= 0; f--) {
+      const cells = sim.cars.map((c) => {
+        const car = c.floor === f ? `<div class="el-car${c.dwell > 0 ? ' el-open' : ''}">${c.dwell > 0 ? '◀▶' : c.dir > 0 ? '▲' : c.dir < 0 ? '▼' : '■'}${c.riders.length ? ' ' + c.riders.length : ''}</div>` : '';
+        const stop = (algo === 'fcfs' ? c.queue.some((q) => q.floor === f) : c.stops.some((x) => x.floor === f)) && c.floor !== f ? '<span class="el-stop"></span>' : '';
+        return `<div class="el-shaft">${stop}${car}</div>`;
+      }).join('');
+      const w = sim.waiting.filter((p) => p.a === f), up = w.filter((p) => p.dir > 0).length, dn = w.length - up;
+      rows.push(`<div class="el-floor"><span class="el-num">${f === 0 ? 'L' : f}</span>${cells}<span class="el-wait">${up ? '▲' + up : ''} ${dn ? '▼' + dn : ''}</span></div>`);
+    }
+    $('#elBld').innerHTML = rows.join('');
+    const d = sim.done, avg = (fn) => d.length ? (d.reduce((s, p) => s + fn(p), 0) / d.length).toFixed(1) : '–';
+    const maxW = Math.max(0, ...d.map((p) => p.tb - p.t0), ...sim.waiting.map((p) => sim.t - p.t0));
+    $('#elStats').innerHTML = `
+      <div class="stat"><div class="k">Time</div><div class="v">${sim.t}<small> s</small></div></div>
+      <div class="stat"><div class="k">Delivered</div><div class="v">${d.length}</div></div>
+      <div class="stat ${+avg((p) => p.tb - p.t0) > 20 ? 'bad' : 'good'}"><div class="k">Avg wait</div><div class="v">${avg((p) => p.tb - p.t0)}<small> s</small></div></div>
+      <div class="stat ${maxW > 60 ? 'bad' : ''}"><div class="k">Longest wait</div><div class="v">${maxW}<small> s</small></div></div>
+      <div class="stat"><div class="k">Avg trip</div><div class="v">${avg((p) => p.t1 - p.t0)}<small> s</small></div></div>
+      <div class="stat"><div class="k">Floors travelled</div><div class="v">${sim.cars.reduce((s, c) => s + c.moved, 0)}</div></div>`;
+  }
+  function loop() { sim.tick(false); draw(); if (playing) timer = setTimeout(loop, 280); }
+  function restart() { clearTimeout(timer); sim = makeSim(9); log.innerHTML = ''; draw(); if (playing) timer = setTimeout(loop, 280); }
+  $$('#elAlgo button').forEach((b) => b.addEventListener('click', () => { algo = b.dataset.v; restart(); }));
+  $$('#elPat button').forEach((b) => b.addEventListener('click', () => { pattern = b.dataset.v; restart(); }));
+  $('#elPlay').onclick = () => { playing = !playing; $('#elPlay').textContent = playing ? '⏸ pause' : '▶ play'; clearTimeout(timer); if (playing) loop(); };
+  $('#elFast').onclick = () => { clearTimeout(timer); for (let i = 0; i < 600; i++) sim.tick(true); LLD.log(log, `fast-forwarded to t${sim.t}`, 'warn'); draw(); if (playing) timer = setTimeout(loop, 280); };
+  $('#elReset').onclick = restart;
+  restart();
+})();
+</script>
 </body>
 </html>
