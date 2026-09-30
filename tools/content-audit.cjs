@@ -5,9 +5,11 @@ const path = require('path');
 const vm = require('vm');
 const { execFileSync } = require('child_process');
 const root = path.resolve(__dirname, '..');
-const courses = ['dsa', 'ml-ai-systems', 'system-design', 'lld'];
-// Scaffolded chapters that haven't been written yet (lld/tools/scaffold.cjs) carry this marker.
-const PLACEHOLDER = '<!-- lld:placeholder -->';
+// Every course in the Atlas registry (assets/atlas.js) whose folder exists in this checkout.
+const REG = require('./registry.cjs');
+const courses = REG.onDisk().map(c => c.dir);
+// Scaffolded chapters that haven't been written yet (<course>/tools/scaffold.cjs) carry a marker like <!-- lld:placeholder -->.
+const isPlaceholder = src => /<!-- [a-z]+:placeholder -->/.test(src);
 const args = process.argv.slice(2);
 const mode = args[0] || 'check';
 const text = s => s.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '').replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -19,9 +21,9 @@ for (const course of courses) {
   const registry = vm.runInNewContext(app.match(/const CHAPTERS = (\[[\s\S]*?\n  \]);/)[1]);
   if (mode === 'registry') { console.log(course, JSON.stringify(registry.map(({n,title}) => ({n,title})))); continue; }
   if (mode === 'bundle') {
-    const prefix = {'dsa':'DSA', 'ml-ai-systems':'ML', 'system-design':'SD', 'lld':'LLD'}[course];
+    const prefix = REG.ns(REG.COURSES.find(c => c.dir === course));
     const bundled = fs.readFileSync(path.join(root, course, 'dist', course+'-course.html'), 'utf8');
-    const written = registry.filter(ch => !fs.readFileSync(path.join(root, course, ch.file), 'utf8').includes(PLACEHOLDER)).length;
+    const written = registry.filter(ch => !isPlaceholder(fs.readFileSync(path.join(root, course, ch.file), 'utf8'))).length;
     const blocks = [...bundled.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(m=>m[1]);
     blocks.forEach(code=>new vm.Script(code));
     const pageCode = blocks.find(code=>code.startsWith('window.'+prefix+'_PAGES = '));
@@ -72,7 +74,7 @@ for (const course of courses) {
     }
     checked++;
     const fail = msg => errors.push(rel + ': ' + msg);
-    const stub = src.includes(PLACEHOLDER);
+    const stub = isPlaceholder(src);
     if (stub) warnings.push(rel + ': placeholder, not written yet');
     const h2 = s => [...s.matchAll(/<h2\b[^>]*>[\s\S]*?<\/h2>/g)].map(m=>m[0]);
     // Sequence diagrams: every message must point at a declared lifeline.
