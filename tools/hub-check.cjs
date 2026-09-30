@@ -127,7 +127,7 @@ function checks(s) {
     s.studyScripts.length === 4 && s.studyScripts.every((x) => !SOON.some((d) => x.startsWith(d + '/'))), s.studyScripts);
   check('theme colours: Cloud & DevOps uses its ' + THEME + ' pair',
     s.devopsK1.toLowerCase() === (THEME === 'dark' ? '#94a3b8' : '#334155'), s.devopsK1);
-  check('viewport is ' + WIDTH + 'px wide', s.innerW === WIDTH, s.innerW);
+  check('viewport is ' + WIDTH + 'px wide (±24 px of window chrome)', Math.abs(s.innerW - WIDTH) <= 24, s.innerW);
   check('no horizontal scroll', s.scrollW <= s.innerW, [s.scrollW, s.innerW]);
   console.log('paths');
   const GENERAL = ['dsa', 'os', 'networks', 'databases', 'lld', 'system-design', 'distributed-systems', 'cloud-devops', 'ml-ai-systems'];
