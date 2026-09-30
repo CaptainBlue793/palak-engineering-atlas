@@ -8,8 +8,9 @@ interfaces and generics, composition, value objects and immutability, exceptions
 Static site, **zero dependencies**, no build step required to read it. Open `index.html` in a
 browser; progress, quiz scores and flashcard state are saved in `localStorage` under `lld-*` keys.
 
-> **Status: scaffolded.** Every chapter has a page with its planned outline; none has content yet.
-> `grep -l lld:placeholder *.html` lists the chapters still to write.
+> **Status: complete.** All 54 pages are written. Each chapter has at least one interactive panel,
+> Java listings in the house style, a comparison table, a real-world use case, a common-mistakes box,
+> an interview drill and a five-question quiz. `grep -l lld:placeholder *.html` should print nothing.
 
 ## The levels
 
@@ -27,7 +28,7 @@ same problem, different zoom.
 ## Study tools
 
 - **`glossary.html`**: LLD terms, each linked to the chapter that introduces it
-- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes (empty until chapters have quizzes)
+- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes (270 cards)
 - **`mock-interview.html`**: timed room with 18 LLD problems, a phase timer, an 8-point rubric and notes saved locally
 
 ## Tools
