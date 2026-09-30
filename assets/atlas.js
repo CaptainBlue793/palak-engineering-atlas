@@ -454,6 +454,8 @@
   }
 
   function renderMosaic() {
+    // Every row gets as many columns as the longest course, so squares match across rows.
+    $('#mosaic').style.setProperty('--cols', Math.max.apply(null, LIVE.map(countOf).concat(SOON.map(function (c) { return c.chapters; }))));
     $('#mosaic').innerHTML = LIVE.map(function (c) {
       var total = countOf(c), d = doneOf(c), next = nextChapter(c), sq = '';
       var chapters = c.data ? c.data.slice().sort(function (a, b) { return a.n - b.n; }) :
