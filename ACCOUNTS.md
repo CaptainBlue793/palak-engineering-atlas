@@ -54,10 +54,12 @@ Run these from the `api/` folder. You need free **Cloudflare** and **Resend** ac
    npx wrangler secret put RESEND_API_KEY     # from resend.com → API Keys
    npx wrangler secret put SERVER_SECRET      # any long random string, e.g. from a password manager
    ```
-4. **Choose the email sender.** In `api/wrangler.toml`, `EMAIL_FROM` defaults to Resend's test
-   sender `onboarding@resend.dev`, which **only delivers to your own Resend account email**. To
-   email everyone, verify a domain you own in Resend (Domains → Add) and set, for example,
-   `EMAIL_FROM = "Engineering Atlas <login@yourdomain.com>"`.
+4. **Choose the email sender.** `EMAIL_FROM` in `api/wrangler.toml` must use a domain verified in
+   Resend (Domains → Add; on Cloudflare DNS, *Auto configure* adds the records). The live Atlas
+   sends from `Engineering Atlas <login@palakdebpatra.com>`. Resend's test sender
+   `onboarding@resend.dev` works without a domain but **only delivers to your own Resend account
+   email**. Also add a DMARC record (`TXT` `_dmarc` → `v=DMARC1; p=none;`): without it, and while
+   the domain is new, Gmail tends to put the codes in spam.
 5. **Check the allowed sites.** `ALLOWED_ORIGINS` in `api/wrangler.toml` must contain the exact
    address the site is served from (default: `https://captainblue793.github.io`).
 6. **Deploy**
