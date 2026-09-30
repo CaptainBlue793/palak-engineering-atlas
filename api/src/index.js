@@ -165,7 +165,7 @@ async function putProgress(req, s, env) {
   const row = await env.DB.prepare('SELECT data FROM progress WHERE user_id = ?').bind(s.id).first();
   const data = row ? JSON.parse(row.data) : {};
   for (const [k, e] of Object.entries(incoming)) {
-    if (!/^(sd|ml|dsa|lld|atlas)-[\w-]{1,80}$/.test(k)) continue;                // only course keys
+    if (!/^(sd|ml|dsa|lld|os|net|db|dist|ops|atlas)-[\w-]{1,80}$/.test(k)) continue;   // only course keys
     if (!e || typeof e !== 'object' || (e.v !== null && typeof e.v !== 'string') || !Number.isFinite(e.t)) continue;
     if (!data[k] || e.t >= data[k].t) data[k] = { v: e.v, t: e.t };           // newest write wins
   }

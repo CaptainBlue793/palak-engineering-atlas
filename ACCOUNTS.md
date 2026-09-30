@@ -17,7 +17,7 @@ runs on free tiers.
   signs them in. The account is the email + phone pair, so the same pair must be used every time.
   (SMS is not sent yet; the phone number is stored on the account. See *Adding SMS later*.)
 - **Sync:** progress still lives in `localStorage`. `assets/account.js` mirrors every course key
-  (`sd-*`, `ml-*`, `dsa-*`, `lld-*`, `atlas-*`) to the API. The first sign-in on a device merges
+  (`sd-*`, `ml-*`, `dsa-*`, `lld-*`, `os-*`, `net-*`, `db-*`, `dist-*`, `ops-*`, `atlas-*`) to the API. The first sign-in on a device merges
   (chapters unioned, best quiz scores kept, most-reviewed flashcards kept, otherwise newest wins);
   after that the newest write wins, and other devices pick up changes every 30 s and on tab focus.
 - **Never in the offline editions:** the loader only runs over http(s), not from `file://`.
