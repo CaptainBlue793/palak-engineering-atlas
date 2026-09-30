@@ -14,6 +14,13 @@ no build step.
 | **[DSA](dsa/)** | 8 prerequisites + 56 | Every structure and algorithm, in one consistent C++ house style |
 | **[Low-Level Design](lld/)** | 8 prerequisites + 46 | SOLID, design patterns, concurrency and 16 case studies in Java |
 
+
+## Optional accounts
+
+Learners can sign in with **email + phone** and a one-time code (sent by email) to sync progress across
+devices. It runs on a small Cloudflare Worker + D1 backend in `api/` and stays switched off until that is
+deployed — see **[ACCOUNTS.md](ACCOUNTS.md)** for how it works and the setup steps.
+
 ```
 palak-engineering-atlas/
 ├── index.html          ← the Atlas (start here)
