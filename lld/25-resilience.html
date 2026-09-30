@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Resilience at the Class Level</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .cb-states { display:flex; gap:10px; margin-top:12px; flex-wrap:wrap; }
+  .cb-st { flex:1; min-width:150px; border:1.5px solid var(--border); border-radius:12px; padding:10px 12px; background:var(--surface-2); font-size:13px; transition:all .25s; }
+  .cb-st b { font-family:var(--mono); display:block; margin-bottom:4px; }
+  .cb-st.cb-cur { border-color:var(--accent); background:var(--accent-soft); box-shadow:0 0 0 3px var(--accent-soft); }
+  .cb-tl { display:flex; flex-wrap:wrap; gap:3px; margin-top:12px; padding:10px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); min-height:34px; }
+  .cb-tl i { width:14px; height:22px; border-radius:3px; display:block; }
+  .cb-tl i.cb-ok { background:var(--green); } .cb-tl i.cb-fail { background:var(--red); } .cb-tl i.cb-fast { background:var(--border-strong); } .cb-tl i.cb-probe { background:var(--amber); }
+  .cb-legend { display:flex; gap:14px; flex-wrap:wrap; font-size:12px; color:var(--muted); margin-top:6px; }
+  .cb-legend span::before { content:""; display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; background:var(--c); }
+</style>
+</head>
+<body data-chapter="25">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 25</span><span class="pill">Advanced LLD</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Resilience at the Class <span class="grad">Level</span></h1>
+    <p class="lead">Every remote call eventually fails: a timeout, a 503, a dropped connection, a partner deploying at the worst moment. Resilience is making sure one failing dependency degrades one feature instead of taking the whole service down with it. Four small objects do most of the work: a timeout on every call, a retry policy that doesn't make things worse, a circuit breaker that stops calling something that's down, and idempotency so that retries are safe at all.</p>
+    <ul class="objectives">
+      <li>Put a timeout on every remote call, and size it from a latency budget</li>
+      <li>Retry only safe failures, with exponential backoff and jitter, within a budget</li>
+      <li>Implement a circuit breaker as a closed/open/half-open state machine</li>
+      <li>Isolate dependencies with bulkheads</li>
+      <li>Make retried operations idempotent with idempotency keys</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Decorators,</b> which is how these features wrap a client. See <a href="13-decorator-proxy.html">Chapter 13</a>.</li>
+        <li><b>State machines.</b> See <a href="18-state.html">Chapter 18</a>.</li>
+        <li><b>Retryable vs non-retryable exceptions.</b> See <a href="p7-exceptions.html">P7</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Timeouts: the first line of defence</h2>
+  <p>A call without a timeout can wait forever, and while it waits it holds a thread, a connection, and the user's request. When a dependency hangs rather than fails, every request that touches it piles up until the service runs out of threads, and a problem in one partner becomes an outage of yours. So <b>every remote call gets a timeout</b>, and the value comes from a budget, not a guess: if the page must respond in 800 ms and makes two sequential calls plus 100 ms of its own work, each call gets well under 350 ms. Set both a connect timeout (how long to establish the connection) and a request timeout (how long to wait for the answer).</p>
+
+  <h2>Retries that don't make things worse</h2>
+  <p>A retry turns a brief glitch into a success. It can also turn a struggling dependency into a dead one: if 1,000 clients each retry three times immediately, the failing service now receives 4,000 requests. Good retry policies follow four rules:</p>
+  <ul>
+    <li><b>Retry only what's safe and might succeed.</b> Timeouts, connection resets, 503 and 429 can be retried; a 400 or a declined card won't change. And only retry operations that are <b>idempotent</b>, or made so with a key (below).</li>
+    <li><b>Back off exponentially:</b> wait base × 2<sup>attempt</sup>, so each retry gives the dependency more time to recover.</li>
+    <li><b>Add jitter.</b> If every client computes the same delay, they all retry at the same moment, and the retries arrive as a synchronised wave. Randomising the delay spreads them out. “Full jitter”, a random delay between 0 and the exponential value, is a widely used choice.</li>
+    <li><b>Cap it:</b> a maximum number of attempts, a maximum delay, and an overall deadline, so a request never retries past the point where its caller has given up.</li>
+  </ul>
+  <div class="codebox">
+    <div class="cb-head"><span class="cb-name">RetryPolicy.java: exponential backoff with full jitter</span><span class="cb-sp"></span></div>
+<pre class="code"><span class="k">public final class</span> <span class="t">RetryPolicy</span> {
+	<span class="k">private final int</span> maxAttempts;                 <span class="c">// e.g. 3</span>
+	<span class="k">private final</span> <span class="t">Duration</span> base, cap;              <span class="c">// e.g. 100 ms, 2 s</span>
+	<span class="k">private final</span> <span class="t">Predicate</span>&lt;<span class="t">Throwable</span>&gt; retryable;
+	<span class="k">private final</span> <span class="t">RandomGenerator</span> random;           <span class="c">// injected: tests use a fixed seed</span>
+	<span class="k">private final</span> <span class="t">Sleeper</span> sleeper;                 <span class="c">// injected: tests don't really sleep</span>
+
+	<span class="k">public</span> &lt;<span class="t">T</span>&gt; <span class="t">T</span> <span class="f">call</span>(<span class="t">Callable</span>&lt;<span class="t">T</span>&gt; op) <span class="k">throws</span> <span class="t">Exception</span> {
+		<span class="k">for</span> (<span class="k">int</span> attempt = <span class="m">1</span>; ; attempt++) {
+			<span class="k">try</span> { <span class="k">return</span> op.<span class="f">call</span>(); }
+			<span class="k">catch</span> (<span class="t">Exception</span> e) {
+				<span class="k">if</span> (attempt &gt;= maxAttempts || !retryable.<span class="f">test</span>(e)) <span class="k">throw</span> e;
+				<span class="k">long</span> exp = <span class="t">Math</span>.<span class="f">min</span>(cap.<span class="f">toMillis</span>(), base.<span class="f">toMillis</span>() * (<span class="m">1L</span> &lt;&lt; (attempt - <span class="m">1</span>)));
+				sleeper.<span class="f">sleep</span>(<span class="t">Duration</span>.<span class="f">ofMillis</span>(random.<span class="f">nextLong</span>(exp + <span class="m">1</span>)));   <span class="c">// full jitter: 0..exp</span>
+			}
+		}
+	}
+}</pre>
+    <div class="cb-foot"><b>Design notes:</b> the retryable predicate keeps the “what's safe to retry” decision in one place; random and sleep are injected (<a href="08-dependency-injection.html">Chapter 8</a>) so tests are fast and deterministic; and the delay doubles per attempt up to the cap. With a 100 ms base, attempt 1 waits 0–100 ms, attempt 2 waits 0–200 ms, attempt 3 waits 0–400 ms.</div>
+  </div>
+
+  <h2>Circuit breakers: stop calling what's down</h2>
+  <p>Retries help with short blips. When a dependency is properly down, even well-behaved retries just spend threads and time waiting for errors, and add load to a service trying to recover. A <b>circuit breaker</b> watches recent failures and, past a threshold, stops calling the dependency for a while, failing immediately instead. It's a state machine (<a href="18-state.html">Chapter 18</a>) with three states:</p>
+  <ul>
+    <li><b>Closed</b>: calls go through normally, and failures are counted. Too many failures in a row (or in a window) opens the breaker.</li>
+    <li><b>Open</b>: calls fail immediately with a “circuit open” error, without touching the network. After a cooldown, the breaker moves to half-open.</li>
+    <li><b>Half-open</b>: one trial call (a probe) is allowed through. If it succeeds, the breaker closes; if it fails, it opens again for another cooldown.</li>
+  </ul>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Circuit breaker: one request per tick against a flaky dependency</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="cbDown"><button class="active" data-v="ok">downstream healthy</button><button data-v="down">downstream down</button><button data-v="flaky">recovering (50% errors)</button></div>
+        <button class="btn sm primary" id="cbRun">▶ send 10 requests</button>
+        <button class="btn sm" id="cbReset">↺</button>
+      </div>
+      <div class="cb-states" id="cbStates"></div>
+      <div class="cb-tl" id="cbTl"></div>
+      <div class="cb-legend"><span style="--c:var(--green)">real call, succeeded</span><span style="--c:var(--red)">real call, failed (1 s timeout)</span><span style="--c:var(--border-strong)">failed fast (circuit open)</span><span style="--c:var(--amber)">half-open probe</span></div>
+      <div class="stats" id="cbStats"></div>
+      <div class="log" id="cbLog" style="height:78px;margin-top:10px"></div>
+    </div>
+    <div class="panel-foot">Thresholds: open after 5 consecutive failures; cooldown of 5 requests' worth of time; one probe in half-open. “Thread time spent waiting” counts the 1-second timeouts that real failing calls cost; fast failures cost almost nothing.</div>
+  </div>
+
+<pre class="code"><span class="k">public final class</span> <span class="t">CircuitBreaker</span> {
+	<span class="k">private enum</span> <span class="t">State</span> { CLOSED, OPEN, HALF_OPEN }
+	<span class="k">private</span> <span class="t">State</span> state = <span class="t">State</span>.CLOSED;
+	<span class="k">private int</span> failures;
+	<span class="k">private</span> <span class="t">Instant</span> openedAt;
+	<span class="k">private final int</span> threshold; <span class="k">private final</span> <span class="t">Duration</span> cooldown; <span class="k">private final</span> <span class="t">Clock</span> clock;
+
+	<span class="k">public synchronized</span> &lt;<span class="t">T</span>&gt; <span class="t">T</span> <span class="f">call</span>(<span class="t">Supplier</span>&lt;<span class="t">T</span>&gt; op) {         <span class="c">// simplified: one lock around the whole call</span>
+		<span class="k">if</span> (state == <span class="t">State</span>.OPEN) {
+			<span class="k">if</span> (clock.<span class="f">instant</span>().<span class="f">isBefore</span>(openedAt.<span class="f">plus</span>(cooldown))) <span class="k">throw new</span> <span class="t">CircuitOpenException</span>();
+			state = <span class="t">State</span>.HALF_OPEN;                                    <span class="c">// cooldown over: allow a probe</span>
+		}
+		<span class="k">try</span> {
+			<span class="t">T</span> result = op.<span class="f">get</span>();
+			state = <span class="t">State</span>.CLOSED; failures = <span class="m">0</span>;                          <span class="c">// success closes it</span>
+			<span class="k">return</span> result;
+		} <span class="k">catch</span> (<span class="t">RuntimeException</span> e) {
+			<span class="k">if</span> (state == <span class="t">State</span>.HALF_OPEN || ++failures &gt;= threshold) { state = <span class="t">State</span>.OPEN; openedAt = clock.<span class="f">instant</span>(); }
+			<span class="k">throw</span> e;
+		}
+	}
+}</pre>
+  <p>This teaching version holds its lock for the whole call, which serialises every request through the breaker; a production breaker (like Resilience4j's) only locks the state transitions, counts failures in a sliding window rather than a streak, and lets a limited number of probes through concurrently. The shape is the same, and it slots in as one more decorator around a client (<a href="13-decorator-proxy.html">Chapter 13</a>), usually outside the retry layer so an open circuit doesn't retry at all.</p>
+
+  <h2>Bulkheads: one failure, one compartment</h2>
+  <p>A ship's hull is divided into watertight compartments so one breach doesn't sink it. A <b>bulkhead</b> in software limits how much of your capacity any one dependency can consume. If recommendations and payments share one 200-thread pool and the recommendation service hangs, 200 threads end up waiting on recommendations and payments can't get a thread. Give each dependency its own bounded pool, or a <code>Semaphore</code> with a fixed number of permits, and the hung dependency can only exhaust its own compartment:</p>
+<pre class="code"><span class="k">private final</span> <span class="t">Semaphore</span> recommendationsBulkhead = <span class="k">new</span> <span class="t">Semaphore</span>(<span class="m">20</span>);
+
+<span class="t">List</span>&lt;<span class="t">Product</span>&gt; <span class="f">recommendations</span>(<span class="t">UserId</span> u) {
+	<span class="k">if</span> (!recommendationsBulkhead.<span class="f">tryAcquire</span>()) <span class="k">return</span> <span class="t">List</span>.<span class="f">of</span>();          <span class="c">// compartment full: degrade, don't wait</span>
+	<span class="k">try</span> { <span class="k">return</span> client.<span class="f">recommend</span>(u); }
+	<span class="k">finally</span> { recommendationsBulkhead.<span class="f">release</span>(); }
+}</pre>
+
+  <h2>Idempotency: making retries safe</h2>
+  <p>Retrying a read is harmless. Retrying “charge this card 1,999 cents” is not: if the first attempt actually succeeded and only the response was lost, a retry charges the customer twice. An operation is <b>idempotent</b> if doing it twice has the same effect as doing it once. Reads, puts of absolute values and deletes usually are; “add”, “charge” and “send” are not. The standard fix is an <b>idempotency key</b>: the client generates a unique key per logical operation and sends it with every attempt; the server records the key with the result, and a repeat of the same key returns the stored result instead of doing the work again.</p>
+  <figure class="seq" data-actors="Checkout|Payments API|Idempotency store">
+    <ol>
+      <li data-m="0>1">POST /charges, Idempotency-Key: ord-8412</li>
+      <li data-m="1>2">key new → charge the card, store (key → ch_3Pq)</li>
+      <li data-m="1>0" data-k="fail">response lost (timeout)</li>
+      <li data-m="0>1">retry: same key ord-8412</li>
+      <li data-m="1>2">key seen → stored result</li>
+      <li data-m="1>0" data-k="reply">200 ch_3Pq (card charged once)</li>
+    </ol>
+    <figcaption><b>A retry with an idempotency key.</b> The client can't tell whether a timed-out request happened; the key lets the server tell for it.</figcaption>
+  </figure>
+  <p>The key must identify the <i>operation</i>, not the attempt: the order id is a good key for “charge this order”, a fresh UUID per retry is useless. The store needs an atomic insert-if-absent on the key (check-then-act from <a href="22-thread-safe-classes.html">Chapter 22</a>), and entries can expire after a day or two, once no client will retry.</p>
+
+  <h2>Which tool for which failure</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Tool</th><th>Protects against</th><th>Costs you</th><th>Order when stacked (outermost first)</th></tr></thead>
+      <tbody>
+        <tr><td>Bulkhead</td><td>One dependency consuming all threads or connections</td><td>Sizing per dependency; some requests rejected when full</td><td>1: reject before any work starts</td></tr>
+        <tr><td>Circuit breaker</td><td>Sustained outages: wasted waits, extra load on a sick service</td><td>Fast failures even for requests that might have worked</td><td>2: an open circuit skips the retries entirely</td></tr>
+        <tr><td>Retry with backoff</td><td>Brief, transient blips</td><td>Latency, extra load; needs idempotency</td><td>3: each attempt gets its own timeout</td></tr>
+        <tr><td>Timeout</td><td>Hanging calls holding threads forever</td><td>Some slow-but-successful calls get cut off</td><td>4: innermost, around each single attempt</td></tr>
+        <tr><td>Idempotency key</td><td>Duplicate side effects when a retry repeats work that succeeded</td><td>A key store with atomic insert and expiry</td><td>Carried on the request, checked by the server</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Payment APIs build this in</div><p>Stripe's API accepts an <code>Idempotency-Key</code> header on requests that create or change things: a retried request with the same key returns the original result rather than performing the operation twice, and keys are pruned after about 24 hours. Its official client libraries can retry network failures automatically with backoff, and they attach an idempotency key so those retries are safe. It's this chapter's toolkit shipped as a product feature, because for a payments company a double charge caused by a retry is the worst kind of bug.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>No timeout,</b> or the library's default of “forever”. Every remote call needs one, from a budget.</li>
+      <li><b>Retrying everything:</b> 400s, declined cards, validation errors. Retry only transient, safe failures.</li>
+      <li><b>Immediate or fixed-delay retries.</b> Back off exponentially, with jitter, capped.</li>
+      <li><b>Retries at every layer.</b> Three layers retrying three times each is 27 calls per request. Retry in one place.</li>
+      <li><b>Retrying non-idempotent operations without a key.</b> Charges and emails happen twice.</li>
+      <li><b>One shared pool for every dependency.</b> A single hung partner takes every feature down. Use bulkheads.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What does a circuit breaker do, and why is it better than just retrying?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It tracks failures to a dependency. While things are fine it's closed and calls go through. After enough failures it opens and fails calls immediately without touching the network, which saves threads, gives the caller a fast answer to degrade with, and takes load off a service that's trying to recover. After a cooldown it goes half-open and lets a probe through; success closes it, failure reopens it. Retries handle brief blips; a breaker handles sustained outages, and it sits outside the retry layer so an open circuit doesn't retry at all.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your service calls a payment API that sometimes times out. Design the client-side resilience.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A request timeout from the page's latency budget, plus a connect timeout. A retry policy for timeouts, connection errors, 429 and 503 only: three attempts, exponential backoff with full jitter, capped, within the caller's deadline. Every charge carries an idempotency key derived from the order, so a retry after a lost response returns the original charge instead of charging twice. A circuit breaker outside the retries, so a sustained outage fails fast and checkout can show “try again shortly”. And a bulkhead, a dedicated bounded pool or semaphore for payment calls, so a hung provider can't starve the rest of the service.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Every remote call needs a connect and a request timeout, derived from a latency budget.</li>
+      <li>Retry only transient, safe failures; back off exponentially with jitter, cap attempts and time, and retry in one layer.</li>
+      <li>A circuit breaker is a state machine: closed counts failures, open fails fast, half-open probes.</li>
+      <li>Bulkheads give each dependency its own bounded pool or semaphore, so one hang can't take everything down.</li>
+      <li>Idempotency keys identify an operation, so a retried charge returns the original result instead of charging twice.</li>
+      <li>These features compose as decorators around a client: breaker outside retry, retry outside the adapter.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why add random jitter to retry delays?</p>
+      <div class="opts">
+        <button class="opt">To make retries faster</button>
+        <button class="opt">To reduce the number of retries</button>
+        <button class="opt">So clients that failed at the same moment don't all retry at the same moment, overwhelming the recovering service again</button>
+        <button class="opt">Because exponential backoff doesn't work without it</button>
+      </div>
+      <div class="explain">Deterministic delays synchronise clients into waves. Randomising spreads retries out over time, giving the dependency a steadier load while it recovers.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A circuit breaker is open. What happens to a new call before the cooldown ends?</p>
+      <div class="opts">
+        <button class="opt">It fails immediately without calling the dependency</button>
+        <button class="opt">It waits for the cooldown, then calls</button>
+        <button class="opt">It's retried three times</button>
+        <button class="opt">It goes through as a probe</button>
+      </div>
+      <div class="explain">Open means fail fast. Only after the cooldown does the breaker move to half-open and let a probe through.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Which error should a retry policy retry?</p>
+      <div class="opts">
+        <button class="opt">400 Bad Request</button>
+        <button class="opt">A declined card</button>
+        <button class="opt">422 validation error</button>
+        <button class="opt">503 Service Unavailable, for an idempotent request</button>
+      </div>
+      <div class="explain">503 signals a transient problem, and retrying an idempotent request can't cause duplicate effects. The others will fail the same way every time.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does a bulkhead protect against?</p>
+      <div class="opts">
+        <button class="opt">Duplicate charges on retry</button>
+        <button class="opt">One slow or hung dependency consuming all threads or connections and starving unrelated features</button>
+        <button class="opt">Clock skew between servers</button>
+        <button class="opt">Memory leaks</button>
+      </div>
+      <div class="explain">By bounding each dependency's share of capacity (its own pool or semaphore), a failure is contained to the features that use that dependency.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which idempotency key design is correct for “charge the customer for order 8412”?</p>
+      <div class="opts">
+        <button class="opt">A new random UUID for every attempt</button>
+        <button class="opt">The current timestamp</button>
+        <button class="opt">A key derived from the operation, like the order id, sent unchanged on every retry</button>
+        <button class="opt">No key: charges are idempotent already</button>
+      </div>
+      <div class="explain">The key must be the same for every attempt of one logical operation, so the server can recognise a retry. A fresh UUID per attempt makes every retry look new.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$, sleep } = LLD;
+  const TH = 5, COOL = 5;
+  let st, down = 'ok', busy = false;
+  const log = $('#cbLog');
+  function reset() { st = { state: 'CLOSED', fails: 0, openedTick: 0, tick: 0, marks: [], calls: 0, fast: 0, ok: 0, waitMs: 0, flakyN: 0 }; log.innerHTML = ''; draw(); }
+  function outcome() { if (down === 'ok') return true; if (down === 'down') return false; st.flakyN++; return st.flakyN % 2 === 0; }
+  function one() {
+    st.tick++;
+    if (st.state === 'OPEN') {
+      if (st.tick - st.openedTick < COOL) { st.fast++; st.marks.push('cb-fast'); LLD.log(log, `t${st.tick}: OPEN → failed fast (${COOL - (st.tick - st.openedTick)} of ${COOL} cooldown ticks left)`, ''); return; }
+      st.state = 'HALF_OPEN'; LLD.log(log, `t${st.tick}: cooldown over → HALF_OPEN, sending one probe`, 'warn');
+    }
+    const probe = st.state === 'HALF_OPEN', ok = outcome();
+    st.calls++;
+    if (ok) {
+      st.ok++; st.waitMs += 80; st.marks.push(probe ? 'cb-probe' : 'cb-ok');
+      if (probe) LLD.log(log, `t${st.tick}: probe succeeded → CLOSED`, 'ok'); else LLD.log(log, `t${st.tick}: call ok (80 ms)`, '');
+      st.state = 'CLOSED'; st.fails = 0;
+    } else {
+      st.waitMs += 1000; st.marks.push(probe ? 'cb-probe' : 'cb-fail');
+      if (probe || ++st.fails >= TH) { st.state = 'OPEN'; st.openedTick = st.tick; LLD.log(log, `t${st.tick}: ${probe ? 'probe failed' : TH + ' failures in a row'} → OPEN`, 'bad'); }
+      else LLD.log(log, `t${st.tick}: call timed out after 1 s (${st.fails}/${TH})`, 'bad');
+    }
+  }
+  function draw() {
+    const S = [['CLOSED', 'Calls go through; failures counted.'], ['OPEN', 'Calls fail immediately; cooling down.'], ['HALF_OPEN', 'One probe decides: close or reopen.']];
+    $('#cbStates').innerHTML = S.map(([n, d]) => `<div class="cb-st${st.state === n ? ' cb-cur' : ''}"><b>${n}</b>${d}${n === 'CLOSED' && st.state === 'CLOSED' ? ` (${st.fails}/${TH} failures)` : ''}</div>`).join('');
+    $('#cbTl').innerHTML = st.marks.map((c) => `<i class="${c}"></i>`).join('') || '<span class="small muted">No requests yet.</span>';
+    $('#cbStats').innerHTML = `
+      <div class="stat"><div class="k">Requests</div><div class="v">${st.tick}</div></div>
+      <div class="stat good"><div class="k">Succeeded</div><div class="v">${st.ok}</div></div>
+      <div class="stat"><div class="k">Failed fast</div><div class="v">${st.fast}</div></div>
+      <div class="stat ${st.waitMs > 5000 ? 'bad' : ''}"><div class="k">Thread time spent waiting</div><div class="v">${(st.waitMs / 1000).toFixed(1)}<small> s</small></div></div>`;
+  }
+  $('#cbRun').onclick = async () => { if (busy) return; busy = true; for (let i = 0; i < 10; i++) { one(); draw(); await sleep(160); } busy = false; };
+  $('#cbReset').onclick = () => { if (!busy) reset(); };
+  $$('#cbDown button').forEach((b) => b.addEventListener('click', () => { down = b.dataset.v; st.flakyN = 0; LLD.log(log, `downstream is now ${b.textContent.replace('downstream ', '')}`, 'warn'); }));
+  reset();
+})();
+</script>
+</body>
+</html>

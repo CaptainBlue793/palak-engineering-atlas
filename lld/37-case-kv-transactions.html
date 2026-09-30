@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Key-Value Store with Transactions</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .kv-grid { display:grid; grid-template-columns: 1.2fr 1fr; gap:12px; margin-top:12px; }
+  @media (max-width: 760px) { .kv-grid { grid-template-columns: 1fr; } }
+  .kv-term { background:#0d1117; color:#c9d1d9; border-radius:12px; border:1px solid var(--border); font-family:var(--mono); font-size:12.5px; display:flex; flex-direction:column; min-height:320px; }
+  .kv-out { flex:1; padding:10px 12px; overflow:auto; max-height:320px; white-space:pre-wrap; line-height:1.5; }
+  .kv-out .kv-cmd { color:#7ee787; } .kv-out .kv-err { color:#ff7b72; } .kv-out .kv-note { color:#8b949e; }
+  .kv-in { display:flex; gap:6px; align-items:center; border-top:1px solid #30363d; padding:8px 12px; }
+  .kv-in span { color:#7ee787; white-space:nowrap; }
+  .kv-in input { flex:1; min-width:0; background:transparent; border:0; outline:0; color:#e6edf3; font-family:var(--mono); font-size:12.5px; }
+  .kv-side { display:flex; flex-direction:column; gap:10px; }
+  .kv-box { background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:8px 12px; font-family:var(--mono); font-size:12px; }
+  .kv-box h4 { margin:0 0 6px; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-family:var(--sans, inherit); }
+  .kv-box table { width:100%; border-collapse:collapse; }
+  .kv-box td { padding:2px 4px; border-bottom:1px solid var(--border); }
+  .kv-box tr:last-child td { border-bottom:0; }
+  .kv-dead { text-decoration:line-through; color:var(--muted); }
+  .kv-unsynced { color:var(--amber); }
+  .kv-layer { border-left:3px solid var(--accent); padding:2px 8px; margin:4px 0; }
+  .kv-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+  .kv-chips button { font-family:var(--mono); font-size:11.5px; }
+</style>
+</head>
+<body data-chapter="37">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 37</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Case Study: <span class="grad">Key-Value Store with Transactions</span></h1>
+    <p class="lead">A key-value store with <code>SET</code>, <code>GET</code> and <code>DELETE</code> is a HashMap. Add <code>BEGIN</code>, <code>ROLLBACK</code> and <code>COMMIT</code>, allow them to nest, add keys that expire, and require that committed writes survive a crash, and it becomes one of the richest LLD problems there is. It's also a small model of how real databases work: an undo log for rollback, a write-ahead log for durability, and lazy plus active expiry. There's a working console to try it in below.</p>
+    <ul class="objectives">
+      <li>Specify commands and their exact semantics, including nested transactions</li>
+      <li>Implement rollback with an undo log of mementos, and compare it with layered write sets</li>
+      <li>Merge a committed inner transaction into its parent correctly</li>
+      <li>Expire keys lazily and actively, storing absolute expiry times</li>
+      <li>Make commits durable with a write-ahead log and an explicit fsync policy</li>
+    </ul>
+  </section>
+
+  <div class="callout analogy">
+    <div class="ico">🏗️</div>
+    <div class="body"><div class="title">Same problem, different zoom</div>
+      The System Design course covers a distributed key-value store: partitioning, replication, quorums and consistency across machines. This chapter zooms into the classes of a single-node store. See <a href="../system-design/39-case-kv-store.html">the high-level design</a>.
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Command and Memento.</b> See <a href="17-command-memento.html">Chapter 17</a>.</li>
+        <li><b>Transactions and all-or-nothing writes.</b> See <a href="26-persistence.html">Chapter 26</a>.</li>
+        <li><b>Injected clocks.</b> See <a href="28-testing-designs.html">Chapter 28</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Requirements and API</h2>
+  <p>This problem lives or dies on precise semantics, so pin them down first. <code>SET k v [EX seconds]</code> sets a value, optionally with a time-to-live. <code>GET k</code> returns the value or nothing. <code>DELETE k</code> removes it. <code>COUNT v</code> returns how many keys currently hold value v (this forces an index). <code>BEGIN</code> opens a transaction, and transactions nest. <code>ROLLBACK</code> undoes everything in the <b>innermost</b> open transaction. <code>COMMIT</code> ends the innermost one, making its changes part of its parent; committing the outermost one makes them durable. Reads inside a transaction see its own writes. For this design, one client drives the store; concurrent sessions with isolation are the follow-up.</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">KvStore</span> {
+	<span class="t">Optional</span>&lt;<span class="t">String</span>&gt; <span class="f">get</span>(<span class="t">String</span> key);
+	<span class="k">void</span> <span class="f">set</span>(<span class="t">String</span> key, <span class="t">String</span> value, <span class="t">Optional</span>&lt;<span class="t">Duration</span>&gt; ttl);
+	<span class="k">boolean</span> <span class="f">delete</span>(<span class="t">String</span> key);
+	<span class="k">long</span> <span class="f">count</span>(<span class="t">String</span> value);
+	<span class="k">void</span> <span class="f">begin</span>();
+	<span class="k">void</span> <span class="f">commit</span>();      <span class="c">// throws NoTransactionException if none is open</span>
+	<span class="k">void</span> <span class="f">rollback</span>();
+}
+
+<span class="k">record</span> <span class="t">Entry</span>(<span class="t">String</span> value, <span class="t">Instant</span> expiresAt) {                     <span class="c">// expiresAt null = never</span>
+	<span class="k">boolean</span> <span class="f">expired</span>(<span class="t">Instant</span> now) { <span class="k">return</span> expiresAt != <span class="k">null</span> &amp;&amp; !now.<span class="f">isBefore</span>(expiresAt); }
+}</pre>
+  <p>Some well-known variants of this exercise define <code>COMMIT</code> as closing <i>all</i> open transactions at once. Either is fine; the point is to choose one and say it. Nested commit-into-parent is the same behaviour as savepoints in SQL databases, and it's the more general of the two.</p>
+
+  <h2>Nested transactions as a stack of change sets</h2>
+  <p>Open transactions form a <b>stack</b>: <code>BEGIN</code> pushes, <code>COMMIT</code> and <code>ROLLBACK</code> pop. The question is what each level stores. There are two classic answers:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Undo log (write in place)</th><th>Write-set layers (write aside)</th></tr></thead>
+      <tbody>
+        <tr><td>On SET inside a transaction</td><td>Save the key's old value in the level's undo map (first time only), then change the data</td><td>Put the new value in the level's own map; data untouched</td></tr>
+        <tr><td>GET</td><td>O(1): read the data</td><td>O(depth): check each level from the top, then the data</td></tr>
+        <tr><td>COUNT v</td><td>O(1) from an index kept on the data</td><td>Hard: counts differ per level</td></tr>
+        <tr><td>ROLLBACK</td><td>Restore the saved old values</td><td>Discard the top level: O(1)</td></tr>
+        <tr><td>COMMIT to parent</td><td>Merge undo maps (parent's older values win)</td><td>Merge the level's writes into the parent's</td></tr>
+        <tr><td>Concurrent readers</td><td>See uncommitted data unless isolated</td><td>Naturally isolated: others read only the data</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>For one client with <code>COUNT</code>, the undo log wins: reads and counts are O(1), and each level stores only the keys it touched. Each saved old value is a <b>memento</b> (<a href="17-command-memento.html">Chapter 17</a>): enough state to put that key back exactly as it was, including “it didn't exist”. Write-set layers are the better starting point once several sessions need isolation, because uncommitted writes never touch shared data, and that's where the follow-up goes.</p>
+<pre class="code"><span class="k">final class</span> <span class="t">Transaction</span> {
+	<span class="k">final</span> <span class="t">Map</span>&lt;<span class="t">String</span>, <span class="t">Entry</span>&gt; undo = <span class="k">new</span> <span class="t">HashMap</span>&lt;&gt;();     <span class="c">// key → entry before this level first touched it; null = absent</span>
+	<span class="k">final</span> <span class="t">List</span>&lt;<span class="t">Op</span>&gt; redo = <span class="k">new</span> <span class="t">ArrayList</span>&lt;&gt;();               <span class="c">// the operations, for the WAL if this reaches the top</span>
+}
+
+<span class="k">public final class</span> <span class="t">InMemoryKvStore</span> <span class="k">implements</span> <span class="t">KvStore</span> {
+	<span class="k">private final</span> <span class="t">Map</span>&lt;<span class="t">String</span>, <span class="t">Entry</span>&gt; data = <span class="k">new</span> <span class="t">HashMap</span>&lt;&gt;();
+	<span class="k">private final</span> <span class="t">Map</span>&lt;<span class="t">String</span>, <span class="t">Long</span>&gt; valueCounts = <span class="k">new</span> <span class="t">HashMap</span>&lt;&gt;();   <span class="c">// index for COUNT</span>
+	<span class="k">private final</span> <span class="t">Deque</span>&lt;<span class="t">Transaction</span>&gt; tx = <span class="k">new</span> <span class="t">ArrayDeque</span>&lt;&gt;();
+	<span class="k">private final</span> <span class="t">WriteAheadLog</span> wal;
+	<span class="k">private final</span> <span class="t">Clock</span> clock;
+
+	<span class="k">public synchronized void</span> <span class="f">set</span>(<span class="t">String</span> key, <span class="t">String</span> value, <span class="t">Optional</span>&lt;<span class="t">Duration</span>&gt; ttl) {
+		<span class="t">Instant</span> exp = ttl.<span class="f">map</span>(d -&gt; clock.<span class="f">instant</span>().<span class="f">plus</span>(d)).<span class="f">orElse</span>(<span class="k">null</span>);   <span class="c">// absolute time, not “seconds left”</span>
+		<span class="f">apply</span>(key, <span class="k">new</span> <span class="t">Entry</span>(value, exp), <span class="k">new</span> <span class="t">Op.Set</span>(key, value, exp));
+	}
+
+	<span class="k">public synchronized boolean</span> <span class="f">delete</span>(<span class="t">String</span> key) {
+		<span class="k">if</span> (<span class="f">live</span>(key) == <span class="k">null</span>) <span class="k">return false</span>;
+		<span class="f">apply</span>(key, <span class="k">null</span>, <span class="k">new</span> <span class="t">Op.Delete</span>(key));
+		<span class="k">return true</span>;
+	}
+
+	<span class="k">private void</span> <span class="f">apply</span>(<span class="t">String</span> key, <span class="t">Entry</span> next, <span class="t">Op</span> op) {
+		<span class="t">Transaction</span> t = tx.<span class="f">peek</span>();
+		<span class="k">if</span> (t == <span class="k">null</span>) wal.<span class="f">append</span>(<span class="t">List</span>.<span class="f">of</span>(op));                       <span class="c">// autocommit: log first, then apply</span>
+		<span class="k">else</span> {
+			<span class="k">if</span> (!t.undo.<span class="f">containsKey</span>(key)) t.undo.<span class="f">put</span>(key, data.<span class="f">get</span>(key));   <span class="c">// memento, once per level (null = absent)</span>
+			t.redo.<span class="f">add</span>(op);
+		}
+		<span class="f">write</span>(key, next);
+	}
+
+	<span class="k">private void</span> <span class="f">write</span>(<span class="t">String</span> key, <span class="t">Entry</span> next) {                  <span class="c">// the only place data and the index change</span>
+		<span class="t">Entry</span> prev = next == <span class="k">null</span> ? data.<span class="f">remove</span>(key) : data.<span class="f">put</span>(key, next);
+		<span class="k">if</span> (prev != <span class="k">null</span>) valueCounts.<span class="f">merge</span>(prev.<span class="f">value</span>(), -<span class="m">1L</span>, <span class="t">Long</span>::<span class="f">sum</span>);
+		<span class="k">if</span> (next != <span class="k">null</span>) valueCounts.<span class="f">merge</span>(next.<span class="f">value</span>(), <span class="m">1L</span>, <span class="t">Long</span>::<span class="f">sum</span>);
+	}
+}</pre>
+  <p>Note <code>containsKey</code> rather than <code>putIfAbsent</code>: the saved value is often <code>null</code> (“the key didn't exist”), and <code>putIfAbsent</code> treats a null mapping as absent, so a second write in the same level would overwrite the memento with the first write's value, and rollback would restore the wrong thing. It's exactly the kind of bug an interviewer probes with “what if I set the same key twice in one transaction?”</p>
+
+  <h2>Rollback via Memento</h2>
+  <p>Rollback pops the innermost level and restores each saved memento through the same <code>write</code> method, which keeps the <code>COUNT</code> index correct for free. Commit is the subtle one: an inner level's changes become part of its parent, so if the parent later rolls back, the inner changes must be undone too. Merge the undo maps, and where both levels saved a value for the same key, <b>the parent's (older) memento wins</b>, because it's the state from before either level began.</p>
+<pre class="code"><span class="k">public synchronized void</span> <span class="f">rollback</span>() {
+	<span class="t">Transaction</span> t = <span class="f">pop</span>();
+	t.undo.<span class="f">forEach</span>(<span class="k">this</span>::<span class="f">write</span>);                            <span class="c">// restore every key this level touched</span>
+}
+
+<span class="k">public synchronized void</span> <span class="f">commit</span>() {
+	<span class="t">Transaction</span> t = <span class="f">pop</span>();
+	<span class="t">Transaction</span> parent = tx.<span class="f">peek</span>();
+	<span class="k">if</span> (parent == <span class="k">null</span>) { wal.<span class="f">append</span>(t.redo); <span class="k">return</span>; }         <span class="c">// outermost: one durable batch</span>
+	t.undo.<span class="f">forEach</span>((k, old) -&gt; { <span class="k">if</span> (!parent.undo.<span class="f">containsKey</span>(k)) parent.undo.<span class="f">put</span>(k, old); });
+	parent.redo.<span class="f">addAll</span>(t.redo);
+}
+
+<span class="k">private</span> <span class="t">Transaction</span> <span class="f">pop</span>() {
+	<span class="t">Transaction</span> t = tx.<span class="f">poll</span>();
+	<span class="k">if</span> (t == <span class="k">null</span>) <span class="k">throw new</span> <span class="t">NoTransactionException</span>();
+	<span class="k">return</span> t;
+}</pre>
+  <figure class="seq" data-actors="Client|KvStore|Tx level 1|Tx level 2|WAL">
+    <ol>
+      <li data-m="0>1">BEGIN; SET a 10</li>
+      <li data-m="1>2">undo[a] = absent</li>
+      <li data-m="0>1">BEGIN; SET a 20; DELETE b</li>
+      <li data-m="1>3">undo[a] = 10, undo[b] = "x"</li>
+      <li data-m="0>1">ROLLBACK</li>
+      <li data-m="3>1" data-k="reply">restore a = 10, b = "x"; pop level 2</li>
+      <li data-m="0>1">COMMIT</li>
+      <li data-m="1>4">append [SET a 10] as one batch, fsync</li>
+      <li data-m="1>0" data-k="reply">OK: a = 10 is durable</li>
+    </ol>
+    <figcaption><b>Nested rollback, then commit.</b> The inner level's mementos restore exactly its own changes; only the outermost commit reaches the log.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">KV console: transactions, TTLs, and a crash</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <p class="small muted" style="margin:0">Commands: <code>SET k v [EX s]</code> <code>GET k</code> <code>DELETE k</code> <code>COUNT v</code> <code>BEGIN</code> <code>ROLLBACK</code> <code>COMMIT</code> <code>ADVANCE s</code> (move the clock) <code>SWEEP</code> (active expiry) <code>CRASH</code> (restart from the WAL).</p>
+      <div class="controls"><span class="small muted">WAL fsync:</span><div class="seg" id="kvSync"><button class="active" data-v="always">always</button><button data-v="everysec">every second</button></div></div>
+      <div class="kv-grid">
+        <div class="kv-term"><div class="kv-out" id="kvOut"></div><div class="kv-in"><span id="kvPrompt">&gt;</span><input id="kvIn" autocomplete="off" spellcheck="false" aria-label="KV command"></div></div>
+        <div class="kv-side">
+          <div class="kv-box"><h4>Data (t = <span id="kvT">0</span> s)</h4><div id="kvData"></div></div>
+          <div class="kv-box"><h4>Open transactions (undo logs)</h4><div id="kvTx"></div></div>
+          <div class="kv-box"><h4>Write-ahead log</h4><div id="kvWal"></div></div>
+        </div>
+      </div>
+      <div class="kv-chips" id="kvChips"></div>
+    </div>
+    <div class="panel-foot">Expired keys stay in memory (struck through) until something reads them or a sweep runs. With “every second”, WAL records written since the last fsync (amber) are lost if you CRASH before an ADVANCE.</div>
+  </div>
+
+  <h2>TTL expiry</h2>
+  <p>Store the <b>absolute</b> expiry instant, never the seconds remaining: an absolute time doesn't need updating as time passes, survives being written to the log and replayed, and compares with one call against an injected clock. Then expire in two ways, because neither is enough alone. <b>Lazily:</b> every read checks the entry and treats an expired one as absent (deleting it on the spot), so a client can never see a stale value. <b>Actively:</b> a periodic sweep removes expired keys nobody reads, which would otherwise hold memory forever.</p>
+<pre class="code"><span class="k">private</span> <span class="t">Entry</span> <span class="f">live</span>(<span class="t">String</span> key) {
+	<span class="t">Entry</span> e = data.<span class="f">get</span>(key);
+	<span class="k">if</span> (e != <span class="k">null</span> &amp;&amp; e.<span class="f">expired</span>(clock.<span class="f">instant</span>())) { <span class="f">write</span>(key, <span class="k">null</span>); <span class="k">return null</span>; }   <span class="c">// lazy expiry</span>
+	<span class="k">return</span> e;
+}
+
+<span class="k">public synchronized</span> <span class="t">Optional</span>&lt;<span class="t">String</span>&gt; <span class="f">get</span>(<span class="t">String</span> key) { <span class="k">return</span> <span class="t">Optional</span>.<span class="f">ofNullable</span>(<span class="f">live</span>(key)).<span class="f">map</span>(<span class="t">Entry</span>::<span class="f">value</span>); }
+
+<span class="k">synchronized int</span> <span class="f">sweep</span>(<span class="k">int</span> sample) {                        <span class="c">// scheduled (Chapter 35); samples keys that have a TTL</span>
+	<span class="k">int</span> removed = <span class="m">0</span>;
+	<span class="k">for</span> (<span class="t">String</span> k : <span class="f">randomKeysWithTtl</span>(sample)) <span class="k">if</span> (<span class="f">live</span>(k) == <span class="k">null</span>) removed++;
+	<span class="k">return</span> removed;                                             <span class="c">// caller repeats if many were expired</span>
+}</pre>
+  <p>Sampling instead of scanning every key keeps each sweep's cost bounded. A sweep that finds a high share of expired keys in its sample runs again straight away, so the amount of expired-but-present memory stays proportional to how fast keys expire. Redis documents the same approach for its active expiry.</p>
+
+  <h2>Write-ahead log</h2>
+  <p>Durability means a <code>COMMIT</code> that returned OK survives a crash. The rule is in the name: <b>write the log before you acknowledge</b>. Every committed batch is appended to a file as one record, and on startup the store replays the file to rebuild memory. Two decisions make or break it. <b>When to fsync:</b> writing to a file only reaches the operating system's cache; <code>force</code> (fsync) waits for the disk, which is the durable point and is slow. Syncing on every commit is safest; syncing once a second is much faster and can lose about a second of acknowledged writes. <b>Torn records:</b> a crash mid-append leaves a partial record at the tail, so each record carries its length and a checksum, and replay stops at the first bad one.</p>
+<pre class="code"><span class="k">final class</span> <span class="t">WriteAheadLog</span> {
+	<span class="k">private final</span> <span class="t">FileChannel</span> channel;
+	<span class="k">private final</span> <span class="t">FsyncPolicy</span> policy;                        <span class="c">// ALWAYS, or EVERY_SECOND via a scheduled force()</span>
+
+	<span class="k">synchronized void</span> <span class="f">append</span>(<span class="t">List</span>&lt;<span class="t">Op</span>&gt; batch) {
+		<span class="t">ByteBuffer</span> record = <span class="t">Codec</span>.<span class="f">encode</span>(batch);                 <span class="c">// [length][crc32][ops…]: a batch is all-or-nothing on replay</span>
+		<span class="k">while</span> (record.<span class="f">hasRemaining</span>()) channel.<span class="f">write</span>(record);
+		<span class="k">if</span> (policy == <span class="t">FsyncPolicy</span>.ALWAYS) channel.<span class="f">force</span>(<span class="k">false</span>); <span class="c">// durable before COMMIT returns</span>
+	}
+
+	<span class="k">static void</span> <span class="f">replay</span>(<span class="t">Path</span> file, <span class="t">Instant</span> now, <span class="t">BiConsumer</span>&lt;<span class="t">String</span>, <span class="t">Entry</span>&gt; apply) {
+		<span class="c">// read records until EOF or a bad length/checksum (a torn tail); apply each op in order;</span>
+		<span class="c">// SETs whose expiresAt is already past are skipped — absolute times make that possible.</span>
+	}
+}</pre>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>COMMIT (outermost)</b> The level's redo list holds every operation in order.</li>
+      <li><b>Encode one record</b> Length + checksum + ops, so replay applies the whole batch or none of it.</li>
+      <li><b>Append to the log</b> The bytes reach the OS page cache.</li>
+      <li data-k="decision"><b>fsync policy?</b> ALWAYS: force to disk now. EVERY_SECOND: a background task forces within a second.</li>
+      <li data-k="end"><b>Acknowledge OK</b> After a restart, replay rebuilds exactly the acknowledged state (minus the unsynced window, if any).</li>
+    </ol>
+    <figcaption><b>A durable commit.</b> The log grows forever unless you checkpoint: write a snapshot of the data, then truncate the log up to it.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">What Redis does, and doesn't</div><p>Redis offers the same durability trade-off as a setting. With its append-only file (AOF) enabled, <code>appendfsync always</code> fsyncs every write, <code>everysec</code> (the default) fsyncs once per second and can lose about a second of writes in a crash, and <code>no</code> leaves flushing to the operating system; the file is compacted by periodically rewriting it. Its transactions, however, are different from this chapter's: <code>MULTI</code> … <code>EXEC</code> queues commands and runs them together without interleaving other clients, but there is <b>no rollback</b>. If one queued command fails at runtime, the others still take effect, and <code>DISCARD</code> only drops the queue before <code>EXEC</code>. It's a useful contrast in the interview: “atomic execution” and “all-or-nothing with rollback” are different promises.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Saving the old value on every write</b> instead of the first per level, or with <code>putIfAbsent</code>, which overwrites a saved “absent”.</li>
+      <li><b>Letting the child's memento win</b> when merging on commit; the parent's older value must.</li>
+      <li><b>Storing “seconds left”</b> for TTLs, which goes stale and replays wrongly.</li>
+      <li><b>Only lazy expiry:</b> expired keys nobody reads leak memory. Only active expiry: reads can see stale values.</li>
+      <li><b>Acknowledging before logging,</b> or logging each operation of a transaction separately so a crash replays half of it.</li>
+      <li><b>No checksum,</b> so a torn final record is replayed as garbage.</li>
+      <li><b>Forgetting the COUNT index</b> on rollback paths; route every change through one write method.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you implement ROLLBACK for nested transactions?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Keep a stack of open transactions. Each level has an undo map: the first time a key changes in that level, I save its previous value, including “didn't exist”. Changes go straight into the data, so reads are O(1). ROLLBACK pops the top level and writes each saved value back. COMMIT pops it and merges its undo map into the parent's, keeping the parent's value where both have one, so that a later rollback of the parent undoes the child's changes too. Only the outermost commit writes to the log.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Now two clients use the store concurrently, each with its own transactions. What breaks, and how would you redesign?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>With write-in-place undo logs, client B would read client A's uncommitted changes, and A's rollback could erase B's work on the same key. I'd move transactions into per-session objects and switch to write-set layers: a session's uncommitted writes live in its own maps, reads check its layers and then the committed data, so nobody sees uncommitted state. At the outermost commit, I apply the write set to the shared data atomically under a lock and log it. For conflicts, optimistic checking: record the version of each key the transaction read, and at commit reject it if any changed since (snapshot isolation with first-committer-wins); the client retries. COUNT then needs to combine the committed index with the session's own pending changes. That's the step from this chapter's design toward MVCC in real databases.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Pin down semantics first: what nested COMMIT and ROLLBACK mean, and what reads inside a transaction see.</li>
+      <li>An undo log of mementos (first change per key per level) gives O(1) reads and an easy COUNT index.</li>
+      <li>On nested commit, merge undo maps with the parent's older memento winning; only the outermost commit is logged.</li>
+      <li>Store absolute expiry times; expire lazily on read and actively by sampling.</li>
+      <li>Log before acknowledging, one checksummed record per committed batch; fsync policy is an explicit durability trade-off.</li>
+      <li>For concurrent sessions, switch to per-session write sets and validate at commit.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q"><code>SET a 1; BEGIN; SET a 2; BEGIN; SET a 3; ROLLBACK; GET a</code> — what's returned?</p>
+      <div class="opts">
+        <button class="opt">1</button>
+        <button class="opt">3</button>
+        <button class="opt">2</button>
+        <button class="opt">Nothing</button>
+      </div>
+      <div class="explain">ROLLBACK undoes only the innermost transaction, restoring a to its value before that level: 2.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">When an inner transaction commits into its parent, both have saved an old value for key k. Which one is kept?</p>
+      <div class="opts">
+        <button class="opt">The parent's: it's the value from before either transaction began</button>
+        <button class="opt">The child's: it's more recent</button>
+        <button class="opt">Neither; both are discarded</button>
+        <button class="opt">Whichever is smaller</button>
+      </div>
+      <div class="explain">If the parent later rolls back, k must return to its state before the parent began, which is exactly the parent's memento.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why store a key's expiry as an absolute instant rather than “seconds remaining”?</p>
+      <div class="opts">
+        <button class="opt">It uses less memory</button>
+        <button class="opt">Instants are easier to print</button>
+        <button class="opt">Remaining seconds can't be negative</button>
+        <button class="opt">It doesn't change as time passes, and replaying the log later still expires keys at the right moment</button>
+      </div>
+      <div class="explain">A countdown would need constant updating and would restart from its logged value on replay, extending the key's life.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why do stores use both lazy and active expiry?</p>
+      <div class="opts">
+        <button class="opt">For redundancy in case one has a bug</button>
+        <button class="opt">Lazy expiry stops reads seeing stale values; active expiry frees keys nobody reads</button>
+        <button class="opt">Active expiry is only for keys without a TTL</button>
+        <button class="opt">Lazy expiry is required by the WAL</button>
+      </div>
+      <div class="explain">Each covers the other's gap: correctness on read, and bounded memory for keys that are never read again.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">With “fsync every second”, what can a crash lose?</p>
+      <div class="opts">
+        <button class="opt">Nothing; the WAL guarantees durability</button>
+        <button class="opt">All data since the last snapshot</button>
+        <button class="opt">Commits acknowledged in roughly the last second, whose log records hadn't reached disk</button>
+        <button class="opt">Only open, uncommitted transactions</button>
+      </div>
+      <div class="explain">Appended bytes sit in the OS cache until fsync. Syncing per second trades up to a second of acknowledged writes for much higher throughput. (Open transactions are lost in every mode.)</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  const out = $('#kvOut'), inp = $('#kvIn');
+  let data, tx, wal, t, sync = 'always';
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  function reset() { data = new Map(); tx = []; wal = []; t = 0; out.innerHTML = ''; print('Try the commands below, or type your own.', 'kv-note'); draw(); }
+  function print(s, cls) { const d = document.createElement('div'); if (cls) d.className = cls; d.textContent = s; out.appendChild(d); out.scrollTop = out.scrollHeight; }
+  const expired = (e) => e && e.exp !== null && t >= e.exp;
+  function write(k, e) { if (e) data.set(k, e); else data.delete(k); }
+  function live(k) { const e = data.get(k); if (expired(e)) { write(k, null); print(`(lazily removed expired key ${k})`, 'kv-note'); return null; } return e || null; }
+  function logOps(ops) { if (!ops.length) return; wal.push({ ops, synced: sync === 'always' }); }
+  function apply(k, e, op) {
+    const top = tx[tx.length - 1];
+    if (!top) logOps([op]);
+    else { if (!top.undo.has(k)) top.undo.set(k, data.has(k) ? { ...data.get(k) } : null); top.redo.push(op); }
+    write(k, e);
+  }
+  const fmtOp = (o) => o.op === 'SET' ? `SET ${o.k} ${o.v}${o.exp !== null ? ` @exp=${o.exp}` : ''}` : `DEL ${o.k}`;
+  const CMD = {
+    SET: (a) => {
+      if (a.length < 2) return 'ERR usage: SET k v [EX s]';
+      let exp = null;
+      if (a[2] && a[2].toUpperCase() === 'EX') { const s = +a[3]; if (!(s > 0)) return 'ERR EX needs a positive number'; exp = t + s; }
+      apply(a[0], { v: a[1], exp }, { op: 'SET', k: a[0], v: a[1], exp }); return 'OK';
+    },
+    GET: (a) => { const e = live(a[0]); return e ? e.v : '(nil)'; },
+    DELETE: (a) => { if (!live(a[0])) return '0'; apply(a[0], null, { op: 'DEL', k: a[0] }); return '1'; },
+    COUNT: (a) => String([...data.values()].filter((e) => !expired(e) && e.v === a[0]).length),
+    BEGIN: () => { tx.push({ undo: new Map(), redo: [] }); return `OK (depth ${tx.length})`; },
+    ROLLBACK: () => { const l = tx.pop(); if (!l) return 'ERR no transaction'; l.undo.forEach((e, k) => write(k, e)); return `OK: restored ${l.undo.size} key${l.undo.size === 1 ? '' : 's'} (depth ${tx.length})`; },
+    COMMIT: () => {
+      const l = tx.pop(); if (!l) return 'ERR no transaction';
+      const p = tx[tx.length - 1];
+      if (!p) { logOps(l.redo); return l.redo.length ? `OK: ${l.redo.length} op${l.redo.length === 1 ? '' : 's'} written to the WAL as one record${sync === 'always' ? ' and fsynced' : ' (not yet fsynced)'}` : 'OK (nothing to log)'; }
+      l.undo.forEach((e, k) => { if (!p.undo.has(k)) p.undo.set(k, e); }); p.redo.push(...l.redo);
+      return `OK: merged into parent (depth ${tx.length}); nothing durable yet`;
+    },
+    ADVANCE: (a) => { const s = +a[0]; if (!(s > 0)) return 'ERR usage: ADVANCE seconds'; t += s; const n = wal.filter((r) => !r.synced).length; wal.forEach((r) => { r.synced = true; }); return `clock t = ${t}s${n ? `; background fsync flushed ${n} record${n === 1 ? '' : 's'}` : ''}`; },
+    SWEEP: () => { let n = 0; [...data.keys()].forEach((k) => { if (expired(data.get(k))) { data.delete(k); n++; } }); return `active expiry removed ${n} key${n === 1 ? '' : 's'}`; },
+    CRASH: () => {
+      const lostTx = tx.length, lostRec = wal.filter((r) => !r.synced).length;
+      wal = wal.filter((r) => r.synced); tx = []; data = new Map();
+      let applied = 0, skipped = 0;
+      wal.forEach((r) => r.ops.forEach((o) => { if (o.op === 'SET') { if (o.exp !== null && t >= o.exp) { data.delete(o.k); skipped++; } else { data.set(o.k, { v: o.v, exp: o.exp }); applied++; } } else { data.delete(o.k); applied++; } }));
+      return `💥 process restarted. Replayed ${wal.length} WAL record${wal.length === 1 ? '' : 's'} (${applied} ops applied, ${skipped} already-expired SETs skipped).${lostTx ? ` ${lostTx} open transaction${lostTx === 1 ? '' : 's'} lost (never committed).` : ''}${lostRec ? ` ${lostRec} acknowledged record${lostRec === 1 ? '' : 's'} lost: never fsynced.` : ''}`;
+    },
+  };
+  function run(line) {
+    line = line.trim(); if (!line) return;
+    print(`> ${line}`, 'kv-cmd');
+    const [c, ...a] = line.split(/\s+/); const f = CMD[c.toUpperCase()];
+    const r = f ? f(a) : `ERR unknown command ${c}`;
+    print(r, /^ERR/.test(r) ? 'kv-err' : '');
+    draw();
+  }
+  function draw() {
+    $('#kvT').textContent = t;
+    const keys = [...data.keys()].sort();
+    $('#kvData').innerHTML = keys.length ? `<table>${keys.map((k) => { const e = data.get(k), x = expired(e); return `<tr class="${x ? 'kv-dead' : ''}"><td>${esc(k)}</td><td>${esc(e.v)}</td><td>${e.exp !== null ? `exp @${e.exp}s${x ? ' (expired)' : ''}` : ''}</td></tr>`; }).join('')}</table>` : '<span class="small muted">empty</span>';
+    $('#kvTx').innerHTML = tx.length ? tx.map((l, i) => `<div class="kv-layer">level ${i + 1}: undo { ${[...l.undo].map(([k, e]) => `${esc(k)}: ${e ? esc(e.v) : 'absent'}`).join(', ') || '—'} }</div>`).join('') : '<span class="small muted">none (autocommit)</span>';
+    $('#kvWal').innerHTML = wal.length ? wal.map((r, i) => `<div class="${r.synced ? '' : 'kv-unsynced'}">#${i + 1} [${r.ops.map((o) => esc(fmtOp(o))).join('; ')}]${r.synced ? '' : ' (not fsynced)'}</div>`).join('') : '<span class="small muted">empty</span>';
+    $('#kvPrompt').textContent = tx.length ? `tx${tx.length}>` : '>';
+  }
+  const CHIPS = ['SET user:1 alice', 'SET session:9 tok EX 5', 'BEGIN', 'SET user:1 bob', 'BEGIN', 'DELETE user:1', 'GET user:1', 'ROLLBACK', 'GET user:1', 'COMMIT', 'COUNT bob', 'ADVANCE 6', 'GET session:9', 'CRASH', 'GET user:1'];
+  $('#kvChips').innerHTML = CHIPS.map((c) => `<button class="btn sm">${esc(c)}</button>`).join('');
+  $$('#kvChips button').forEach((b) => b.addEventListener('click', () => run(b.textContent)));
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { run(inp.value); inp.value = ''; } });
+  $$('#kvSync button').forEach((b) => b.addEventListener('click', () => { sync = b.dataset.v; print(`WAL fsync policy: ${sync}`, 'kv-note'); }));
+  reset();
+})();
+</script>
+</body>
+</html>

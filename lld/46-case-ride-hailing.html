@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Ride-Hailing (LLD)</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('lld-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rh-map { width:100%; height:auto; display:block; margin-top:12px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); }
+  .rh-map .rh-grid { stroke:var(--border); stroke-width:1; }
+  .rh-map text { font-family:var(--mono); font-size:10px; font-weight:700; }
+  .rh-legend { display:flex; flex-wrap:wrap; gap:14px; font-size:12px; color:var(--muted); margin-top:6px; }
+  .rh-fare { margin-top:14px; padding:10px 12px; border-radius:12px; background:var(--surface-2); border:1px solid var(--border); font-size:13px; }
+  .rh-fare .rh-row { display:flex; flex-wrap:wrap; gap:14px; align-items:center; }
+  .rh-fare input[type=range] { width:140px; accent-color:var(--accent); }
+  .rh-fare .v { font-family:var(--mono); font-weight:700; }
+  .rh-bill { font-family:var(--mono); font-size:12.5px; margin-top:8px; line-height:1.6; }
+</style>
+</head>
+<body data-chapter="46">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 46</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Case Study: <span class="grad">Ride-Hailing (LLD)</span></h1>
+    <p class="lead">The last case study pulls the course together. A ride-hailing core has a trip that moves through a strict lifecycle (State), drivers who must never be offered two trips at once (atomic claims), a matching policy and a pricing policy that the business will keep changing (Strategy), and a stream of events that riders, drivers, payments and analytics all react to (Observer). Chapter 27 sketched its aggregate boundaries; this chapter designs the classes, and the simulator shows why “nearest available driver” is not the best matching rule.</p>
+    <ul class="objectives">
+      <li>Scope the core use cases and the API between apps and the dispatch service</li>
+      <li>Model riders, drivers and trips, with the trip as an explicit state machine</li>
+      <li>Offer trips to drivers safely, with timeouts and fallbacks, and compare matching strategies</li>
+      <li>Quote and compute fares with a pricing policy and surge multiplier</li>
+      <li>Publish trip events to observers without coupling the core to every consumer</li>
+    </ul>
+  </section>
+
+  <div class="callout analogy">
+    <div class="ico">🏗️</div>
+    <div class="body"><div class="title">Same problem, different zoom</div>
+      The System Design course covers ride-hailing as a distributed system: location ingestion at millions of updates a minute, geo-sharded matching and real-time dispatch. This chapter zooms into the classes of the trip and dispatch core. See <a href="../system-design/35-case-ride-hailing.html">the high-level design</a>.
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Aggregates and domain events.</b> See <a href="27-domain-modeling.html">Chapter 27</a>.</li>
+        <li><b>State, Strategy and Observer.</b> See <a href="18-state.html">Chapter 18</a>, <a href="15-strategy.html">Chapter 15</a> and <a href="16-observer-mediator.html">Chapter 16</a>.</li>
+        <li><b>Atomic claims.</b> See <a href="40-case-parking-lot.html">Chapter 40</a>'s <code>tryPark</code>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Requirements and API</h2>
+  <p>Clarify: a rider requests a ride from a pickup to a drop-off and sees an upfront price; the system offers the trip to a suitable nearby driver, who accepts or declines within a few seconds; the rider sees the driver approach; the trip starts on pickup and ends at drop-off; the fare is charged; either side can cancel, with rules and fees; drivers go online and offline and stream their location. Out of scope: the routing engine and maps (an ETA service interface), payments internals (a gateway), shared rides and scheduled rides (follow-ups).</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">RideService</span> {
+	<span class="t">FareQuote</span> <span class="f">quote</span>(<span class="t">RiderId</span> r, <span class="t">Location</span> pickup, <span class="t">Location</span> dropoff, <span class="t">RideType</span> type);   <span class="c">// valid for a few minutes</span>
+	<span class="t">TripId</span> <span class="f">request</span>(<span class="t">QuoteId</span> quote);                                                 <span class="c">// starts matching</span>
+	<span class="k">void</span> <span class="f">cancel</span>(<span class="t">TripId</span> trip, <span class="t">Party</span> by);
+}
+
+<span class="k">public interface</span> <span class="t">DriverService</span> {
+	<span class="k">void</span> <span class="f">goOnline</span>(<span class="t">DriverId</span> d); <span class="k">void</span> <span class="f">goOffline</span>(<span class="t">DriverId</span> d);
+	<span class="k">void</span> <span class="f">updateLocation</span>(<span class="t">DriverId</span> d, <span class="t">Location</span> at, <span class="t">Instant</span> when);                   <span class="c">// every few seconds</span>
+	<span class="k">void</span> <span class="f">respond</span>(<span class="t">OfferId</span> offer, <span class="k">boolean</span> accept);
+	<span class="k">void</span> <span class="f">arrived</span>(<span class="t">TripId</span> t); <span class="k">void</span> <span class="f">startTrip</span>(<span class="t">TripId</span> t); <span class="k">void</span> <span class="f">completeTrip</span>(<span class="t">TripId</span> t);
+}</pre>
+
+  <h2>Entities and trip lifecycle</h2>
+  <p>Three aggregates, each guarding its own invariant, referring to one another by id (<a href="27-domain-modeling.html">Chapter 27</a>). The <b>Trip</b> owns the lifecycle: which transitions are legal, who may cancel when, and what the fare is. The <b>Driver</b> owns availability: a driver is in at most one offer or trip at a time. The <b>Rider</b> owns profile and payment method, and has at most one active trip. Locations, quotes and fare breakdowns are value objects.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Trip state</th><th>Entered when</th><th>Allowed next</th></tr></thead>
+      <tbody>
+        <tr><td><code>MATCHING</code></td><td>Rider requested with a valid quote</td><td><code>DRIVER_ASSIGNED</code>, <code>NO_DRIVERS</code>, <code>CANCELLED</code> (free)</td></tr>
+        <tr><td><code>DRIVER_ASSIGNED</code></td><td>A driver accepted the offer</td><td><code>DRIVER_ARRIVED</code>; <code>CANCELLED</code> (rider fee after a grace period; driver cancel returns to <code>MATCHING</code>)</td></tr>
+        <tr><td><code>DRIVER_ARRIVED</code></td><td>Driver at pickup</td><td><code>IN_PROGRESS</code>; <code>CANCELLED</code> (no-show fee after a wait)</td></tr>
+        <tr><td><code>IN_PROGRESS</code></td><td>Rider picked up</td><td><code>COMPLETED</code></td></tr>
+        <tr><td><code>COMPLETED</code>, <code>CANCELLED</code>, <code>NO_DRIVERS</code></td><td>Terminal</td><td>none</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="k">public final class</span> <span class="t">Trip</span> {                                              <span class="c">// aggregate root</span>
+	<span class="k">private final</span> <span class="t">TripId</span> id; <span class="k">private final</span> <span class="t">RiderId</span> rider; <span class="k">private final</span> <span class="t">FareQuote</span> quote;
+	<span class="k">private</span> <span class="t">TripState</span> state = <span class="t">TripState</span>.MATCHING;
+	<span class="k">private</span> <span class="t">DriverId</span> driver;
+	<span class="k">private final</span> <span class="t">List</span>&lt;<span class="t">TripEvent</span>&gt; events = <span class="k">new</span> <span class="t">ArrayList</span>&lt;&gt;();
+	<span class="k">private long</span> version;
+
+	<span class="k">public void</span> <span class="f">assign</span>(<span class="t">DriverId</span> d, <span class="t">Instant</span> now) {
+		<span class="f">require</span>(<span class="t">TripState</span>.MATCHING);
+		driver = d; state = <span class="t">TripState</span>.DRIVER_ASSIGNED;
+		events.<span class="f">add</span>(<span class="k">new</span> <span class="t">DriverAssigned</span>(id, d, now));
+	}
+
+	<span class="k">public</span> <span class="t">CancellationFee</span> <span class="f">cancelByRider</span>(<span class="t">Instant</span> now, <span class="t">CancellationPolicy</span> policy) {
+		<span class="f">require</span>(<span class="t">TripState</span>.MATCHING, <span class="t">TripState</span>.DRIVER_ASSIGNED, <span class="t">TripState</span>.DRIVER_ARRIVED);
+		<span class="t">CancellationFee</span> fee = policy.<span class="f">feeFor</span>(<span class="k">this</span>, now);                     <span class="c">// Strategy: grace periods, no-show rules</span>
+		state = <span class="t">TripState</span>.CANCELLED;
+		events.<span class="f">add</span>(<span class="k">new</span> <span class="t">TripCancelled</span>(id, <span class="t">Party</span>.RIDER, fee, now));
+		<span class="k">return</span> fee;
+	}
+
+	<span class="k">private void</span> <span class="f">require</span>(<span class="t">TripState</span>... allowed) {
+		<span class="k">if</span> (!<span class="t">List</span>.<span class="f">of</span>(allowed).<span class="f">contains</span>(state)) <span class="k">throw new</span> <span class="t">IllegalTripTransition</span>(id, state);
+	}
+	<span class="c">// arrived(), start(), complete(distance, duration, fare): same pattern — check state, change it, record an event.</span>
+}</pre>
+
+  <h2>Driver matching strategy</h2>
+  <p>Matching has three separable steps. <b>Find candidates:</b> available drivers near the pickup, from a spatial index (a grid of cells, geohash prefixes, or hexagons) that answers “drivers in these cells” without scanning every driver. <b>Rank them:</b> a <code>MatchingStrategy</code>, from straight-line distance up to real road ETAs from a routing service. <b>Offer:</b> claim the top driver atomically and send the offer with a timeout; on decline or timeout, release the driver and try the next.</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">MatchingStrategy</span> {
+	<span class="t">List</span>&lt;<span class="t">DriverId</span>&gt; <span class="f">rank</span>(<span class="t">Trip</span> trip, <span class="t">List</span>&lt;<span class="t">DriverSnapshot</span>&gt; nearby);             <span class="c">// best first</span>
+}
+
+<span class="k">final class</span> <span class="t">Dispatcher</span> {
+	<span class="k">void</span> <span class="f">offerNext</span>(<span class="t">Trip</span> trip, <span class="t">Iterator</span>&lt;<span class="t">DriverId</span>&gt; ranked) {
+		<span class="k">while</span> (ranked.<span class="f">hasNext</span>()) {
+			<span class="t">Driver</span> d = drivers.<span class="f">get</span>(ranked.<span class="f">next</span>());
+			<span class="k">if</span> (!d.<span class="f">tryReserve</span>(trip.<span class="f">id</span>())) <span class="k">continue</span>;                          <span class="c">// CAS AVAILABLE → OFFERED; lost the race: next</span>
+			<span class="t">Offer</span> o = offers.<span class="f">create</span>(trip.<span class="f">id</span>(), d.<span class="f">id</span>(), clock.<span class="f">instant</span>().<span class="f">plus</span>(OFFER_TTL));
+			push.<span class="f">send</span>(d.<span class="f">id</span>(), o);
+			scheduler.<span class="f">schedule</span>(() -&gt; <span class="f">onTimeout</span>(o, ranked), OFFER_TTL);          <span class="c">// Chapter 35</span>
+			<span class="k">return</span>;
+		}
+		trips.<span class="f">update</span>(trip.<span class="f">id</span>(), t -&gt; t.<span class="f">noDrivers</span>(clock.<span class="f">instant</span>()));         <span class="c">// widen the radius first, in practice</span>
+	}
+
+	<span class="k">void</span> <span class="f">onResponse</span>(<span class="t">Offer</span> o, <span class="k">boolean</span> accept) {
+		<span class="k">if</span> (!offers.<span class="f">close</span>(o.<span class="f">id</span>())) <span class="k">return</span>;                                <span class="c">// already timed out: ignore the late answer</span>
+		<span class="k">if</span> (accept) trips.<span class="f">update</span>(o.<span class="f">trip</span>(), t -&gt; t.<span class="f">assign</span>(o.<span class="f">driver</span>(), clock.<span class="f">instant</span>()));
+		<span class="k">else</span> { drivers.<span class="f">get</span>(o.<span class="f">driver</span>()).<span class="f">release</span>(o.<span class="f">trip</span>()); <span class="f">offerNext</span>(trips.<span class="f">get</span>(o.<span class="f">trip</span>()), o.<span class="f">remaining</span>()); }
+	}
+}</pre>
+  <p>Two races are handled by design. A driver can't receive two offers, because <code>tryReserve</code> is a compare-and-set from <code>AVAILABLE</code> (the same idea as a parking spot in <a href="40-case-parking-lot.html">Chapter 40</a>). And an accept that arrives after the timeout can't assign a trip that has moved on, because closing the offer is itself atomic and only the first of “accepted” or “timed out” wins.</p>
+  <p>The ranking policy matters more than it looks. Matching each request to its nearest free driver <b>as it arrives</b> is greedy: an early request can take the only driver who was close to a later one, leaving that rider a long wait. <b>Batching</b> collects the requests from a short window (a second or two) and assigns them together, minimising the total pickup time across the batch, which is an assignment problem with a well-known optimal solution (the Hungarian algorithm; for a handful of requests, trying the permutations is fine).</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Matching six riders to six drivers: first come vs batched</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="rhAlgo"><button data-v="greedy">nearest driver, in request order</button><button class="active" data-v="batch">batch: minimise total pickup distance</button></div>
+        <button class="btn sm" id="rhNew">🎲 new city</button>
+        <button class="btn sm" id="rhTrap">⚠ the classic trap</button>
+      </div>
+      <svg class="rh-map" id="rhMap" viewBox="0 0 640 320" role="img" aria-label="City grid with drivers, riders and assignments"></svg>
+      <div class="rh-legend"><span>🚗 available driver</span><span>🙋 rider (number = request order)</span><span>line = assigned pickup (Manhattan distance on the grid)</span></div>
+      <div class="stats" id="rhStats"></div>
+      <div class="rh-fare">
+        <div class="rh-row">
+          <b>Fare quote</b>
+          <label>Trip <input type="range" id="rhKm" min="1" max="25" value="8"> <span class="v" id="rhKmV"></span></label>
+          <label>Requests in zone <input type="range" id="rhDem" min="0" max="60" value="30"> <span class="v" id="rhDemV"></span></label>
+          <label>Free drivers <input type="range" id="rhSup" min="1" max="40" value="20"> <span class="v" id="rhSupV"></span></label>
+        </div>
+        <div class="rh-bill" id="rhBill"></div>
+      </div>
+    </div>
+    <div class="panel-foot">Riders request in the numbered order. The greedy dispatcher gives each one the nearest free driver at that moment; the batch dispatcher assigns all six at once to minimise the sum of pickup distances. The fare box uses an example pricing policy (base + per km + per minute, minimum fare) and an example surge policy (demand ÷ supply, capped at 2.5×).</div>
+  </div>
+
+  <h2>Pricing and surge</h2>
+  <p>Pricing changes more often than any other part of the system, by city, by product and by promotion, so it's a pipeline of small strategies: a <code>FarePolicy</code> computes the base price from estimated distance and time; a <code>SurgePolicy</code> computes a multiplier from demand and supply in the pickup zone; promotions adjust the result. The rider accepts a <b>quote</b> (a value object with its own id and an expiry) before requesting, and the trip stores it, so the price the rider agreed to is the price charged under upfront pricing, even if surge changes a second later. The final fare is computed at completion from the quote or from actual distance and time, depending on the product.</p>
+<pre class="code"><span class="k">public record</span> <span class="t">FareQuote</span>(<span class="t">QuoteId</span> id, <span class="t">Money</span> base, <span class="t">BigDecimal</span> surge, <span class="t">Money</span> total, <span class="t">Instant</span> expiresAt) {}
+
+<span class="k">final class</span> <span class="t">StandardFare</span> <span class="k">implements</span> <span class="t">FarePolicy</span> {
+	<span class="k">public</span> <span class="t">Money</span> <span class="f">base</span>(<span class="t">RouteEstimate</span> r, <span class="t">CityRates</span> c) {
+		<span class="t">Money</span> m = c.<span class="f">flagFall</span>().<span class="f">plus</span>(c.<span class="f">perKm</span>().<span class="f">times</span>(r.<span class="f">km</span>())).<span class="f">plus</span>(c.<span class="f">perMinute</span>().<span class="f">times</span>(r.<span class="f">minutes</span>()));
+		<span class="k">return</span> <span class="t">Money</span>.<span class="f">max</span>(m, c.<span class="f">minimumFare</span>());
+	}
+}
+
+<span class="k">final class</span> <span class="t">SupplyDemandSurge</span> <span class="k">implements</span> <span class="t">SurgePolicy</span> {
+	<span class="k">public</span> <span class="t">BigDecimal</span> <span class="f">multiplier</span>(<span class="t">ZoneStats</span> z) {
+		<span class="k">double</span> ratio = z.<span class="f">openRequests</span>() / (<span class="k">double</span>) <span class="t">Math</span>.<span class="f">max</span>(<span class="m">1</span>, z.<span class="f">availableDrivers</span>());
+		<span class="k">double</span> m = <span class="t">Math</span>.<span class="f">min</span>(CAP, <span class="t">Math</span>.<span class="f">max</span>(<span class="m">1.0</span>, ratio));
+		<span class="k">return</span> <span class="t">BigDecimal</span>.<span class="f">valueOf</span>(m).<span class="f">setScale</span>(<span class="m">1</span>, <span class="t">RoundingMode</span>.HALF_UP);    <span class="c">// shown to the rider as e.g. 1.5×</span>
+	}
+}</pre>
+
+  <h2>Observers for trip updates</h2>
+  <p>Many parts of the system care about a trip: the rider's app (driver on the way, arrived), the driver's app, the ETA display, payments (charge on completion), receipts, ratings prompts, fraud checks and analytics. If the trip or the dispatcher called each of them, every new consumer would mean editing the core. Instead the Trip aggregate records <b>domain events</b>, they're published after the state change commits (through an outbox, <a href="27-domain-modeling.html">Chapter 27</a>), and each consumer subscribes to the ones it needs (<a href="16-observer-mediator.html">Observer</a>). Location updates are the exception worth calling out: they arrive every few seconds per driver, so they go to a separate, lossy, latest-value-wins stream rather than the durable event log.</p>
+  <figure class="seq" data-actors="Rider app|RideService|Dispatcher|Driver app|Event bus|Payments">
+    <ol>
+      <li data-m="0>1">request(quote Q-7)</li>
+      <li data-m="1>2">match(trip T-91)</li>
+      <li data-m="2>3">offer (reserve driver D-4, 15 s)</li>
+      <li data-m="3>2" data-k="reply">accept</li>
+      <li data-m="2>4">DriverAssigned(T-91, D-4)</li>
+      <li data-m="4>0">push: “Driver 3 min away”</li>
+      <li data-m="3>1">completeTrip(T-91)</li>
+      <li data-m="1>4">TripCompleted(T-91, fare)</li>
+      <li data-m="4>5">charge fare, key = T-91</li>
+    </ol>
+    <figcaption><b>One trip, end to end.</b> The core never calls the rider app or payments directly; it records events, and subscribers react. Payment is keyed by the trip id, so a redelivered event can't charge twice.</figcaption>
+  </figure>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Quote</b> Fare policy + surge; the rider sees a price with an expiry.</li>
+      <li><b>Request → MATCHING</b> Candidates from the spatial index; ranked by the matching strategy.</li>
+      <li data-k="decision"><b>Offer accepted in time?</b> No: release the driver, offer to the next; none left: widen the radius or NO_DRIVERS.</li>
+      <li><b>DRIVER_ASSIGNED → ARRIVED → IN_PROGRESS</b> Each transition checked by the Trip and published as an event.</li>
+      <li><b>COMPLETED</b> Final fare computed; payment charged idempotently; driver back to AVAILABLE.</li>
+      <li data-k="end"><b>Afterwards</b> Receipts, ratings, analytics: all subscribers, none in the core.</li>
+    </ol>
+    <figcaption><b>The trip pipeline.</b> Each box is a class you've designed earlier in the course.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Hexagons and batches in production</div><p>Two ideas in this chapter come straight from how ride-hailing companies describe their systems. For the spatial index, Uber open-sourced <b>H3</b> in 2018, a hierarchical grid of hexagonal cells covering the globe; hexagons are used because every neighbour is the same distance from the centre, which makes “nearby drivers” and zone-level surge calculations cleaner than with square cells. For matching, ride-hailing companies including Uber and Lyft have written publicly about moving beyond “nearest available driver” toward matching requests in batches to improve pickup times across the whole marketplace, the same effect you can see in the simulator's total and worst pickup distances.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Trip status as a free-form string</b> any service can set, instead of transitions the Trip enforces.</li>
+      <li><b>Offering one driver two trips</b> because availability is checked, then set, non-atomically.</li>
+      <li><b>No offer timeout,</b> or honouring an accept that arrives after the offer moved on.</li>
+      <li><b>Scanning every driver</b> to find nearby ones instead of a spatial index.</li>
+      <li><b>Recomputing the price at completion</b> when the rider agreed to an upfront quote.</li>
+      <li><b>The trip calling payments, notifications and analytics directly;</b> publish events instead.</li>
+      <li><b>Putting location pings in the durable event log,</b> flooding it with data only the latest value of which matters.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you make sure a driver isn't assigned two trips at once?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Driver availability is the Driver aggregate's invariant. Offering a trip first calls <code>tryReserve</code>, a compare-and-set from AVAILABLE to OFFERED for that trip; if two dispatchers race for the same driver, only one CAS succeeds and the other moves to its next candidate. Accepting moves the driver to EN_ROUTE, and declining or timing out releases them back to AVAILABLE. With a database it's a conditional update on the driver row, <code>WHERE status = 'AVAILABLE'</code>, checking one row was updated.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Add shared rides (pooling): two riders going the same way share a car. What changes in your design?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The unit a driver serves stops being a single trip. I'd introduce a <code>Route</code> (or ride) aggregate on the driver side: an ordered list of stops (pickups and drop-offs) for one or more trips, with capacity and detour limits as its invariants. Each rider still has their own <code>Trip</code> with its own lifecycle and fare, now referencing a route id. Matching becomes “which existing route can absorb this request within the detour limit, or which free driver starts a new one”, a new <code>MatchingStrategy</code> that scores insertion positions. Pricing gets a pooled <code>FarePolicy</code> with a discount. Events stay per trip, so the rider apps and payments don't change. The biggest new rule is ordering: a stop can't be dropped off before it's picked up, which the Route enforces when inserting stops.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Trip, Driver and Rider are separate aggregates referenced by id; the Trip owns an explicit lifecycle.</li>
+      <li>Reserve drivers with a compare-and-set, offer with a timeout, and let only the first of accept or timeout win.</li>
+      <li>Find candidates with a spatial index; rank with a matching strategy; batching beats first-come nearest-driver.</li>
+      <li>Price with fare and surge strategies; the rider agrees to a quote with an expiry, which the trip keeps.</li>
+      <li>Publish trip events to subscribers through an outbox; keep high-frequency locations on a separate, lossy stream.</li>
+      <li>Every piece is a pattern from earlier in the course, combined deliberately.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why can “assign each request to its nearest free driver, in order” produce worse pickups than batching?</p>
+      <div class="opts">
+        <button class="opt">It's slower to compute</button>
+        <button class="opt">An early request can take the only driver close to a later one, forcing that rider onto a distant driver</button>
+        <button class="opt">It ignores surge pricing</button>
+        <button class="opt">It can assign two drivers to one rider</button>
+      </div>
+      <div class="explain">Greedy decisions are locally best but globally poor. Batching over a short window minimises total pickup time across requests.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A driver accepts an offer 2 seconds after it timed out and was sent to someone else. What should happen?</p>
+      <div class="opts">
+        <button class="opt">Assign the trip to both drivers</button>
+        <button class="opt">Assign it to the late driver, since they accepted</button>
+        <button class="opt">Crash the dispatcher</button>
+        <button class="opt">Ignore the late accept: the offer was already closed atomically by the timeout</button>
+      </div>
+      <div class="explain">Closing an offer is atomic, and only the first of “accepted” or “timed out” wins.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why does the trip store the fare quote the rider accepted?</p>
+      <div class="opts">
+        <button class="opt">So the price agreed at request time is what's charged under upfront pricing, even if surge changes afterwards</button>
+        <button class="opt">To compute the driver's rating</button>
+        <button class="opt">Quotes are needed for matching</button>
+        <button class="opt">To avoid storing the pickup location</button>
+      </div>
+      <div class="explain">A quote is a value object with an id and an expiry: the contract between rider and service for this trip.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How should the payments service learn that a trip has completed?</p>
+      <div class="opts">
+        <button class="opt">The Trip class calls <code>payments.charge()</code> inside <code>complete()</code></button>
+        <button class="opt">Payments polls every trip every second</button>
+        <button class="opt">It subscribes to TripCompleted events and charges with the trip id as the idempotency key</button>
+        <button class="opt">The driver's app calls payments directly</button>
+      </div>
+      <div class="explain">Events decouple the core from consumers; the key makes redelivered events harmless.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why keep driver location updates out of the durable trip event log?</p>
+      <div class="opts">
+        <button class="opt">Locations are secret</button>
+        <button class="opt">They arrive every few seconds per driver and only the latest value matters, so a lossy latest-value stream fits and avoids flooding the log</button>
+        <button class="opt">The event log can't store coordinates</button>
+        <button class="opt">They're computed by the rider's app</button>
+      </div>
+      <div class="explain">Business events (assigned, started, completed) must be durable; high-frequency telemetry needs freshness, not every value.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = LLD;
+  const W = 16, H = 8, CELL = 40;
+  let algo = 'batch', drivers, riders, seed = 21;
+  function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+  const dist = (a, b) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+  function city() {
+    const taken = new Set(), pt = () => { let p; do { p = { x: Math.floor(rnd() * W), y: Math.floor(rnd() * H) }; } while (taken.has(p.x + ',' + p.y)); taken.add(p.x + ',' + p.y); return p; };
+    drivers = Array.from({ length: 6 }, pt); riders = Array.from({ length: 6 }, pt);
+  }
+  function trap() {
+    drivers = [{ x: 4, y: 1 }, { x: 9, y: 1 }, { x: 12, y: 4 }, { x: 7, y: 4 }, { x: 5, y: 7 }, { x: 10, y: 7 }];
+    riders = [{ x: 5, y: 1 }, { x: 11, y: 4 }, { x: 6, y: 7 }, { x: 2, y: 1 }, { x: 14, y: 4 }, { x: 3, y: 7 }];
+  }
+  function greedy() { const free = drivers.map((_, i) => i), out = []; riders.forEach((r) => { let best = 0; free.forEach((d, k) => { if (dist(drivers[d], r) < dist(drivers[free[best]], r)) best = k; }); out.push(free[best]); free.splice(best, 1); }); return out; }
+  function batch() {
+    let best = null, bestCost = Infinity;
+    const perm = (arr, used, acc, cost) => {
+      if (cost >= bestCost) return;
+      if (acc.length === riders.length) { best = acc.slice(); bestCost = cost; return; }
+      const r = riders[acc.length];
+      for (let d = 0; d < drivers.length; d++) if (!used[d]) { used[d] = true; acc.push(d); perm(arr, used, acc, cost + dist(drivers[d], r)); acc.pop(); used[d] = false; }
+    };
+    perm(null, [], [], 0); return best;
+  }
+  function draw() {
+    const asg = algo === 'batch' ? batch() : greedy();
+    const X = (x) => 20 + x * CELL + CELL / 2, Y = (y) => 10 + y * CELL + CELL / 2;
+    let svg = '';
+    for (let x = 0; x <= W; x++) svg += `<line class="rh-grid" x1="${20 + x * CELL}" x2="${20 + x * CELL}" y1="10" y2="${10 + H * CELL}"/>`;
+    for (let y = 0; y <= H; y++) svg += `<line class="rh-grid" x1="20" x2="${20 + W * CELL}" y1="${10 + y * CELL}" y2="${10 + y * CELL}"/>`;
+    const colors = ['#6366f1', '#10b981', '#f59e0b', '#ec4899', '#06b6d4', '#8b5cf6'];
+    riders.forEach((r, i) => { const d = drivers[asg[i]], o = (i - 2.5) * 3; svg += `<path d="M${X(d.x) + o},${Y(d.y) + o} L${X(r.x) + o},${Y(d.y) + o} L${X(r.x) + o},${Y(r.y) + o}" fill="none" stroke="${colors[i]}" stroke-width="3" stroke-linecap="round" opacity=".85"/>`; });
+    drivers.forEach((d) => { svg += `<text x="${X(d.x)}" y="${Y(d.y) + 6}" text-anchor="middle" style="font-size:22px">🚗</text>`; });
+    riders.forEach((r, i) => { svg += `<text x="${X(r.x)}" y="${Y(r.y) + 6}" text-anchor="middle" style="font-size:22px">🙋</text><circle cx="${X(r.x) + 12}" cy="${Y(r.y) - 12}" r="8" fill="${colors[i]}"/><text x="${X(r.x) + 12}" y="${Y(r.y) - 8.5}" text-anchor="middle" fill="#fff">${i + 1}</text>`; });
+    $('#rhMap').innerHTML = svg;
+    const ds = riders.map((r, i) => dist(drivers[asg[i]], r)), g = greedy(), b = batch();
+    const tot = (a) => riders.reduce((s, r, i) => s + dist(drivers[a[i]], r), 0), worst = (a) => Math.max(...riders.map((r, i) => dist(drivers[a[i]], r)));
+    $('#rhStats').innerHTML = `
+      <div class="stat"><div class="k">Total pickup (blocks)</div><div class="v">${ds.reduce((a, c) => a + c, 0)}</div></div>
+      <div class="stat ${Math.max(...ds) > 8 ? 'bad' : ''}"><div class="k">Worst pickup</div><div class="v">${Math.max(...ds)}</div></div>
+      <div class="stat"><div class="k">Greedy · batch totals</div><div class="v" style="font-size:17px">${tot(g)} · ${tot(b)}</div></div>
+      <div class="stat"><div class="k">Greedy · batch worst</div><div class="v" style="font-size:17px">${worst(g)} · ${worst(b)}</div></div>`;
+  }
+  function fare() {
+    const km = +$('#rhKm').value, dem = +$('#rhDem').value, sup = +$('#rhSup').value, min = Math.round(km * 2.4);
+    $('#rhKmV').textContent = `${km} km`; $('#rhDemV').textContent = dem; $('#rhSupV').textContent = sup;
+    const base = Math.max(700, 250 + 120 * km + 30 * min), surge = Math.round(Math.min(2.5, Math.max(1, dem / Math.max(1, sup))) * 10) / 10, total = Math.round(base * surge);
+    $('#rhBill').innerHTML = `base = max($7.00 minimum, $2.50 + $1.20 × ${km} km + $0.30 × ${min} min) = $${(base / 100).toFixed(2)}<br>surge = clamp(1.0, 2.5, ${dem} requests ÷ ${sup} drivers) = <b>${surge.toFixed(1)}×</b><br>quote = <b>$${(total / 100).toFixed(2)}</b>, valid for 5 minutes, stored on the trip`;
+  }
+  $$('#rhAlgo button').forEach((b) => b.addEventListener('click', () => { algo = b.dataset.v; draw(); }));
+  $('#rhNew').onclick = () => { city(); draw(); };
+  $('#rhTrap').onclick = () => { trap(); draw(); };
+  ['#rhKm', '#rhDem', '#rhSup'].forEach((s) => $(s).addEventListener('input', fare));
+  trap(); draw(); fare();
+})();
+</script>
+</body>
+</html>
