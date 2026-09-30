@@ -65,13 +65,23 @@ window.addEventListener('load', function () { whenIndexed(function () {
     progTxt: document.getElementById('progTxt').textContent,
     mosaic: q('#mosaic .mgroup').map(function (g) { var nm = g.querySelector('.nm'), ct = g.querySelector('.ct');
       return { name: nm ? nm.textContent : '', soon: g.classList.contains('soon'), links: q('a[href]', g).length,
-        squares: q('.mosaic > *', g).length, done: q('.mosaic .done', g).length, ct: ct ? ct.textContent : '' }; }),
+        squares: q('.mosaic > *', g).length, done: q('.mosaic .done', g).length, ct: ct ? ct.textContent : '',
+        lines: new Set(q('.mosaic > *', g).map(function (sq) { return Math.round(sq.getBoundingClientRect().top); })).size,
+        size: (function () { var f = g.querySelector('.mosaic > *'); return f ? Math.round(f.getBoundingClientRect().width * 10) / 10 : 0; })() }; }),
     filters: q('#palFilters [data-f]').map(function (c) { return c.dataset.f; }),
     studyScripts: q('script[src]').map(function (x) { return x.getAttribute('src'); }).filter(function (x) { return /study-data/.test(x); }),
     devopsK1: devops ? getComputedStyle(devops).getPropertyValue('--k1').trim() : '',
     scrollW: document.documentElement.scrollWidth, innerW: window.innerWidth,
     theme: document.documentElement.getAttribute('data-theme'),
     lead: ((document.getElementById('leadCount') || {}).textContent || '').trim(),
+    // Right edge of the widest line of the hero title vs the left edge of the tracker beside it.
+    titleGap: (function () {
+      var h = document.querySelector('.hero h1'), m = document.querySelector('.hero .map'); if (!h || !m) return null;
+      var r = document.createRange(); r.selectNodeContents(h);
+      var right = Math.max.apply(null, Array.prototype.map.call(r.getClientRects(), function (x) { return x.right; }));
+      var mt = m.getBoundingClientRect(), ht = h.getBoundingClientRect();
+      return mt.top < ht.bottom && mt.bottom > ht.top ? Math.round(mt.left - right) : 999;   // 999: stacked, not side by side
+    })(),
     stats: q('#stats .stat').map(function (x) { return q('b, span', x).map(function (e) { return e.textContent; }).join(' '); }),
   };
   var pre = document.createElement('pre'); pre.id = 'hub-probe'; pre.hidden = true; pre.textContent = JSON.stringify(s);
@@ -138,6 +148,13 @@ function checks(s) {
     soonRows.every((g) => g.links === 0 && g.squares === 56), soonRows.map((g) => [g.name, g.links, g.squares]));
   check('stale progress never fills an upcoming row (os-done is set)', soonRows.every((g) => g.done === 0), soonRows.map((g) => g.done));
   check('released rows are unchanged', s.mosaic.filter((g) => !g.soon).every((g) => g.links === g.squares + 1), s.mosaic.filter((g) => !g.soon));
+  // Laptop and wider: one line of squares per course, all rows the same square size, big enough to click.
+  // Phones wrap (64 squares on one 390 px line would be ~4 px each).
+  if (WIDTH >= 1280) {
+    check('each tracker row is one line of squares', s.mosaic.every((g) => g.lines === 1), s.mosaic.map((g) => [g.name, g.lines]));
+    const sizes = [...new Set(s.mosaic.map((g) => g.size))];
+    check('every row uses the same square size, at least 7 px', sizes.length === 1 && sizes[0] >= 7, sizes);
+  }
   check('search filters list released courses only', eq(s.filters, ['all', 'system-design', 'ml-ai-systems', 'dsa', 'lld']), s.filters);
   check('no study-data requested for unreleased courses',
     s.studyScripts.length === 4 && s.studyScripts.every((x) => !SOON.some((d) => x.startsWith(d + '/'))), s.studyScripts);
@@ -182,6 +199,7 @@ function checks(s) {
   // Derived from the registry, so releasing a course (removing `soon`) updates it.
   check('hero lead counts courses from the registry', s.lead === 'Nine courses, four out now and five on the way,', s.lead);
   check('stats show released and upcoming courses', s.stats[0] === '4 courses' && s.stats[1] === '5 on the way', s.stats);
+  check('hero title keeps clear of the tracker (≥ 24 px)', s.titleGap === null || s.titleGap >= 24, s.titleGap);
 }
 
 function rgb(c) {
