@@ -1,7 +1,8 @@
 # Accounts v2 — plan (replace Firebase with a free, self-owned backend)
 
-Status: **implemented on `feature/accounts`** (Phases 1–5 done and tested locally; Phase 6, deploy,
-needs the owner's Cloudflare login — see `ACCOUNTS.md`). This replaced the Firebase design.
+Status: **implemented and deployed** (2026-09-30) on `feature/accounts`: Worker live at
+`https://atlas-accounts-api.atlas-accounts-api.workers.dev`, D1 in APAC, real email sign-in verified.
+Goes live for learners once `feature/accounts` is merged to `main`. This replaced the Firebase design.
 
 ## Goal
 
