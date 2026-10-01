@@ -18,3 +18,4 @@
 - P7 Layering & Encapsulation: encapsulation builder (MSS, fragmentation, TLS overhead, MTU)
 - P8 Latency, Bandwidth & Throughput: latency-vs-bandwidth calculator with BDP pipe
 - Ch 1 OSI vs TCP/IP: layer sorter (20 cards with defensible answers)
+- Ch 2 Ethernet, MAC Addresses & Switches: learning-switch simulator (flood, learn, age, VM move, hub mode)
