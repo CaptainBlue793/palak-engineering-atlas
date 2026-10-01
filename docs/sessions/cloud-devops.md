@@ -18,3 +18,4 @@
 - P5 Networking for Operations: troubleshooter (5 faults: TTL, expired cert, 127.0.0.1 bind, firewall timeout, SAN mismatch)
 - P6 Processes & systemd: supervisor simulator (4 failure modes × Restart= × RestartSec × start limit, journal output)
 - P7 SSH & Keys: sshd hardening lab (auth.log for an hour of bots, second-session lockout test), ProxyJump vs agent forwarding
+- P8 HTTP APIs & curl: stateful API console (token scopes, 6/min rate limit, dropped responses, idempotency keys, generated curl)
