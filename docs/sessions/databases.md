@@ -16,3 +16,4 @@
 - DB P5: JSON, CSV & Loading Data: bulk-load calculator with race (autocommit, txn, batched, COPY)
 - DB P6: Python & psycopg: SQL-injection lab (f-string vs parameter, with restore)
 - DB P7: Sets & Relational Algebra: algebra workbench (σ π × ⋈ ∪ ∩ −, bag vs set)
+- DB P8: Data-Size Arithmetic: size estimator with tuple byte map, padding and growth
