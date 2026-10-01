@@ -22,3 +22,4 @@
 - P7 Reading papers: claim-sorting panel (Raft/Dynamo/Spanner goals, assumptions, mechanisms, evidence), three passes, Figure 2 to code
 - P8 Building blocks recap: fail-a-block panel (state per tier, failure timelines, chapter map), dual write, GitHub 2018
 - Ch 1 Eight fallacies: fallacy lab (loss, jitter, topology move; naive→timeout→retry→idempotency), partial failure, JVM DNS cache
+- Ch 2 System models: model explorer (sync/partial/async × crash/recovery/Byzantine heartbeat detector), durable vote in Java, Cloudflare 2020
