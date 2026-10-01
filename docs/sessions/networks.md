@@ -23,3 +23,4 @@
 - Ch 4 IP Addressing & Subnetting: VLSM subnet planner (AWS rules, growth, /31)
 - Ch 5 Routing Tables & Forwarding: three-router hop-by-hop tracer (LPM, return path, loop, null route)
 - Ch 6 ICMP, ping & traceroute: traceroute/mtr simulator (probe types, silent and rate-limited hops, real loss)
+- Ch 7 UDP: voice call over UDP vs TCP on a lossy path (late = lost)
