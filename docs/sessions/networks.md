@@ -19,3 +19,4 @@
 - P8 Latency, Bandwidth & Throughput: latency-vs-bandwidth calculator with BDP pipe
 - Ch 1 OSI vs TCP/IP: layer sorter (20 cards with defensible answers)
 - Ch 2 Ethernet, MAC Addresses & Switches: learning-switch simulator (flood, learn, age, VM move, hub mode)
+- Ch 3 ARP: LAN simulator (resolve, cache states, failed lookup, spoofing, keepalived failover)
