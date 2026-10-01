@@ -15,3 +15,4 @@
 - P4 ping, curl, dig & Friends: debug-the-broken-endpoint game (6 incidents)
 - P5 Sockets in Python: two-sided socket-call stepper (backlog, blocking, refused, timeouts)
 - P6 Reading Packets with Wireshark: mini-Wireshark (display-filter parser, details tree, real header bytes, follow stream)
+- P7 Layering & Encapsulation: encapsulation builder (MSS, fragmentation, TLS overhead, MTU)
