@@ -17,3 +17,4 @@
 - P2 RPC & timeouts: timeout-lab panel (latency histogram, false timeouts, unknown outcomes), Outcome type, deadlines
 - P3 Serialization: live Protobuf encoder panel with v1/v2/v3 readers (unknown fields, reused field number)
 - P4 Failure arithmetic: availability calculator (tiers, quorum replicas, correlated outage), MTBF/MTTR, S3 2017
+- P5 Clocks on one machine: wall vs monotonic panel (step back/forward, leap second, slew), Ticker injection, leap-second incidents
