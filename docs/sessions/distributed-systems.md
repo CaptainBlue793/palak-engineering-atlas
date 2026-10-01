@@ -1,0 +1,13 @@
+# Distributed Systems — session log
+
+## 2026-10-01 — session 1
+- Done: chapter list approved by the owner as drafted (tools/chapters.cjs, P1–P8 + 48, no changes).
+- Decisions: overlapping topics keep one owner each — fencing tokens in Ch 32 (Ch 13 only shows split brain and
+  points forward); SWIM probing in Ch 5, SWIM dissemination in Ch 23; Kafka: Ch 28 delivery semantics, Ch 29 broker
+  internals, Ch 43 history/design story; Dynamo/TrueTime/Jepsen concept chapters teach the idea, case studies
+  (42/41/48) cover the real system, incidents and evolution.
+- Step 2: course home (pill, lead, 4-layer dependency map with 24 nodes + routes, Java code-style strip,
+  playbook link, footer), glossary (131 terms), mock interview (18 problems, 6-phase plan with a failure
+  walkthrough phase, 8-row rubric), flashcards intro, README.
+- Needs a shared change: none yet.
+- Next: P1 and onwards, one commit per chapter.
