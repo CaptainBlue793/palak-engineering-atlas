@@ -1,35 +1,39 @@
 # Database Internals & SQL — Interactive Course
 
-Object-oriented design for the DB interview round, in Java: from "what is a class, really" to a
-thread-safe movie-booking system. **46 chapters across four levels, plus an 8-chapter
-Prerequisites level** (P1–P8: classes and references, encapsulation, inheritance and dispatch,
-interfaces and generics, composition, value objects and immutability, exceptions, reading UML).
+What happens between your SQL and the disk. The SQL that interviews and real jobs ask for (joins,
+window functions, schema design, indexes, transactions), then the engine underneath: pages, the
+buffer pool, B-trees and LSM trees, query planning, the write-ahead log, isolation and MVCC, and
+finally scaling out with replication, sharding, column stores and distributed SQL.
+**48 chapters across five levels, plus an 8-chapter Prerequisites level** (P1–P8: tables and keys,
+a first `SELECT`, disks and pages, data types, loading JSON and CSV, Python with psycopg, relational
+algebra, data-size arithmetic).
+
+Every listing is PostgreSQL SQL, with Python (psycopg) where application code matters.
 
 Static site, **zero dependencies**, no build step required to read it. Open `index.html` in a
 browser; progress, quiz scores and flashcard state are saved in `localStorage` under `db-*` keys.
 
-> **Status: complete.** All 54 pages are written. Each chapter has at least one interactive panel,
-> Java listings in the house style, a comparison table, a real-world use case, a common-mistakes box,
-> an interview drill and a five-question quiz. `grep -l db:placeholder *.html` should print nothing.
+> **Status: in progress.** Chapters are written in order; `grep -l db:placeholder *.html` lists the
+> ones still to write. Each finished chapter has an interactive panel, SQL listings in the house
+> style, a sequence or workflow diagram, a comparison table, a real-world use case, a
+> common-mistakes box, an interview drill and a five-question quiz.
 
 ## The levels
 
 | Level | Chapters | What it covers |
 |---|---|---|
-| **Prerequisites** | P1–P8 | The Java object model, encapsulation, inheritance and dynamic dispatch, interfaces and generics, composition, value objects, exceptions, UML |
-| **Principles** | 1–8 | The DB round, requirements to classes, SOLID, coupling and cohesion, relationships, class contracts, dependency injection |
-| **Design Patterns** | 9–21 | Singleton, factories, builder, adapter/facade/bridge, decorator/proxy, composite/flyweight, strategy, observer/mediator, command/memento, state, chain/template, iterator/visitor, combining patterns |
-| **Advanced DB** | 22–30 | Thread-safe classes, producer-consumer and pools, extensibility, resilience, persistence, domain modeling, testing, refactoring, the interview playbook |
-| **Case Studies** | 31–46 | LRU cache, rate limiter, logger, pub-sub, task scheduler, file system, KV store with transactions, text editor, connection pool, parking lot, elevator, ticket booking, Splitwise, chess, vending machine/ATM, ride-hailing |
-
-Case studies that also appear in the System Design course link to the high-level version:
-same problem, different zoom.
+| **Prerequisites** | P1–P8 | Tables and keys, `SELECT` and `NULL`, disks and pages, data types, `COPY`/CSV/JSON, psycopg and SQL injection, relational algebra, sizing tables |
+| **Beginner** | 1–10 | The relational model, filtering and pagination, joins, `GROUP BY`, subqueries and CTEs, window functions, normalisation, constraints, a first look at indexes, ACID |
+| **Intermediate** | 11–24 | Pages and heap files, the buffer pool, B-trees, LSM trees, GIN/GiST/BRIN, how a query runs, `EXPLAIN`, join algorithms, the cost-based optimiser, WAL and recovery, isolation anomalies, two-phase locking, MVCC, deadlocks |
+| **Advanced** | 25–36 | Replication, partitioning and sharding, connection pooling, column stores, time series, NoSQL families, search, vector databases, materialised views, schema migrations, backups and PITR, distributed SQL |
+| **Expert** | 37–40 | The tuning playbook, ORMs and N+1, SQL interview drills, the database interview playbook |
+| **Case Studies** | 41–48 | An e-commerce schema, a slow query made fast, Uber's Postgres → MySQL move, GitHub's 2018 failover, Discord's messages, Instagram's sharded IDs, a mini LSM store in Python, an analytics warehouse |
 
 ## Study tools
 
-- **`glossary.html`**: DB terms, each linked to the chapter that introduces it
-- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes (270 cards)
-- **`mock-interview.html`**: timed room with 18 DB problems, a phase timer, an 8-point rubric and notes saved locally
+- **`glossary.html`**: database terms, each linked to the chapter that explains it
+- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes (five cards per chapter)
+- **`mock-interview.html`**: timed room with 20 schema, SQL and internals problems, a phase timer, an 8-point rubric and notes saved locally
 
 ## Tools
 
@@ -46,6 +50,7 @@ chapters start being edited by hand.
 
 ## House style
 
-Every listing is Java written the same way: interface first, constructor injection into `final`
-fields, validation at the boundary, small classes, and each design naming its pattern and the
-extension it survives.
+Every SQL listing is written the same way: keywords in capitals, names in `snake_case`, one clause
+per line; every table has a primary key and its rules as constraints; named columns instead of
+`SELECT *`; values passed as parameters, never formatted into the SQL string; and every
+performance claim backed by `EXPLAIN (ANALYZE, BUFFERS)`.
