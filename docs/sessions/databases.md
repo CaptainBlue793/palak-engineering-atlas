@@ -21,3 +21,4 @@
 - DB 2: Filtering, Sorting & Pagination: pagination lab (deep OFFSET cost + drift demo vs keyset)
 - DB 3: Joins: join visualiser (7 join types, NULL padding, fan-out and fix); [hidden] rule in style.css
 - DB 4: GROUP BY & Aggregates: grouping machine (WHERE/GROUP BY/HAVING stages, GROUP BY error)
+- DB 5: Subqueries & CTEs: recursive CTE stepper with cycle bug and CYCLE clause
