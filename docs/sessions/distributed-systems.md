@@ -24,3 +24,4 @@
 - Ch 1 Eight fallacies: fallacy lab (loss, jitter, topology move; naive→timeout→retry→idempotency), partial failure, JVM DNS cache
 - Ch 2 System models: model explorer (sync/partial/async × crash/recovery/Byzantine heartbeat detector), durable vote in Java, Cloudflare 2020
 - Ch 3 gRPC in Java: deadline lab (propagation, cancellation, wasted work), service/server/client/streaming code, status-code retry table, HTTP/2 LB pitfall
+- Ch 4 Retries: open-loop retry-storm lab (metastable failure, budget, deadline-aware server), Retrier with full jitter, idempotency-key store, DynamoDB 2015

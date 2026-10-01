@@ -6,34 +6,337 @@
 <title>Retries, Backoff &amp; Idempotency</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rs-row { display:flex; gap:16px; align-items:center; flex-wrap:wrap; margin-top:12px; font-size:14px; color:var(--text-2); }
+  .rs-row input[type=range] { flex:1; min-width:180px; accent-color:var(--accent); }
+  .rs-row output { font-family:var(--mono); font-weight:700; color:var(--accent); min-width:50px; }
+  .rs-chart { width:100%; height:auto; display:block; margin-top:12px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; }
+  .rs-chart .rs-att { fill:none; stroke:var(--accent); stroke-width:2; }
+  .rs-chart .rs-ok { fill:none; stroke:var(--green); stroke-width:2.2; }
+  .rs-chart .rs-cap { stroke:var(--red); stroke-width:1.4; stroke-dasharray:6 4; }
+  .rs-chart .rs-out { fill:var(--red-soft); }
+  .rs-chart text { font-family:var(--mono); font-size:10px; fill:var(--muted); }
+  .rs-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); }
+  .rs-res.rs-good { background:var(--green-soft); } .rs-res.rs-bad { background:var(--red-soft); } .rs-res.rs-warn { background:var(--amber-soft); }
+</style>
 </head>
 <body data-chapter="4">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 4</span><span class="pill">Beginner</span><span class="pill">⏱ 45 min</span></div>
     <h1>Retries, Backoff &amp; <span class="grad">Idempotency</span></h1>
-    <p class="lead">Exponential backoff with jitter, retry budgets, and idempotency keys so a retry is safe.</p>
+    <p class="lead">Retrying is the first fix everyone reaches for, and it's usually right: most failures in a healthy system are brief, and a second attempt succeeds. But retries have two side effects that cause some of the worst outages in the industry. A retried request can be <b>applied twice</b>, and a fleet of clients retrying at once can <b>keep a recovering service down</b> long after the original problem is gone. This chapter covers when to retry, how to space retries out with exponential backoff and jitter, how to cap them with a budget, and how idempotency keys make retries safe.</p>
+    <ul class="objectives">
+      <li>Decide which failures to retry, and at which layer</li>
+      <li>Implement exponential backoff with full jitter and a total deadline in Java</li>
+      <li>Explain retry amplification and metastable failure, and cap retries with a budget</li>
+      <li>Design an idempotency-key store that turns retries into exactly-once effects</li>
+      <li>Recognise at-least-once delivery and its consequences</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Unknown outcomes and deadlines</b> from <a href="p2-rpc-timeouts.html">P2</a>; <b>gRPC status codes</b> from <a href="03-grpc-java.html">Chapter 3</a>.</li>
+        <li><b>The fallacy lab</b> in <a href="01-why-distributed-is-hard.html">Chapter 1</a>, where retries without idempotency double-credited accounts.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>When to retry</li>
-    <li>Exponential backoff and jitter</li>
-    <li>Retry storms and budgets</li>
-    <li>Idempotency keys</li>
-    <li>At-least-once delivery</li>
-  </ol>
+  <h2>When to retry</h2>
+  <p>Retry a failure only if a second attempt might succeed <b>and</b> repeating the request is safe:</p>
+  <ul>
+    <li><b>Retry transient failures:</b> connection refused or reset, <code>UNAVAILABLE</code>, HTTP 503 (respecting any <code>Retry-After</code>), 429 after the indicated wait, and <code>ABORTED</code> transaction conflicts (by retrying the whole transaction).</li>
+    <li><b>Retry timeouts only if the operation is idempotent</b>, or made idempotent with a key. A timeout is an unknown outcome (<a href="p2-rpc-timeouts.html">P2</a>).</li>
+    <li><b>Never retry permanent failures:</b> 400, 401, 403, 404, <code>INVALID_ARGUMENT</code>. They will fail the same way every time, and retrying just adds load.</li>
+  </ul>
+  <p>And retry at <b>one layer</b>. If a browser retries 3 times, the API gateway retries each of those 3 times, and the service behind it retries its database call 3 times, one user click can become 4 × 4 × 4 = 64 database queries when the database is struggling, exactly when it can least afford them. The usual rule: retry at the layer closest to the failure that knows whether the operation is safe to repeat, and have the others fail fast.</p>
+
+  <h2>Exponential backoff with jitter</h2>
+  <p>Retrying immediately hits a service while it's still failing. <b>Exponential backoff</b> waits longer after each failure: 50 ms, 100 ms, 200 ms, up to a cap. That gives a struggling service room to recover. But if a thousand clients failed at the same moment, they all back off by the same amounts and return together in synchronized waves. <b>Jitter</b> breaks the synchronization by randomising each wait. The variant usually recommended, called <b>full jitter</b> in Marc Brooker's 2015 AWS analysis, sleeps for a random time between zero and the exponential value:</p>
+  <p style="text-align:center;font-family:var(--mono);font-size:15px">sleep = random(0, min(cap, base × 2<sup>attempt</sup>))</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">Retrier</span> {
+	<span class="k">private final int</span> maxAttempts;
+	<span class="k">private final long</span> baseMs, capMs;
+	<span class="k">private final</span> <span class="t">RetryBudget</span> budget;
+
+	<span class="k">public</span> &lt;<span class="t">T</span>&gt; <span class="t">T</span> <span class="f">call</span>(<span class="t">Supplier</span>&lt;<span class="t">T</span>&gt; op, <span class="t">Predicate</span>&lt;<span class="t">RuntimeException</span>&gt; retryable, <span class="t">Deadline</span> deadline)
+			<span class="k">throws</span> <span class="t">InterruptedException</span> {
+		<span class="k">for</span> (<span class="k">int</span> attempt = <span class="m">1</span>; ; attempt++) {
+			<span class="k">try</span> {
+				<span class="t">T</span> value = op.<span class="f">get</span>();
+				budget.<span class="f">onSuccess</span>();
+				<span class="k">return</span> value;
+			} <span class="k">catch</span> (<span class="t">RuntimeException</span> e) {
+				<span class="k">if</span> (!retryable.<span class="f">test</span>(e) || attempt == maxAttempts || !budget.<span class="f">tryAcquire</span>()) <span class="k">throw</span> e;
+				<span class="k">long</span> ceiling = <span class="t">Math</span>.<span class="f">min</span>(capMs, baseMs &lt;&lt; attempt);           <span class="c">// exponential, capped</span>
+				<span class="k">long</span> sleep = <span class="t">ThreadLocalRandom</span>.<span class="f">current</span>().<span class="f">nextLong</span>(ceiling + <span class="m">1</span>);   <span class="c">// full jitter</span>
+				<span class="k">if</span> (sleep &gt;= deadline.<span class="f">remaining</span>().<span class="f">toMillis</span>()) <span class="k">throw</span> e;       <span class="c">// no time left: give up now</span>
+				<span class="t">Thread</span>.<span class="f">sleep</span>(sleep);
+			}
+		}
+	}
+}</pre>
+  <p>Three details matter. The loop respects the request's <b>deadline</b>, so retries never outlive the caller. Only errors the predicate marks as retryable are retried. And every retry must get a token from a <b>budget</b>, which is what the next section is about.</p>
+
+  <h2>Retry storms and metastable failure</h2>
+  <p>Here's the trap. When a service is overloaded, requests queue up and time out. Clients retry the timed-out requests, adding load to the overloaded service, which makes more requests time out. Worse, the server still processes the original attempts sitting in its queue, even though their clients have already given up, so its capacity goes on work nobody will read. The system can stay in this state <b>after the original trigger is gone</b>. Bronson and colleagues named this a <b>metastable failure</b> (HotOS 2021): the system has a good stable state and a bad stable state, and a brief shock can push it from one to the other.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Retry storm lab: 1,000 requests/s, a 1,400/s server, a short outage</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="rsStrat"><button data-v="none">No retries</button><button class="active" data-v="immediate">Immediate retry ×3</button><button data-v="jitter">Backoff + jitter ×3</button><button data-v="budget">Jitter + retry budget</button></div>
+      </div>
+      <div class="rs-row">
+        <label for="rsOut">Outage length</label><input type="range" id="rsOut" min="0.5" max="6" step="0.5" value="3"><output id="rsOutV"></output>
+        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="rsDrop"> Server drops requests whose deadline has passed</label>
+      </div>
+      <svg class="rs-chart" id="rsChart" viewBox="0 0 640 210" role="img" aria-label="Attempts and successful requests over time"></svg>
+      <div class="stats" id="rsStats"></div>
+      <div class="rs-res" id="rsRes"></div>
+    </div>
+    <div class="panel-foot">New requests arrive at about 1,000 per second whatever happens (users keep clicking). The server handles 1,400 per second from a FIFO queue and stops completely during the outage, which starts at 5 s. Clients time out after 1 s and retry up to 3 times. Purple: attempts sent per second, retries included. Green: requests that succeeded in time. Red dashed: server capacity.</div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Strategy</th><th>Spreads retries in time?</th><th>Caps total extra load?</th><th>Recovers after a long outage?</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td>Immediate retry</td><td>No</td><td>No: up to ×(1 + retries)</td><td>Often not</td><td>Nothing, except a reconnect to another replica</td></tr>
+        <tr><td>Exponential backoff</td><td>Yes, but clients stay in lockstep</td><td>No</td><td>Slowly, in waves</td><td>Single clients</td></tr>
+        <tr><td>Backoff + full jitter</td><td>Yes, desynchronised</td><td>No</td><td>Not under sustained overload</td><td>The default retry delay</td></tr>
+        <tr><td>Retry budget / throttling</td><td>With jitter</td><td>Yes: retries ≤ ~10% of successes</td><td>Yes</td><td>Every client in a large fleet</td></tr>
+        <tr><td>Deadline-aware server</td><td>n/a (server side)</td><td>Stops wasted work</td><td>Yes, quickly</td><td>Any queueing server: drop expired work</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The panel's lesson is uncomfortable: <b>backoff and jitter alone don't save you from sustained overload</b>, because each failing request still makes the same number of attempts; they're only spread out. What fixes it is limiting the total. A <b>retry budget</b> allows retries only up to a fraction of recent successful requests. gRPC's built-in retry throttling works this way: every failure costs a token, every success refunds a fraction of one, and retries stop when the bucket is half empty. On the server side, <b>dropping requests whose deadline has already passed</b> (the deadline from <a href="03-grpc-java.html">Chapter 3</a>) stops it wasting capacity on clients who left.</p>
+<pre class="code"><span class="c">/** Token bucket: retries are allowed while recent successes keep it topped up. */</span>
+<span class="k">final class</span> <span class="t">RetryBudget</span> {
+	<span class="k">private static final double</span> MAX = <span class="m">10</span>, REFUND = <span class="m">0.1</span>;   <span class="c">// ~1 retry per 10 successes, burst of 10</span>
+	<span class="k">private double</span> tokens = MAX;
+	<span class="k">synchronized void</span> <span class="f">onSuccess</span>() { tokens = <span class="t">Math</span>.<span class="f">min</span>(MAX, tokens + REFUND); }
+	<span class="k">synchronized boolean</span> <span class="f">tryAcquire</span>() {
+		<span class="k">if</span> (tokens &lt; <span class="m">1</span>) <span class="k">return false</span>;
+		tokens -= <span class="m">1</span>;
+		<span class="k">return true</span>;
+	}
+}</pre>
+
+  <h2>Idempotency keys: making retries safe</h2>
+  <p>An operation is <b>idempotent</b> if doing it twice has the same effect as doing it once. "Set the price to £40" is; "charge £40" isn't. To make a non-idempotent operation safe to retry, the client generates a unique <b>idempotency key</b> for each logical operation, before the first attempt, and sends the same key with every retry. The server records the key with the result, and when a retry arrives with a key it has seen, it returns the stored result instead of acting again.</p>
+  <figure class="seq" data-actors="Client|Payments API|Idempotency store|Card network">
+    <ol>
+      <li data-m="0>1">POST /charges, key k-81, £40</li>
+      <li data-m="1>2">claim k-81 (INSERT … ON CONFLICT DO NOTHING)</li>
+      <li data-m="2>1" data-k="reply">claimed: first attempt</li>
+      <li data-m="1>3">charge £40</li>
+      <li data-m="1>2">store k-81 → receipt r-5</li>
+      <li data-m="1>0" data-k="fail">201 receipt r-5 (reply lost)</li>
+      <li data-m="0>1">retry: POST /charges, key k-81, £40</li>
+      <li data-m="1>2">claim k-81 → already done: receipt r-5</li>
+      <li data-m="1>0" data-k="reply">201 receipt r-5 (same answer, no new charge)</li>
+    </ol>
+    <figcaption><b>One logical charge, two attempts, one effect.</b> The client sees the same response it would have seen the first time.</figcaption>
+  </figure>
+<pre class="code"><span class="k">public</span> <span class="t">Receipt</span> <span class="f">charge</span>(<span class="t">ChargeRequest</span> req) {
+	<span class="t">Claim</span> c = keys.<span class="f">claim</span>(req.<span class="f">idempotencyKey</span>(), <span class="f">fingerprint</span>(req));   <span class="c">// unique index on the key</span>
+	<span class="k">return switch</span> (c) {
+		<span class="k">case</span> <span class="t">Claim.First</span> f        -&gt; {
+			<span class="t">Receipt</span> r = cards.<span class="f">charge</span>(req.<span class="f">card</span>(), req.<span class="f">amount</span>(), req.<span class="f">idempotencyKey</span>());   <span class="c">// pass it on</span>
+			keys.<span class="f">complete</span>(req.<span class="f">idempotencyKey</span>(), r);
+			<span class="k">yield</span> r;
+		}
+		<span class="k">case</span> <span class="t">Claim.Done</span> d         -&gt; d.<span class="f">receipt</span>();                                <span class="c">// a retry: same result</span>
+		<span class="k">case</span> <span class="t">Claim.InProgress</span> p   -&gt; <span class="k">throw new</span> <span class="t">ConflictException</span>(<span class="s">"retry later"</span>);       <span class="c">// concurrent duplicate</span>
+		<span class="k">case</span> <span class="t">Claim.Mismatch</span> m     -&gt; <span class="k">throw new</span> <span class="t">BadRequest</span>(<span class="s">"key reused with a different request"</span>);
+	};
+}</pre>
+  <p>The details are where implementations go wrong:</p>
+  <ul>
+    <li><b>Claim atomically.</b> Two retries can arrive at once. A unique index (or a conditional put) ensures exactly one wins; the other sees <code>InProgress</code>.</li>
+    <li><b>Fingerprint the request.</b> Reusing a key with different parameters is a client bug; reject it rather than returning an unrelated result. Stripe does exactly this.</li>
+    <li><b>Handle a crash between claim and complete.</b> The key is stuck "in progress". Either ask the downstream system (here, by passing the same key on to the card network, so <i>its</i> retry is safe too), or let the claim expire so a later retry can proceed.</li>
+    <li><b>Keep keys long enough.</b> At least as long as any client might retry. Stripe keeps them for 24 hours.</li>
+  </ul>
+
+  <h2>At-least-once delivery</h2>
+  <p>A client that retries until it hears back has made the request <b>at-least-once</b>: it will be delivered once or more, never zero times (within the deadline). Combined with an idempotent receiver, at-least-once delivery produces an <b>exactly-once effect</b>, which is the only practical meaning of "exactly once" in distributed systems. Message queues, Kafka consumers and payment flows all use this pattern; <a href="28-delivery-semantics.html">Chapter 28</a> generalises it.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🗃️</div>
+    <div class="body"><div class="title">Use case: DynamoDB, 20 September 2015</div><p>Amazon's postmortem for a multi-hour DynamoDB disruption in us-east-1 reads like the panel above. A brief network problem made many storage servers re-request their membership data from an internal metadata service at the same time. That service was already running near capacity because a new feature (global secondary indexes) had made the membership data much larger, so requests took longer than the storage servers' timeout. The servers timed out and retried, keeping the metadata service overloaded, and storage servers that couldn't get their data took themselves out of service, so customer requests failed. The retry load didn't stop on its own: engineers had to pause the metadata requests to add capacity before the system could recover. Afterwards Amazon increased the service's capacity, lengthened timeouts and changed how the requests were made. The trigger lasted minutes; the retries made it hours.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Retrying non-idempotent operations</b> (charges, inserts, "add 1") without a key.</li>
+      <li><b>Retrying at every layer</b>, so attempts multiply: 4 attempts at 3 layers is 64 calls at the bottom.</li>
+      <li><b>Backoff without jitter</b>, so clients that failed together retry together.</li>
+      <li><b>No cap on total retries</b>, assuming backoff alone prevents storms. Use a retry budget or circuit breaker.</li>
+      <li><b>Retrying permanent errors</b> such as 400 or <code>INVALID_ARGUMENT</code>.</li>
+      <li><b>Generating a new idempotency key per attempt</b> instead of per logical operation, which makes the key useless.</li>
+      <li><b>Servers that process requests whose client has already timed out</b>, wasting capacity exactly when it's scarce.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why add jitter to exponential backoff?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because failures are often correlated: many clients fail at the same moment, for example when a server restarts. With plain exponential backoff, they all wait 100 ms, then 200 ms, then 400 ms, and hit the server in synchronized waves that can knock it over again. Jitter randomises each wait, typically a uniform value between zero and the exponential ceiling, so retries spread out evenly and the server sees a smooth load it can absorb.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Design idempotency for a "create payment" API that clients retry on timeout.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Clients generate a unique idempotency key per logical payment, before the first attempt, and send it in a header on every retry. The server claims the key atomically, with a unique index or a conditional insert, along with a fingerprint of the request. If the claim succeeds, it processes the payment, passing the key down to the payment processor so that hop is idempotent too, then stores the response under the key. A retry with a completed key gets the stored response; one with an in-progress key gets a 409 "retry later"; a key with a different fingerprint gets a 400. For crashes between claim and completion, a recovery job checks with the processor by key and completes or releases the claim. Keys are kept at least as long as clients might retry, say 24 hours. Combined with client retries, that gives at-least-once delivery with an exactly-once effect.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Retry transient failures; retry timeouts only when the operation is idempotent; never retry permanent errors.</li>
+      <li>Retry at one layer; attempts multiply across layers.</li>
+      <li>Use exponential backoff with full jitter, inside the request's overall deadline.</li>
+      <li>Backoff spreads retries but doesn't cap them; a retry budget (or throttling) does, and deadline-aware servers stop wasted work.</li>
+      <li>Idempotency keys, claimed atomically and stored with the result, make retries safe.</li>
+      <li>At-least-once delivery plus an idempotent receiver gives an exactly-once effect.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A browser, an API gateway and a backend service each retry a failed call up to 3 times (4 attempts each). How many database calls can one click cause in the worst case?</p>
+      <div class="opts">
+        <button class="opt">4</button>
+        <button class="opt">12</button>
+        <button class="opt">64</button>
+        <button class="opt">9</button>
+      </div>
+      <div class="explain">Attempts multiply across layers: 4 × 4 × 4 = 64. Retry at one layer and fail fast elsewhere.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does full jitter compute for the wait before retry number n?</p>
+      <div class="opts">
+        <button class="opt">A random value between 0 and min(cap, base × 2ⁿ)</button>
+        <button class="opt">Exactly base × 2ⁿ</button>
+        <button class="opt">base × 2ⁿ plus or minus 1 ms</button>
+        <button class="opt">A fixed 100 ms</button>
+      </div>
+      <div class="explain">Full jitter picks uniformly from zero up to the capped exponential value, which spreads synchronized clients evenly.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A service recovers from a 3-second outage, but stays overloaded for an hour while clients keep retrying with backoff and jitter. What would most directly let it recover?</p>
+      <div class="opts">
+        <button class="opt">Increasing the clients' timeout to 60 seconds</button>
+        <button class="opt">Switching from full jitter to equal jitter</button>
+        <button class="opt">Adding more retry attempts</button>
+        <button class="opt">A retry budget that caps retries to a fraction of successes, plus a server that drops requests whose deadline has passed</button>
+      </div>
+      <div class="explain">This is a metastable failure: retries keep the load above capacity. Capping total retries and not wasting work on abandoned requests break the loop.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">When should a client generate the idempotency key for a payment?</p>
+      <div class="opts">
+        <button class="opt">Fresh for each attempt, so the server can tell attempts apart</button>
+        <button class="opt">Once per logical payment, before the first attempt, and reuse it for every retry</button>
+        <button class="opt">After the first timeout</button>
+        <button class="opt">The server should generate it</button>
+      </div>
+      <div class="explain">The key identifies the logical operation. A new key per attempt makes every retry look like a new payment.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Two retries with the same idempotency key arrive at the server at the same moment. What should happen?</p>
+      <div class="opts">
+        <button class="opt">Both are processed, and the second result is stored</button>
+        <button class="opt">Both are rejected</button>
+        <button class="opt">An atomic claim lets exactly one proceed; the other is told the request is in progress (or waits for its result)</button>
+        <button class="opt">The one with the earlier timestamp wins</button>
+      </div>
+      <div class="explain">The claim must be atomic, for example a unique index or conditional insert, so concurrent duplicates can't both act.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  let strat = 'immediate';
+
+  // Open-loop model: arrivals don't wait; a FIFO server; clients time out after 1 s and may retry.
+  function sim(strategy, outLen, drop) {
+    const TICK = 10, T = 25000, RATE = 10, CAP = 14, TO = 1000, OUT0 = 5000, OUT1 = OUT0 + outLen * 1000, MAXA = 4;
+    const r = rng(9), queue = []; let qh = 0;
+    const pending = new Map(), timeouts = new Map(), done = new Set();
+    const push = (m, k, v) => { let l = m.get(k); if (!l) m.set(k, l = []); l.push(v); };
+    let tokens = 10, id = 0, attempts = 0, logical = 0, wasted = 0, wArr = 0, wOk = 0, wAtt = 0;
+    const win = [];
+    const send = (lid, att, t) => { queue.push({ lid, dl: t + TO }); attempts++; wAtt++; push(timeouts, t + TO, { lid, att }); };
+    for (let t = 0; t < T; t += TICK) {
+      const n = RATE + (r() < 0.5 ? -1 : 1) * Math.floor(r() * 3);
+      for (let i = 0; i < n; i++) { logical++; wArr++; send(id++, 1, t); }
+      for (const rt of pending.get(t) || []) if (!done.has(rt.lid)) send(rt.lid, rt.att, t);
+      pending.delete(t);
+      let cap = t >= OUT0 && t < OUT1 ? 0 : CAP;
+      while (cap > 0 && qh < queue.length) {
+        const a = queue[qh++];
+        if (drop && t > a.dl) continue;                       // expired: skip for free
+        cap--;
+        if (t <= a.dl && !done.has(a.lid)) { done.add(a.lid); wOk++; tokens = Math.min(10, tokens + 0.1); }
+        else wasted++;
+      }
+      for (const a of timeouts.get(t) || []) {
+        if (done.has(a.lid) || strategy === 'none' || a.att >= MAXA) continue;
+        if (strategy === 'budget') { if (tokens < 1) continue; tokens -= 1; }
+        const d = strategy === 'immediate' ? TICK : Math.max(TICK, Math.round(r() * Math.min(100 * 2 ** a.att, 4000) / TICK) * TICK);
+        push(pending, t + d, { lid: a.lid, att: a.att + 1 });
+      }
+      timeouts.delete(t);
+      if ((t + TICK) % 100 === 0) { win.push({ t: t + TICK, arr: wArr * 10, ok: wOk * 10, att: wAtt * 10, q: queue.length - qh }); wArr = wOk = wAtt = 0; }
+    }
+    let rec = null;
+    for (let i = 0; i < win.length; i++) { if (win[i].t <= OUT1) continue; const nx = win.slice(i, i + 10); if (nx.length === 10 && nx.reduce((s, w) => s + w.ok, 0) >= 0.95 * nx.reduce((s, w) => s + w.arr, 0)) { rec = win[i].t - OUT1; break; } }
+    return { win, amp: attempts / logical, wasted, rec, maxQ: Math.max(...win.map((w) => w.q)), OUT0, OUT1, T };
+  }
+
+  function render() {
+    const outLen = +$('#rsOut').value, drop = $('#rsDrop').checked;
+    $('#rsOutV').textContent = outLen + ' s';
+    const s = sim(strat, outLen, drop);
+    const x0 = 46, W = 580, y0 = 185, H = 165, top = 5000;
+    const X = (t) => x0 + t / s.T * W, Y = (v) => y0 - Math.min(v, top) / top * H;
+    let svg = `<rect class="rs-out" x="${X(s.OUT0)}" y="${y0 - H}" width="${X(s.OUT1) - X(s.OUT0)}" height="${H}"/><text x="${X(s.OUT0) + 3}" y="${y0 - H + 12}" style="fill:var(--red)">outage</text>`;
+    [0, 1000, 2000, 3000, 4000, 5000].forEach((v) => { svg += `<text x="4" y="${Y(v) + 3}">${v / 1000}k/s</text>`; });
+    svg += `<line class="rs-cap" x1="${x0}" y1="${Y(1400)}" x2="${x0 + W}" y2="${Y(1400)}"/>`;
+    const line = (key, cls) => `<polyline class="${cls}" points="${s.win.map((w) => `${X(w.t).toFixed(1)},${Y(w[key]).toFixed(1)}`).join(' ')}"/>`;
+    svg += line('att', 'rs-att') + line('ok', 'rs-ok');
+    svg += `<line x1="${x0}" y1="${y0}" x2="${x0 + W}" y2="${y0}" stroke="var(--border-strong)"/><text x="${x0}" y="200">0 s</text><text x="${x0 + W}" y="200" text-anchor="end">25 s</text>`;
+    svg += `<text x="${x0 + W - 4}" y="${Y(1400) - 4}" text-anchor="end" style="fill:var(--red)">capacity 1,400/s</text>`;
+    $('#rsChart').innerHTML = svg;
+    const peak = Math.max(...s.win.map((w) => w.att));
+    $('#rsStats').innerHTML = `
+      <div class="stat ${peak > 1400 * 1.5 ? 'bad' : 'good'}"><div class="k">Peak attempts</div><div class="v">${(peak / 1000).toFixed(1)}k<small>/s</small></div></div>
+      <div class="stat ${s.amp > 1.5 ? 'bad' : s.amp > 1.1 ? 'warn' : 'good'}"><div class="k">Attempts per request</div><div class="v">${s.amp.toFixed(2)}</div></div>
+      <div class="stat ${s.wasted > 5000 ? 'bad' : s.wasted ? 'warn' : 'good'}"><div class="k">Work for clients who left</div><div class="v">${(s.wasted / 1000).toFixed(1)}k</div></div>
+      <div class="stat ${s.rec == null ? 'bad' : s.rec > 2000 ? 'warn' : 'good'}"><div class="k">Recovered after outage</div><div class="v" style="font-size:18px">${s.rec == null ? 'never' : (s.rec / 1000).toFixed(1) + ' s'}</div></div>`;
+    const res = $('#rsRes');
+    if (s.rec == null) { res.className = 'rs-res rs-bad'; res.innerHTML = `<b>Metastable failure.</b> The outage ended at ${(s.OUT1 / 1000).toFixed(1)} s, but the system never recovers: retries push attempts to ${(peak / 1000).toFixed(1)}k/s against a capacity of 1.4k/s, the queue grows to ${Math.round(s.maxQ / 1000)}k, and the server spends its time on requests whose clients already timed out. ${strat === 'jitter' ? 'Jitter spread the retries out, but each failing request still makes up to 4 attempts.' : ''} Try the retry budget, or tick the deadline box.`; }
+    else if (drop && strat !== 'none' && strat !== 'budget') { res.className = 'rs-res rs-good'; res.innerHTML = `<b>Deadline-aware server.</b> Retries still multiply attempts (${s.amp.toFixed(2)} per request), but the server skips anything whose client has given up, so all its capacity goes to requests someone is waiting for. Recovery took ${(s.rec / 1000).toFixed(1)} s.`; }
+    else if (strat === 'budget') { res.className = 'rs-res rs-good'; res.innerHTML = `<b>Retry budget.</b> During the outage there are no successes to earn tokens, so retries stop almost at once: ${s.amp.toFixed(2)} attempts per request. After the outage the queue drains and the system recovers in ${(s.rec / 1000).toFixed(1)} s, as fast as with no retries at all, while still retrying the occasional isolated failure in normal times.`; }
+    else if (strat === 'none') { res.className = 'rs-res rs-warn'; res.innerHTML = `<b>No retries.</b> Everything sent during the outage fails, and the backlog drains in ${(s.rec / 1000).toFixed(1)} s${drop ? '' : ', slowed by the queued requests whose clients already gave up'}. Safe, but every brief blip in normal operation becomes a user-visible error.`; }
+    else { res.className = 'rs-res rs-warn'; res.innerHTML = `With an outage this short, the system recovers in ${(s.rec / 1000).toFixed(1)} s, at ${s.amp.toFixed(2)} attempts per request. Lengthen the outage: past a point, retries alone keep it down.`; }
+  }
+  $('#rsStrat').addEventListener('segchange', (e) => { strat = e.detail; render(); });
+  ['#rsOut', '#rsDrop'].forEach((sel) => $(sel).addEventListener('input', render));
+  render();
+})();
+</script>
 </body>
 </html>
