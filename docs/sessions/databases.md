@@ -18,3 +18,4 @@
 - DB P7: Sets & Relational Algebra: algebra workbench (σ π × ⋈ ∪ ∩ −, bag vs set)
 - DB P8: Data-Size Arithmetic: size estimator with tuple byte map, padding and growth
 - DB 1: The Relational Model: data-independence panel (navigational code vs SQL under storage changes)
+- DB 2: Filtering, Sorting & Pagination: pagination lab (deep OFFSET cost + drift demo vs keyset)
