@@ -25,3 +25,4 @@
   - Ch 4 Process States & the Process Control Block (29 KB)
   - Ch 5 Threads (28 KB)
   - Ch 6 Context Switches & Interrupts (26 KB)
+  - Ch 7 CPU Scheduling I: FCFS, SJF, Round Robin (26 KB)
