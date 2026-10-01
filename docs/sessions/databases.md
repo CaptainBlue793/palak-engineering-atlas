@@ -23,3 +23,4 @@
 - DB 4: GROUP BY & Aggregates: grouping machine (WHERE/GROUP BY/HAVING stages, GROUP BY error)
 - DB 5: Subqueries & CTEs: recursive CTE stepper with cycle bug and CYCLE clause
 - DB 6: Window Functions: window playground (functions, partition, order, frames, click-to-highlight frame)
+- DB 7: Schema Design & Normalisation: normalisation workbench (UNF→3NF with update/insert/delete anomalies)
