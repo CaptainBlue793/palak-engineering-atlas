@@ -15,3 +15,4 @@
 ## Chapters (one commit each)
 - P1 Java concurrency refresher: race-lab panel (double vote), firstK quorum futures, happens-before, event loop
 - P2 RPC & timeouts: timeout-lab panel (latency histogram, false timeouts, unknown outcomes), Outcome type, deadlines
+- P3 Serialization: live Protobuf encoder panel with v1/v2/v3 readers (unknown fields, reused field number)
