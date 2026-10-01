@@ -13,3 +13,4 @@
 - P2 IP Addresses & Binary Arithmetic: mask workbench (bitwise AND, same-network check)
 - P3 Clients, Servers & Ports: connection-table simulator (5-tuples, refused, port exhaustion)
 - P4 ping, curl, dig & Friends: debug-the-broken-endpoint game (6 incidents)
+- P5 Sockets in Python: two-sided socket-call stepper (backlog, blocking, refused, timeouts)
