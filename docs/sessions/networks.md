@@ -22,3 +22,4 @@
 - Ch 3 ARP: LAN simulator (resolve, cache states, failed lookup, spoofing, keepalived failover)
 - Ch 4 IP Addressing & Subnetting: VLSM subnet planner (AWS rules, growth, /31)
 - Ch 5 Routing Tables & Forwarding: three-router hop-by-hop tracer (LPM, return path, loop, null route)
+- Ch 6 ICMP, ping & traceroute: traceroute/mtr simulator (probe types, silent and rate-limited hops, real loss)
