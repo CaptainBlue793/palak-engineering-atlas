@@ -13,3 +13,4 @@
 - Chapters:
   - P1 C for Systems: Pointers & Memory (37 KB)
   - P2 Structs, Arrays & Strings in C (28 KB)
+  - P3 How a CPU Runs Your Code (29 KB)
