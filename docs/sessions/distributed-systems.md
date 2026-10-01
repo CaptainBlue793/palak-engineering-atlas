@@ -11,3 +11,6 @@
   walkthrough phase, 8-row rubric), flashcards intro, README.
 - Needs a shared change: none yet.
 - Next: P1 and onwards, one commit per chapter.
+
+## Chapters (one commit each)
+- P1 Java concurrency refresher: race-lab panel (double vote), firstK quorum futures, happens-before, event loop
