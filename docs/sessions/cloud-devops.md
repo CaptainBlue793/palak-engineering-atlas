@@ -15,3 +15,4 @@
 - P2 Bash Scripting: script runner (deploy/cleanup/backup × -e/-u/pipefail), Steam rm -rf use case
 - P3 Git Workflows: commit-graph simulator (fast-forward, merge, rebase, squash), PR sequence, trunk vs GitFlow
 - P4 YAML & JSON: type inspector (YAML 1.1 vs 1.2 resolution, four documents, free input), jq
+- P5 Networking for Operations: troubleshooter (5 faults: TTL, expired cert, 127.0.0.1 bind, firewall timeout, SAN mismatch)
