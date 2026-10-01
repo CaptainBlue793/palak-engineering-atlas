@@ -11,3 +11,4 @@
   is course-neutral and kept (commit 2503894).
 - Decisions: chapters written in order P1→48, one commit each; each chapter is headless-checked by driving its panel.
 - Chapters:
+  - P1 C for Systems: Pointers & Memory (37 KB)
