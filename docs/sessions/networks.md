@@ -20,3 +20,4 @@
 - Ch 1 OSI vs TCP/IP: layer sorter (20 cards with defensible answers)
 - Ch 2 Ethernet, MAC Addresses & Switches: learning-switch simulator (flood, learn, age, VM move, hub mode)
 - Ch 3 ARP: LAN simulator (resolve, cache states, failed lookup, spoofing, keepalived failover)
+- Ch 4 IP Addressing & Subnetting: VLSM subnet planner (AWS rules, growth, /31)
