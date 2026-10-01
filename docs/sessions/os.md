@@ -34,3 +34,4 @@
 - Chapters (continued):
   - Ch 10 File Descriptors & "Everything Is a File" (30 KB)
   - Ch 11 Address Spaces & Virtual Memory (30 KB)
+  - Ch 12 Paging & Page Tables (27 KB)
