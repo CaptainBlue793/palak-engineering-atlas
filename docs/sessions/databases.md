@@ -26,3 +26,4 @@
 - DB 7: Schema Design & Normalisation: normalisation workbench (UNF→3NF with update/insert/delete anomalies)
 - DB 8: Constraints & Integrity: constraint gatekeeper (FK ON DELETE modes, CHECK, lower() unique, exclusion, deferrable)
 - DB 9: Indexes: A First Look: index lab (7 queries x 5 indexes: seq/index/bitmap/index-only, write cost)
+- DB 10: Transactions & ACID: crash lab (txn vs autocommit, failing credit, synchronous_commit off)
