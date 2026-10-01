@@ -11,3 +11,4 @@
 ### Chapters
 - DB P1: Tables, Rows & Keys: key-chooser panel (unique / not null / stable)
 - DB P2: Your First SELECT: query-builder panel with per-row true/false/unknown
+- DB P3: Disks, Files & Pages: random-vs-sequential I/O calculator with crossover chart
