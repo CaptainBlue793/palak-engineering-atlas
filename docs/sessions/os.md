@@ -22,3 +22,4 @@
   - Ch 1 What an Operating System Does (27 KB)
   - Ch 2 Kernel Mode, User Mode & System Calls (31 KB)
   - Ch 3 Processes: fork, exec, wait (33 KB)
+  - Ch 4 Process States & the Process Control Block (29 KB)
