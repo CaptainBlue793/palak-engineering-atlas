@@ -12,3 +12,4 @@
 - Decisions: chapters written in order P1→48, one commit each; each chapter is headless-checked by driving its panel.
 - Chapters:
   - P1 C for Systems: Pointers & Memory (37 KB)
+  - P2 Structs, Arrays & Strings in C (28 KB)
