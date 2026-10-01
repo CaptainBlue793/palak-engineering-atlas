@@ -1,35 +1,38 @@
 # Computer Networks — Interactive Course
 
-Object-oriented design for the NET interview round, in Java: from "what is a class, really" to a
-thread-safe movie-booking system. **46 chapters across four levels, plus an 8-chapter
-Prerequisites level** (P1–P8: classes and references, encapsulation, inheritance and dispatch,
-interfaces and generics, composition, value objects and immutability, exceptions, reading UML).
+How networks really work, from the bits on an Ethernet cable to BGP and the protocols that carry
+the web. **48 chapters across five levels, plus an 8-chapter Prerequisites level** (P1–P8: bytes
+and byte order, IP arithmetic, clients/servers/ports, the CLI tools, Python sockets, Wireshark,
+layering, latency and bandwidth).
 
 Static site, **zero dependencies**, no build step required to read it. Open `index.html` in a
 browser; progress, quiz scores and flashcard state are saved in `localStorage` under `net-*` keys.
 
-> **Status: complete.** All 54 pages are written. Each chapter has at least one interactive panel,
-> Java listings in the house style, a comparison table, a real-world use case, a common-mistakes box,
-> an interview drill and a five-question quiz. `grep -l net:placeholder *.html` should print nothing.
+> **Status: in progress.** Chapters are being written in order. Each chapter has an interactive
+> panel, Python socket and CLI listings in the house style, a sequence or flow diagram, a comparison
+> table, a real-world use case, a common-mistakes box, an interview drill and a five-question quiz.
+> `grep -l net:placeholder *.html` lists the chapters still to come.
 
 ## The levels
 
 | Level | Chapters | What it covers |
 |---|---|---|
-| **Prerequisites** | P1–P8 | The Java object model, encapsulation, inheritance and dynamic dispatch, interfaces and generics, composition, value objects, exceptions, UML |
-| **Principles** | 1–8 | The NET round, requirements to classes, SOLID, coupling and cohesion, relationships, class contracts, dependency injection |
-| **Design Patterns** | 9–21 | Singleton, factories, builder, adapter/facade/bridge, decorator/proxy, composite/flyweight, strategy, observer/mediator, command/memento, state, chain/template, iterator/visitor, combining patterns |
-| **Advanced NET** | 22–30 | Thread-safe classes, producer-consumer and pools, extensibility, resilience, persistence, domain modeling, testing, refactoring, the interview playbook |
-| **Case Studies** | 31–46 | LRU cache, rate limiter, logger, pub-sub, task scheduler, file system, KV store with transactions, text editor, connection pool, parking lot, elevator, ticket booking, Splitwise, chess, vending machine/ATM, ride-hailing |
+| **Prerequisites** | P1–P8 | Bytes and network byte order, IP addresses as numbers, ports and the 5-tuple, `ping`/`curl`/`dig`/`ss`, Python sockets, Wireshark and `tcpdump`, encapsulation, latency vs bandwidth |
+| **Beginner** | 1–10 | OSI vs TCP/IP, Ethernet and switches, ARP, subnetting, routing tables, ICMP and traceroute, UDP, the TCP handshake, NAT, DNS resolution |
+| **Intermediate** | 11–24 | TCP reliability, flow control, congestion control (CUBIC, BBR), `TIME_WAIT`, HTTP/1.1, HTTP/2, TLS 1.3, HTTP/3 and QUIC, DHCP, IPv6, WebSockets and SSE, REST and gRPC on the wire, proxies, L4 vs L7 load balancing |
+| **Advanced** | 25–36 | BGP, anycast and CDNs, DNSSEC and GeoDNS, VPNs and WireGuard, VLANs and VXLAN, leaf–spine data centres, Kubernetes networking, service mesh and mTLS, Nagle and delayed ACK, kernel networking, firewalls and iptables, DDoS |
+| **Expert** | 37–40 | Packet-level debugging, internet latency budgets, SDN, the interview playbook |
+| **Case Studies** | 41–48 | Typing google.com packet by packet, a WebRTC call, a CDN and a viral video, Facebook's 2021 BGP outage, the 2016 Dyn DNS attack, load-balancer failover, multiplayer game networking, debugging a slow API from a capture |
 
-Case studies that also appear in the System Design course link to the high-level version:
-same problem, different zoom.
+Where this course meets the others, each keeps its own angle and links across: the OS course
+covers `epoll` and network namespaces from the kernel's side, Cloud & DevOps runs Kubernetes, and
+System Design uses load balancers and CDNs as building blocks.
 
 ## Study tools
 
-- **`glossary.html`**: NET terms, each linked to the chapter that introduces it
-- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes (270 cards)
-- **`mock-interview.html`**: timed room with 18 NET problems, a phase timer, an 8-point rubric and notes saved locally
+- **`glossary.html`**: networking terms, each linked to the chapter that introduces it
+- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes
+- **`mock-interview.html`**: timed room with 18 networking questions (explain, debug and design), a phase timer, an 8-point rubric and notes saved locally
 
 ## Tools
 
@@ -46,6 +49,8 @@ chapters start being edited by hand.
 
 ## House style
 
-Every listing is Java written the same way: interface first, constructor injection into `final`
-fields, validation at the boundary, small classes, and each design naming its pattern and the
-extension it survives.
+Every listing is Python 3 sockets or a real command with its real output. Bytes on the wire and
+strings in the program, converted explicitly at the edge; a timeout on every socket; messages
+framed on top of TCP's byte stream (a length prefix or a delimiter); sockets closed with `with`;
+and every `curl`, `dig`, `ss` or `tcpdump` listing shows the command, its trimmed output and what
+the important fields mean.
