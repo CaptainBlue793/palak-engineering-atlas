@@ -11,3 +11,4 @@
 - Needs a shared change: `.objectives li` is `display:flex`, so an objective containing `<code>` splits into columns (LLD pages have it too). Fix in style.css: wrap content or use `display:block` with a positioned ✓. Networks chapters wrap objective text in `<span>` meanwhile.
 - P1 Bytes, Encoding & Byte Order: byte inspector (UTF-8/UTF-16/Latin-1/ASCII, endianness)
 - P2 IP Addresses & Binary Arithmetic: mask workbench (bitwise AND, same-network check)
+- P3 Clients, Servers & Ports: connection-table simulator (5-tuples, refused, port exhaustion)
