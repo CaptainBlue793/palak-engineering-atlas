@@ -15,3 +15,4 @@
   - P2 Structs, Arrays & Strings in C (28 KB)
   - P3 How a CPU Runs Your Code (29 KB)
   - P4 The Memory Hierarchy (24 KB)
+  - P5 Bits, Hex & Binary Data (25 KB)
