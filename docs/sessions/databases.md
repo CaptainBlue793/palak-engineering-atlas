@@ -7,3 +7,6 @@
 - Done: Step 2: course home (hero, 4-layer dependency map, SQL code-style strip, playbook link,
   footer), glossary (86 terms), mock interview (20 problems, DB phases and rubric), README.
   Flashcards intro checked; it is generic and needed no change.
+
+### Chapters
+- DB P1: Tables, Rows & Keys: key-chooser panel (unique / not null / stable)
