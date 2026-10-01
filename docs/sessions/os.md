@@ -19,3 +19,4 @@
   - P6 Compiling & Linking (28 KB)
   - P7 The Linux Shell & Files (37 KB)
   - P8 Reading Syscalls & Man Pages (32 KB)
+  - Ch 1 What an Operating System Does (27 KB)
