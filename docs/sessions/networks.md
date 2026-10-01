@@ -21,3 +21,4 @@
 - Ch 2 Ethernet, MAC Addresses & Switches: learning-switch simulator (flood, learn, age, VM move, hub mode)
 - Ch 3 ARP: LAN simulator (resolve, cache states, failed lookup, spoofing, keepalived failover)
 - Ch 4 IP Addressing & Subnetting: VLSM subnet planner (AWS rules, growth, /31)
+- Ch 5 Routing Tables & Forwarding: three-router hop-by-hop tracer (LPM, return path, loop, null route)
