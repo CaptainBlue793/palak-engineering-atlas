@@ -28,3 +28,8 @@
   - Ch 7 CPU Scheduling I: FCFS, SJF, Round Robin (26 KB)
   - Ch 8 CPU Scheduling II: Priorities, MLFQ & Linux CFS (29 KB)
   - Ch 9 IPC: Pipes, Signals & Shared Memory (31 KB)
+- Incident (2026-10-01, after Ch 9): `.git/refs/heads/feature/os-course` in the shared .git (inside OneDrive) was zeroed
+  (41 null bytes). Restored from the reflog to dc8b067 (Ch 9); working tree was intact. Other branches' refs were fine.
+  Mitigation: the branch is now pushed to origin after every chapter.
+- Chapters (continued):
+  - Ch 10 File Descriptors & "Everything Is a File" (30 KB)
