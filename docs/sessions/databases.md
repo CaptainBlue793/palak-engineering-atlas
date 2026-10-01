@@ -13,3 +13,4 @@
 - DB P2: Your First SELECT: query-builder panel with per-row true/false/unknown
 - DB P3: Disks, Files & Pages: random-vs-sequential I/O calculator with crossover chart
 - DB P4: Data Types: type lab panel (money, ID overflow, time zones, text limits, json/jsonb)
+- DB P5: JSON, CSV & Loading Data: bulk-load calculator with race (autocommit, txn, batched, COPY)
