@@ -12,3 +12,4 @@
 - P1 Bytes, Encoding & Byte Order: byte inspector (UTF-8/UTF-16/Latin-1/ASCII, endianness)
 - P2 IP Addresses & Binary Arithmetic: mask workbench (bitwise AND, same-network check)
 - P3 Clients, Servers & Ports: connection-table simulator (5-tuples, refused, port exhaustion)
+- P4 ping, curl, dig & Friends: debug-the-broken-endpoint game (6 incidents)
