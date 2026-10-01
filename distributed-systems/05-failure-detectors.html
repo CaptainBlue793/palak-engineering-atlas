@@ -6,34 +6,310 @@
 <title>Failure Detectors &amp; Heartbeats</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .fd-ctl { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:12px; }
+  @media (max-width:760px) { .fd-ctl { grid-template-columns:1fr; } }
+  .fd-ctl label { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); display:block; }
+  .fd-ctl input { width:100%; accent-color:var(--accent); margin-top:6px; }
+  .fd-ctl .fd-v { font-family:var(--mono); font-size:13px; color:var(--text); text-transform:none; letter-spacing:0; float:right; }
+  .fd-chart { width:100%; height:auto; display:block; margin-top:12px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; }
+  .fd-chart .fd-phi { fill:none; stroke:var(--accent); stroke-width:1.8; }
+  .fd-chart .fd-th { stroke:var(--accent); stroke-width:1.2; stroke-dasharray:5 4; }
+  .fd-chart .fd-hb { stroke:var(--green); stroke-width:1; }
+  .fd-chart .fd-sus { fill:var(--amber); opacity:.35; }
+  .fd-chart .fd-susp { fill:var(--accent); opacity:.3; }
+  .fd-chart .fd-ev { stroke:var(--red); stroke-width:1.4; stroke-dasharray:3 3; }
+  .fd-chart text { font-family:var(--mono); font-size:10px; fill:var(--muted); }
+  .fd-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); }
+</style>
 </head>
 <body data-chapter="5">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 5</span><span class="pill">Beginner</span><span class="pill">⏱ 40 min</span></div>
     <h1>Failure Detectors &amp; <span class="grad">Heartbeats</span></h1>
-    <p class="lead">Heartbeats, timeouts, the phi accrual detector, and why you can't tell slow from dead.</p>
+    <p class="lead">Almost every mechanism in this course starts with one node deciding that another has failed: a load balancer removes a backend, a Raft follower starts an election, a Cassandra node routes around a peer, a lock service revokes a lease. That decision is made by a <b>failure detector</b>, and it is always a guess, because a crashed node and a slow one look the same from outside (<a href="02-system-models.html">Chapter 2</a>). This chapter builds detectors from heartbeats and timeouts, shows why fixed timeouts are hard to tune, implements the adaptive <b>phi accrual</b> detector used by Cassandra and Akka, and introduces SWIM's probing scheme for large clusters.</p>
+    <ul class="objectives">
+      <li>Explain completeness and accuracy, and why no detector achieves both perfectly</li>
+      <li>Build a heartbeat detector and reason about the timeout trade-off</li>
+      <li>Implement the phi accrual detector in Java and choose a threshold</li>
+      <li>Describe SWIM's direct and indirect probes and why they scale</li>
+      <li>Design what happens after a suspicion so false positives are cheap</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Timing models</b> from <a href="02-system-models.html">Chapter 2</a>: why silence proves nothing without known bounds.</li>
+        <li><b>The monotonic clock</b> from <a href="p5-clocks-on-one-machine.html">P5</a>: every interval below is measured with <code>nanoTime</code>.</li>
+        <li><b>Latency percentiles and timeouts</b> from <a href="p2-rpc-timeouts.html">P2</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Heartbeats</li>
-    <li>Choosing a timeout</li>
-    <li>Phi accrual</li>
-    <li>SWIM-style probing</li>
-    <li>False positives</li>
-  </ol>
+  <h2>What a failure detector promises</h2>
+  <p>Chandra and Toueg (1996) described failure detectors by two properties:</p>
+  <ul>
+    <li><b>Completeness:</b> every node that has crashed is eventually suspected. Missing this means waiting forever on a dead node.</li>
+    <li><b>Accuracy:</b> nodes that are alive are not suspected. Missing this means false alarms: failovers, elections and data movement for nothing.</li>
+  </ul>
+  <p>In an asynchronous network you can't have both perfectly: to be sure a node is dead you'd have to wait forever, and if you never wait forever you'll sometimes suspect a slow node. Every real detector picks a point on that trade-off, usually through one number: <b>how long to wait</b>. Fast detection means more false positives; fewer false positives means slower detection. The best you can promise, under partial synchrony, is a detector that is <b>eventually accurate</b>: it may make mistakes during bad periods, but it stops making them once the network settles, which is exactly what consensus protocols need.</p>
+
+  <h2>Heartbeats and a fixed timeout</h2>
+  <p>The simplest detector: each node sends a small heartbeat every interval (say 1 s), and a monitor suspects a node once no heartbeat has arrived for <i>T</i>. Choosing <i>T</i> is the whole problem. Set it just above the heartbeat interval and one late packet triggers a false alarm; set it to 30 s and a crashed leader stalls the cluster for 30 s. And the right value depends on the environment: a value that works in one data centre causes constant false alarms across regions, or during the occasional 2-second garbage-collection pause. TCP faced the same problem for retransmission and solved it adaptively, setting its timeout from a smoothed average of measured round-trip times plus four times their variation. The phi accrual detector applies the same idea to heartbeats.</p>
+
+  <h2>Phi accrual: suspicion as a number</h2>
+  <p>Hayashibara and colleagues (2004) proposed that a detector should output not "alive" or "dead" but a continuous <b>suspicion level</b>, φ (phi). The detector keeps a sliding window of recent heartbeat inter-arrival times and models them as a normal distribution. When the next heartbeat is late, it asks: if heartbeats really follow this distribution, how unlikely is it that we would still be waiting? φ is that probability on a logarithmic scale:</p>
+  <p style="text-align:center;font-family:var(--mono);font-size:15px">φ = −log<sub>10</sub>( P(a heartbeat arrives later than now) )</p>
+  <p>φ = 1 means about a 10% chance the node is fine; φ = 8 means about one chance in 10<sup>8</sup>. Applications pick a threshold; Cassandra and Akka both default to 8. Because the distribution is learned, the same threshold adapts automatically: on a jittery network the spread is wider, so φ rises more slowly, and the detector waits longer before suspecting.</p>
+<pre class="code"><span class="k">public final class</span> <span class="t">PhiAccrualDetector</span> {
+	<span class="k">private final</span> <span class="t">ArrayDeque</span>&lt;<span class="t">Double</span>&gt; intervalsMs = <span class="k">new</span> <span class="t">ArrayDeque</span>&lt;&gt;();
+	<span class="k">private final int</span> window;                     <span class="c">// e.g. the last 100 intervals</span>
+	<span class="k">private final double</span> minStdMs;                 <span class="c">// floor, so a very regular sender doesn't make φ explode</span>
+	<span class="k">private long</span> lastNanos = -<span class="m">1</span>;
+
+	<span class="k">public synchronized void</span> <span class="f">heartbeat</span>(<span class="k">long</span> nowNanos) {
+		<span class="k">if</span> (lastNanos &gt;= <span class="m">0</span>) {
+			intervalsMs.<span class="f">addLast</span>((nowNanos - lastNanos) / <span class="m">1e6</span>);
+			<span class="k">if</span> (intervalsMs.<span class="f">size</span>() &gt; window) intervalsMs.<span class="f">removeFirst</span>();
+		}
+		lastNanos = nowNanos;
+	}
+
+	<span class="k">public synchronized double</span> <span class="f">phi</span>(<span class="k">long</span> nowNanos) {
+		<span class="k">if</span> (intervalsMs.<span class="f">isEmpty</span>()) <span class="k">return</span> <span class="m">0</span>;
+		<span class="k">double</span> mean = intervalsMs.<span class="f">stream</span>().<span class="f">mapToDouble</span>(<span class="t">Double</span>::<span class="f">doubleValue</span>).<span class="f">average</span>().<span class="f">orElse</span>(<span class="m">0</span>);
+		<span class="k">double</span> var = intervalsMs.<span class="f">stream</span>().<span class="f">mapToDouble</span>(x -&gt; (x - mean) * (x - mean)).<span class="f">average</span>().<span class="f">orElse</span>(<span class="m">0</span>);
+		<span class="k">double</span> std = <span class="t">Math</span>.<span class="f">max</span>(<span class="t">Math</span>.<span class="f">sqrt</span>(var), minStdMs);
+		<span class="k">double</span> sinceMs = (nowNanos - lastNanos) / <span class="m">1e6</span>;
+		<span class="k">double</span> y = (sinceMs - mean) / std;
+		<span class="k">double</span> e = <span class="t">Math</span>.<span class="f">exp</span>(-y * (<span class="m">1.5976</span> + <span class="m">0.070566</span> * y * y));   <span class="c">// logistic approximation of the normal CDF</span>
+		<span class="k">return</span> sinceMs &gt; mean ? -<span class="t">Math</span>.<span class="f">log10</span>(e / (<span class="m">1</span> + e)) : -<span class="t">Math</span>.<span class="f">log10</span>(<span class="m">1</span> - <span class="m">1</span> / (<span class="m">1</span> + e));
+	}
+
+	<span class="k">public boolean</span> <span class="f">isAvailable</span>(<span class="k">long</span> nowNanos, <span class="k">double</span> threshold) { <span class="k">return</span> <span class="f">phi</span>(nowNanos) &lt; threshold; }
+}</pre>
+  <p>This is the formula Akka uses. Cassandra's implementation simplifies it by assuming exponentially distributed intervals, which makes φ grow linearly with the time since the last heartbeat, but the idea is the same. Compare the two kinds of detector on three kinds of network:</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Detector duel: fixed timeout vs phi accrual</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls"><div class="seg" id="fdNet"><button class="active" data-v="lan">Steady LAN</button><button data-v="wan">Jittery cross-region</button><button data-v="gc">GC pauses</button></div></div>
+      <div class="fd-ctl">
+        <label>Fixed timeout <span class="fd-v" id="fdToV"></span><input type="range" id="fdTo" min="1100" max="6000" step="100" value="1500"></label>
+        <label>Phi threshold <span class="fd-v" id="fdThV"></span><input type="range" id="fdTh" min="1" max="16" step="0.5" value="8"></label>
+      </div>
+      <svg class="fd-chart" id="fdChart" viewBox="0 0 640 220" role="img" aria-label="Phi over time, heartbeats, suspicion periods"></svg>
+      <div class="stats" id="fdStats"></div>
+      <div class="fd-res" id="fdRes"></div>
+    </div>
+    <div class="panel-foot">Node B sends a heartbeat every 1 s for 120 s and really crashes at 100 s. Green ticks: heartbeat arrivals. Purple line: φ. Amber bands: when the fixed timeout suspects B; purple bands: when φ is above its threshold. Bands before 100 s are false positives. φ uses a 30-interval window and a 50 ms minimum standard deviation.</div>
+  </div>
+
+  <h2>SWIM: probing at scale</h2>
+  <p>All-to-all heartbeats don't scale: 1,000 nodes each heartbeating every other node is a million messages a second, and every node's view depends on every link. <b>SWIM</b> (Das, Gupta and Motivala, 2002) replaces them with random probing. Every protocol period, each node picks one random member and pings it. If no ack arrives in time, it doesn't conclude anything yet: it asks <i>k</i> other members to ping the target on its behalf (<code>ping-req</code>). Only if none of them gets through is the target marked <b>suspect</b>, and only if it stays suspect for a while, without refuting the suspicion, is it declared dead.</p>
+  <figure class="seq" data-actors="Node A|Node C|Node D|Node B (target)">
+    <ol>
+      <li data-m="0>3" data-k="fail">ping (lost: A's link to B is flaky)</li>
+      <li data-m="0>1">ping-req(B)</li>
+      <li data-m="0>2">ping-req(B)</li>
+      <li data-m="1>3">ping</li>
+      <li data-m="3>1" data-k="reply">ack</li>
+      <li data-m="1>0" data-k="reply">B is alive (relayed ack)<small>One bad link between A and B doesn't make B "dead": a different path vouches for it.</small></li>
+    </ol>
+    <figcaption><b>Indirect probing filters out bad links.</b> A node is suspected only if several independent paths fail to reach it.</figcaption>
+  </figure>
+  <p>The cost per node is constant, one probe per period whatever the cluster size, and the expected time to detect a crash doesn't grow with the cluster either. The <b>suspect</b> state lets a slow node clear its name before it's removed: if it hears it is suspected, it broadcasts "I'm alive" with a higher incarnation number. How SWIM spreads these updates through the cluster by gossip is the subject of <a href="23-gossip.html">Chapter 23</a>. HashiCorp's memberlist library, used by Consul, implements SWIM with extensions.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Detector</th><th>Adapts to the network?</th><th>Messages per node</th><th>Handles one bad link?</th><th>Used by</th></tr></thead>
+      <tbody>
+        <tr><td>Fixed timeout heartbeat</td><td>No: tuned by hand</td><td>O(n) if all-to-all</td><td>No</td><td>Load-balancer health checks, Raft election timeouts</td></tr>
+        <tr><td>Adaptive timeout (mean + k·deviation)</td><td>Yes</td><td>As above</td><td>No</td><td>TCP retransmission timer</td></tr>
+        <tr><td>Phi accrual</td><td>Yes, and outputs a level</td><td>As above</td><td>No</td><td>Cassandra, Akka Cluster</td></tr>
+        <tr><td>SWIM probing</td><td>Partly (suspect timeout)</td><td>O(1)</td><td>Yes: indirect probes</td><td>Consul / memberlist, many service meshes</td></tr>
+        <tr><td>Leases (<a href="32-leases-fencing.html">Ch 32</a>)</td><td>n/a</td><td>One renewal per lease</td><td>n/a</td><td>Chubby, etcd, Kafka controllers</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Make false positives cheap</h2>
+  <p>Since mistakes are unavoidable, the design question is what a suspicion <i>triggers</i>. A load balancer that stops sending traffic to a slow backend loses little if it's wrong. A database that promotes a replica on suspicion risks two primaries (<a href="13-leader-election.html">Chapter 13</a>). Good systems separate the two: suspicion causes cheap, reversible actions (route around, stop sending new work), and expensive, irreversible actions (failover, re-replicating terabytes, evicting pods) wait longer or require stronger evidence such as a lease expiring. Kubernetes follows this pattern: a node that stops reporting is first marked <code>NotReady</code> and taints are added, and its pods are evicted only after a separate, longer toleration period.</p>
+
+  <div class="callout usecase">
+    <div class="ico">👁️</div>
+    <div class="body"><div class="title">Use case: Cassandra in the cloud</div><p>Cassandra uses phi accrual over gossip heartbeats, with <code>phi_convict_threshold</code> defaulting to 8. On early EC2 deployments, network jitter between availability zones was high enough that nodes were frequently marked down and up again ("flapping"), and every false conviction caused hints to be stored and requests to be rerouted. The common operational advice, repeated in vendor documentation, was to raise the threshold to around 12 in such environments: slower detection of real failures, in exchange for far fewer false ones. The panel's jittery setting shows why one threshold doesn't fit every network even with an adaptive detector.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Treating a suspicion as a fact</b> and acting irreversibly on it, such as promoting a new primary without fencing the old one.</li>
+      <li><b>Timeouts barely above the heartbeat interval</b>, so one delayed packet or GC pause triggers a false alarm.</li>
+      <li><b>Measuring heartbeat gaps with the wall clock</b> (<a href="p5-clocks-on-one-machine.html">P5</a>): one NTP step marks every peer dead.</li>
+      <li><b>Sending heartbeats from a thread that can be starved</b>, so a busy but healthy node looks dead, or from a separate thread while the main work is stuck, so a hung node looks alive.</li>
+      <li><b>All-to-all heartbeats in large clusters</b>, which cost O(n²) messages; use SWIM-style probing.</li>
+      <li><b>One threshold for every environment.</b> Cross-region and noisy cloud networks need more tolerance than a single rack.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why can't a failure detector be both fast and always right?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because from the outside, a crashed node and a slow node look identical: both are silent. The only way to tell them apart is to wait, and in a real network there's no upper bound on how long a slow node might take, because of GC pauses, congestion or overload. So any detector that answers in finite time will sometimes suspect a node that's actually alive, and making it wait longer to avoid that makes it slower to detect real crashes. You pick a point on that trade-off and design the system so that wrong suspicions are cheap.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How does phi accrual improve on a fixed timeout, and how would you choose its threshold?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Instead of a fixed cutoff, it learns the distribution of heartbeat inter-arrival times over a sliding window and reports φ, minus log10 of the probability that a heartbeat would be this late if the node were healthy. On a steady network the distribution is narrow and φ rises quickly once a heartbeat is late; on a jittery one it's wide and φ rises slowly, so one threshold adapts to both. To choose the threshold, I'd look at the cost of a false positive versus slow detection for what the suspicion triggers: around 8 is a common default, higher for noisy cloud or cross-region links, and I'd validate it by replaying recorded heartbeat timings and counting false convictions and detection latency. I'd also set a minimum standard deviation and an acceptable pause, so a perfectly regular sender doesn't make φ explode on the first late heartbeat.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A failure detector trades completeness (catching crashes) against accuracy (no false alarms); it can't be perfect.</li>
+      <li>Fixed timeouts are simple but hard to tune; every network and every GC pause needs a different value.</li>
+      <li>Phi accrual learns the heartbeat distribution and outputs a suspicion level; a threshold around 8 is common.</li>
+      <li>SWIM probes one random member per period and uses indirect probes and a suspect state to avoid false positives from bad links.</li>
+      <li>Measure intervals on the monotonic clock, and send heartbeats from where real work happens.</li>
+      <li>Make suspicion trigger cheap, reversible actions; save irreversible ones for stronger evidence.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does "completeness" mean for a failure detector?</p>
+      <div class="opts">
+        <button class="opt">It never suspects a live node</button>
+        <button class="opt">Every crashed node is eventually suspected</button>
+        <button class="opt">It monitors every node in the cluster</button>
+        <button class="opt">It detects crashes within one heartbeat interval</button>
+      </div>
+      <div class="explain">Completeness is about catching real failures; accuracy is about not suspecting live nodes. No detector achieves both perfectly in an asynchronous network.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A phi accrual detector reports φ = 8 for a node. What does that mean?</p>
+      <div class="opts">
+        <button class="opt">The node has missed 8 heartbeats</button>
+        <button class="opt">The node has been silent for 8 seconds</button>
+        <button class="opt">Given recent heartbeat timing, the chance a healthy node would be this late is about 1 in 10⁸</button>
+        <button class="opt">8 other nodes agree that it is dead</button>
+      </div>
+      <div class="explain">φ is minus log10 of the probability that a heartbeat would arrive this late if the node were fine. Higher φ means stronger suspicion.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why does SWIM send ping-req messages through other members before suspecting a node?</p>
+      <div class="opts">
+        <button class="opt">So that one bad link between the prober and the target doesn't make a live node look dead</button>
+        <button class="opt">To measure the network's bandwidth</button>
+        <button class="opt">To elect a leader for the probe</button>
+        <button class="opt">To reduce the number of messages to zero</button>
+      </div>
+      <div class="explain">Indirect probes test other network paths. A target is suspected only if none of them reach it.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">On a jittery cross-region network, a fixed 1.5 s timeout flags healthy nodes several times an hour. What does phi accrual do differently?</p>
+      <div class="opts">
+        <button class="opt">It ignores the network and uses CPU load instead</button>
+        <button class="opt">It always waits exactly twice as long</button>
+        <button class="opt">It requires a majority vote before suspecting</button>
+        <button class="opt">It learns the wider spread of heartbeat intervals, so φ rises more slowly and the same threshold tolerates more delay</button>
+      </div>
+      <div class="explain">The detector models recent inter-arrival times. A wider distribution means a late heartbeat is less surprising, so suspicion grows more slowly.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What is a good response to a node being suspected by a failure detector?</p>
+      <div class="opts">
+        <button class="opt">Immediately delete its data and re-replicate everything it held</button>
+        <button class="opt">Take cheap, reversible actions first (route around it), and save irreversible ones for stronger evidence such as an expired lease</button>
+        <button class="opt">Restart every other node to be safe</button>
+        <button class="opt">Ignore it until a human confirms</button>
+      </div>
+      <div class="explain">Suspicions are sometimes wrong. Designing so that a false positive costs little is the main defence.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  let net = 'lan';
+  const T = 120000, CRASH = 100000, WINDOW = 30, MINSTD = 50;
+  function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  const gauss = (r) => Math.sqrt(-2 * Math.log(r() || 1e-9)) * Math.cos(2 * Math.PI * r());
+
+  function arrivals() {
+    const r = rng(net.length * 13 + 1), out = [];
+    for (let s = 1000; s < CRASH; s += 1000) {
+      let d = net === 'lan' ? 2 + Math.abs(gauss(r)) * 15 : net === 'wan' ? 80 + Math.abs(gauss(r)) * 300 : 2 + Math.abs(gauss(r)) * 15;
+      let at = s + d;
+      if (net === 'gc' && (s === 41000 || s === 42000 || s === 43000)) at = 43600 + (s - 41000) / 1000 * 3;   // a 2.6 s stop-the-world pause: three heartbeats arrive together
+      if (net === 'gc' && (s === 71000)) at = 72400;                                                         // a shorter 1.4 s pause
+      out.push(at);
+    }
+    return out.sort((a, b) => a - b);
+  }
+  function phiAt(intervals, since) {
+    if (!intervals.length) return 0;
+    const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+    const std = Math.max(Math.sqrt(intervals.reduce((a, b) => a + (b - mean) ** 2, 0) / intervals.length), MINSTD);
+    const y = (since - mean) / std, e = Math.exp(-y * (1.5976 + 0.070566 * y * y));
+    return since > mean ? -Math.log10(e / (1 + e)) : -Math.log10(1 - 1 / (1 + e));
+  }
+  function run(to, th) {
+    const hb = arrivals(), STEP = 20;
+    let k = 0, last = hb[0], intervals = [];
+    const phi = [], toSus = [], phSus = [];
+    for (let t = hb[0]; t <= T; t += STEP) {
+      while (k + 1 < hb.length && hb[k + 1] <= t) { k++; intervals.push(hb[k] - last); if (intervals.length > WINDOW) intervals.shift(); last = hb[k]; }
+      const since = t - last, p = Math.min(phiAt(intervals, since), 40);
+      phi.push([t, p]); toSus.push([t, since > to]); phSus.push([t, p > th]);
+    }
+    const spans = (arr) => { const out = []; let start = null; arr.forEach(([t, s]) => { if (s && start == null) start = t; if (!s && start != null) { out.push([start, t]); start = null; } }); if (start != null) out.push([start, T]); return out; };
+    return { hb, phi, toSp: spans(toSus), phSp: spans(phSus) };
+  }
+  function render() {
+    const to = +$('#fdTo').value, th = +$('#fdTh').value;
+    $('#fdToV').textContent = (to / 1000).toFixed(1) + ' s'; $('#fdThV').textContent = th.toFixed(1);
+    const s = run(to, th);
+    const x0 = 34, W = 590, y0 = 190, H = 150, PMAX = 16;
+    const X = (t) => x0 + t / T * W, Y = (p) => y0 - Math.min(p, PMAX) / PMAX * H;
+    let svg = '';
+    s.toSp.forEach(([a, b]) => { svg += `<rect class="fd-sus" x="${X(a)}" y="${y0 + 4}" width="${Math.max(1.5, X(b) - X(a))}" height="9"/>`; });
+    s.phSp.forEach(([a, b]) => { svg += `<rect class="fd-susp" x="${X(a)}" y="${y0 + 15}" width="${Math.max(1.5, X(b) - X(a))}" height="9"/>`; });
+    s.hb.forEach((t) => { svg += `<line class="fd-hb" x1="${X(t)}" y1="${y0}" x2="${X(t)}" y2="${y0 - 6}"/>`; });
+    svg += `<polyline class="fd-phi" points="${s.phi.filter((_, i) => i % 3 === 0).map(([t, p]) => `${X(t).toFixed(1)},${Y(p).toFixed(1)}`).join(' ')}"/>`;
+    svg += `<line class="fd-th" x1="${x0}" y1="${Y(th)}" x2="${x0 + W}" y2="${Y(th)}"/><text x="${x0 + 3}" y="${Y(th) - 3}" style="fill:var(--accent)">φ threshold ${th}</text>`;
+    svg += `<line class="fd-ev" x1="${X(CRASH)}" y1="${y0 - H}" x2="${X(CRASH)}" y2="${y0 + 24}"/><text x="${X(CRASH) + 3}" y="${y0 - H + 10}" style="fill:var(--red)">real crash</text>`;
+    if (net === 'gc') svg += `<text x="${X(41000)}" y="${y0 - H + 10}" style="fill:var(--amber)">GC pause</text><text x="${X(70500)}" y="${y0 - H + 10}" style="fill:var(--amber)">GC pause</text>`;
+    svg += `<text x="4" y="${Y(PMAX) + 4}">φ16</text><text x="4" y="${Y(8) + 4}">φ8</text><text x="4" y="${y0}">0</text><text x="${x0}" y="${y0 + 34}" style="font-size:9px">timeout ▬ amber · φ ▬ purple</text><text x="${x0 + W}" y="${y0 + 34}" text-anchor="end">120 s</text>`;
+    $('#fdChart').innerHTML = svg;
+    const falseOf = (sp) => sp.filter(([a]) => a < CRASH).length;
+    const detectOf = (sp) => { const d = sp.find(([a, b]) => b > CRASH && a >= CRASH - 1000); return d ? Math.max(0, d[0] - CRASH) : null; };
+    const fT = falseOf(s.toSp), fP = falseOf(s.phSp), dT = detectOf(s.toSp), dP = detectOf(s.phSp);
+    const sec = (ms) => ms == null ? '—' : (ms / 1000).toFixed(1) + ' s';
+    $('#fdStats').innerHTML = `
+      <div class="stat ${fT ? 'bad' : 'good'}"><div class="k">Timeout: false alarms</div><div class="v">${fT}</div></div>
+      <div class="stat"><div class="k">Timeout: detects crash in</div><div class="v">${sec(dT)}</div></div>
+      <div class="stat ${fP ? 'bad' : 'good'}"><div class="k">φ: false alarms</div><div class="v">${fP}</div></div>
+      <div class="stat"><div class="k">φ: detects crash in</div><div class="v">${sec(dP)}</div></div>`;
+    const msg = {
+      lan: `On a steady LAN the intervals are tight, so φ climbs almost vertically once a heartbeat is late: it detects the crash in ${sec(dP)} with ${fP} false alarms. The fixed timeout detects in ${sec(dT)}${fT ? ` but raised ${fT} false alarms` : ''}.`,
+      wan: `Cross-region jitter: each heartbeat takes anywhere from about 0.1 to 0.9 s, so gaps between arrivals range from roughly 0.3 to 1.8 s. ${fT ? `The ${(to / 1000).toFixed(1)} s timeout raised ${fT} false alarms; ` : 'The timeout avoids false alarms only because it is long; '}φ learned the wider spread (${fP} false alarms) and still detects the crash in ${sec(dP)}. Drop the threshold to 1 or 2 to see it get twitchy.`,
+      gc: `A 2.6 s and a 1.4 s GC pause. Neither detector can tell a pause from a crash: ${fT} false alarm(s) from the timeout, ${fP} from φ. Raising the timeout above the longest pause fixes that, at the cost of ${sec(dT)} to detect the real crash. Pauses are why suspicion should trigger cheap actions first.`,
+    }[net];
+    $('#fdRes').innerHTML = msg;
+  }
+  $('#fdNet').addEventListener('segchange', (e) => { net = e.detail; render(); });
+  ['#fdTo', '#fdTh'].forEach((sel) => $(sel).addEventListener('input', render));
+  render();
+})();
+</script>
 </body>
 </html>
