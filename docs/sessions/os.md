@@ -17,3 +17,4 @@
   - P4 The Memory Hierarchy (24 KB)
   - P5 Bits, Hex & Binary Data (25 KB)
   - P6 Compiling & Linking (28 KB)
+  - P7 The Linux Shell & Files (37 KB)
