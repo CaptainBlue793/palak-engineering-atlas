@@ -14,3 +14,4 @@
 - DB P3: Disks, Files & Pages: random-vs-sequential I/O calculator with crossover chart
 - DB P4: Data Types: type lab panel (money, ID overflow, time zones, text limits, json/jsonb)
 - DB P5: JSON, CSV & Loading Data: bulk-load calculator with race (autocommit, txn, batched, COPY)
+- DB P6: Python & psycopg: SQL-injection lab (f-string vs parameter, with restore)
