@@ -9,3 +9,6 @@
   covered inside Ch 36, managed-database operations inside Ch 4/32 where they fit.
 - Needs a shared change: none yet.
 - Next: P1.
+
+### Chapters
+- P1 The Linux Command Line: terminal simulator (02:00 502 page; disk full, deleted-but-open log), permission bits widget
