@@ -61,3 +61,4 @@
 - Status after Ch 22: 30 of 56 lessons written (P1-P8, Ch 1-22); the Intermediate level needs only Ch 23-24.
 - Next: Ch 23 File Systems: Inodes, Directories & Blocks.
   - Ch 23 File Systems (42 KB): hands-on file system with 8 inodes and 12 blocks and a small command line (touch, write, ln, ln -s, mv, rm, cat, ls) showing directory entries, link counts, dangling links, and running out of inodes before blocks
+  - Ch 24 Journaling & Crash Consistency (37 KB): pull-the-plug simulator for a one-block append (no journal with the three writes in any order and fsck; ordered metadata journal; full data journal) with reboot-and-recover
