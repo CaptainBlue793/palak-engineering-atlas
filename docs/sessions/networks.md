@@ -41,3 +41,4 @@
 - Ch 16 HTTP/2: twelve files over six HTTP/1.1 connections or one HTTP/2 connection (interleaved packets on the wire, urgent streams first, completion time per file), with one lost packet to show TCP head-of-line blocking stalling every stream
 - Ch 17 TLS 1.3 & Certificates: certificate-chain validator (correct, expired, wrong name, intermediate not sent, self-signed, private CA; browser or curl) showing the chain, the four checks and the exact error each client reports
 - Ch 18 HTTP/3 & QUIC: round-trip comparison of TCP + TLS 1.3 against QUIC (50 / 150 / 300 ms; first visit or returning with 0-RTT) for time to first byte, and for a Wi-Fi to mobile network change (reconnect against connection migration)
+- Ch 19 DHCP: café lease simulator (five addresses, one-hour leases; devices join with DORA, walk out without releasing, 30-minute steps with renewals and expiry) showing the lease table, pool exhaustion and 169.254 self-assigned addresses
