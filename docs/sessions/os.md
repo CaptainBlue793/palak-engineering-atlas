@@ -84,3 +84,10 @@
   - Ch 46 Case Study: docker run (35 KB): stop-the-container panel (app as PID 1, a wrapper script as PID 1, or tini with --init; with or without a SIGTERM handler) showing the signal's path, the 10-second timeout, exit status 137 / 143 / 0, requests cut off, and zombies from orphaned helpers
   - Ch 47 Case Study: Chrome's sandbox (36 KB): hostile-advert panel (one process, sandboxed process per tab, or site isolation; a crash, a Spectre read or a renderer exploit) showing which process is hit, what the attacker reaches among files, cookies and three sites, and the memory cost
   - Ch 48 Case Study: an OOM-killer incident (35 KB): who-gets-killed panel (a 16 GB host with a database, an API, a cache and a leaking batch job; adjustable oom_score_adj per process; an optional 2 GB cgroup limit) stepping through each kill with scores, the bystander killed first, and a kernel panic when the leaker is unkillable
+- Status after Ch 48 (2026-10-06): all 56 lessons are written (P1–P8 + Ch 1–48). A full sweep loaded every lesson headlessly: five quizzes,
+  one panel, at least one figure, no script errors, no placeholder left. Audit: 0 errors. Bundle rebuilt (60 pages, 2.40 MB).
+- Needs a shared change (release, Step 4 of the playbook; not done, waiting for the owner's go-ahead): in `assets/atlas.js` remove
+  `soon: true` from the os entry and set `hours: 41` (the lessons total 2,475 minutes; `chapters` stays 56). In `README.md` add the OS row
+  to the course table, drop OS from "On the way", change the totals to 284 chapters (244 main + 40 prerequisites) and ~209 hours, and add
+  `os/` to the folder tree. `gh` is not installed on this machine, so the release tag has to be made another way.
+- Next: the owner's go-ahead, then Step 4 (shared edits, hub and palette checks, merge into main, release). After that, the next course.
