@@ -43,3 +43,4 @@
 - DB 17: Reading EXPLAIN: four EXPLAIN ANALYZE plans with per-node decoding (missing index, 1-row misestimate under a nested loop, sort spill, heap fetches)
 - DB 18: Join Algorithms: cost comparison of nested loop, index nested loop, hash and merge join (outer rows, index, sorted inputs, work_mem)
 - DB 19: The Cost-Based Optimiser: estimate, plan and reality for four filters (common value, stale statistics, correlated columns, expression), with each remedy
+- DB 20: WAL & Crash Recovery: log, buffer pool and data files with update, commit, page write, checkpoint, crash and redo (LSN test, redo point)
