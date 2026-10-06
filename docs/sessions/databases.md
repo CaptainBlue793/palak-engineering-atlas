@@ -66,3 +66,4 @@
 - DB 40: Database Interview Playbook: assemble a two-minute answer to three questions from ten points each (four essential, three depth, three wrong), with a time bar and the interviewer's reaction
 - DB 41: Case Study: Designing an E-Commerce Schema: one order's invoice under two designs (joins to live rows, or facts copied at purchase) as the price, name and address change and the product is deleted
 - DB 42: Case Study: A Slow Query Made Fast: the planner's choice among three plans for three accounts, with extended statistics and a partial composite index switched on or off, and the rows read and time for each
+- DB 43: Case Study: Uber's Move from Postgres to MySQL: the structures one UPDATE writes with 2, 6 or 12 secondary indexes, for a PostgreSQL heap-only update, a PostgreSQL update to a new location, and InnoDB, with bytes replicated and read cost
