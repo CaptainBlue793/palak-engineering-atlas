@@ -6,34 +6,352 @@
 <title>Case Study: Chrome’s Multi-Process Sandbox</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .cr-cols { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(0,1fr); gap:12px; margin-top:14px; }
+  @media (max-width:820px) { .cr-cols { grid-template-columns:1fr; } }
+  .cr-procs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; align-content:start; }
+  @media (max-width:520px) { .cr-procs { grid-template-columns:1fr; } }
+  .cr-p { border:1.5px solid var(--border); border-radius:12px; padding:8px 10px; background:var(--surface); transition:.2s; }
+  .cr-p.cr-wide { grid-column:1 / -1; }
+  .cr-p h6 { margin:0 0 4px; font-size:13px; display:flex; flex-wrap:wrap; gap:4px 8px; align-items:center; }
+  .cr-p h6 i { font-style:normal; font-size:10.5px; font-weight:600; padding:1px 7px; border-radius:99px; background:var(--green-soft); color:var(--green); }
+  .cr-p h6 i.cr-open { background:var(--amber-soft); color:var(--amber); }
+  .cr-p ul { margin:0; padding:0; list-style:none; font-size:12.5px; color:var(--muted); }
+  .cr-p li { padding:1px 0; }
+  .cr-p li.cr-evil { color:var(--red); font-weight:600; }
+  .cr-p.cr-owned { border-color:var(--red); background:var(--red-soft); }
+  .cr-p.cr-dead { opacity:.45; border-style:dashed; }
+  .cr-p.cr-dead h6::after { content:'crashed'; font-size:11px; color:var(--red); font-weight:700; }
+  .cr-list { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; }
+  .cr-list h6 { margin:0 0 6px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .cr-list div { display:flex; justify-content:space-between; gap:10px; font-size:13px; padding:4px 0; border-top:1px solid var(--border); }
+  .cr-list div b { font-size:12px; white-space:nowrap; color:var(--green); }
+  .cr-list div.cr-x b { color:var(--red); }
+  .cr-list div.cr-l b { color:var(--amber); }
+  .cr-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:88px; }
+  .cr-desc.cr-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .cr-desc.cr-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .cr-desc.cr-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="47">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 47</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
     <h1>Case Study: <span class="grad">Chrome’s Multi-Process Sandbox</span></h1>
-    <p class="lead">Browser, renderer and GPU processes, site isolation, IPC, and seccomp-based sandboxing.</p>
+    <p class="lead">A web browser downloads programs from strangers and runs them, thousands of times a day, on the machine where you do your banking. It parses formats nobody fully understands, in millions of lines of C++, and it will always contain memory bugs. Chrome's answer, from its first release in 2008, was to stop trying to make that code safe and to make it <i>powerless</i> instead: run it in a process that can't open a file, can't make a network connection and can't see any other process, and have it ask a small trusted process for everything. This case study looks at that design as an exercise in using the operating system's own boundaries, and at what happened in 2018 when a hardware flaw moved the boundary.</p>
+    <ul class="objectives">
+      <li>Explain why a browser splits itself into browser, renderer and other processes</li>
+      <li>Explain site isolation and why Spectre made it necessary</li>
+      <li>Describe how a sandboxed process gets work done through IPC and passed descriptors</li>
+      <li>Describe the layers of the Linux sandbox and why one layer isn't enough</li>
+      <li>Weigh the memory cost of more processes against what they protect</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Processes and separate address spaces.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a> and <a href="11-address-spaces.html">Chapter 11</a>.</li>
+        <li><b>Pipes, sockets and shared memory between processes.</b> See <a href="09-ipc-pipes-signals-shm.html">Chapter 9</a>.</li>
+        <li><b>Namespaces.</b> See <a href="34-containers-namespaces-cgroups.html">Chapter 34</a>.</li>
+        <li><b>Least privilege, memory attacks and seccomp.</b> See <a href="36-os-security.html">Chapter 36</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why multiple processes</li>
-    <li>Site isolation</li>
-    <li>IPC between processes</li>
-    <li>The Linux sandbox: namespaces + seccomp</li>
-    <li>Memory cost trade-offs</li>
-  </ol>
+  <h2>Why multiple processes</h2>
+  <p>Until 2008 a browser was one process. Every tab, every plug-in and the user interface shared one address space, which had two consequences. A crash anywhere closed everything. And a memory-corruption bug in the code handling one page (<a href="36-os-security.html">Chapter 36</a>) gave an attacker the whole browser: every other page, every stored password, and all the user's files, because the process ran with the user's full rights.</p>
+<pre class="code"><span class="c">$</span> ps -o pid,ppid,rss,cmd -C chrome | cut -c1-<span class="m">104</span>
+    PID    PPID    RSS CMD
+   <span class="m">5100</span>    <span class="m">1870</span> <span class="m">312480</span> /opt/google/chrome/chrome
+   <span class="m">5108</span>    <span class="m">5100</span>  <span class="m">58120</span> /opt/google/chrome/chrome --type=zygote
+   <span class="m">5131</span>    <span class="m">5100</span> <span class="m">142776</span> /opt/google/chrome/chrome --type=gpu-process
+   <span class="m">5134</span>    <span class="m">5100</span>  <span class="m">96408</span> /opt/google/chrome/chrome --type=utility --utility-sub-type=network.mojom.NetworkService
+   <span class="m">5190</span>    <span class="m">5108</span> <span class="m">188204</span> /opt/google/chrome/chrome --type=renderer --renderer-client-id=7
+   <span class="m">5203</span>    <span class="m">5108</span> <span class="m">121336</span> /opt/google/chrome/chrome --type=renderer --renderer-client-id=9
+   <span class="m">5236</span>    <span class="m">5108</span>  <span class="m">61244</span> /opt/google/chrome/chrome --type=renderer --renderer-client-id=12</pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Process</th><th>What it does</th><th>Trust</th></tr></thead>
+      <tbody>
+        <tr><td><b>Browser</b> (one)</td><td>Windows, tabs, the address bar; cookies, passwords and files; decides what every other process may do</td><td>Full: runs with your rights, no sandbox</td></tr>
+        <tr><td><b>Renderer</b> (many)</td><td>Parses HTML and CSS, runs JavaScript, lays out the page. Nearly all the complicated code that touches untrusted input</td><td>None: assumed to be under an attacker's control</td></tr>
+        <tr><td><b>GPU</b> (one)</td><td>Talks to the graphics driver for every other process</td><td>Low, with a looser sandbox, because drivers need more of the system</td></tr>
+        <tr><td><b>Network and other utilities</b></td><td>Network connections, audio, decoding</td><td>Varies by job</td></tr>
+        <tr><td><b>Zygote</b> (Linux)</td><td>A pre-initialised process that every renderer is forked from, so start-up is fast and pages are shared copy-on-write (<a href="30-mmap-copy-on-write.html">Chapter 30</a>)</td><td>Already inside the sandbox</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The split buys three things at once. <b>Stability</b>: a renderer that crashes takes down one page, and the browser shows a sad-tab message. <b>Responsiveness</b>: a page stuck in a loop is just a busy process, and the kernel's scheduler takes the CPU away from it. <b>Security</b>: the code most likely to be exploited can be run with almost no privileges, which is least privilege applied to a single program. The third is why the design spread to every other browser.</p>
+
+  <h2>Site isolation</h2>
+  <p>For its first ten years Chrome used roughly one renderer per tab. A page from one site and a frame it embedded from another, such as an advert, shared a process. That was thought to be safe, because the rule that keeps sites apart, the same-origin policy, was enforced by checks <i>inside</i> the renderer: script from one site simply wasn't given references to another site's data.</p>
+  <div class="callout usecase">
+    <div class="ico">⚖️</div>
+    <div class="body"><div class="title">Spectre moves the boundary</div><p>In January 2018 the Spectre attacks were published. They showed that on almost every modern processor, code can read any memory in its own address space, whatever checks the software makes, by steering the CPU's speculative execution and measuring its effect on the cache (<a href="32-multicore-caches-numa.html">Chapter 32</a>). JavaScript was enough to do it. For browsers that was the end of an assumption. If an advert's script shares a process with your webmail, no check written in C++ keeps the mail from it. There is only one boundary the hardware still enforces: the one between address spaces. The Chrome team had been building a stricter process model for several years, mainly as a defence against compromised renderers, and Spectre turned it from an improvement into a necessity. <b>Site Isolation</b> was switched on for all desktop users in Chrome 67, in May 2018. Every site now gets its own renderer process, a frame from another site is drawn by a different process from the page around it, and the browser refuses to deliver another site's HTML or JSON into a renderer that didn't ask for it as a page. Google put the cost at 10 to 13% more memory in real use, and paid it. Firefox followed with its own version in 2021.</p></div>
+  </div>
+  <p>The change also closed an older hole. Before it, a renderer wasn't tied to a site, so a compromised renderer could tell the browser process "I am showing bank.example, send me its cookies" and be believed. With site isolation each renderer is <b>locked to one site</b>. The browser process knows which, and treats a request for anything else as proof of compromise and kills the renderer.</p>
+
+  <h2>One page, three browsers</h2>
+  <p>Three tabs are open: your mail, your bank and a news article. The article contains an advert in a frame from <code>ads.evil</code>, and the advert is hostile. Choose how the browser is built, then choose what the advert does.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">What can a hostile advert reach?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="crModel"><button data-v="one">one process (before 2008)</button><button data-v="tab">process per tab, sandboxed</button><button class="active" data-v="site">site isolation (since 2018)</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm" id="crCrash">The advert crashes its process</button>
+        <button class="btn sm" id="crSpectre">Spectre: read my own memory</button>
+        <button class="btn sm" id="crExploit">Exploit: run attacker's code</button>
+        <button class="btn sm" id="crReset">↺ Reset</button>
+      </div>
+      <div class="cr-cols">
+        <div class="cr-procs" id="crProcs"></div>
+        <div class="cr-list" id="crList"></div>
+      </div>
+      <div class="cr-desc" id="crDesc"></div>
+      <div class="stats" id="crStats"></div>
+    </div>
+    <div class="panel-foot">Memory figures are a rough model: 180 MB for the browser process, 80 MB for a GPU process, 45 MB of overhead for each renderer, plus the pages themselves. Real pages carry many more cross-site frames than this one, which is how the real overhead of site isolation reaches 10 to 13%.</div>
+  </div>
+
+  <p>Things to notice. In the single process, every attack reaches everything: a crash closes all three tabs, and an exploit owns your files. With a sandboxed process per tab, the exploit can no longer touch the file system, which is the 2008 design doing its job. But the advert shares a process with the news page, Spectre reads whatever is in that process, and the advert can pull other sites' data <i>into</i> it by requesting, say, a bank URL as if it were an image. A full exploit can also lie to the browser about which site it is. With site isolation the advert is alone in a process locked to <code>ads.evil</code>, and all three attacks reach nothing but the advert itself. The stats show the price: one more process and more memory, for the same three tabs.</p>
+
+  <h2>IPC between processes</h2>
+  <p>A process that can't open files or sockets still has to load pages and read the file you chose to upload. It does so by asking. Chrome's processes are connected by message pipes (its IPC system is called Mojo), which on Linux are Unix domain sockets created before the sandbox closes, with shared memory for bulky data such as bitmaps (<a href="09-ipc-pipes-signals-shm.html">Chapter 9</a>). The important trick is one from <a href="10-file-descriptors.html">Chapter 10</a>: an open file descriptor can be sent across a Unix socket.</p>
+  <figure class="seq" data-actors="Renderer|Browser process|Kernel">
+    <ol>
+      <li data-m="0>2">open("/home/sam/.ssh/id_rsa")</li>
+      <li data-m="2>0" data-k="reply">refused: the sandbox allows no open at all</li>
+      <li data-m="0>1">message: the page wants the user to choose a file</li>
+      <li data-m="1>2">the user picks photo.jpg; open("photo.jpg")</li>
+      <li data-m="2>1" data-k="reply">descriptor 57</li>
+      <li data-m="1>0" data-k="reply">the open descriptor, sent across the socket</li>
+      <li data-m="0>2">read() on the descriptor it was given: allowed</li>
+    </ol>
+    <figcaption><b>Asking instead of doing.</b> The renderer can't name a file. It can only use handles that a more trusted process chose to give it. The browser process is acting as a <b>broker</b>.</figcaption>
+  </figure>
+  <p>This rearranges the security problem; it doesn't remove it. The renderer is assumed hostile, so every message it sends is untrusted input to the browser process, and every handler in the browser must check it: is this renderer allowed that origin, that file, that size? A mistake in one of those checks is a <b>sandbox escape</b>. That is why real attacks on Chrome come as chains. In March 2019 Google caught attackers using a memory bug in the renderer together with a second bug in the Windows 7 kernel. The first gave them code execution in a process that could do nothing, and they needed the second purely to get out.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>A renderer wants to…</th><th>Directly</th><th>What it does instead</th></tr></thead>
+      <tbody>
+        <tr><td><b>Fetch a URL</b></td><td>No sockets</td><td>Asks the network service, which checks the request against the renderer's site</td></tr>
+        <tr><td><b>Read a cookie</b></td><td>Not in its memory</td><td>Asks the browser, which answers only for the site the process is locked to</td></tr>
+        <tr><td><b>Read a file</b></td><td>No file system</td><td>Receives a descriptor for a file the user picked</td></tr>
+        <tr><td><b>Draw to the screen</b></td><td>No display access</td><td>Sends drawing commands to the GPU process through shared memory</td></tr>
+        <tr><td><b>Start a program</b></td><td>No <code>execve</code></td><td>Nothing. There is no message for it</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>The Linux sandbox: namespaces and seccomp</h2>
+  <p>On Linux the renderer's powerlessness is built from two mechanisms you have already met, applied one after the other.</p>
+<pre class="code"><span class="c">/* What the zygote does before any web content is loaded (simplified) */</span>
+<span class="f">unshare</span>(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET);   <span class="c">/* layer 1: no other processes, no network devices */</span>
+<span class="f">chroot</span>(empty_dir);  <span class="f">chdir</span>(<span class="s">"/"</span>);                         <span class="c">/*          and a root directory with nothing in it */</span>
+
+<span class="c">/* ... and in each renderer, after fork() and before it touches a page: */</span>
+<span class="f">prctl</span>(PR_SET_NO_NEW_PRIVS, <span class="m">1</span>);
+<span class="f">prctl</span>(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &amp;renderer_policy);    <span class="c">/* layer 2: most system calls now fail */</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Layer 1: namespaces and an empty root</th><th>Layer 2: a seccomp filter</th></tr></thead>
+      <tbody>
+        <tr><td><b>From</b></td><td><a href="34-containers-namespaces-cgroups.html">Chapter 34</a></td><td><a href="36-os-security.html">Chapter 36</a></td></tr>
+        <tr><td><b>Takes away</b></td><td>Things to name: there are no files, no other PIDs and no network interfaces in the renderer's view</td><td>Things to call: <code>open</code>, <code>socket</code>, <code>connect</code>, <code>execve</code>, <code>ptrace</code> and many more are refused</td></tr>
+        <tr><td><b>Still allowed</b></td><td>Any system call</td><td>Memory management, <code>futex</code>, reading and writing descriptors it already holds, sending messages on its sockets</td></tr>
+        <tr><td><b>Weak at</b></td><td>Protecting the kernel: every system call is still reachable, and so is every kernel bug behind one</td><td>Decisions about paths: a filter sees a pointer to a file name, not the name</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Each covers the other's weakness. The filter can't judge which file a path refers to, so the file system is removed altogether and files arrive only as descriptors. Namespaces can't stop a process attacking the kernel through an obscure system call, so the filter leaves only a few dozen reachable. An attacker who escapes through the kernel has to find a bug in that small set.</p>
+<pre class="code"><span class="c"># chrome://sandbox on Linux</span>
+Layer 1 Sandbox                            Namespace
+  PID namespaces                           Yes
+  Network namespaces                       Yes
+Seccomp-BPF sandbox                        Yes
+Seccomp-BPF sandbox supports TSYNC         Yes
+You are adequately sandboxed.
+
+<span class="c">$</span> grep -E <span class="s">'NoNewPrivs|Seccomp:'</span> /proc/<span class="m">5190</span>/status       <span class="c"># a renderer</span>
+NoNewPrivs:     <span class="m">1</span>
+Seccomp:        <span class="m">2</span>                                        <span class="c"># 2 = a filter is installed</span></pre>
+  <p>Other systems give the same result with different parts: restricted tokens and job objects on Windows, sandbox profiles on macOS, and on Android a separate user ID for each renderer. The architecture, a broker with rights and workers with none, is the portable part.</p>
+
+  <h2>Memory cost trade-offs</h2>
+  <p>Isolation is bought with memory. Each renderer has its own JavaScript heap, its own copy of the engine's data structures and its own allocator arenas, tens of megabytes before a page is loaded. Program code is shared between processes through the page cache, and the zygote lets renderers share whatever was initialised before the fork, but a hundred tabs from a hundred sites are still a hundred processes.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>One process</th><th>Process per tab</th><th>Process per site</th></tr></thead>
+      <tbody>
+        <tr><td><b>A crash loses</b></td><td>Everything</td><td>One tab</td><td>One site's frames</td></tr>
+        <tr><td><b>A renderer exploit reaches</b></td><td>The user's whole account</td><td>Other sites' data, by lying to the browser</td><td>One site</td></tr>
+        <tr><td><b>Spectre reads</b></td><td>Everything</td><td>Any site sharing the process</td><td>One site</td></tr>
+        <tr><td><b>Memory</b></td><td>Lowest</td><td>Higher</td><td>About 10–13% higher again</td></tr>
+        <tr><td><b>Used where</b></td><td>Browsers before 2008</td><td>Chrome 2008–2018</td><td>Desktop Chrome since 2018; on Android only for sites you log in to, on devices with enough RAM</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The Android row is the trade-off stated openly: on a phone with little memory, more processes mean other apps are killed sooner, so isolation is spent where the data is most valuable. On desktop, Chrome also caps the number of renderers according to installed RAM. Past the cap, tabs from the <i>same</i> site share a process, but different sites are never merged. And when you look at the numbers yourself, remember <a href="43-case-postgres-on-os.html">Chapter 43</a>: adding up the RSS of every Chrome process counts the shared pages many times over. The browser's own task manager reports each process's private memory for that reason.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Thinking the sandbox makes renderer bugs harmless.</b> A compromised renderer still holds everything in its own process: with site isolation, one site's data.</li>
+      <li><b>Trusting messages from the sandboxed process.</b> The broker must validate every one. Most sandbox escapes are missing checks in the trusted side.</li>
+      <li><b>Relying on one layer.</b> Namespaces leave the kernel exposed, and a system-call filter can't reason about file names. Use both.</li>
+      <li><b>Running with <code>--no-sandbox</code> to make something work.</b> Common in containers and test scripts, and it turns every renderer bug into full access as that user.</li>
+      <li><b>Believing in-process checks survive Spectre.</b> Secrets and untrusted code must not share an address space.</li>
+      <li><b>Summing RSS to measure a multi-process program.</b> Shared pages are counted once per process.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why does Chrome run so many processes?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>For stability, responsiveness and above all security. A browser constantly parses and executes untrusted content with a huge C++ code base, so memory-safety bugs are inevitable. Chrome separates the code that handles web content, the renderer, from the part that holds the user's privileges. A browser process owns the UI, cookies, files and network policy; each renderer runs in a sandbox with almost no privileges and talks to the browser over IPC. If a renderer crashes, one tab or frame is lost. If it hangs, the OS still schedules the others. If it is exploited, the attacker is inside a process that can't open files, create sockets or see other processes. Since 2018 renderers are also split by site, so that one site's data never shares an address space with another site's code, which is the defence against Spectre-style attacks. The cost is memory, because every process has its own heap and runtime.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> An attacker gets arbitrary code execution inside a renderer on Linux. What stands between them and your files or your bank session?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Several layers. The renderer runs in its own user, PID and network namespaces with an empty root directory, so there are no file paths to open, no other processes to signal or trace, and no network interfaces. On top of that a seccomp-BPF filter refuses most system calls, including <code>open</code>, <code>socket</code> and <code>execve</code>, which also shrinks the kernel attack surface to a small set of calls. So the attacker can compute and can use the descriptors the process already holds, mainly its IPC channel to the browser. Over that channel they can ask for things, but with site isolation the browser has locked that renderer to one site and will refuse, and kill it, if it asks for another site's cookies or data. My bank session lives in a different renderer process and in the browser process, neither of which shares memory with the compromised one. To go further the attacker needs a second vulnerability: a logic or memory bug in a browser-side IPC handler, a bug in the GPU process, or a kernel bug reachable through the few permitted system calls. That is why real attacks are chains of two or more exploits.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Chrome puts the code that handles untrusted content in renderer processes with no privileges, and keeps privileges in one browser process.</li>
+      <li>Separate processes give crash containment, scheduling by the kernel, and a hardware-enforced security boundary.</li>
+      <li>Spectre showed that code can read its whole address space, so since 2018 each site gets its own process, locked to that site.</li>
+      <li>A sandboxed process works by asking a broker over IPC and receiving descriptors. Every such message is untrusted input.</li>
+      <li>The Linux sandbox layers namespaces and an empty root (nothing to name) with a seccomp filter (little to call).</li>
+      <li>The price is memory, about 10–13% for site isolation, and escaping still needs a second bug.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is the renderer, and not the browser process, the one that is sandboxed?</p>
+      <div class="opts">
+        <button class="opt">It uses the most memory</button>
+        <button class="opt">It runs the complex code that parses and executes untrusted content, so it is the most likely to be exploited</button>
+        <button class="opt">It draws to the screen</button>
+        <button class="opt">It holds the cookies</button>
+      </div>
+      <div class="explain">Least privilege: the code most exposed to attack gets the fewest rights, and the rights live elsewhere.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What did Spectre change for browsers?</p>
+      <div class="opts">
+        <button class="opt">It made system calls slower</button>
+        <button class="opt">It broke the seccomp filter</button>
+        <button class="opt">It let pages escape the sandbox directly</button>
+        <button class="opt">It meant script could read anything in its own address space, so data from different sites can't safely share a process</button>
+      </div>
+      <div class="explain">Checks inside a process no longer protect secrets in that process. The address-space boundary still does.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A sandboxed renderer can't call <code>open</code>. How does it read a file the user chose to upload?</p>
+      <div class="opts">
+        <button class="opt">The browser process opens the file and sends the open descriptor over a Unix socket</button>
+        <button class="opt">The sandbox is switched off briefly</button>
+        <button class="opt">It maps the disk directly</button>
+        <button class="opt">It asks the GPU process</button>
+      </div>
+      <div class="explain">The broker decides which file; the renderer only receives a handle to that one file.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why does the Linux sandbox use both namespaces and a seccomp filter?</p>
+      <div class="opts">
+        <button class="opt">Each works only on some kernels</button>
+        <button class="opt">One is for renderers and the other for the GPU process</button>
+        <button class="opt">A filter can't decide by file name, and namespaces don't reduce the system calls an attacker can aim at the kernel</button>
+        <button class="opt">Namespaces are needed to load a filter</button>
+      </div>
+      <div class="explain">Remove what can be named, then restrict what can be called. Each covers the other's gap.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">With site isolation, a compromised renderer for <code>ads.evil</code> asks the browser for <code>bank.example</code>'s cookies. What happens?</p>
+      <div class="opts">
+        <button class="opt">It receives them, since it is a renderer</button>
+        <button class="opt">The browser refuses and kills the renderer, because that process is locked to a different site</button>
+        <button class="opt">The kernel blocks the message</button>
+        <button class="opt">The seccomp filter blocks the message</button>
+      </div>
+      <div class="explain">The enforcement is in the browser process, which knows which site each renderer belongs to.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const ITEM = { ui: 'Windows, tabs, the address bar', cookies: 'Cookies and passwords, all sites', mail: 'mail.example: your inbox', bank: 'bank.example: your accounts', news: 'news.example: an article', ads: 'ads.evil: the advert (in a frame)' };
+  const SIZE = { mail: 120, bank: 60, news: 150, ads: 30 };
+  const MODELS = {
+    one: [{ id: 'b', name: 'The browser', sand: false, has: ['ui', 'cookies', 'mail', 'bank', 'news', 'ads'] }],
+    tab: [{ id: 'b', name: 'Browser process', sand: false, has: ['ui', 'cookies'] }, { id: 'r1', name: 'Renderer 1', sand: true, has: ['mail'] }, { id: 'r2', name: 'Renderer 2', sand: true, has: ['bank'] },
+          { id: 'r3', name: 'Renderer 3', sand: true, has: ['news', 'ads'] }, { id: 'g', name: 'GPU process', sand: true, has: [] }],
+    site: [{ id: 'b', name: 'Browser process', sand: false, has: ['ui', 'cookies'] }, { id: 'r1', name: 'Renderer 1', sand: true, has: ['mail'] }, { id: 'r2', name: 'Renderer 2', sand: true, has: ['bank'] },
+          { id: 'r3', name: 'Renderer 3', sand: true, has: ['news'] }, { id: 'r4', name: 'Renderer 4', sand: true, has: ['ads'] }, { id: 'g', name: 'GPU process', sand: true, has: [] }],
+  };
+  const ASSETS = [['files', 'Your files and the rest of the computer'], ['cookies', 'Cookies and passwords for every site'], ['mail', 'mail.example: your inbox'], ['bank', 'bank.example: your accounts'], ['news', 'news.example: the article']];
+  // For each model and attack: which assets are exposed (x) or lost (l), and what to say.
+  const OUT = {
+    one: {
+      crash: { l: ['mail', 'bank', 'news'], cls: 'cr-bad', text: '<b>The whole browser is gone.</b> There is one process, so a bad pointer in the code drawing an advert closes your mail, your bank and the article with it.' },
+      spectre: { x: ['cookies', 'mail', 'bank', 'news'], cls: 'cr-bad', text: '<b>Everything in memory is readable.</b> The advert\'s script shares an address space with every page and with the browser\'s own stores, so a Spectre read reaches all of it. Your files on disk are spared only because this attack reads memory.' },
+      exploit: { x: ['files', 'cookies', 'mail', 'bank', 'news'], cls: 'cr-bad', text: '<b>The attacker has your user account.</b> Their code runs in a process with all your rights and no sandbox: it can read every page, take every cookie, open <code>~/.ssh</code> and install software.' },
+    },
+    tab: {
+      crash: { l: ['news'], cls: 'cr-warn', text: '<b>One tab is lost.</b> The advert lives in Renderer 3 with the news page, so the article goes down with it and shows the sad-tab message. Mail and bank are other processes and never notice.' },
+      spectre: { x: ['mail', 'bank', 'news'], cls: 'cr-bad', text: '<b>Renderer 3 is readable, and that is more than it looks.</b> The article is in it. And the advert can request <code>bank.example/accounts.json</code> or a mail URL as if it were an image: the browser attaches your cookies and delivers the bytes into this process, where script can\'t use them but Spectre can read them.' },
+      exploit: { x: ['cookies', 'mail', 'bank', 'news'], cls: 'cr-bad', text: '<b>The sandbox holds, and it isn\'t enough.</b> The attacker\'s code can\'t open a file or a socket, so your computer is safe. But this renderer isn\'t tied to a site. It tells the browser process "I am showing bank.example" and is sent the cookies, then does the same for your mail.' },
+    },
+    site: {
+      crash: { l: [], cls: 'cr-ok', text: '<b>Only the advert disappears.</b> It was alone in Renderer 4. The frame goes blank, and the article around it, which is a different process, carries on.' },
+      spectre: { x: [], cls: 'cr-ok', text: '<b>There is nothing worth reading.</b> Renderer 4 holds only ads.evil\'s own data. A request for a bank or mail URL is answered with nothing, because the browser won\'t deliver another site\'s HTML or JSON into this process.' },
+      exploit: { x: [], cls: 'cr-ok', text: '<b>Contained.</b> The attacker runs code in a process with no files, no sockets and no neighbours, locked to ads.evil. When it asks for bank.example\'s cookies the browser refuses and kills it. To get further they need a second bug, in the browser process or the kernel.' },
+    },
+  };
+  let model = 'site', attack = null;
+  function render() {
+    const procs = MODELS[model], evil = procs.find((p) => p.has.includes('ads')), o = attack ? OUT[model][attack] : null;
+    $('#crProcs').innerHTML = procs.map((p) => {
+      const hit = attack && p === evil, cls = (p.id === 'b' ? 'cr-wide ' : '') + (hit ? (attack === 'crash' ? 'cr-dead' : 'cr-owned') : '');
+      return `<div class="cr-p ${cls}"><h6>${p.name}<i class="${p.sand ? '' : 'cr-open'}">${p.sand ? 'sandboxed' : 'no sandbox'}</i></h6><ul>${p.has.length ? p.has.map((h) => `<li class="${h === 'ads' ? 'cr-evil' : ''}">${ITEM[h]}</li>`).join('') : '<li>drawing for the other processes</li>'}</ul></div>`;
+    }).join('');
+    $('#crList').innerHTML = '<h6>' + (attack === 'crash' ? 'What you lose' : 'What the attacker reaches') + '</h6>' + ASSETS.map(([k, label]) => {
+      const x = o && o.x && o.x.includes(k), l = o && o.l && o.l.includes(k);
+      return `<div class="${x ? 'cr-x' : l ? 'cr-l' : ''}"><span>${label}</span><b>${!o ? '–' : x ? '✕ exposed' : l ? '✕ tab closed' : '✓ safe'}</b></div>`;
+    }).join('');
+    const d = $('#crDesc');
+    d.className = 'cr-desc ' + (o ? o.cls : '');
+    d.innerHTML = o ? o.text : 'Three tabs and one hostile advert, which is drawn inside the news article. Its home is <b>' + evil.name + '</b>. Choose what it does.';
+    const rend = procs.filter((p) => p.id[0] === 'r').length;
+    const mb = 180 + (model === 'one' ? 0 : 80 + rend * 45) + SIZE.mail + SIZE.bank + SIZE.news + SIZE.ads;
+    const n = o ? (o.x || o.l).length : null;
+    $('#crStats').innerHTML = `<div class="stat"><div class="k">Processes</div><div class="v">${procs.length}</div></div>
+      <div class="stat"><div class="k">Memory</div><div class="v">${mb} MB</div></div>
+      <div class="stat ${n == null ? '' : n ? 'bad' : 'good'}"><div class="k">${attack === 'crash' ? 'Tabs lost' : 'Reached by the attacker'}</div><div class="v">${n == null ? '–' : attack === 'crash' ? n + ' of 3' : n + ' of 5'}</div></div>
+      <div class="stat"><div class="k">Sites in its process</div><div class="v">${evil.has.filter((h) => h in SIZE && h !== 'ads').length}</div></div>`;
+    $$('#crCrash, #crSpectre, #crExploit').forEach((b) => b.classList.toggle('primary', b.id === { crash: 'crCrash', spectre: 'crSpectre', exploit: 'crExploit' }[attack]));
+  }
+  $('#crCrash').onclick = () => { attack = 'crash'; render(); };
+  $('#crSpectre').onclick = () => { attack = 'spectre'; render(); };
+  $('#crExploit').onclick = () => { attack = 'exploit'; render(); };
+  $('#crReset').onclick = () => { attack = null; render(); };
+  $('#crModel').addEventListener('segchange', (e) => { model = e.detail; attack = null; render(); });
+  render();
+})();
+</script>
 </body>
 </html>
