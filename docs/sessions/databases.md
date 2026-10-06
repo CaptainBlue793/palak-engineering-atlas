@@ -71,3 +71,4 @@
 - DB 45: Case Study: Discord's Trillions of Messages: three partition keys and three bucket lengths against four channels, giving the largest partition and the partitions read for the latest 50 messages
 - DB 46: Case Study: Instagram's Sharded IDs: real 64-bit IDs built from a time, a user's logical shard and a sequence, shown as bits, decoded back, and unchanged when the number of servers changes
 - DB 47: Case Study: Building a Mini LSM Key-Value Store: the store running (put, delete, get with its search path, crash and restart, compaction) with the memtable, the log and every table's contents shown; the 125 lines of Python were tested against a dictionary over 40,000 random operations and 178 restarts
+- DB 48: Case Study: An Analytics Warehouse: bytes read, time and monthly cost of four queries over two years of events, with partitioning by day, clustering by event type or customer, and daily rollups switched on or off
