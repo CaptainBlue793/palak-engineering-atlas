@@ -35,3 +35,11 @@
   - Ch 10 File Descriptors & "Everything Is a File" (30 KB)
   - Ch 11 Address Spaces & Virtual Memory (30 KB)
   - Ch 12 Paging & Page Tables (27 KB)
+
+## 2026-10-06 — session 2 (standalone clone)
+- Setup: the old worktrees (`C:\Users\StarBlue\atlas-courses\`) are not on this machine. Work continues in a
+  standalone clone of `feature/os-course` at `C:\Users\palak\atlas-courses\os`, outside OneDrive, so its `.git`
+  is not synced. The owner's plan is now one course at a time: finish OS, release it, then the next course.
+- Decisions: glossary gained ASID, TLB reach and Effective access time (189 terms).
+- Chapters:
+  - Ch 13 The TLB (40 KB): 8-entry TLB simulator (4 workloads, 4 KiB vs 2 MiB pages, process switch with PCIDs off/on)
