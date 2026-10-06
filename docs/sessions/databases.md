@@ -57,3 +57,4 @@
 - DB 31: Search & Inverted Indexes: live search over six titles (analyser levels, posting lists, real BM25 scores)
 - DB 32: Vector Databases: 150 vectors in eight k-means lists, exact search vs IVF with 1, 2 or 4 lists probed, recall and a movable query
 - DB 33: Caching & Materialised Views: cache and database stepped through four invalidation schemes, in order and with the unlucky interleaving
+- DB 34: Schema Migrations at Scale: a column rename stepped through as a direct rename or as expand and contract, with four servers on mixed code versions
