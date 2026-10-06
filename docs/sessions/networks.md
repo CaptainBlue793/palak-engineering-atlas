@@ -71,3 +71,13 @@
 - Ch 46 Case Study: Load-Balancer Failover: 36 seconds after a backend dies (crash or freeze, check interval, passive ejection, retries)
 - Ch 47 Case Study: Networking for Multiplayer Games: how late you see an opponent (pings, tick rate, prediction), with peeker's advantage and rewind
 - Ch 48 Case Study: Debugging a Slow API from a Capture: latency budget with three fixes (one write/TCP_NODELAY, receive-buffer autotuning, connection reuse)
+- Status after Ch 48 (2026-10-06): all 56 lessons are written (P1–P8 + Ch 1–48). A full sweep loaded every lesson headlessly at 1100 px
+  and at 390 px: five quizzes, one panel, at least one figure, no script errors, no horizontal overflow, no placeholder left.
+  Audit: 0 errors. Bundle rebuilt (60 pages, 2.19 MB).
+- Needs a shared change (release, Step 4 of the playbook; not done, waiting for the owner's go-ahead): in `assets/atlas.js` remove
+  `soon: true` from the networks entry and set `hours: 40` (the lessons total 2,400 minutes; `chapters` stays 56). In `README.md` add
+  the Networks row to the course table, drop Computer Networks from "On the way", change the totals to 340 chapters (292 main + 48
+  prerequisites) and ~249 hours, and add `networks/` to the folder tree. The `.objectives li` flex fix in `style.css` noted above is
+  still open. `gh` is not installed on this machine, so the pull request and release tag go through the REST API, as for OS.
+- Next: the owner's go-ahead, then Step 4 (shared edits, hub and palette checks, pull request into main, release `networks-v1.0.0`).
+  After that, the next course (Databases).
