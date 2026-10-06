@@ -174,7 +174,6 @@
       first: 'p1-bytes-and-encoding.html',
       dist: 'networks-course.html',
       release: null,
-      soon: true,
     },
     {
       id: 'databases',

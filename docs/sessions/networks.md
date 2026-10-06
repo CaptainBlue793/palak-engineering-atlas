@@ -81,3 +81,6 @@
   still open. `gh` is not installed on this machine, so the pull request and release tag go through the REST API, as for OS.
 - Next: the owner's go-ahead, then Step 4 (shared edits, hub and palette checks, pull request into main, release `networks-v1.0.0`).
   After that, the next course (Databases).
+- Release prepared (2026-10-07, with the owner's go-ahead): the shared edits above are made on this branch (`assets/atlas.js`: `soon`
+  removed, `hours` already 40; `README.md`: Networks row, totals, folder tree). Checks: content audit 0 errors across all courses,
+  bundle check, palette check, hub check in light, dark and at 390 px all pass. The `.objectives li` fix is left for later.
