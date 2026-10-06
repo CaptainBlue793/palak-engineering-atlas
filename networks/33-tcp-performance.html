@@ -6,34 +6,304 @@
 <title>TCP Performance: Nagle, Delayed ACK &amp; HOL</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('net-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .nd-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .nd-row > span { font-size:12.5px; color:var(--muted); min-width:150px; }
+  .nd-tl { list-style:none; margin:14px 0 0; padding:6px 12px; border:1px solid var(--border); border-radius:12px; background:var(--surface); font-size:13px; }
+  .nd-tl li { display:grid; grid-template-columns:70px 22px minmax(0,1fr); gap:8px; padding:5px 0; border-bottom:1px solid var(--border); align-items:baseline; }
+  .nd-tl li:last-child { border-bottom:0; }
+  .nd-tl li > i { font-style:normal; font-family:var(--mono); font-size:12px; color:var(--muted); text-align:right; }
+  .nd-tl li > b { color:var(--accent); font-size:15px; text-align:center; }
+  .nd-tl li.nd-s > b { color:var(--accent-2); }
+  .nd-tl li.nd-wait > b, .nd-tl li.nd-wait > span { color:var(--red); }
+  .nd-tl li.nd-wait { background:var(--red-soft); margin:0 -12px; padding-left:12px; padding-right:12px; }
+  .nd-tl li.nd-done > span { font-weight:600; color:var(--green); }
+  .nd-tl li.nd-done > b { color:var(--green); }
+  .nd-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent); min-height:66px; }
+  .nd-desc.nd-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .nd-desc.nd-ok { background:var(--green-soft); border-left-color:var(--green); }
+</style>
 </head>
 <body data-chapter="33">
-<!-- net:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 33</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>TCP Performance: <span class="grad">Nagle, Delayed ACK &amp; HOL</span></h1>
-    <p class="lead">The small-packet traps that add 40 ms, buffer sizing, and head-of-line blocking.</p>
+    <p class="lead">Two machines in the same rack are half a millisecond apart. A request between them takes 41 milliseconds, every time, and nothing is overloaded. That figure, 40 ms more than it should be, is one of the most recognisable in systems work. It comes from two reasonable optimisations inside TCP, each added in the 1980s to save packets, which wait for each other when an application sends its data in a certain way. This chapter is about that trap and its relatives: the places where TCP is correct and unexpectedly slow because of small packets, buffers of the wrong size, or one thing queued behind another. None of them appears as an error anywhere. They show up as latency, and you can only recognise them if you know they exist.</p>
+    <ul class="objectives">
+      <li><span>Explain Nagle's algorithm and delayed acknowledgements, and what each was meant to save</span></li>
+      <li><span>Explain how the two combine into a 40 ms stall, and the ways to avoid it</span></li>
+      <li><span>Say what TCP_NODELAY does, and what it obliges the application to do</span></li>
+      <li><span>Size socket buffers from the bandwidth-delay product</span></li>
+      <li><span>Recognise head-of-line blocking at each layer of the stack</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + CLI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Acknowledgements and retransmission:</b> <a href="11-tcp-reliability.html">Chapter 11</a>.</li>
+        <li><b>The receive window and buffers:</b> <a href="12-flow-control.html">Chapter 12</a>. <b>The bandwidth-delay product:</b> <a href="p8-latency-bandwidth.html">P8</a>.</li>
+        <li><b>Head-of-line blocking in HTTP:</b> <a href="15-http-1-1.html">Chapter 15</a> and <a href="16-http-2.html">Chapter 16</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Nagle's algorithm</li>
-    <li>Delayed ACKs and the 40 ms stall</li>
-    <li>TCP_NODELAY</li>
-    <li>Buffer sizing and BDP</li>
-    <li>Head-of-line blocking</li>
-  </ol>
+  <h2>Nagle's algorithm</h2>
+  <p>In the early 1980s people typed into remote terminals over slow links, and each keystroke was sent as its own packet: one byte of data inside 40 bytes of headers. On a busy link those tiny packets caused congestion by themselves. In 1984 John Nagle proposed a rule that every TCP still has, switched on by default:</p>
+<pre class="code"><span class="c"># Nagle's algorithm, when the application writes some data</span>
+<span class="k">if</span> there is a full segment's worth to send:           send it now
+<span class="k">elif</span> nothing sent earlier is still unacknowledged:    send it now      <span class="c"># the connection is idle: no reason to wait</span>
+<span class="k">else</span>:                                                 hold it          <span class="c"># until an ACK arrives, or enough accumulates to fill a segment</span></pre>
+  <p>It lets the first small write go at once and gathers any that follow into one packet, released when the first is acknowledged. For a stream of keystrokes it is ideal: the number of packets adapts by itself to the speed of the link. The assumption hidden in it is that acknowledgements come back promptly.</p>
+
+  <h2>Delayed acknowledgements</h2>
+  <p>The receiver has an optimisation of its own, from the same period. Acknowledging every segment the instant it arrives doubles the number of packets on the path, and many of those ACKs are wasted, because the application is about to send a reply that could carry the acknowledgement for free. So a receiver <b>delays</b> an ACK briefly:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>The receiver sends its ACK when</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><b>It has data of its own to send</b></td><td>The ACK rides along in that segment at no cost</td></tr>
+        <tr><td><b>A second full segment arrives</b></td><td>One ACK then covers both</td></tr>
+        <tr><td><b>A timer expires</b>: 40 ms on Linux, up to 200 ms elsewhere</td><td>The sender mustn't be left waiting for ever</td></tr>
+        <tr><td><b>Something is out of order</b></td><td>Duplicate ACKs must go at once, for fast retransmit (<a href="11-tcp-reliability.html">Chapter 11</a>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>The 40 ms stall</h2>
+  <p>Put the two together with an application that sends one request as <b>two small writes</b>, a header and then a body, and waits for the reply. This pattern is called write–write–read.</p>
+  <figure class="seq" data-actors="Client|Server">
+    <ol>
+      <li data-m="0>1">write 1: the header, 200 bytes<small>Nothing is outstanding, so Nagle sends it at once.</small></li>
+      <li data-m="0>0">write 2: the body, 300 bytes: held<small>Nagle: the header hasn't been acknowledged yet, and this isn't a full segment.</small></li>
+      <li data-m="1>1">wait up to 40 ms before acknowledging<small>Delayed ACK: the server has no reply to send, since the request is incomplete, and no second segment has come.</small></li>
+      <li data-m="1>0" data-k="reply">ACK, when the timer expires</li>
+      <li data-m="0>1">the body, at last</li>
+      <li data-m="1>0" data-k="reply">the response</li>
+    </ol>
+    <figcaption><b>Each side is waiting for the other.</b> The client won't send the rest until it gets an ACK. The server won't send an ACK until it gets the rest, or its timer runs out. Only the timer breaks the tie.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One request, sent as a header and a body</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="nd-row"><span>The application sends with</span><div class="seg" id="ndWrites"><button class="active" data-v="2">two writes: header, then body</button><button data-v="1">one write of both</button></div></div>
+      <div class="nd-row"><span>On the client</span><div class="seg" id="ndNagle"><button class="active" data-v="1">Nagle on (the default)</button><button data-v="0">TCP_NODELAY</button></div></div>
+      <div class="nd-row"><span>On the server</span><div class="seg" id="ndDack"><button class="active" data-v="1">delayed ACKs (the default)</button><button data-v="0">immediate ACKs</button></div></div>
+      <div class="nd-row"><span>Round-trip time</span><div class="seg" id="ndRtt"><button class="active" data-v="1">1 ms (same data centre)</button><button data-v="20">20 ms</button><button data-v="100">100 ms</button></div></div>
+      <ul class="nd-tl" id="ndTl"></ul>
+      <div class="nd-desc" id="ndDesc"></div>
+      <div class="stats" id="ndStats"></div>
+    </div>
+    <div class="panel-foot">The server needs 5 ms to produce the response once it has the whole request. The delayed-ACK timer is 40 ms, as on Linux. Arrows pointing right are from the client, and left from the server.</div>
+  </div>
+
+  <p>Things to notice. With the defaults and a 1 ms round trip, the response takes 47 ms where 6 ms would do: 40 of those milliseconds are the two machines waiting for each other. Any one of three changes removes the stall. Set <code>TCP_NODELAY</code> on the client, and both writes leave at once. Make the application send the header and body in a <b>single write</b>, and there is nothing for Nagle to hold. Turn off delayed ACKs on the server, and the ACK comes straight back, though the body still waits one round trip for it, which is cheap at 1 ms and costs a full extra 100 ms on a long path. That last case shows what Nagle's algorithm costs when everything else is ideal: a small write behind unacknowledged data waits one round trip. On a 100 ms path the same defaults give 245 ms against a possible 105: the delayed ACK accounts for 40 of the difference, and the round trip that the body waits for its ACK accounts for the other 100. In proportion, though, the trap is at its worst on fast networks, where it multiplies the latency instead of adding to it.</p>
+
+  <h2>TCP_NODELAY</h2>
+<pre class="code">sock.<span class="f">setsockopt</span>(socket.IPPROTO_TCP, socket.TCP_NODELAY, <span class="m">1</span>)      <span class="c"># turn Nagle's algorithm off for this socket</span>
+
+<span class="c"># The bug, and the cheaper fix: one write, not two</span>
+sock.<span class="f">sendall</span>(header); sock.<span class="f">sendall</span>(body)       <span class="c"># write-write-read: stalls with Nagle on</span>
+sock.<span class="f">sendall</span>(header + body)                     <span class="c"># one segment: nothing to stall</span></pre>
+  <p>With <code>TCP_NODELAY</code> every write is sent immediately. Nearly every request-and-response system sets it: database drivers, Redis, RPC libraries, web servers, and Go's standard library turns it on for every connection. The responsibility then moves to the application. If it makes a hundred tiny writes, it now sends a hundred tiny packets, so it must gather its output itself, in a buffer or with one vectored write, and hand TCP whole messages.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Nagle on (default)</th><th><code>TCP_NODELAY</code></th><th><code>TCP_CORK</code> (Linux)</th></tr></thead>
+      <tbody>
+        <tr><td><b>A small write is sent</b></td><td>At once if the connection is idle, otherwise when the previous data is acknowledged</td><td>At once, always</td><td>Not until the cork is removed, a segment fills, or 200 ms pass</td></tr>
+        <tr><td><b>Who batches</b></td><td>The kernel, by guessing</td><td>The application</td><td>The application, explicitly</td></tr>
+        <tr><td><b>Good for</b></td><td>Interactive streams of tiny writes, bulk transfer</td><td>Request and response, RPC, anything latency-sensitive</td><td>A header followed by a file: nginx's <code>tcp_nopush</code> does this</td></tr>
+        <tr><td><b>Risk</b></td><td>The 40 ms stall</td><td>Floods of tiny packets from careless code</td><td>Forgetting to uncork</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">"It's always TCP_NODELAY. Every damn time."</div><p>That is the title of a 2024 essay by Marc Brooker, a senior engineer at Amazon Web Services, and it describes something anyone who has run distributed systems for long enough will recognise. A service is slower than it should be by tens of milliseconds, with no load and no errors. Days go into examining garbage collection, disks, locks and queues. Then someone looks at a packet capture, sees a small segment sitting for 40 ms, and sets one socket option. Brooker's argument is that the world Nagle's algorithm was designed for has gone. In 1984 the problem was single keystrokes on links measured in kilobits. Today's applications send whole messages and want them delivered now, a data-centre round trip is shorter than the delayed-ACK timer by a factor of a hundred, and a default that silently trades 40 ms for a handful of bytes is the wrong way round. John Nagle himself has written, in comments on discussions of the subject, that the real fault lies with delayed ACKs and their fixed timer, which was added independently at about the same time and defeats his algorithm's assumption that acknowledgements return promptly. Both defaults are still in every operating system, because changing them would alter the behaviour of decades of software. So the knowledge travels by word of mouth: when a latency has a floor of 40 ms, or 200 ms on some systems, and a write–write–read pattern is anywhere near, check for this first.</p></div>
+  </div>
+
+  <h2>Buffer sizing and the BDP</h2>
+  <p>The opposite problem to small packets is not being able to keep enough data in flight. To use a path fully, a sender must have one <b>bandwidth-delay product</b> of data outstanding (<a href="p8-latency-bandwidth.html">P8</a>): the amount that fits "in the pipe". The receiver's buffer must be large enough to advertise that as its window (<a href="12-flow-control.html">Chapter 12</a>), and the sender's buffer large enough to hold it for possible retransmission.</p>
+<pre class="code">BDP  =  bandwidth × round-trip time
+
+1 Gbit/s  × 1 ms    =  125 KB          <span class="c"># in a data centre: any default is plenty</span>
+1 Gbit/s  × 80 ms   =  10 MB           <span class="c"># across an ocean: more than Linux's default ceiling of 6 MB</span>
+10 Gbit/s × 80 ms   =  100 MB
+
+$ sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+net.ipv4.tcp_rmem = <span class="m">4096</span>  <span class="m">131072</span>  <span class="m">6291456</span>          <span class="c"># receive: minimum, initial, and the most autotuning may use</span>
+net.ipv4.tcp_wmem = <span class="m">4096</span>  <span class="m">16384</span>   <span class="m">4194304</span>          <span class="c"># send</span></pre>
+  <p>With a 6 MB ceiling and an 80 ms round trip, one connection can't exceed about 600 Mbit/s whatever the link's speed, and raising the third number is the fix for long, fast transfers. Bigger isn't simply better, though. Data sitting in a large send buffer has already been committed in order, so anything more urgent written afterwards waits behind it. For interactive traffic you want the buffer in the kernel short, and the queue in the application, where it can still be reordered or dropped.</p>
+
+  <h2>Head-of-line blocking, layer by layer</h2>
+  <p>"One thing stuck behind another" has appeared in several chapters. It is the same problem each time, and it moves down the stack as each layer fixes its own version:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Where</th><th>What blocks what</th><th>Removed by</th></tr></thead>
+      <tbody>
+        <tr><td><b>HTTP/1.1</b> (<a href="15-http-1-1.html">Chapter 15</a>)</td><td>A slow response blocks later responses on the connection</td><td>More connections, then HTTP/2's streams</td></tr>
+        <tr><td><b>HTTP/2 on TCP</b> (<a href="16-http-2.html">Chapter 16</a>)</td><td>One lost packet blocks every stream until it is retransmitted</td><td>QUIC, where each stream is ordered separately (<a href="18-http-3-quic.html">Chapter 18</a>)</td></tr>
+        <tr><td><b>A send buffer</b></td><td>Bytes already queued block more urgent bytes written later</td><td>Small kernel buffers and prioritising in the application</td></tr>
+        <tr><td><b>A shared connection with one slow reader</b></td><td>A stream whose consumer stalls fills the shared window and blocks the rest</td><td>Per-stream flow control, as in HTTP/2 and QUIC</td></tr>
+        <tr><td><b>A single-threaded server</b></td><td>One slow request blocks every request behind it in the queue</td><td>Concurrency, timeouts, and separate pools for slow work</td></tr>
+        <tr><td><b>Nagle and delayed ACK</b></td><td>A small write blocks behind an acknowledgement that is being withheld</td><td><code>TCP_NODELAY</code>, or one write per message</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The remedy has the same shape at every layer: stop forcing unrelated things into one ordered queue. Where an order is truly required, keep the queue short.</p>
+<pre class="code">$ ss -ti dst 10.4.7.19                    <span class="c"># what the kernel knows about one connection's performance</span>
+     cubic wscale:7,7 rto:204 <span class="k">rtt:0.45/0.08</span> <span class="k">ato:40</span> mss:1448 cwnd:10 <span class="k">send 257Mbps</span> rcv_space:14480 <span class="k">notsent:0</span> minrtt:0.31
+<span class="c">#                               RTT 0.45 ms   delayed-ACK timer 40 ms                     bytes written and not yet sent</span></pre>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Sending one message in several small writes.</b> Header then body, length then payload. Build the message and write it once.</li>
+      <li><b>Setting <code>TCP_NODELAY</code> and then writing byte by byte.</b> Every write is now a packet. Buffer in the application.</li>
+      <li><b>Hunting a 40 ms or 200 ms latency floor in the application.</b> Those two numbers are delayed-ACK timers. Capture packets first.</li>
+      <li><b>Leaving default buffer limits on long, fast paths.</b> Throughput is capped at buffer size over round-trip time.</li>
+      <li><b>Making every buffer huge.</b> Queued data can't be reprioritised or cancelled, so latency rises and urgent messages wait.</li>
+      <li><b>Testing only on localhost.</b> With no delay and no loss, none of these effects appears.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is Nagle's algorithm, and why do so many systems disable it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Nagle's algorithm reduces the number of small packets a TCP sender emits. If the application writes less than a full segment while earlier data is still unacknowledged, the kernel holds the new data until the outstanding data is acknowledged or enough accumulates to fill a segment; if nothing is outstanding it sends immediately. It was designed for interactive terminals on slow links, where each keystroke would otherwise be a 41-byte packet. Systems disable it with <code>TCP_NODELAY</code> because it interacts badly with delayed acknowledgements on the receiver. A receiver holds its ACK for up to 40 ms on Linux, hoping to piggyback it on a response. If the sender does write–write–read, the second small write waits for an ACK that the receiver is deliberately delaying, and the request stalls for the length of the delayed-ACK timer. For request-and-response protocols that latency matters far more than a few saved packets, so RPC libraries, databases and web servers set <code>TCP_NODELAY</code> and take responsibility for batching writes themselves.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A service calls another in the same data centre. Median latency is 41 ms, though the callee's own timing shows 1 ms per request. What do you suspect, and how do you confirm it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A constant extra 40 ms on a sub-millisecond path is the signature of Nagle's algorithm meeting delayed ACKs. I'd suspect that the client writes each request in two parts, typically headers and then body, or a length prefix and then the payload, on a socket without <code>TCP_NODELAY</code>. The first part goes out; the second is held by Nagle because the first is unacknowledged; the server can't respond because the request is incomplete, and it delays its ACK for 40 ms; when the ACK finally arrives the client sends the rest. The callee measures only from the moment it has the full request, hence its 1 ms. To confirm, I'd capture on either host and look at the timing: a small segment, a gap of about 40 ms, a bare ACK, and then the second small segment immediately after it. <code>ss -ti</code> on the server would show the delayed-ACK timer at 40. I'd also check for <code>setsockopt</code> with <code>TCP_NODELAY</code> in a trace of the client. The fix is to set <code>TCP_NODELAY</code> on the client and, better, to send each request in a single write, so that it doesn't depend on the option. I'd verify with the same capture that the gap is gone.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Nagle's algorithm holds a small write while earlier data is unacknowledged. Delayed ACKs hold an acknowledgement for up to 40 ms hoping to combine it with something.</li>
+      <li>Together, with a request sent as two small writes, each waits for the other: a stall of one delayed-ACK timer.</li>
+      <li><code>TCP_NODELAY</code> removes Nagle, and so does writing each message in one call. With it on, batching is the application's job.</li>
+      <li>A latency floor of 40 ms, or 200 ms, on a fast network is a delayed-ACK timer until shown otherwise.</li>
+      <li>Throughput on a long path needs buffers of at least bandwidth times round-trip time. Oversized buffers add latency and hide queues.</li>
+      <li>Head-of-line blocking recurs at every layer where unrelated things share one ordered queue.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">With Nagle's algorithm on, an application writes 100 bytes to an idle connection, and immediately writes 100 more. What is sent, and when?</p>
+      <div class="opts">
+        <button class="opt">Both at once, in one packet</button>
+        <button class="opt">Both at once, in two packets</button>
+        <button class="opt">The first at once; the second when the first is acknowledged</button>
+        <button class="opt">Neither until 40 ms have passed</button>
+      </div>
+      <div class="explain">Nothing was outstanding for the first write. The second is small and finds unacknowledged data, so it is held.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why does a receiver delay its acknowledgements?</p>
+      <div class="opts">
+        <button class="opt">To send them with reply data or cover two segments with one ACK, saving packets</button>
+        <button class="opt">To slow the sender down</button>
+        <button class="opt">To measure the round-trip time</button>
+        <button class="opt">Because acknowledgements are low priority in the kernel</button>
+      </div>
+      <div class="explain">Most ACKs can be combined with something. The timer is the fallback when nothing turns up to combine with.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A client sends each request as a 50-byte header write followed by a 200-byte body write, with default socket options on both sides. What does that cost?</p>
+      <div class="opts">
+        <button class="opt">Nothing</button>
+        <button class="opt">One extra packet</button>
+        <button class="opt">A retransmission</button>
+        <button class="opt">About 40 ms per request, while the body waits for an ACK that the server is delaying</button>
+      </div>
+      <div class="explain">Write–write–read: Nagle holds the body, and delayed ACK holds the acknowledgement that would release it.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">After setting <code>TCP_NODELAY</code>, what must the application take care of?</p>
+      <div class="opts">
+        <button class="opt">Acknowledging data itself</button>
+        <button class="opt">Assembling each message before writing it, since every small write now becomes a packet</button>
+        <button class="opt">Retransmitting lost segments</button>
+        <button class="opt">Nothing: it is free</button>
+      </div>
+      <div class="explain">The kernel no longer coalesces small writes. Buffer in user space and write whole messages.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A transfer runs over a 1 Gbit/s path with an 80 ms round trip. Roughly how much data must be in flight to use the path fully?</p>
+      <div class="opts">
+        <button class="opt">64 KB</button>
+        <button class="opt">1 MB</button>
+        <button class="opt">10 MB</button>
+        <button class="opt">1 GB</button>
+      </div>
+      <div class="explain">The bandwidth-delay product: 125 MB per second times 0.08 seconds. Buffers and windows must allow at least that.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = NET;
+  const cfg = { writes: 2, nagle: 1, dack: 1, rtt: 1 };
+  const DACK = 40, WORK = 5;
+  function sim() {
+    const h = cfg.rtt / 2, ev = [];
+    const add = (t, cls, arrow, text) => ev.push({ t, cls, arrow, text });
+    let reqComplete, waited = 0, pkts = 0;
+    if (cfg.writes === 1) {
+      add(0, '', '→', 'The application writes the header and body together: one 500-byte segment, sent at once.'); pkts++;
+      reqComplete = h;
+    } else if (!cfg.nagle) {
+      add(0, '', '→', 'Write 1, the header: sent at once.'); add(0, '', '→', 'Write 2, the body: sent at once as well. <code>TCP_NODELAY</code> means no waiting for an ACK.'); pkts += 2;
+      reqComplete = h;
+    } else {
+      add(0, '', '→', 'Write 1, the header: nothing is outstanding, so it is sent at once.'); pkts++;
+      add(0, 'nd-wait', '·', 'Write 2, the body: <b>held by Nagle</b>. The header hasn\'t been acknowledged and this isn\'t a full segment.');
+      const ackSent = h + (cfg.dack ? DACK : 0);
+      if (cfg.dack) { add(h, 'nd-wait nd-s', '·', `The header arrives. The server has no reply to send yet, so it <b>delays its ACK</b>, hoping for something to send it with.`); add(ackSent, 'nd-s', '←', 'The 40 ms timer expires. The server sends a bare ACK.'); waited = DACK; }
+      else add(ackSent, 'nd-s', '←', 'The header arrives, and the server acknowledges it immediately.');
+      pkts++;
+      const bodySent = ackSent + h;
+      add(bodySent, '', '→', 'The ACK arrives and releases the body.'); pkts++;
+      reqComplete = bodySent + h;
+      if (!cfg.dack) waited = cfg.rtt;
+    }
+    add(reqComplete, 'nd-s', '·', 'The server has the whole request and starts work.');
+    const respSent = reqComplete + WORK; pkts++;
+    add(respSent, 'nd-s', '←', 'The response is sent' + (cfg.writes === 2 && !cfg.nagle || cfg.writes === 1 ? ', carrying the acknowledgement with it.' : '.'));
+    const done = respSent + h;
+    add(done, 'nd-done', '✓', 'The response arrives at the client.');
+    return { ev, done, waited, pkts, ideal: cfg.rtt + WORK };
+  }
+  const ms = (t) => (t % 1 ? t.toFixed(1) : t) + ' ms';
+  function render() {
+    const r = sim();
+    $('#ndTl').innerHTML = r.ev.map((e) => `<li class="${e.cls}"><i>${ms(e.t)}</i><b>${e.arrow}</b><span>${e.text}</span></li>`).join('');
+    const d = $('#ndDesc'), extra = r.done - r.ideal; let cls, text;
+    if (extra < 0.01) { cls = 'nd-ok'; text = `<b>No stall.</b> The response arrives after ${ms(r.done)}: one round trip plus the server's 5 ms. ${cfg.writes === 1 ? 'A single write gives Nagle nothing to hold, whatever the socket options are.' : 'Both small segments left immediately, at the price of one extra packet.'}`; }
+    else if (cfg.dack) { cls = 'nd-bad'; text = `<b>${ms(extra)} lost to two optimisations waiting for each other.</b> The client held the body until the header was acknowledged, and the server held the acknowledgement for 40 ms because it had nothing to send with it. The response took ${ms(r.done)} where ${ms(r.ideal)} was possible${cfg.rtt <= 1 ? ', nearly eight times as long' : ''}.`; }
+    else { cls = ''; text = `<b>One extra round trip.</b> With immediate ACKs the 40 ms wait is gone, but Nagle still holds the body until the header's ACK returns, which costs ${ms(cfg.rtt)} here. The response took ${ms(r.done)} where ${ms(r.ideal)} was possible.`; }
+    d.className = 'nd-desc ' + cls; d.innerHTML = text;
+    $('#ndStats').innerHTML = `<div class="stat ${extra > 30 ? 'bad' : extra > 0.01 ? 'warn' : 'good'}"><div class="k">Response arrives after</div><div class="v">${ms(r.done)}</div></div>
+      <div class="stat"><div class="k">Best possible</div><div class="v">${ms(r.ideal)}</div></div>
+      <div class="stat ${extra > 30 ? 'bad' : extra > 0.01 ? 'warn' : 'good'}"><div class="k">Spent waiting</div><div class="v">${ms(extra)}</div></div>
+      <div class="stat"><div class="k">Packets</div><div class="v">${r.pkts}</div></div>`;
+  }
+  $('#ndWrites').addEventListener('segchange', (e) => { cfg.writes = +e.detail; render(); });
+  $('#ndNagle').addEventListener('segchange', (e) => { cfg.nagle = +e.detail; render(); });
+  $('#ndDack').addEventListener('segchange', (e) => { cfg.dack = +e.detail; render(); });
+  $('#ndRtt').addEventListener('segchange', (e) => { cfg.rtt = +e.detail; render(); });
+  render();
+})();
+</script>
 </body>
 </html>

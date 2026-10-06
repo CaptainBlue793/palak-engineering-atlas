@@ -6,34 +6,351 @@
 <title>Event Loops &amp; io_uring</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ev-h { margin:14px 0 6px; font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .ev-strip { position:relative; height:26px; border-radius:7px; border:1px solid var(--border); background:color-mix(in srgb, var(--green) 14%, var(--surface)); overflow:hidden; }
+  .ev-strip i { position:absolute; top:0; bottom:0; background:var(--red); }
+  .ev-bars { display:flex; align-items:flex-end; gap:1px; height:110px; padding:4px; border-radius:7px; border:1px solid var(--border); background:var(--surface-2); }
+  .ev-bars i { display:block; flex:1 1 0; min-width:0; border-radius:2px 2px 0 0; background:var(--green); }
+  .ev-bars i.ev-mid { background:var(--amber); }
+  .ev-bars i.ev-hi { background:var(--red); }
+  .ev-axis { display:flex; justify-content:space-between; margin-top:3px; font-family:var(--mono); font-size:10.5px; color:var(--muted); }
+  .ev-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .ev-desc.ev-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .ev-desc.ev-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .ev-desc.ev-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="29">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 29</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
     <h1>Event Loops &amp; <span class="grad">io_uring</span></h1>
-    <p class="lead">The reactor pattern behind Node and nginx, callbacks vs async/await, and io_uring's shared rings.</p>
+    <p class="lead">Chapter 28 gave one thread the ability to watch thousands of sockets. The program built on top of that is an <b>event loop</b>: wait for something to be ready, run the small piece of code that deals with it, go back to waiting. Node.js, nginx, Redis, browsers and every <code>async</code>/<code>await</code> runtime are this loop. It buys enormous concurrency from a single thread, at the price of one iron rule, which is that no piece of code may hold the thread for long. This chapter builds the loop, shows what breaking the rule does, and then looks at <b>io_uring</b>, the newer Linux interface that changes the question from "what is ready?" to "what has finished?".</p>
+    <ul class="objectives">
+      <li>Describe the reactor loop and how handlers, timers and state fit into it</li>
+      <li>Explain what async/await compiles to, and how it differs from a thread</li>
+      <li>Explain why one blocking handler delays every connection, and three ways to fix it</li>
+      <li>Describe io_uring's submission and completion rings</li>
+      <li>Compare the readiness model (reactor) with the completion model (proactor)</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Non-blocking descriptors and epoll.</b> See <a href="28-io-multiplexing-epoll.html">Chapter 28</a>.</li>
+        <li><b>Thread pools, for the work a loop can't do itself.</b> See <a href="27-thread-pools.html">Chapter 27</a>.</li>
+        <li><b>What a system call costs.</b> See <a href="02-kernel-user-mode-syscalls.html">Chapter 2</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The reactor loop</li>
-    <li>Callbacks, futures and async/await</li>
-    <li>Don't block the loop</li>
-    <li>io_uring submission and completion rings</li>
-    <li>Proactor vs reactor</li>
-  </ol>
+  <h2>The reactor loop</h2>
+  <p>Attach a small object to each descriptor saying what to do when it is ready, and the epoll loop of Chapter 28 becomes a general-purpose engine. This structure is called a <b>reactor</b>: it reacts to readiness events by dispatching to handlers.</p>
+<pre class="code"><span class="k">struct</span> <span class="t">handler</span> {
+    <span class="t">int</span> fd;
+    <span class="t">void</span> (*on_ready)(<span class="k">struct</span> <span class="t">handler</span> *self, <span class="t">uint32_t</span> events);
+    <span class="t">void</span> *state;                                  <span class="c">/* whatever this connection needs to remember */</span>
+};
+
+<span class="t">void</span> <span class="f">loop_run</span>(<span class="t">int</span> ep)
+{
+    <span class="k">for</span> (;;) {
+        <span class="k">struct</span> <span class="t">epoll_event</span> ev[<span class="m">64</span>];
+        <span class="t">int</span> n = <span class="f">epoll_wait</span>(ep, ev, <span class="m">64</span>, <span class="f">ms_until_next_timer</span>());   <span class="c">/* the only place the thread sleeps */</span>
+        <span class="k">for</span> (<span class="t">int</span> i = <span class="m">0</span>; i &lt; n; i++) {
+            <span class="k">struct</span> <span class="t">handler</span> *h = ev[i].data.ptr;
+            h-&gt;<span class="f">on_ready</span>(h, ev[i].events);            <span class="c">/* must return quickly and must never block */</span>
+        }
+        <span class="f">run_expired_timers</span>();
+    }
+}</pre>
+  <p>Everything happens in turn on one thread. Two consequences follow, one welcome and one not. Handlers never run at the same time, so they can share data with <b>no locks</b> and none of the races of Chapter 17. And while one handler is running, nothing else is: the loop is only as responsive as its slowest handler.</p>
+
+  <h2>Where does the state go? Callbacks and async/await</h2>
+  <p>A thread serving one connection keeps its place in local variables: it calls <code>read()</code>, sleeps, and wakes up on the next line with its stack intact. A handler in an event loop can't do that. When there is nothing more to read it has to <i>return</i> to the loop, and its stack frame is gone. Whatever it needs to remember must be saved in an object on the heap, and the handler becomes a <b>state machine</b> that picks up where it left off.</p>
+<pre class="code"><span class="k">enum</span> <span class="t">phase</span> { <span class="m">READING</span>, <span class="m">WRITING</span> };
+<span class="k">struct</span> <span class="t">conn</span> { <span class="t">int</span> fd; <span class="k">enum</span> <span class="t">phase</span> phase; <span class="t">char</span> buf[<span class="m">4096</span>]; <span class="t">size_t</span> have, sent; };
+
+<span class="t">void</span> <span class="f">conn_ready</span>(<span class="k">struct</span> <span class="t">conn</span> *c)                  <span class="c">/* called each time the socket is ready */</span>
+{
+    <span class="k">if</span> (c-&gt;phase == <span class="m">READING</span>) {
+        <span class="t">ssize_t</span> n = <span class="f">read</span>(c-&gt;fd, c-&gt;buf + c-&gt;have, <span class="k">sizeof</span> c-&gt;buf - c-&gt;have);
+        <span class="k">if</span> (n &lt; <span class="m">0</span> &amp;&amp; errno == <span class="m">EAGAIN</span>) <span class="k">return</span>;   <span class="c">/* back to the loop; c remembers where we are */</span>
+        c-&gt;have += n;
+        <span class="k">if</span> (!<span class="f">request_complete</span>(c)) <span class="k">return</span>;
+        <span class="f">build_response</span>(c);
+        c-&gt;phase = <span class="m">WRITING</span>;
+    }
+    <span class="k">if</span> (c-&gt;phase == <span class="m">WRITING</span>) {
+        <span class="t">ssize_t</span> n = <span class="f">write</span>(c-&gt;fd, c-&gt;buf + c-&gt;sent, c-&gt;have - c-&gt;sent);
+        <span class="k">if</span> (n &lt; <span class="m">0</span> &amp;&amp; errno == <span class="m">EAGAIN</span>) <span class="k">return</span>;
+        c-&gt;sent += n;
+        <span class="k">if</span> (c-&gt;sent == c-&gt;have) <span class="f">conn_close</span>(c);
+    }
+}</pre>
+  <p>Writing every piece of logic inside out like this is tedious and error-prone. The first relief was callbacks ("when the read finishes, call this function"), which nest badly. The second was promises and futures, objects standing for a result that isn't there yet. The third, now nearly universal, is <b>async/await</b>, which lets you write the sequential version and has the compiler produce the state machine:</p>
+<pre class="code"><span class="c">// What you write (Rust-like pseudocode):</span>
+async fn handle(conn) {
+    let request = conn.read_request().await;     <span class="c">// may pause here ...</span>
+    let reply   = build_response(request);
+    conn.write_all(reply).await;                 <span class="c">// ... and here</span>
+}
+<span class="c">// What the compiler builds: a struct holding conn, request and reply, a "phase" field,</span>
+<span class="c">// and a function that the loop calls to advance it to the next await. The C above.</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>A thread per connection</th><th>A task on an event loop</th></tr></thead>
+      <tbody>
+        <tr><td><b>State between steps lives</b></td><td>On the thread's stack</td><td>In a heap object: the state machine</td></tr>
+        <tr><td><b>Who switches between tasks</b></td><td>The kernel, at any instruction</td><td>The task itself, only at an <code>await</code></td></tr>
+        <tr><td><b>Cost per idle connection</b></td><td>A stack and a kernel thread</td><td>A few hundred bytes</td></tr>
+        <tr><td><b>Shared data</b></td><td>Needs locks</td><td>Safe between awaits, on a single-threaded loop</td></tr>
+        <tr><td><b>A slow or blocking step</b></td><td>Delays only that connection</td><td>Delays every connection on that loop</td></tr>
+        <tr><td><b>Uses several cores</b></td><td>Naturally</td><td>Only by running several loops</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Don't block the loop</h2>
+  <p>The second-to-last row is the rule that governs everything written for an event loop. Tasks are scheduled <b>cooperatively</b>: each runs until it awaits or returns. There is no timer interrupt to rescue the others. If one handler spends 200 ms without yielding, every one of the other ten thousand connections waits 200 ms. The usual culprits:</p>
+  <ul>
+    <li><b>Blocking system calls:</b> reading a file, a synchronous DNS lookup, a blocking database driver, <code>sleep</code>.</li>
+    <li><b>CPU work:</b> parsing a huge JSON document, compressing, hashing a password, resizing an image, a regular expression with catastrophic backtracking.</li>
+    <li><b>Waiting for a lock</b> that some other thread holds.</li>
+  </ul>
+  <p>There are three ways out. <b>Offload</b> the work to a thread pool and have its completion posted back to the loop as an event; this is what libuv does for file I/O and what <code>spawn_blocking</code> and similar calls are for. <b>Chunk</b> long computations and yield to the loop between pieces. Or run <b>several loops</b>, one per core, so that one stall affects only a fraction of the connections.</p>
+
+  <h2>Block a loop</h2>
+  <p>One event loop for one second. Five hundred small requests arrive, one every 2 ms, each needing 0.2 ms. Four times in that second a heavy request arrives too. Choose how heavy it is and how the server deals with it, and watch what happens to everybody else.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One event loop, one second</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="evB"><button data-v="5">heavy task: 5 ms</button><button class="active" data-v="50">50 ms</button><button data-v="200">200 ms</button></div>
+        <div class="seg" id="evMode"><button class="active" data-v="loop">run it on the loop</button><button data-v="chunk">chunk it, yielding every 5 ms</button><button data-v="pool">hand it to a thread pool</button></div>
+      </div>
+      <div class="ev-h">The loop's thread: red = busy with a heavy task</div>
+      <div class="ev-strip" id="evStrip"></div>
+      <div class="ev-h">Latency of the small requests, by arrival time</div>
+      <div class="ev-bars" id="evBars"></div>
+      <div class="ev-axis"><span>0</span><span>250 ms</span><span>500 ms</span><span>750 ms</span><span>1 s</span></div>
+      <div class="ev-desc" id="evDesc"></div>
+      <div class="stats" id="evStats"></div>
+    </div>
+    <div class="panel-foot">A model: events are handled strictly in arrival order; a chunked task goes to the back of the queue after each 5 ms piece; the thread pool always has a free thread, and handing over and collecting the result cost the loop 0.05 ms each. Each bar is the worst latency among requests arriving in that 10 ms. Bar heights share one scale across all the settings so you can compare them.</div>
+  </div>
+
+  <p>Things to notice. A 5 ms task on the loop barely shows. A 200 ms task turns the loop red for three quarters of the second: the median small request, which needs 0.2 ms, takes about 90 ms, because most of them arrive while the loop is busy. Chunking caps the damage at about one chunk, 5 ms, at the price of the heavy task itself taking longer to finish. Handing it to a pool leaves the small requests untouched, and the heavy task takes exactly as long as before: its cost hasn't gone away, it has moved to a thread where it holds nobody up.</p>
+
+  <div class="callout usecase">
+    <div class="ico">☁️</div>
+    <div class="body"><div class="title">One regular expression, every core, 27 minutes</div><p>On 2 July 2019 Cloudflare deployed a new rule to its web application firewall, the component that inspects every HTTP request passing through its network. The rule contained a regular expression which, for certain inputs, made the matching engine backtrack through an enormous number of possibilities. The firewall runs inside the same event-driven worker processes that serve the traffic. Within seconds of the rule going live worldwide, each worker that received a request was stuck evaluating the expression, its event loop unable to return to <code>epoll_wait</code>, and every CPU core that handled web traffic sat at 100%. Requests that were perfectly ordinary queued behind the stuck ones and failed. Cloudflare's traffic fell by about 80% for 27 minutes, until the rule was withdrawn. Nothing blocked in the system-call sense; the handlers were simply computing. On an event loop that is the same thing. The fixes included switching to a regular-expression engine that guarantees running time proportional to its input, and CPU limits for rules: both ways of making sure no single handler can hold the loop.</p></div>
+  </div>
+
+  <h2>io_uring: ask for the work, not for readiness</h2>
+  <p>The readiness model has two limits. It doesn't cover disk files, which are always "ready" and then block (<a href="28-io-multiplexing-epoll.html">Chapter 28</a>). And every operation still costs a system call: wait, then one <code>read</code> or <code>write</code> per ready descriptor. At a million operations a second, crossing into the kernel is the main expense.</p>
+  <p><b>io_uring</b>, added to Linux in 2019, replaces "tell me when I can try" with "do this for me and tell me when it is done". The program and the kernel share two ring buffers, mapped into both address spaces:</p>
+  <ul>
+    <li>the <b>submission queue</b>: the program writes entries describing operations: read this file at this offset into this buffer, accept on this socket, send these bytes;</li>
+    <li>the <b>completion queue</b>: the kernel writes an entry for each finished operation, with its result.</li>
+  </ul>
+  <figure class="seq" data-actors="Program|Submission ring (shared memory)|Kernel|Completion ring (shared memory)">
+    <ol>
+      <li data-m="0>1">write 32 entries: reads, writes, accepts. No system call</li>
+      <li data-m="0>2">io_uring_enter(): "32 new entries" (one system call for all of them)</li>
+      <li data-m="2>1">take the entries and start every operation</li>
+      <li data-m="2>3">as each finishes, write its result</li>
+      <li data-m="3>0" data-k="reply">read the results straight from shared memory. No system call</li>
+    </ol>
+    <figcaption><b>io_uring.</b> Requests and results travel through memory both sides can see. One system call can submit a whole batch and collect earlier completions, and a polling mode needs none at all.</figcaption>
+  </figure>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;liburing.h&gt;</span>
+
+<span class="k">struct</span> <span class="t">io_uring</span> ring;
+<span class="f">io_uring_queue_init</span>(<span class="m">256</span>, &amp;ring, <span class="m">0</span>);
+
+<span class="k">struct</span> <span class="t">io_uring_sqe</span> *sqe = <span class="f">io_uring_get_sqe</span>(&amp;ring);       <span class="c">/* a free slot in the submission ring */</span>
+<span class="f">io_uring_prep_read</span>(sqe, fd, buf, <span class="k">sizeof</span> buf, offset);     <span class="c">/* describe the operation: it works for files too */</span>
+<span class="f">io_uring_sqe_set_data</span>(sqe, req);                          <span class="c">/* a tag, to recognise the completion later */</span>
+<span class="f">io_uring_submit</span>(&amp;ring);                                   <span class="c">/* one system call, however many entries are queued */</span>
+
+<span class="k">struct</span> <span class="t">io_uring_cqe</span> *cqe;
+<span class="f">io_uring_wait_cqe</span>(&amp;ring, &amp;cqe);                           <span class="c">/* something has finished */</span>
+<span class="k">struct</span> <span class="t">request</span> *done = <span class="f">io_uring_cqe_get_data</span>(cqe);
+<span class="t">int</span> result = cqe-&gt;res;                                    <span class="c">/* bytes transferred, or a negative errno */</span>
+<span class="f">io_uring_cqe_seen</span>(&amp;ring, cqe);</pre>
+  <p>This is the <b>proactor</b> pattern, or completion-based I/O. Windows has had it for decades as I/O completion ports.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Reactor (epoll, kqueue)</th><th>Proactor (io_uring, Windows IOCP)</th></tr></thead>
+      <tbody>
+        <tr><td><b>The kernel tells you</b></td><td>"This descriptor is ready"</td><td>"This operation finished, with this result"</td></tr>
+        <tr><td><b>Who performs the I/O</b></td><td>You, with a system call afterwards</td><td>The kernel, before it tells you</td></tr>
+        <tr><td><b>Disk files</b></td><td>Not covered</td><td>Covered</td></tr>
+        <tr><td><b>System calls per operation</b></td><td>At least one, plus the wait</td><td>A fraction of one, with batching</td></tr>
+        <tr><td><b>Buffers</b></td><td>Supplied at the moment you read</td><td>Handed over at submission, and must stay valid until completion</td></tr>
+        <tr><td><b>Difficulty</b></td><td>Well understood, portable through libraries</td><td>Newer; cancellation and buffer lifetimes need care</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>io_uring is used by newer storage engines and network servers, and by runtimes built around it. It is also a large new surface inside the kernel. Google reported in 2023 that most of the kernel exploits submitted to its bug-bounty programme in the previous year had targeted io_uring, and restricted it on its own systems; some container setups block it by default. For most services epoll is still the right default, and io_uring is what you reach for when measurement shows that system calls or disk I/O are the limit.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Calling blocking code from a handler.</b> A synchronous file read, DNS lookup or database call stops every connection on the loop for its duration.</li>
+      <li><b>Forgetting that computation blocks too.</b> No system call is needed. A 100 ms loop over data is a 100 ms outage for everyone else.</li>
+      <li><b>Assuming async means parallel.</b> A single loop uses one core. More throughput needs more loops or a pool.</li>
+      <li><b>Offloading without a limit.</b> Sending every request to a pool rebuilds thread-per-request. Bound the pool and its queue (<a href="27-thread-pools.html">Chapter 27</a>).</li>
+      <li><b>Freeing a buffer before its io_uring operation completes.</b> The kernel writes into it later. It must outlive the operation.</li>
+      <li><b>Not measuring loop lag.</b> The time between a timer being due and running is the loop's health in one number. Export it.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does a single-threaded server such as Node.js or Redis handle thousands of connections?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>With an event loop over non-blocking sockets. All connections are registered with the kernel's readiness mechanism, epoll on Linux. The single thread calls <code>epoll_wait</code>, which sleeps until some sockets are ready, then runs a short handler for each one: read what has arrived, do a little work, write what can be written, and return. No handler ever waits for I/O; if a socket isn't ready, the handler saves its state and goes back to the loop. Because connections spend nearly all their time idle or waiting on the network, one thread can interleave thousands of them, with no stack per connection and no locks, since only one handler runs at a time. The condition is that every handler is quick. Anything slow, such as a blocking call or heavy computation, has to be moved to a thread pool or broken up, because while it runs nothing else does.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How does io_uring differ from epoll, and when would you choose it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>epoll is readiness-based: it tells you a descriptor can be read or written, and you then make the system call yourself. io_uring is completion-based: you describe the operation, the kernel carries it out, and you are told the result. Its interface is two ring buffers shared between user space and the kernel, a submission queue you fill with requests and a completion queue the kernel fills with results, so many operations can be submitted and reaped with one system call, or with none in polling mode. Two things follow. It handles regular files asynchronously, which epoll can't, because files always look ready and then block. And it cuts system-call overhead for high-rate network I/O. I'd choose it for storage-heavy systems such as databases and object stores, or for servers where profiling shows time going to system-call entry and exit. I'd stay with epoll when portability matters, when the workload is ordinary network serving, or where io_uring is restricted for security reasons, since it has been a frequent source of kernel vulnerabilities.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>An event loop waits for readiness and dispatches short handlers, one at a time, on one thread.</li>
+      <li>State that a thread would keep on its stack lives in a heap object; async/await has the compiler build that state machine.</li>
+      <li>Tasks on a loop yield only when they choose to. One slow handler, blocking or just computing, delays all the others.</li>
+      <li>Fixes: offload to a bounded thread pool, chunk and yield, or run a loop per core.</li>
+      <li>io_uring is completion-based: shared submission and completion rings, batching, and real asynchronous file I/O.</li>
+      <li>Reactor: "it is ready, you do it". Proactor: "it is done, here is the result".</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">An event-loop server calls a function that hashes a password for 150 ms of CPU time inside a request handler. What do the other connections experience?</p>
+      <div class="opts">
+        <button class="opt">Nothing: the kernel preempts the handler</button>
+        <button class="opt">Every connection on that loop is delayed by up to 150 ms</button>
+        <button class="opt">Only connections from the same client are delayed</button>
+        <button class="opt">They are closed</button>
+      </div>
+      <div class="explain">Handlers on a loop are not preempted in favour of each other. Until this one returns, the loop can't get back to <code>epoll_wait</code>.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does a compiler turn an <code>async</code> function into?</p>
+      <div class="opts">
+        <button class="opt">A new operating-system thread</button>
+        <button class="opt">A system call</button>
+        <button class="opt">A function that blocks until all its awaits finish</button>
+        <button class="opt">A state machine: an object holding its local variables and position, resumed by the loop at each await</button>
+      </div>
+      <div class="explain">The state a thread would keep on its stack is stored in the object, so the function can return to the loop and continue later.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why can handlers on a single-threaded event loop usually share data structures without locks?</p>
+      <div class="opts">
+        <button class="opt">Only one handler runs at a time, and it is never interrupted by another</button>
+        <button class="opt">The kernel locks the data for them</button>
+        <button class="opt">Event loops copy all data for each handler</button>
+        <button class="opt">They can't; locks are always needed</button>
+      </div>
+      <div class="explain">There is no interleaving between awaits. The care needed is across an await, where other handlers may run.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In io_uring, how does a program submit operations and learn their results?</p>
+      <div class="opts">
+        <button class="opt">With one <code>read</code> or <code>write</code> system call per operation</button>
+        <button class="opt">By polling each descriptor in turn</button>
+        <button class="opt">Through two ring buffers shared with the kernel: a submission queue and a completion queue</button>
+        <button class="opt">Through signals</button>
+      </div>
+      <div class="explain">Shared rings let a batch of requests be submitted, and results collected, with one system call or none.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which statement describes the proactor (completion) model, as opposed to the reactor (readiness) model?</p>
+      <div class="opts">
+        <button class="opt">"This socket is readable; go and read it"</button>
+        <button class="opt">"The read you asked for is finished; here are the bytes"</button>
+        <button class="opt">"One thread per connection"</button>
+        <button class="opt">"Check every descriptor on every call"</button>
+      </div>
+      <div class="explain">A proactor is told about finished operations. A reactor is told that an operation could now be attempted.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const HEAVY_AT = [100, 350, 600, 850], CHUNK = 5, HOP = 0.05;
+  let B = 50, mode = 'loop';
+  // Run one second of the loop. Events are handled in arrival order; everything is in milliseconds.
+  function simulate(B, mode) {
+    const q = [];
+    for (let t = 1; t < 1000; t += 2) q.push({ t, cost: 0.2, kind: 'n', t0: t });
+    HEAVY_AT.forEach((t) => q.push({ t, kind: 'h', t0: t, rem: B, cost: mode === 'loop' ? B : mode === 'pool' ? HOP : Math.min(CHUNK, B) }));
+    q.sort((a, b) => a.t - b.t);
+    const insert = (e) => { let i = q.length; while (i > 0 && q[i - 1].t > e.t) i--; q.splice(i, 0, e); };
+    const lat = [], red = [], heavy = [];
+    let now = 0;
+    while (q.length) {
+      const e = q.shift(), start = Math.max(now, e.t), end = start + e.cost;
+      now = end;
+      if (e.kind === 'n') { lat.push({ t: e.t0, l: end - e.t0 }); continue; }
+      if (e.kind === 'done') { heavy.push(end - e.t0); continue; }
+      if (mode === 'pool') { insert({ t: start + B, cost: HOP, kind: 'done', t0: e.t0 }); continue; }
+      red.push([start, end]);
+      const rem = e.rem - e.cost;
+      if (mode === 'chunk' && rem > 1e-9) insert({ t: now, kind: 'h', t0: e.t0, rem, cost: Math.min(CHUNK, rem) });
+      else heavy.push(end - e.t0);
+    }
+    const ls = lat.map((x) => x.l).sort((a, b) => a - b);
+    return { lat, red, heavy, median: ls[Math.floor(ls.length / 2)], p99: ls[Math.floor(ls.length * 0.99)], worst: ls[ls.length - 1], busy: red.reduce((a, r) => a + Math.min(1000, r[1]) - Math.min(1000, r[0]), 0) / 10 };
+  }
+  const ms = (x) => x >= 100 ? Math.round(x) + '<small> ms</small>' : x >= 10 ? x.toFixed(0) + '<small> ms</small>' : x.toFixed(1) + '<small> ms</small>';
+  const scale = () => Math.max(...['loop', 'chunk', 'pool'].map((m) => simulate(B, m).worst), 2);
+  function render() {
+    const r = simulate(B, mode), top = scale();
+    $('#evStrip').innerHTML = r.red.filter((x) => x[0] < 1000).map((x) => `<i style="left:${(x[0] / 10).toFixed(2)}%;width:${Math.max(0.15, (Math.min(1000, x[1]) - x[0]) / 10).toFixed(2)}%"></i>`).join('');
+    const buckets = new Array(100).fill(0);
+    r.lat.forEach((x) => { const b = Math.min(99, Math.floor(x.t / 10)); if (x.l > buckets[b]) buckets[b] = x.l; });
+    $('#evBars').innerHTML = buckets.map((v) => `<i class="${v >= 20 ? 'ev-hi' : v >= 2 ? 'ev-mid' : ''}" style="height:${Math.max(2, v / top * 100).toFixed(1)}%" title="${v.toFixed(1)} ms"></i>`).join('');
+    const hv = r.heavy.reduce((a, b) => a + b, 0) / r.heavy.length;
+    let cls, text;
+    if (mode === 'loop') {
+      cls = r.worst >= 20 ? 'ev-bad' : r.worst >= 2 ? 'ev-warn' : 'ev-ok';
+      text = `Each heavy task holds the loop for ${B} ms. Every small request that arrives in that time waits for it to finish, then queues behind the others that arrived first. The worst small request took <b>${r.worst.toFixed(0)} ms</b> for 0.2 ms of work` + (B >= 200 ? ', and because the loop is busy most of the time, even the typical request is slow.' : '.');
+    } else if (mode === 'chunk') {
+      cls = 'ev-warn';
+      text = `The heavy task runs in ${CHUNK} ms pieces and goes to the back of the queue between them, so nothing waits longer than about one piece: the worst small request took <b>${r.worst.toFixed(1)} ms</b>. The same total work still runs on the loop, so the heavy task itself now takes ${hv.toFixed(0)} ms from arrival to finish instead of ${B}.`;
+    } else {
+      cls = 'ev-ok';
+      text = `The loop spends 0.05 ms handing the task to a pool thread and 0.05 ms collecting the result. Meanwhile it keeps serving: the worst small request took <b>${r.worst.toFixed(1)} ms</b>. The heavy task still takes ${hv.toFixed(0)} ms, on another thread and another core.`;
+    }
+    const d = $('#evDesc'); d.className = 'ev-desc ' + cls; d.innerHTML = text;
+    $('#evStats').innerHTML = `<div class="stat"><div class="k">Small requests</div><div class="v">${r.lat.length}</div></div>
+      <div class="stat ${r.median >= 20 ? 'bad' : r.median >= 2 ? 'warn' : 'good'}"><div class="k">Median latency</div><div class="v">${ms(r.median)}</div></div>
+      <div class="stat ${r.p99 >= 20 ? 'bad' : r.p99 >= 2 ? 'warn' : 'good'}"><div class="k">99th percentile</div><div class="v">${ms(r.p99)}</div></div>
+      <div class="stat ${r.worst >= 20 ? 'bad' : r.worst >= 2 ? 'warn' : 'good'}"><div class="k">Worst</div><div class="v">${ms(r.worst)}</div></div>
+      <div class="stat"><div class="k">Heavy task takes</div><div class="v">${ms(hv)}</div></div>
+      <div class="stat ${r.busy >= 50 ? 'bad' : ''}"><div class="k">Loop held by heavy work</div><div class="v">${r.busy.toFixed(0)}%</div></div>`;
+  }
+  $('#evB').addEventListener('segchange', (e) => { B = +e.detail; render(); });
+  $('#evMode').addEventListener('segchange', (e) => { mode = e.detail; render(); });
+  render();
+})();
+</script>
 </body>
 </html>

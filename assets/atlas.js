@@ -37,55 +37,6 @@
 
   var COURSES = [
     {
-      id: 'system-design',
-      title: 'System Design',
-      // A tier fanning out across two services — the shape of every design here.
-      mark: '<rect x="3" y="3" width="18" height="4.5" rx="1.5"/>' +
-            '<path d="M12 7.5v3M4.5 10.5h15M6.75 10.5v3.5M17.25 10.5v3.5"/>' +
-            '<rect x="2.75" y="14" width="8" height="5.5" rx="1.6"/>' +
-            '<rect x="13.25" y="14" width="8" height="5.5" rx="1.6"/>',
-      tagline: 'From "what happens when I type a URL" to multi-region failover.',
-      blurb: 'The vocabulary and the building blocks of every large system — then consensus, stream processing and global scale, finishing with 17 full case studies.',
-      topics: ['Caching', 'Sharding', 'Queues', 'Consensus', 'Multi-region', '17 case studies'],
-      chapters: 50,
-      hours: 36,
-      c1: '#2563eb',
-      c2: '#0891b2',
-      d1: '#60a5fa',
-      d2: '#22d3ee',
-      short: 'System Design',
-      store: 'sd',
-      indexVar: 'SD_INDEX',
-      dir: 'system-design',
-      first: 'p1-how-computers-work.html',
-      dist: 'system-design-course.html',
-      release: null,
-    },
-    {
-      id: 'ml-ai-systems',
-      title: 'ML & AI Systems',
-      // A loss curve descending to its minimum — what "learning" actually is.
-      mark: '<path d="M3.5 3v15.5h17"/>' +
-            '<path d="M6.5 6.2c2.6.3 2.4 9.1 5.6 9.1 2.9 0 3-4.6 5.9-6.3"/>' +
-            '<circle cx="12.1" cy="15.3" r="1.8" fill="currentColor" stroke="none"/>',
-      tagline: 'How learning actually works, up to a 10,000-GPU training run.',
-      blurb: 'Data, gradients and evaluation first; then transformers, RAG, agents, distributed training and serving — and what it takes to keep all of it alive in production.',
-      topics: ['Transformers', 'RAG', 'Agents', 'Distributed training', 'Inference', '12 case studies'],
-      chapters: 60,
-      hours: 45,
-      c1: '#0d9488',
-      c2: '#8b5cf6',
-      d1: '#2dd4bf',
-      d2: '#a78bfa',
-      short: 'ML & AI',
-      store: 'ml',
-      indexVar: 'ML_INDEX',
-      dir: 'ml-ai-systems',
-      first: 'p1-python-for-ml.html',
-      dist: 'ml-ai-systems-course.html',
-      release: null,
-    },
-    {
       id: 'dsa',
       title: 'DSA',
       // A binary tree — the structure half the course is built on.
@@ -108,6 +59,70 @@
       first: 'p1-setup-judges.html',
       dist: 'dsa-course.html',
       release: null,
+    },
+    {
+      id: 'os',
+      title: 'OS & Concurrency',
+      short: 'OS',
+      // A CPU die with its pins: the thing the operating system shares out.
+      mark: '<rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/>' +
+            '<path d="M9 2.5v3.5M15 2.5v3.5M9 18v3.5M15 18v3.5M2.5 9h3.5M2.5 15h3.5M18 9h3.5M18 15h3.5"/>',
+      tagline: 'From "what is a process" to a lock-free queue.',
+      blurb: 'Processes, threads, scheduling, virtual memory and file systems in C, then the concurrency that trips everyone up: locks, deadlock, atomics and event loops.',
+      topics: ['Processes', 'Virtual memory', 'Scheduling', 'Locks & deadlock', 'epoll', '8 case studies'],
+      lang: 'C',
+      chapters: 56,
+      hours: 41,
+      c1: '#dc2626', c2: '#d97706', d1: '#f87171', d2: '#fbbf24',
+      store: 'os',
+      indexVar: 'OS_INDEX',
+      dir: 'os',
+      first: 'p1-c-for-systems.html',
+      dist: 'os-course.html',
+      release: null,
+    },
+    {
+      id: 'networks',
+      title: 'Computer Networks',
+      short: 'Networks',
+      // Three hosts and the links between them.
+      mark: '<circle cx="12" cy="4.5" r="2.5"/><circle cx="4.5" cy="18" r="2.5"/><circle cx="19.5" cy="18" r="2.5"/>' +
+            '<path d="M10.8 6.7L5.7 15.8M13.2 6.7l5.1 9.1M7 18h10"/>',
+      tagline: 'From a single Ethernet frame to a packet crossing the internet.',
+      blurb: 'The TCP/IP stack layer by layer: addressing, routing, TCP, DNS, TLS and HTTP/3, then CDNs, BGP, data-centre networks and debugging with a packet capture.',
+      topics: ['TCP/IP', 'DNS', 'TLS', 'HTTP/2 & 3', 'BGP & CDNs', '8 case studies'],
+      lang: 'Python + CLI',
+      chapters: 56,
+      hours: 40,
+      c1: '#15803d', c2: '#0e7490', d1: '#4ade80', d2: '#22d3ee',
+      store: 'net',
+      indexVar: 'NET_INDEX',
+      dir: 'networks',
+      first: 'p1-bytes-and-encoding.html',
+      dist: 'networks-course.html',
+      release: null,
+    },
+    {
+      id: 'databases',
+      title: 'Database Internals & SQL',
+      short: 'Databases',
+      // A stacked disk: rows at rest.
+      mark: '<ellipse cx="12" cy="5" rx="8" ry="2.8"/><path d="M4 5v14c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8V5"/>' +
+            '<path d="M4 12c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8"/>',
+      tagline: 'From your first JOIN to how MVCC keeps readers and writers apart.',
+      blurb: 'SQL you will actually write, then what happens underneath: pages, B-trees and LSM trees, query plans, WAL, isolation levels, replication and sharding.',
+      topics: ['SQL', 'Indexes', 'Query plans', 'Transactions & MVCC', 'Replication', '8 case studies'],
+      lang: 'SQL + Python',
+      chapters: 56,
+      hours: 42,
+      c1: '#a16207', c2: '#4d7c0f', d1: '#facc15', d2: '#a3e635',
+      store: 'db',
+      indexVar: 'DB_INDEX',
+      dir: 'databases',
+      first: 'p1-tables-and-keys.html',
+      dist: 'databases-course.html',
+      release: null,
+      soon: true,
     },
     {
       id: 'lld',
@@ -134,70 +149,29 @@
       release: null,
     },
     {
-      id: 'os',
-      title: 'OS & Concurrency',
-      short: 'OS',
-      // A CPU die with its pins: the thing the operating system shares out.
-      mark: '<rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/>' +
-            '<path d="M9 2.5v3.5M15 2.5v3.5M9 18v3.5M15 18v3.5M2.5 9h3.5M2.5 15h3.5M18 9h3.5M18 15h3.5"/>',
-      tagline: 'From "what is a process" to a lock-free queue.',
-      blurb: 'Processes, threads, scheduling, virtual memory and file systems in C, then the concurrency that trips everyone up: locks, deadlock, atomics and event loops.',
-      topics: ['Processes', 'Virtual memory', 'Scheduling', 'Locks & deadlock', 'epoll', '8 case studies'],
-      lang: 'C',
-      chapters: 56,
-      hours: 42,
-      c1: '#dc2626', c2: '#d97706', d1: '#f87171', d2: '#fbbf24',
-      store: 'os',
-      indexVar: 'OS_INDEX',
-      dir: 'os',
-      first: 'p1-c-for-systems.html',
-      dist: 'os-course.html',
+      id: 'system-design',
+      title: 'System Design',
+      // A tier fanning out across two services — the shape of every design here.
+      mark: '<rect x="3" y="3" width="18" height="4.5" rx="1.5"/>' +
+            '<path d="M12 7.5v3M4.5 10.5h15M6.75 10.5v3.5M17.25 10.5v3.5"/>' +
+            '<rect x="2.75" y="14" width="8" height="5.5" rx="1.6"/>' +
+            '<rect x="13.25" y="14" width="8" height="5.5" rx="1.6"/>',
+      tagline: 'From "what happens when I type a URL" to multi-region failover.',
+      blurb: 'The vocabulary and the building blocks of every large system — then consensus, stream processing and global scale, finishing with 17 full case studies.',
+      topics: ['Caching', 'Sharding', 'Queues', 'Consensus', 'Multi-region', '17 case studies'],
+      chapters: 50,
+      hours: 36,
+      c1: '#2563eb',
+      c2: '#0891b2',
+      d1: '#60a5fa',
+      d2: '#22d3ee',
+      short: 'System Design',
+      store: 'sd',
+      indexVar: 'SD_INDEX',
+      dir: 'system-design',
+      first: 'p1-how-computers-work.html',
+      dist: 'system-design-course.html',
       release: null,
-      soon: true,
-    },
-    {
-      id: 'networks',
-      title: 'Computer Networks',
-      short: 'Networks',
-      // Three hosts and the links between them.
-      mark: '<circle cx="12" cy="4.5" r="2.5"/><circle cx="4.5" cy="18" r="2.5"/><circle cx="19.5" cy="18" r="2.5"/>' +
-            '<path d="M10.8 6.7L5.7 15.8M13.2 6.7l5.1 9.1M7 18h10"/>',
-      tagline: 'From a single Ethernet frame to a packet crossing the internet.',
-      blurb: 'The TCP/IP stack layer by layer: addressing, routing, TCP, DNS, TLS and HTTP/3, then CDNs, BGP, data-centre networks and debugging with a packet capture.',
-      topics: ['TCP/IP', 'DNS', 'TLS', 'HTTP/2 & 3', 'BGP & CDNs', '8 case studies'],
-      lang: 'Python + CLI',
-      chapters: 56,
-      hours: 40,
-      c1: '#15803d', c2: '#0e7490', d1: '#4ade80', d2: '#22d3ee',
-      store: 'net',
-      indexVar: 'NET_INDEX',
-      dir: 'networks',
-      first: 'p1-bytes-and-encoding.html',
-      dist: 'networks-course.html',
-      release: null,
-      soon: true,
-    },
-    {
-      id: 'databases',
-      title: 'Database Internals & SQL',
-      short: 'Databases',
-      // A stacked disk: rows at rest.
-      mark: '<ellipse cx="12" cy="5" rx="8" ry="2.8"/><path d="M4 5v14c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8V5"/>' +
-            '<path d="M4 12c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8"/>',
-      tagline: 'From your first JOIN to how MVCC keeps readers and writers apart.',
-      blurb: 'SQL you will actually write, then what happens underneath: pages, B-trees and LSM trees, query plans, WAL, isolation levels, replication and sharding.',
-      topics: ['SQL', 'Indexes', 'Query plans', 'Transactions & MVCC', 'Replication', '8 case studies'],
-      lang: 'SQL + Python',
-      chapters: 56,
-      hours: 42,
-      c1: '#a16207', c2: '#4d7c0f', d1: '#facc15', d2: '#a3e635',
-      store: 'db',
-      indexVar: 'DB_INDEX',
-      dir: 'databases',
-      first: 'p1-tables-and-keys.html',
-      dist: 'databases-course.html',
-      release: null,
-      soon: true,
     },
     {
       id: 'distributed-systems',
@@ -242,6 +216,30 @@
       dist: 'cloud-devops-course.html',
       release: null,
       soon: true,
+    },
+    {
+      id: 'ml-ai-systems',
+      title: 'ML & AI Systems',
+      // A loss curve descending to its minimum — what "learning" actually is.
+      mark: '<path d="M3.5 3v15.5h17"/>' +
+            '<path d="M6.5 6.2c2.6.3 2.4 9.1 5.6 9.1 2.9 0 3-4.6 5.9-6.3"/>' +
+            '<circle cx="12.1" cy="15.3" r="1.8" fill="currentColor" stroke="none"/>',
+      tagline: 'How learning actually works, up to a 10,000-GPU training run.',
+      blurb: 'Data, gradients and evaluation first; then transformers, RAG, agents, distributed training and serving — and what it takes to keep all of it alive in production.',
+      topics: ['Transformers', 'RAG', 'Agents', 'Distributed training', 'Inference', '12 case studies'],
+      chapters: 60,
+      hours: 45,
+      c1: '#0d9488',
+      c2: '#8b5cf6',
+      d1: '#2dd4bf',
+      d2: '#a78bfa',
+      short: 'ML & AI',
+      store: 'ml',
+      indexVar: 'ML_INDEX',
+      dir: 'ml-ai-systems',
+      first: 'p1-python-for-ml.html',
+      dist: 'ml-ai-systems-course.html',
+      release: null,
     },
   ];
 
@@ -456,7 +454,14 @@
   function renderMosaic() {
     // Every row gets as many columns as the longest course, so squares match across rows.
     $('#mosaic').style.setProperty('--cols', Math.max.apply(null, LIVE.map(countOf).concat(SOON.map(function (c) { return c.chapters; }))));
-    $('#mosaic').innerHTML = LIVE.map(function (c) {
+    $('#mosaic').innerHTML = COURSES.map(function (c) {
+      // Upcoming courses: one faded square per planned chapter, never filled, never counted.
+      if (c.soon) {
+        return '<div class="mgroup tint soon" style="' + tintVars(c) + '" role="group" aria-label="' + esc(c.title) + ', coming soon">' +
+          '<div class="gh"><span class="nm">' + esc(c.title) + '</span>' +
+          '<span class="rule"></span><span class="ct">Soon</span></div>' +
+          '<div class="mosaic" aria-hidden="true">' + new Array(c.chapters + 1).join('<i></i>') + '</div></div>';
+      }
       var total = countOf(c), d = doneOf(c), next = nextChapter(c), sq = '';
       var chapters = c.data ? c.data.slice().sort(function (a, b) { return a.n - b.n; }) :
         Array.from({ length: total }, function (_, i) { return { n: i + 1 }; });
@@ -471,13 +476,6 @@
         '<div class="gh"><a class="nm" href="' + url(c, 'index.html') + '">' + esc(c.title) + '</a>' +
         '<span class="rule"></span><span class="ct">' + doneCount(c) + '/' + total + '</span></div>' +
         '<div class="mosaic">' + sq + '</div></div>';
-    }).join('') +
-    // Upcoming courses: one faded square per planned chapter, never filled, never counted.
-    SOON.map(function (c) {
-      return '<div class="mgroup tint soon" style="' + tintVars(c) + '" role="group" aria-label="' + esc(c.title) + ', coming soon">' +
-        '<div class="gh"><span class="nm">' + esc(c.title) + '</span>' +
-        '<span class="rule"></span><span class="ct">Soon</span></div>' +
-        '<div class="mosaic" aria-hidden="true">' + new Array(c.chapters + 1).join('<i></i>') + '</div></div>';
     }).join('');
   }
 

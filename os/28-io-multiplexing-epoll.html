@@ -6,34 +6,350 @@
 <title>I/O Multiplexing: select, poll, epoll</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ep-h { margin:14px 0 6px; font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .ep-conns { display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); gap:6px; }
+  @media (max-width:760px) { .ep-conns { grid-template-columns:repeat(4,minmax(0,1fr)); } }
+  .ep-c { display:block; width:100%; text-align:center; border:1.5px solid var(--border); border-radius:10px; padding:7px 4px; background:var(--surface); color:var(--text); font-family:var(--mono); font-size:11.5px; line-height:1.45; min-height:74px; cursor:pointer; transition:.15s; }
+  .ep-c:hover { border-color:var(--border-strong); }
+  .ep-c b { display:block; font-size:13px; }
+  .ep-c span { display:block; color:var(--muted); }
+  .ep-c em { display:block; font-style:normal; font-size:10.5px; font-weight:700; }
+  .ep-c.ep-data { background:color-mix(in srgb, var(--accent-2) 12%, var(--surface)); border-color:var(--accent-2); }
+  .ep-c.ep-ready { background:var(--green-soft); border-color:var(--green); }
+  .ep-c.ep-ready em { color:var(--green); }
+  .ep-c.ep-stuck { background:var(--red-soft); border-color:var(--red); }
+  .ep-c.ep-stuck em { color:var(--red); }
+  .ep-idle { margin-top:8px; font-size:13px; color:var(--muted); }
+  .ep-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .ep-desc.ep-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .ep-desc.ep-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .ep-desc.ep-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="28">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 28</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
     <h1>I/O Multiplexing: <span class="grad">select, poll, epoll</span></h1>
-    <p class="lead">Blocking vs non-blocking I/O, and how one thread watches thousands of sockets with epoll.</p>
+    <p class="lead">A chat server holds 50,000 open connections. At any instant perhaps twenty of them have something to say; the rest are idle. Giving each connection its own thread means 50,000 threads asleep in <code>read()</code>. The alternative is to turn the question round. Instead of each thread asking "is there data on my socket?", one thread asks the kernel "<i>which</i> of my 50,000 sockets have data?" and handles only those. That is <b>I/O multiplexing</b>, and how well the kernel can answer that question decides how many connections one machine can hold. It is the mechanism under nginx, Redis, Node.js, HAProxy and every async runtime.</p>
+    <ul class="objectives">
+      <li>Explain blocking and non-blocking descriptors, and what <code>EAGAIN</code> means</li>
+      <li>Explain why select and poll cost time proportional to the number of connections</li>
+      <li>Describe epoll's interest list and ready list, and write an epoll loop</li>
+      <li>Tell level-triggered from edge-triggered notification, and avoid the edge-triggered stall</li>
+      <li>Say what readiness notification can't do</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>File descriptors, and that sockets are descriptors too.</b> See <a href="10-file-descriptors.html">Chapter 10</a>.</li>
+        <li><b>Blocked threads and wait queues.</b> See <a href="04-process-states-pcb.html">Chapter 4</a>.</li>
+        <li><b>What a thread per task costs.</b> See <a href="27-thread-pools.html">Chapter 27</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Blocking vs non-blocking fds</li>
-    <li>select and poll and their O(n) cost</li>
-    <li>epoll: interest list and ready list</li>
-    <li>Level vs edge triggered</li>
-    <li>The C10K problem</li>
-  </ol>
+  <h2>Blocking I/O, and one thread per connection</h2>
+  <p>By default a descriptor is <b>blocking</b>: <code>read()</code> on a socket with nothing to read puts the thread to sleep until bytes arrive. That makes simple code, one thread per connection, each written as if it were the only one:</p>
+<pre class="code"><span class="k">for</span> (;;) {
+    <span class="t">ssize_t</span> n = <span class="f">read</span>(conn, buf, <span class="k">sizeof</span> buf);     <span class="c">/* sleeps here, perhaps for minutes */</span>
+    <span class="k">if</span> (n &lt;= <span class="m">0</span>) <span class="k">break</span>;
+    <span class="f">handle</span>(conn, buf, n);
+}</pre>
+  <p>It works well up to a few thousand connections. Past that, the costs of Chapter 27 take over: a stack and kernel structures per thread, and a scheduler juggling thousands of threads when a burst of traffic wakes them. In 1999 Dan Kegel named this the <b>C10K problem</b>: how should a server handle ten thousand clients at once? The answer was to stop dedicating a thread to each.</p>
+
+  <h2>Non-blocking descriptors</h2>
+  <p>A descriptor can be switched to <b>non-blocking</b> mode. Then a <code>read()</code> with nothing to read returns at once with the error <code>EAGAIN</code> ("try again later") instead of sleeping.</p>
+<pre class="code"><span class="t">int</span> flags = <span class="f">fcntl</span>(fd, <span class="m">F_GETFL</span>);
+<span class="f">fcntl</span>(fd, <span class="m">F_SETFL</span>, flags | <span class="m">O_NONBLOCK</span>);
+
+<span class="t">ssize_t</span> n = <span class="f">read</span>(fd, buf, <span class="k">sizeof</span> buf);
+<span class="k">if</span> (n &lt; <span class="m">0</span> &amp;&amp; errno == <span class="m">EAGAIN</span>) {
+    <span class="c">/* nothing there right now: go and do something else */</span>
+}</pre>
+  <p>Now one thread <i>can</i> serve many connections, by trying each in turn. But a loop that keeps trying 50,000 sockets, nearly all of which answer <code>EAGAIN</code>, is the busy-wait of Chapter 19 with a system call in it. The thread needs to sleep until <i>any</i> of its descriptors is ready, and then be told which. That service is called <b>readiness notification</b>.</p>
+
+  <h2>select and poll: ask about everything, every time</h2>
+  <p>The original interfaces are <code>select</code> (1983) and <code>poll</code>. You hand the kernel the complete list of descriptors you care about; it sleeps until at least one is ready, and marks which.</p>
+<pre class="code"><span class="k">struct</span> <span class="t">pollfd</span> fds[<span class="m">MAX</span>];                         <span class="c">/* fd and events wanted, for every connection */</span>
+
+<span class="k">for</span> (;;) {
+    <span class="t">int</span> n = <span class="f">poll</span>(fds, nfds, -<span class="m">1</span>);                 <span class="c">/* the whole array goes into the kernel, every call */</span>
+    <span class="k">for</span> (<span class="t">int</span> i = <span class="m">0</span>; i &lt; nfds; i++)               <span class="c">/* and you scan the whole array to find the ready ones */</span>
+        <span class="k">if</span> (fds[i].revents &amp; <span class="m">POLLIN</span>)
+            <span class="f">handle</span>(fds[i].fd);
+}</pre>
+  <p>It works, and it is still fine for a handful of descriptors. The flaw is in the shape of the interface. The kernel keeps nothing between calls, so on <i>every</i> call the full list is copied in, every descriptor on it is checked, and the program then walks the full list again to find the few that were marked. With 50,000 connections and 20 active, each trip does 50,000 units of work to deliver 20 results, and a busy server makes that trip thousands of times a second. <code>select</code> has a further limit: its bitmap is fixed at 1,024 descriptors.</p>
+
+  <h2>epoll: tell the kernel once</h2>
+  <p>Linux's <b>epoll</b> (2002) splits the job into two. You register interest in a descriptor <i>once</i>, and the kernel remembers. Later you ask only for what has become ready.</p>
+  <ul>
+    <li><code>epoll_create1()</code> makes an epoll instance, itself a descriptor.</li>
+    <li><code>epoll_ctl()</code> adds, changes or removes one descriptor in its <b>interest list</b>.</li>
+    <li><code>epoll_wait()</code> sleeps until the <b>ready list</b> is non-empty, then returns its contents.</li>
+  </ul>
+  <figure class="seq" data-actors="Server thread|epoll instance|Socket in the kernel|Network">
+    <ol>
+      <li data-m="0>1">epoll_ctl(ADD, fd 7): "tell me when fd 7 is readable" (once)</li>
+      <li data-m="0>1">epoll_wait(): the ready list is empty, so sleep</li>
+      <li data-m="3>2">a packet for fd 7 arrives</li>
+      <li data-m="2>1">the socket's wake-up hook puts fd 7 on the ready list</li>
+      <li data-m="1>0" data-k="reply">epoll_wait returns [fd 7]</li>
+      <li data-m="0>2">read(fd 7): the data is there, so it doesn't block</li>
+    </ol>
+    <figcaption><b>How epoll finds out.</b> The kernel doesn't scan anything. When data arrives, the socket itself reports to every epoll instance watching it. The 49,999 idle connections cost nothing.</figcaption>
+  </figure>
+<pre class="code"><span class="t">int</span> ep = <span class="f">epoll_create1</span>(<span class="m">0</span>);
+<span class="k">struct</span> <span class="t">epoll_event</span> ev = { .events = <span class="m">EPOLLIN</span>, .data.fd = listen_fd };
+<span class="f">epoll_ctl</span>(ep, <span class="m">EPOLL_CTL_ADD</span>, listen_fd, &amp;ev);
+
+<span class="k">for</span> (;;) {
+    <span class="k">struct</span> <span class="t">epoll_event</span> ready[<span class="m">64</span>];
+    <span class="t">int</span> n = <span class="f">epoll_wait</span>(ep, ready, <span class="m">64</span>, -<span class="m">1</span>);            <span class="c">/* sleep until something is ready */</span>
+
+    <span class="k">for</span> (<span class="t">int</span> i = <span class="m">0</span>; i &lt; n; i++) {                    <span class="c">/* only the ready ones: no scan */</span>
+        <span class="t">int</span> fd = ready[i].data.fd;
+        <span class="k">if</span> (fd == listen_fd) {                        <span class="c">/* a new client */</span>
+            <span class="t">int</span> c = <span class="f">accept4</span>(listen_fd, <span class="m">NULL</span>, <span class="m">NULL</span>, <span class="m">SOCK_NONBLOCK</span>);
+            ev.events = <span class="m">EPOLLIN</span>; ev.data.fd = c;
+            <span class="f">epoll_ctl</span>(ep, <span class="m">EPOLL_CTL_ADD</span>, c, &amp;ev);     <span class="c">/* registered once, for its whole life */</span>
+        } <span class="k">else</span> {                                      <span class="c">/* data from an existing client */</span>
+            <span class="t">char</span> buf[<span class="m">4096</span>];
+            <span class="t">ssize_t</span> len = <span class="f">read</span>(fd, buf, <span class="k">sizeof</span> buf);
+            <span class="k">if</span> (len &lt;= <span class="m">0</span>) { <span class="f">close</span>(fd); <span class="k">continue</span>; }   <span class="c">/* closing also removes it from the epoll set */</span>
+            <span class="f">write</span>(fd, buf, len);                      <span class="c">/* echo it back */</span>
+        }
+    }
+}</pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>select</th><th>poll</th><th>epoll</th></tr></thead>
+      <tbody>
+        <tr><td><b>The kernel remembers your set?</b></td><td>No</td><td>No</td><td>Yes: the interest list</td></tr>
+        <tr><td><b>Work per call</b></td><td>Proportional to all descriptors</td><td>Proportional to all descriptors</td><td>Proportional to the <i>ready</i> descriptors</td></tr>
+        <tr><td><b>Limit</b></td><td>1,024 descriptors</td><td>None</td><td>None</td></tr>
+        <tr><td><b>Portable?</b></td><td>Everywhere</td><td>Every Unix</td><td>Linux only</td></tr>
+        <tr><td><b>Equivalents elsewhere</b></td><td colspan="3">kqueue on the BSDs and macOS; I/O completion ports on Windows. Libraries such as libuv and libevent hide the difference</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Level-triggered and edge-triggered</h2>
+  <p>There are two meanings "ready" can have, and epoll offers both.</p>
+  <ul>
+    <li><b>Level-triggered</b> (the default): a descriptor is reported for as long as it <i>has</i> data. If you read only part of what is there, the next <code>epoll_wait</code> reports it again. Forgiving, and exactly how <code>select</code> and <code>poll</code> behave.</li>
+    <li><b>Edge-triggered</b> (<code>EPOLLET</code>): a descriptor is reported when it <i>becomes</i> ready, once. The kernel won't mention it again until more data arrives.</li>
+  </ul>
+  <p>Edge-triggered mode produces fewer wake-ups, which matters when several threads share one epoll instance. It comes with a strict rule: <b>when a descriptor is reported, read until you get <code>EAGAIN</code></b>. If you take one buffer's worth and go back to waiting, the rest of the data stays in the kernel, the edge has already passed, and the connection stalls, possibly for ever if the client is itself waiting for your reply.</p>
+<pre class="code"><span class="c">/* Edge-triggered: drain the socket completely each time it is reported. */</span>
+<span class="k">for</span> (;;) {
+    <span class="t">ssize_t</span> len = <span class="f">read</span>(fd, buf, <span class="k">sizeof</span> buf);
+    <span class="k">if</span> (len &gt; <span class="m">0</span>) { <span class="f">consume</span>(fd, buf, len); <span class="k">continue</span>; }
+    <span class="k">if</span> (len &lt; <span class="m">0</span> &amp;&amp; errno == <span class="m">EAGAIN</span>) <span class="k">break</span>;        <span class="c">/* empty: safe to wait again */</span>
+    <span class="f">close</span>(fd); <span class="k">break</span>;                             <span class="c">/* 0 = the peer closed; otherwise a real error */</span>
+}</pre>
+
+  <h2>Be the event loop</h2>
+  <p>Eight active connections, plus as many idle ones as you choose. Click a connection to make 200 bytes arrive on it. Then call the wait function and handle what it returns. Compare what each call costs with 100,000 idle connections, then make edge-triggered mode lose data by reading only once.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One thread, many sockets</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="epMode"><button data-v="select">select / poll</button><button class="active" data-v="lt">epoll, level-triggered</button><button data-v="et">epoll, edge-triggered</button></div>
+        <div class="seg" id="epIdle"><button data-v="0">no idle connections</button><button data-v="1000">+ 1,000 idle</button><button class="active" data-v="100000">+ 100,000 idle</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="epWait">Call the wait function</button>
+        <div class="seg" id="epRead"><button class="active" data-v="once">read once (100 bytes)</button><button data-v="drain">read until EAGAIN</button></div>
+        <button class="btn sm primary" id="epHandle">Handle what it returned</button>
+        <button class="btn sm" id="epReset">↺ Reset</button>
+      </div>
+      <div class="ep-h">Active connections (click one: 200 bytes arrive)</div>
+      <div class="ep-conns" id="epConns"></div>
+      <div class="ep-idle" id="epIdleNote"></div>
+      <div class="ep-desc" id="epDesc"></div>
+      <div class="stats" id="epStats"></div>
+    </div>
+    <div class="panel-foot">"Descriptors examined" counts the work the kernel does to answer each wait call: every registered descriptor for select and poll, only the ready ones for epoll. Green means "returned by the last wait call, not yet handled". Red means data is sitting in the socket and nothing will report it.</div>
+  </div>
+
+  <p>Things to notice. With 100,000 idle connections, each <code>select</code> call examines 100,008 descriptors to find the one or two you clicked, and <code>epoll</code> examines one or two. In level-triggered mode, reading once is safe: whatever is left is reported again on the next call. In edge-triggered mode, read once and call wait again: the connection turns red, with 100 bytes that nobody will ever be told about unless the client happens to send more. Switch to "read until EAGAIN" and the problem can't occur.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🌐</div>
+    <div class="body"><div class="title">C10K: the web page that changed how servers are built</div><p>In 1999 a typical web server ran a process or a thread per connection, and hardware had just become able to serve far more clients than that design could hold. Dan Kegel collected the options on a page titled "The C10K problem", and laid out the argument that the limit was the operating system's interface, not the machine: <code>select</code> and <code>poll</code> spent their time re-examining idle connections. The page became a reference point for kernel and server developers. Within three years FreeBSD had kqueue and Linux had epoll, both built on the idea in this chapter, that the kernel should remember what you are interested in and report only changes. A generation of servers followed that used one event loop per core instead of a thread per client: nginx, written by Igor Sysoev for a busy Russian web portal and released in 2004, then lighttpd, HAProxy, memcached, Redis and Node.js. Today a single ordinary server holding a million idle connections is unremarkable, and what limits it is memory per connection, not the cost of finding out who is ready.</p></div>
+  </div>
+
+  <h2>What readiness can't do</h2>
+  <ul>
+    <li><b>Regular files are always "ready".</b> Readiness is about whether a call would have to wait for the other side. A disk file has no other side, so epoll reports it readable at once, and the <code>read()</code> then blocks for a disk seek all the same. Event-driven servers hand file I/O to a thread pool (<a href="27-thread-pools.html">Chapter 27</a>) or use io_uring (<a href="29-event-loops-io-uring.html">Chapter 29</a>).</li>
+    <li><b>It doesn't do the I/O.</b> You are told a socket is readable; you still make a <code>read</code> system call for each one. At very high rates those calls are the cost, which io_uring also addresses.</li>
+    <li><b>One slow handler stalls everyone.</b> While the loop's thread is computing for one connection, the other 49,999 wait. The next chapter is about living with that.</li>
+  </ul>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Edge-triggered without draining.</b> Read (or accept, or write) until <code>EAGAIN</code>, every time, or connections will stall.</li>
+      <li><b>Blocking descriptors under an event loop.</b> A readiness report can be out of date by the time you read. With a blocking socket, that hangs the whole loop. Always use <code>O_NONBLOCK</code>.</li>
+      <li><b>Asking for writability all the time.</b> A socket is nearly always writable, so a level-triggered loop spins at 100% CPU. Register for <code>EPOLLOUT</code> only while you have data waiting to go.</li>
+      <li><b>Assuming one read is one message.</b> TCP delivers a byte stream. A request may arrive in pieces or several may arrive together; buffer and parse.</li>
+      <li><b>Using select in new code with many descriptors.</b> A descriptor number above 1,023 overflows its bitmap.</li>
+      <li><b>Expecting epoll to make file reads asynchronous.</b> It doesn't. Disk I/O still blocks.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why is epoll faster than select for a server with many connections?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because of how much work each call does. With <code>select</code> or <code>poll</code> the kernel has no memory of your descriptors, so every call passes the entire set in, the kernel checks every one, and then the program scans the entire set again to find which were marked ready. That is proportional to the total number of connections, on every call, even if only one is active. With epoll you register each descriptor once using <code>epoll_ctl</code>, and the kernel keeps that interest list. When data arrives on a socket, the socket adds itself to the epoll instance's ready list through a callback. <code>epoll_wait</code> just returns that list, so the work is proportional to the number of ready descriptors. For ten thousand mostly idle connections that is the difference between examining ten thousand entries and examining a handful, thousands of times a second. <code>select</code> also has a hard limit of 1,024 descriptors.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> What is the difference between level-triggered and edge-triggered epoll, and what must an edge-triggered program do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Level-triggered reports a descriptor whenever its condition holds: while unread data remains, every <code>epoll_wait</code> returns it. Edge-triggered reports only the transition: when new data arrives on a socket, you are told once, and not again until more arrives. So with edge-triggering the program must consume everything available when notified: use non-blocking descriptors and loop on <code>read</code>, or <code>accept</code>, or <code>write</code>, until it returns <code>EAGAIN</code>. If it reads only part and returns to <code>epoll_wait</code>, the remaining bytes sit in the kernel buffer with no further notification, and the connection hangs. Edge-triggering reduces redundant wake-ups, which helps when several threads wait on one epoll instance, usually together with <code>EPOLLONESHOT</code> or <code>EPOLLEXCLUSIVE</code> so only one thread handles a given event. The price is that draining loop, and care that one very busy connection doesn't starve the others while it is being drained.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>One thread per connection stops scaling at thousands of connections; the alternative is one thread watching many descriptors.</li>
+      <li>Non-blocking descriptors return <code>EAGAIN</code> instead of sleeping; readiness notification says which descriptors are worth trying.</li>
+      <li>select and poll re-examine every descriptor on every call: work proportional to the total.</li>
+      <li>epoll keeps an interest list in the kernel and returns a ready list: work proportional to the active connections.</li>
+      <li>Level-triggered repeats while data remains; edge-triggered reports once, so you must read until <code>EAGAIN</code>.</li>
+      <li>Readiness doesn't cover disk files or CPU-heavy handlers; both still block the loop.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A socket is in non-blocking mode and has no data waiting. What does <code>read()</code> do?</p>
+      <div class="opts">
+        <button class="opt">Sleeps until data arrives</button>
+        <button class="opt">Returns 0</button>
+        <button class="opt">Returns -1 at once, with <code>errno</code> set to <code>EAGAIN</code></button>
+        <button class="opt">Closes the socket</button>
+      </div>
+      <div class="explain"><code>EAGAIN</code> means "nothing now, try later". A return of 0 means something different: the peer has closed the connection.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A server has 20,000 connections, of which 5 have data. Roughly how much work does one <code>poll()</code> call cause, compared with one <code>epoll_wait()</code>?</p>
+      <div class="opts">
+        <button class="opt">poll examines all 20,000; epoll_wait returns just the 5</button>
+        <button class="opt">Both examine all 20,000</button>
+        <button class="opt">Both examine only the 5</button>
+        <button class="opt">poll examines 1,024; epoll_wait examines 20,000</button>
+      </div>
+      <div class="explain">poll receives and checks the whole set on every call. epoll's ready list already holds exactly the descriptors with events.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Which call tells epoll which descriptors you are interested in?</p>
+      <div class="opts">
+        <button class="opt"><code>epoll_wait</code>, on every call</button>
+        <button class="opt"><code>epoll_create1</code></button>
+        <button class="opt"><code>fcntl</code></button>
+        <button class="opt"><code>epoll_ctl</code>, once per descriptor</button>
+      </div>
+      <div class="explain">Registration is separate from waiting. That is the whole design: say it once, and the kernel remembers.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">An edge-triggered epoll server reads 4,096 bytes from a socket that held 10,000 and then calls <code>epoll_wait</code> again. What happens to the other 5,904 bytes?</p>
+      <div class="opts">
+        <button class="opt">They are reported on the next <code>epoll_wait</code></button>
+        <button class="opt">They stay in the socket unreported until more data arrives on that connection</button>
+        <button class="opt">They are discarded</button>
+        <button class="opt">The kernel delivers them to another thread</button>
+      </div>
+      <div class="explain">The edge, "became readable", has already been reported. Edge-triggered code must read until <code>EAGAIN</code>.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why doesn't epoll help with reading large files from disk?</p>
+      <div class="opts">
+        <button class="opt">Files can't be opened in non-blocking mode</button>
+        <button class="opt">epoll only supports 1,024 descriptors</button>
+        <button class="opt">A regular file always counts as ready, so the read is attempted and blocks on the disk anyway</button>
+        <button class="opt">Disk reads never block</button>
+      </div>
+      <div class="explain">Readiness describes waiting for a peer. Disk I/O needs a thread pool or a true asynchronous interface such as io_uring.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const NAME = { select: 'select()', lt: 'epoll_wait()', et: 'epoll_wait()' };
+  let mode = 'lt', idle = 100000, style = 'once', c, ready, st, last;
+  const f0 = (x) => x.toLocaleString('en-GB');
+  function reset() { c = []; for (let i = 0; i < 8; i++) c.push({ fd: 5 + i, buf: 0, edge: false }); ready = []; st = { waits: 0, examined: 0, read: 0 }; last = null; }
+  const stuck = (x) => mode === 'et' && x.buf > 0 && !x.edge && !ready.includes(x.fd);
+  function arrive(i) {
+    const x = c[i]; x.buf += 200; x.edge = true;
+    last = { cls: '', text: `200 bytes arrive on fd ${x.fd}. ` + (mode === 'select' ? 'The kernel queues them in the socket. Nothing else happens until the server next asks about every descriptor.' : `The kernel queues them in the socket, and the socket puts fd ${x.fd} on the epoll instance's <b>ready list</b>.`) };
+  }
+  function wait() {
+    const total = idle + 8;
+    const rs = c.filter((x) => mode === 'et' ? x.edge : x.buf > 0);
+    st.waits++;
+    if (!rs.length) {
+      const lost = c.filter(stuck);
+      if (mode === 'select') st.examined += total;
+      last = { cls: lost.length ? 'ep-bad' : 'ep-warn', text: `<code>${NAME[mode]}</code> finds nothing ready` + (mode === 'select' ? ` after examining all ${f0(total)} descriptors` : '') + ', so the thread goes to sleep until something arrives.' + (lost.length ? ` <b>But fd ${lost.map((x) => x.fd).join(', ')} still ${lost.length > 1 ? 'have' : 'has'} unread data.</b> In edge-triggered mode it was reported once already and won't be again. If the client is waiting for a reply, this connection is now stuck.` : '') };
+      ready = []; return;
+    }
+    ready = rs.map((x) => x.fd);
+    if (mode === 'et') rs.forEach((x) => { x.edge = false; });
+    const cost = mode === 'select' ? total : rs.length; st.examined += cost;
+    last = { cls: 'ep-ok', text: `<code>${NAME[mode]}</code> returns <b>fd ${ready.join(', ')}</b>. ` + (mode === 'select' ? `To find ${rs.length === 1 ? 'it' : 'them'}, the kernel examined <b>all ${f0(total)}</b> descriptors, and the program must now scan the same ${f0(total)} entries to see which were marked.` : `The kernel just handed over its ready list: <b>${rs.length} descriptor${rs.length > 1 ? 's' : ''}</b>.` + (idle ? ` The ${f0(idle)} idle connections cost nothing.` : '')) + (mode === 'et' ? ' Edge-triggered: these will not be reported again until more data arrives.' : '') };
+  }
+  function handle() {
+    if (!ready.length) { last = { cls: '', text: 'There is nothing to handle: call the wait function first.' }; return; }
+    const left = [];
+    ready.forEach((fd) => { const x = c.find((y) => y.fd === fd), n = style === 'once' ? Math.min(100, x.buf) : x.buf; x.buf -= n; st.read += n; if (x.buf > 0) left.push(x); });
+    const did = ready.slice(); ready = [];
+    let text = `The server reads from fd ${did.join(', ')}` + (style === 'once' ? ', one <code>read()</code> of up to 100 bytes each.' : ', looping on <code>read()</code> until it returns <code>EAGAIN</code>: the sockets are empty.');
+    let cls = 'ep-ok';
+    if (left.length) {
+      const fds = left.map((x) => `fd ${x.fd} (${x.buf} bytes)`).join(', ');
+      if (mode === 'et') { text += ` <b>Data is left on ${fds}.</b> Edge-triggered epoll has already reported it and will stay silent until new bytes arrive.`; cls = 'ep-bad'; }
+      else text += ` Data is left on ${fds}. That is fine here: a level-triggered wait will report ${left.length > 1 ? 'them' : 'it'} again.`;
+    }
+    last = { cls, text };
+  }
+  function render() {
+    $('#epConns').innerHTML = c.map((x, i) => {
+      const isReady = ready.includes(x.fd), bad = stuck(x);
+      return `<button class="ep-c ${bad ? 'ep-stuck' : isReady ? 'ep-ready' : x.buf ? 'ep-data' : ''}" data-i="${i}"><b>fd ${x.fd}</b><span>${x.buf ? x.buf + ' B unread' : 'empty'}</span><em>${bad ? 'unreported' : isReady ? 'returned' : mode === 'et' && x.edge ? 'on ready list' : mode === 'lt' && x.buf ? 'on ready list' : '&nbsp;'}</em></button>`;
+    }).join('');
+    $('#epIdleNote').textContent = idle ? `plus ${f0(idle)} idle connections with nothing to read` : 'no other connections';
+    $('#epWait').textContent = 'Call ' + NAME[mode];
+    const d = $('#epDesc');
+    d.className = 'ep-desc ' + (last ? last.cls : '');
+    d.innerHTML = last ? last.text : `All ${f0(idle + 8)} connections are quiet. Click a connection to deliver some data, then call the wait function.`;
+    const lost = c.filter(stuck).reduce((a, x) => a + x.buf, 0);
+    $('#epStats').innerHTML = `<div class="stat"><div class="k">Wait calls</div><div class="v">${st.waits}</div></div>
+      <div class="stat ${mode === 'select' && st.examined > 1000 ? 'bad' : 'acc'}"><div class="k">Descriptors examined</div><div class="v" style="font-size:19px">${f0(st.examined)}</div></div>
+      <div class="stat good"><div class="k">Bytes read</div><div class="v">${f0(st.read)}</div></div>
+      <div class="stat ${lost ? 'bad' : ''}"><div class="k">Bytes stuck</div><div class="v">${f0(lost)}</div></div>`;
+  }
+  $('#epConns').addEventListener('click', (e) => { const b = e.target.closest('.ep-c'); if (!b) return; arrive(+b.dataset.i); render(); });
+  $('#epWait').onclick = () => { wait(); render(); };
+  $('#epHandle').onclick = () => { handle(); render(); };
+  $('#epReset').onclick = () => { reset(); render(); };
+  $('#epMode').addEventListener('segchange', (e) => { mode = e.detail; reset(); render(); });
+  $('#epIdle').addEventListener('segchange', (e) => { idle = +e.detail; reset(); render(); });
+  $('#epRead').addEventListener('segchange', (e) => { style = e.detail; });
+  reset(); render();
+})();
+</script>
 </body>
 </html>
