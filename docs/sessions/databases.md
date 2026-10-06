@@ -55,3 +55,4 @@
 - DB 29: Time-Series Storage: Gorilla encoder on real bits (delta-of-delta timestamps, XOR values) for steady, slow-moving and noisy series
 - DB 30: NoSQL Families: one blogging site in five data models, with seven needs rated natural, workable or awkward for each
 - DB 31: Search & Inverted Indexes: live search over six titles (analyser levels, posting lists, real BM25 scores)
+- DB 32: Vector Databases: 150 vectors in eight k-means lists, exact search vs IVF with 1, 2 or 4 lists probed, recall and a movable query
