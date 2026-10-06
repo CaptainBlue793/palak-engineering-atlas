@@ -66,3 +66,4 @@
   - Ch 26 Lock-Free Data Structures (35 KB): Treiber-stack stepper (thread 1 pops in three steps while thread 2 pops, frees and pushes back) reproducing ABA and the read of a freed node, with plain CAS or pointer + version
   - Ch 27 Thread Pools & Work Stealing (30 KB): pool-sizing explorer on 4 cores (CPU-bound or I/O-bound tasks, 1-128 threads, arrival rate, bounded or unbounded queue) showing capacity, CPU use, latency, rejections and what each thread is doing
   - Ch 28 I/O Multiplexing (32 KB): be-the-event-loop panel (8 active connections plus 0 / 1,000 / 100,000 idle; select-poll, level-triggered or edge-triggered epoll; read once or until EAGAIN) counting descriptors examined and showing the edge-triggered stall
+  - Ch 29 Event Loops & io_uring (32 KB): one-second event-loop simulation (500 small requests plus four heavy tasks of 5, 50 or 200 ms; run on the loop, chunked, or handed to a thread pool) with a loop-busy strip, a latency chart and percentiles
