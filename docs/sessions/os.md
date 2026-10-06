@@ -57,3 +57,4 @@
   - Ch 19 Condition Variables (34 KB): three-thread stepper (two workers, one producer) with three waiting styles (no mutex / if / while), reproduces the lost wake-up and the stale-condition bug, and counts every schedule (1,750 / 24 / 24)
   - Ch 20 Semaphores (30 KB): one-semaphore simulator (start at 0, 1 or 3; threads wait, post, return early without posting, or post without waiting) showing the value, who is inside and who sleeps
   - Ch 21 Classic Problems (36 KB): dining-philosophers table (left-then-right, lower fork first, four seats, try-and-back-off; step one philosopher, all at once, or 300 random steps) showing deadlock and livelock; links to LLD Ch 23 for the Java producer-consumer
+  - Ch 22 Deadlock (33 KB): banker's algorithm on the textbook 5-process, 3-resource state (step-by-step safety check, three preset requests that are granted / must wait / refused as unsafe, and free-form requests)
