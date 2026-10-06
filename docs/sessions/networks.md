@@ -62,3 +62,4 @@
 - Ch 37 Packet-Level Debugging: six tcpdump captures to diagnose (dropped SYN, closed port, loss, zero window, slow server, idle reset)
 - Ch 38 Internet Latency Budgets: time-to-first-byte budget (distance, protocol, connection state, server time) against the cold TLS 1.2 case
 - Ch 39 Software-Defined Networking: OpenFlow flow table with a controller (reactive vs proactive entries, controller up or down)
+- Ch 40 Networking Interview Playbook: twelve true-or-trap statements with explanations and chapter links
