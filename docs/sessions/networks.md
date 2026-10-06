@@ -57,3 +57,4 @@
 - Ch 32 Service Mesh & mTLS: retry-amplification panel (gateway > web > orders > inventory; inventory healthy, failing half, or down; 0 / 1 / 3 retries; every layer, edge only, or every layer with a 20% retry budget) showing requests per user request at each service and the user's success rate
 - Ch 33 TCP Performance: write-write-read timeline (one or two writes; Nagle or TCP_NODELAY; delayed or immediate ACKs; 1 / 20 / 100 ms round trip) showing each segment, the 40 ms stall, time spent waiting and packets sent
 - Ch 34 Kernel Networking: one-core receive-path model (10 thousand to 10 million packets a second; interrupt per packet, NAPI, or kernel bypass; 1 / 4 / 8 RSS queues) showing where each core's time goes, packets delivered and dropped, interrupts, and receive livelock
+- Ch 35 Firewalls, iptables & Security Groups: first-match rule list judged against six packets (state rule, drop-all at top, policy)
