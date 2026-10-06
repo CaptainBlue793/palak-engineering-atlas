@@ -68,3 +68,4 @@
 - Ch 43 Case Study: A CDN Serves a Viral Video: cache-stampede model for a new live segment (viewers, coalescing, origin shield)
 - Ch 44 Case Study: Facebook's 2021 BGP Outage: dependency model (backbone, DNS self-withdrawal, out-of-band repair path) over eight components
 - Ch 45 Case Study: The 2016 Dyn DNS Attack: share of users still resolving a name through a 130-minute outage (TTL, second provider, serve-stale)
+- Ch 46 Case Study: Load-Balancer Failover: 36 seconds after a backend dies (crash or freeze, check interval, passive ejection, retries)
