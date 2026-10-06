@@ -6,33 +6,285 @@
 <title>DNS in Depth: DNSSEC, GeoDNS &amp; Failover</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('net-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .df-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .df-row > span { font-size:12.5px; color:var(--muted); min-width:140px; }
+  .df-chart { margin-top:14px; border:1px solid var(--border); border-radius:12px; background:var(--surface); padding:8px 8px 2px; }
+  .df-chart svg { display:block; width:100%; height:auto; }
+  .df-chart text { font-size:11px; fill:var(--muted); font-family:var(--mono); }
+  .df-chart .df-area { fill:var(--red); opacity:.3; }
+  .df-chart .df-line { fill:none; stroke:var(--red); stroke-width:2; }
+  .df-chart .df-grid { stroke:var(--border); stroke-width:1; }
+  .df-chart .df-mark { stroke:var(--accent); stroke-width:1.5; stroke-dasharray:5 4; }
+  .df-chart .df-lbl { fill:var(--accent); font-family:inherit; font-weight:600; }
+  .df-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent); min-height:66px; }
+</style>
 </head>
 <body data-chapter="27">
-<!-- net:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 27</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>DNS in Depth: <span class="grad">DNSSEC, GeoDNS &amp; Failover</span></h1>
-    <p class="lead">Signed zones, geographic answers, low TTLs for failover, and DNS over HTTPS.</p>
+    <p class="lead"><a href="10-dns-resolution.html">Chapter 10</a> treated DNS as a lookup service: ask for a name, get an address. In production it does three more jobs. It is a <b>traffic director</b>, giving different answers to different users so that each reaches a nearby or healthy data centre. It is a <b>failover switch</b>, the thing you change when a region dies. And it is a <b>target</b>, because whoever can forge its answers can send your users anywhere. Each of those has its own mechanism, and each is limited by the same fact from Chapter 10: every answer is cached, by machines you don't control, for as long as its TTL says. This chapter covers signing DNS answers, steering traffic with them, failing over through them, and hiding the questions from the network.</p>
+    <ul class="objectives">
+      <li><span>Explain how DNSSEC lets a resolver verify an answer, and how it fails</span></li>
+      <li><span>Describe how an authoritative server gives different answers by location, latency or weight</span></li>
+      <li><span>Work out how long a DNS failover takes from the health check and the TTL</span></li>
+      <li><span>Distinguish DNSSEC from encrypted DNS, and say what each protects</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + CLI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Resolvers, authoritative servers, delegation and TTLs:</b> <a href="10-dns-resolution.html">Chapter 10</a>.</li>
+        <li><b>Signatures and chains of trust:</b> <a href="17-tls-1-3.html">Chapter 17</a>.</li>
+        <li><b>Steering users by DNS or by anycast:</b> <a href="26-anycast-cdn.html">Chapter 26</a>. <b>Health checks:</b> <a href="24-load-balancers-l4-l7.html">Chapter 24</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>DNSSEC chain of trust</li>
-    <li>GeoDNS and latency routing</li>
-    <li>Failover and TTL trade-offs</li>
-    <li>DoH and DoT</li>
-  </ol>
+  <h2>DNSSEC: a chain of trust</h2>
+  <p>A classic DNS answer is a UDP datagram with nothing to prove where it came from. A resolver accepts the first reply that matches its question's 16-bit ID and source port. In 2008 Dan Kaminsky showed how to win that guessing game reliably and plant a false record in a resolver's cache, so that everyone using the resolver would be sent to an attacker's server for a chosen name. Resolvers were hurriedly patched to randomise their source ports, which makes the guess much harder. It doesn't make the answer verifiable.</p>
+  <p><b>DNSSEC</b> does. The owner of a zone signs its records, and a resolver checks the signatures. It adds four record types:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Record</th><th>Holds</th><th>Lives in</th></tr></thead>
+      <tbody>
+        <tr><td><b>RRSIG</b></td><td>A signature over one set of records, with a validity period</td><td>The zone, next to the records it signs</td></tr>
+        <tr><td><b>DNSKEY</b></td><td>The zone's public keys</td><td>The zone</td></tr>
+        <tr><td><b>DS</b></td><td>A hash of the child zone's key</td><td>The <i>parent</i> zone, next to the NS records that delegate to the child</td></tr>
+        <tr><td><b>NSEC / NSEC3</b></td><td>A signed statement of which names exist, so that "no such name" can be proved too</td><td>The zone</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The DS record is what joins zones into a chain, in the same way that certificates chain to a root (<a href="17-tls-1-3.html">Chapter 17</a>):</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>The root's public key</b> built into every validating resolver</li>
+      <li data-k="step"><b>Root zone</b> signs a DS record: "the key of <code>com</code> has this hash"</li>
+      <li data-k="step"><b>com zone</b> its DNSKEY matches that hash, and it signs a DS record for <code>example.com</code></li>
+      <li data-k="step"><b>example.com zone</b> its DNSKEY matches, and it signs the A record for <code>www</code></li>
+      <li data-k="decision"><b>Every signature verifies and is in date?</b> the answer is authentic, and the resolver marks it so</li>
+      <li data-k="fail"><b>Any link fails?</b> the resolver returns SERVFAIL. It doesn't fall back to the unsigned answer</li>
+    </ol>
+    <figcaption><b>Validating one answer.</b> The resolver follows the same delegations as in Chapter 10, checking a signature at each step. The last line is the important one: to a validating resolver a broken signature looks exactly like an attack, so the name stops resolving.</figcaption>
+  </figure>
+<pre class="code">$ dig +dnssec www.example.com
+;; flags: qr rd ra <span class="k">ad</span>; QUERY: 1, ANSWER: 2          <span class="c"># ad = "authenticated data": the resolver validated the chain</span>
+www.example.com.   300  IN  A      93.184.216.34
+www.example.com.   300  IN  <span class="k">RRSIG</span>  A 13 3 300 20261105000000 20261015000000 31406 example.com. oJB1W6WNGv+ldvQ3…
+
+$ dig +short DS example.com @a.gtld-servers.net             <span class="c"># the link held by the parent</span>
+31406 13 2 3490A6806D47F17A34C29E2CE80E8A999FFBE4BE…
+
+$ dig www.dnssec-failed.org | grep status                    <span class="c"># a zone signed wrongly on purpose, for testing</span>
+;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: <span class="k">SERVFAIL</span></pre>
+  <p>Be clear about what this buys. DNSSEC proves that an answer is what the zone's owner published. It encrypts nothing, so anyone on the path can still read the question and the answer. And it adds a way to break your own domain: let a signature expire, publish a key that doesn't match the DS record, or remove the signatures while a DS record still says they should be there, and every validating resolver, which is roughly a third of the world's users, refuses to resolve the name.</p>
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Slack, September 2021: a rollback that the caches didn't follow</div><p>On 30 September 2021 Slack began signing <code>slack.com</code> with DNSSEC, the last step of a careful rollout that had already covered its other domains. The DS record went into the <code>.com</code> zone, and almost at once some users reported that they couldn't resolve Slack's names. The cause was a subtle fault in how their DNS provider answered for a wildcard record under DNSSEC, though that wasn't known yet, and the on-call engineers did what incident training says to do: undo the last change. They had the DS record removed from <code>.com</code> and switched signing off. That turned a small problem into a large one. Resolvers all over the world had already fetched the DS record, and it had a TTL of 24 hours. For as long as a resolver held it, the resolver believed <code>slack.com</code> was a signed zone. It now received answers with no signatures at all, which is precisely what a forgery looks like, and returned SERVFAIL. Slack was unreachable for a large share of users for most of a day, until the cached DS records expired, and the engineers had no means of making other people's resolvers forget them. Their own account of the incident is unusually clear on the point. In DNS, a rollback changes what you publish and doesn't touch what has been cached, and with DNSSEC the old cached state doesn't merely give a stale answer: it invalidates the new one.</p></div>
+  </div>
+
+  <h2>GeoDNS and latency routing</h2>
+  <p>An authoritative server is a program, and nothing obliges it to give everyone the same answer. A managed DNS service can choose its answer by looking at who is asking:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Policy</th><th>The answer depends on</th><th>Used for</th></tr></thead>
+      <tbody>
+        <tr><td><b>Geolocation</b></td><td>The country or region of the resolver's address</td><td>Legal and language requirements: users in Germany get the Frankfurt site</td></tr>
+        <tr><td><b>Latency-based</b></td><td>Measured latency from the resolver's network to each region</td><td>Speed: each user gets the region that is fastest for them</td></tr>
+        <tr><td><b>Weighted</b></td><td>Chance, in proportions you set</td><td>Shifting 5% of traffic to a new region or a new version</td></tr>
+        <tr><td><b>Failover</b></td><td>Health checks on the primary</td><td>Switching to a standby when the primary stops answering</td></tr>
+        <tr><td><b>Multi-value</b></td><td>Health checks; several addresses are returned</td><td>Simple spreading over a few servers</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code">$ dig +short api.shop.example @ns1.dns-provider.example     <span class="c"># asked from Frankfurt</span>
+18.184.20.7                                                  <span class="c"># the eu-central region</span>
+$ dig +short api.shop.example @ns1.dns-provider.example     <span class="c"># the same question from Oregon</span>
+44.230.11.3                                                  <span class="c"># the us-west region</span>
+
+$ dig +short api.shop.example +subnet=203.0.113.0/24 @8.8.8.8   <span class="c"># a resolver passing on part of the client's address</span></pre>
+  <p>The limits are the ones from <a href="26-anycast-cdn.html">Chapter 26</a>. The server sees the <i>resolver</i>, not the user, unless the resolver forwards part of the client's address in the query. Location databases are sometimes wrong. And each answer is then cached for its TTL, so any steering decision is really a decision about the next few minutes of everyone behind that resolver.</p>
+
+  <h2>Failover and the TTL trade-off</h2>
+  <p>DNS failover is simple to describe. A health checker probes the primary region, and when it fails, the authoritative servers start answering with the standby's address. How long users are actually affected is the sum of two delays that people tend to underestimate: the time to <b>notice</b>, and the time for caches to <b>forget</b>.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A region dies: how long until users are moved?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="df-row"><span>TTL of the record</span><div class="seg" id="dfTtl"><button data-v="30">30 seconds</button><button class="active" data-v="300">5 minutes</button><button data-v="3600">1 hour</button></div></div>
+      <div class="df-row"><span>Health check</span><div class="seg" id="dfHc"><button class="active" data-v="30">every 10 s, 3 failures</button><button data-v="90">every 30 s, 3 failures</button></div></div>
+      <div class="df-row"><span>Clients that ignore the TTL</span><div class="seg" id="dfBad"><button class="active" data-v="0">none</button><button data-v="5">5% of them</button></div></div>
+      <div class="df-chart" id="dfChart"></div>
+      <div class="df-desc" id="dfDesc"></div>
+      <div class="stats" id="dfStats"></div>
+    </div>
+    <div class="panel-foot">The primary region fails at time zero. The chart shows the share of users still being sent to it. Resolver caches are assumed to have fetched the record at evenly spread moments, so after the record changes they expire at a steady rate over one TTL. The query rate is for 100,000 resolver caches each refreshing once per TTL.</div>
+  </div>
+
+  <p>Things to notice. With a 5-minute TTL and the faster health check, nothing at all improves for the first 30 seconds, because the DNS provider doesn't yet know. After that users return steadily, half of them by 3 minutes, and the last at 5 and a half. Set the TTL to an hour and the outage for the unluckiest users is an hour long, whatever the health check does. Set it to 30 seconds and everyone is back within a minute, but the authoritative servers now answer ten times as many queries, and every user pays for a fresh lookup far more often. Now add clients that ignore the TTL: applications that resolve a name once at start-up, connection pools that never reconnect, resolvers that enforce a minimum. They stay on the dead region until someone restarts them, and no DNS setting reaches them.</p>
+  <p>That is why DNS is the <i>slow</i> layer of failover. It is the right tool for moving traffic between regions, where minutes are acceptable and nothing else can do the job. Within a region, a load balancer's health checks act in seconds (<a href="24-load-balancers-l4-l7.html">Chapter 24</a>), and an anycast address moves with no TTL at all (<a href="26-anycast-cdn.html">Chapter 26</a>).</p>
+
+  <h2>DoH and DoT: hiding the question</h2>
+  <p>One more weakness of classic DNS has nothing to do with forged answers. The query from your device to its resolver travels as plain text on UDP port 53. The café's Wi-Fi, your internet provider and anyone else on the path can read every name you look up, and can change the answers. Two protocols wrap that first hop in TLS:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Classic DNS</th><th>DNS over TLS (DoT)</th><th>DNS over HTTPS (DoH)</th></tr></thead>
+      <tbody>
+        <tr><td><b>Carried in</b></td><td>UDP (or TCP) port 53, plain text</td><td>TLS on port 853</td><td>Ordinary HTTPS requests on port 443</td></tr>
+        <tr><td><b>The network on the path sees</b></td><td>Every name, and can alter answers</td><td>That DNS is in use, and nothing of its content</td><td>HTTPS to a resolver's address, indistinguishable from web traffic</td></tr>
+        <tr><td><b>Easy for a network to block</b></td><td>n/a</td><td>Yes: block port 853</td><td>No, short of blocking the resolver's addresses</td></tr>
+        <tr><td><b>Configured in</b></td><td>The operating system, usually from DHCP</td><td>The operating system (Android's "private DNS")</td><td>Often the browser itself, bypassing the system's resolver</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code">$ curl -s -H <span class="s">'accept: application/dns-json'</span> <span class="s">'https://cloudflare-dns.com/dns-query?name=example.com&amp;type=A'</span>
+{"Status":0,"AD":true,"Question":[{"name":"example.com","type":1}],
+ "Answer":[{"name":"example.com","type":1,"TTL":287,"data":"93.184.216.34"}]}      <span class="c"># a DNS lookup that is just an HTTPS request</span></pre>
+  <p>Encrypting the hop moves trust; it doesn't remove it. Your internet provider can no longer see your lookups, and the operator of the resolver you chose sees all of them. A company's network loses the ability to filter or log by DNS, and internal names that only the company's resolver knows stop resolving in a browser that sends its queries elsewhere. And the server name in the TLS handshake that follows is usually still visible (<a href="17-tls-1-3.html">Chapter 17</a>).</p>
+  <p>DNSSEC and encrypted DNS are often confused, and they solve different problems on different parts of the path:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>DNSSEC</th><th>DoT / DoH</th></tr></thead>
+      <tbody>
+        <tr><td><b>Protects</b></td><td>The <i>data</i>: an answer can be proved genuine</td><td>The <i>conversation</i> between a device and its resolver</td></tr>
+        <tr><td><b>Against</b></td><td>Forged or altered records, wherever they were introduced</td><td>Eavesdropping and tampering on the first hop</td></tr>
+        <tr><td><b>Hides what you look up</b></td><td>No</td><td>Yes, from the local network</td></tr>
+        <tr><td><b>Set up by</b></td><td>The owner of each zone, and resolvers that validate</td><td>The user's device or browser, and the resolver</td></tr>
+        <tr><td><b>If the resolver itself lies</b></td><td>Detected, if the device validates</td><td>Not detected</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Counting only the TTL in a failover plan.</b> Add the detection time, and the clients that never look the name up again.</li>
+      <li><b>Leaving a long TTL on a record you may need to switch.</b> Records used for failover want 30 to 60 seconds. NS and MX records can be long.</li>
+      <li><b>Rolling back DNSSEC by deleting things.</b> Cached DS records outlive the change. Follow the documented order, and wait out each TTL.</li>
+      <li><b>Letting signatures or keys expire.</b> An expired signature is an outage for every validating resolver. Automate signing and monitor it.</li>
+      <li><b>Thinking DNSSEC gives privacy, or that DoH gives authenticity.</b> One signs the data and the other encrypts one hop.</li>
+      <li><b>One DNS provider for everything.</b> If it is down, every name you own is gone, however healthy your servers are (<a href="45-case-dyn-dns-attack.html">Chapter 45</a>).</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What does DNSSEC do, and what doesn't it do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>DNSSEC lets a resolver verify that a DNS answer is exactly what the zone's owner published. Each set of records in a signed zone has an RRSIG signature made with the zone's private key. The public key is published as a DNSKEY record, and the parent zone holds a DS record containing a hash of that key, signed by the parent's own key. That continues up to the root, whose key is built into validating resolvers, so there is a chain of trust from the root down to the record. If every signature checks out, the answer is authentic; if any fails or has expired, a validating resolver returns SERVFAIL. It also covers non-existence, through signed NSEC records. What it doesn't do: it provides no confidentiality, since queries and answers still travel in the clear; it doesn't protect the hop between a device and its resolver unless the device validates itself; and it doesn't protect against a compromised zone or registrar. Operationally it adds a new failure mode, because a signing or key-rollover mistake makes the domain unresolvable for everyone who validates.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You fail over between two regions by changing a DNS record with a 60-second TTL. During a drill, some clients are still hitting the old region twenty minutes later. Why?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The TTL only bounds how long well-behaved resolvers cache the record, and several things sit outside that. First, detection: nothing moves until the health check has failed enough times to flip the record, so that time comes before any TTL starts to matter. Second, many clients don't re-resolve. A long-lived process may resolve the name once at start-up; HTTP clients and database drivers keep pooled connections open to the old address and never look the name up again while those connections work or hang; some runtimes cache DNS results much longer than the TTL by default; and some ISP resolvers enforce a minimum TTL of several minutes. Browsers add their own short cache. If the old region is degraded and not dead, existing connections stay up and those clients never get a reason to reconnect. So I'd find which clients they are from the old region's logs. The fixes are on the client side: bound connection lifetime so that pools re-resolve periodically, make sure runtimes honour TTLs, and on failover actively close connections in the old region so that clients are forced to reconnect. For a faster and more deterministic switch I'd move the decision out of DNS, to an anycast address or a global load balancer.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>DNSSEC signs record sets and chains each zone's key to its parent with a DS record, up to the root, so answers can be verified.</li>
+      <li>A validation failure is a SERVFAIL, not a fallback. Expired signatures and mismatched keys take a domain offline for validating users.</li>
+      <li>Authoritative servers can answer by location, latency, weight or health. They see the resolver, and their choice is cached for a TTL.</li>
+      <li>DNS failover takes the detection time plus up to one TTL, and never reaches clients that don't look the name up again.</li>
+      <li>Short TTLs make changes fast and cost more queries and more dependence on your DNS provider.</li>
+      <li>DoT and DoH encrypt the hop from device to resolver. That is privacy from the local network, and it is separate from DNSSEC.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does DNSSEC guarantee about an answer that validates?</p>
+      <div class="opts">
+        <button class="opt">Nobody on the network could read it</button>
+        <button class="opt">It came from the nearest server</button>
+        <button class="opt">It is what the zone's owner published, unaltered</button>
+        <button class="opt">The server it points to is safe</button>
+      </div>
+      <div class="explain">Authenticity and integrity of the data. Not confidentiality, and nothing about the destination.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Which record, held in the parent zone, links a signed zone to the chain of trust?</p>
+      <div class="opts">
+        <button class="opt">DS, a hash of the child zone's key</button>
+        <button class="opt">RRSIG</button>
+        <button class="opt">NS</button>
+        <button class="opt">TXT</button>
+      </div>
+      <div class="explain">The parent signs the DS record, and the child's DNSKEY must match the hash in it.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A zone's signatures expire because the signing job failed. What do users of a validating resolver see?</p>
+      <div class="opts">
+        <button class="opt">The records, with a warning</button>
+        <button class="opt">The records, unsigned</button>
+        <button class="opt">Slower lookups</button>
+        <button class="opt">SERVFAIL: the names don't resolve at all</button>
+      </div>
+      <div class="explain">An invalid signature can't be told apart from an attack, so the resolver refuses to answer.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A failover record has a TTL of 300 seconds. The health check needs 30 seconds to declare the primary down. Roughly when have all well-behaved clients moved to the standby?</p>
+      <div class="opts">
+        <button class="opt">After 30 seconds</button>
+        <button class="opt">After about 330 seconds</button>
+        <button class="opt">After 300 seconds exactly</button>
+        <button class="opt">Immediately</button>
+      </div>
+      <div class="explain">Detection first, then up to one full TTL for the last cache to expire.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A browser uses DNS over HTTPS to a public resolver. Who can still see which names the user looks up?</p>
+      <div class="opts">
+        <button class="opt">The café's Wi-Fi operator</button>
+        <button class="opt">The user's internet provider</button>
+        <button class="opt">The operator of that resolver</button>
+        <button class="opt">Nobody</button>
+      </div>
+      <div class="explain">The hop to the resolver is encrypted, and the resolver itself reads every question. Trust has moved, not vanished.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = NET;
+  const cfg = { ttl: 300, hc: 30, bad: 0 };
+  const dur = (s) => (s >= 3600 ? (s / 3600).toFixed(s % 3600 ? 1 : 0) + ' h' : s >= 120 ? (s / 60).toFixed(s % 60 ? 1 : 0) + ' min' : Math.round(s) + ' s');
+  function chart() {
+    const W = 660, H = 190, L = 40, R = 10, T = 12, B = 24, end = (cfg.hc + cfg.ttl) * 1.15;
+    const x = (t) => L + (W - L - R) * t / end, y = (v) => T + (H - T - B) * (1 - v / 100);
+    let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Share of users still sent to the failed region over time">`;
+    for (const g of [0, 50, 100]) s += `<line class="df-grid" x1="${L}" x2="${W - R}" y1="${y(g)}" y2="${y(g)}"/><text x="${L - 5}" y="${y(g) + 4}" text-anchor="end">${g}%</text>`;
+    const pts = [[0, 100], [cfg.hc, 100], [cfg.hc + cfg.ttl, cfg.bad], [end, cfg.bad]].map((p) => x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1));
+    s += `<polygon class="df-area" points="${x(0)},${y(0)} ${pts.join(' ')} ${x(end)},${y(0)}"/><polyline class="df-line" points="${pts.join(' ')}"/>`;
+    s += `<line class="df-mark" x1="${x(cfg.hc)}" x2="${x(cfg.hc)}" y1="${T}" y2="${H - B}"/><text class="df-lbl" x="${x(cfg.hc) + 5}" y="${T + 10}">record changed</text>`;
+    s += `<line class="df-mark" x1="${x(cfg.hc + cfg.ttl)}" x2="${x(cfg.hc + cfg.ttl)}" y1="${T}" y2="${H - B}"/><text class="df-lbl" x="${x(cfg.hc + cfg.ttl) - 5}" y="${T + 10}" text-anchor="end">last cache expires</text>`;
+    s += `<text x="${L}" y="${H - 6}">0</text><text x="${W - R}" y="${H - 6}" text-anchor="end">${dur(end)}</text></svg>`;
+    return s;
+  }
+  function render() {
+    $('#dfChart').innerHTML = chart();
+    const half = cfg.hc + cfg.ttl / 2, all = cfg.hc + cfg.ttl, qps = 100000 / cfg.ttl;
+    const lost = (cfg.hc + cfg.ttl / 2) / 60;          // user-minutes of failure per user, for clients that honour the TTL
+    $('#dfDesc').innerHTML = `For the first <b>${dur(cfg.hc)}</b> every user is still sent to the dead region, because the health check hasn't yet failed three times. Then the record changes, and resolver caches pick up the new address as they expire: half of the users are back after ${dur(half)} and the last after <b>${dur(all)}</b>. `
+      + (cfg.bad ? `The ${cfg.bad}% of clients that never look the name up again stay broken until they are restarted.` : `An average user loses ${lost >= 1 ? lost.toFixed(1) + ' minutes' : Math.round(lost * 60) + ' seconds'}.`)
+      + (cfg.ttl >= 3600 ? ' A one-hour TTL makes this a one-hour outage for some, however quick the detection.' : cfg.ttl <= 30 ? ' The price of this TTL is the query rate below, and a lookup on almost every new connection.' : '');
+    $('#dfStats').innerHTML = `<div class="stat"><div class="k">Nothing improves for</div><div class="v">${dur(cfg.hc)}</div></div>
+      <div class="stat ${half > 600 ? 'bad' : half > 120 ? 'warn' : 'good'}"><div class="k">Half the users back after</div><div class="v">${dur(half)}</div></div>
+      <div class="stat ${cfg.bad ? 'bad' : all > 600 ? 'bad' : all > 120 ? 'warn' : 'good'}"><div class="k">${cfg.bad ? (100 - cfg.bad) + '% back after' : 'Everyone back after'}</div><div class="v">${dur(all)}</div></div>
+      <div class="stat ${qps > 1000 ? 'warn' : ''}"><div class="k">Queries to your DNS servers</div><div class="v">${Math.round(qps).toLocaleString('en-GB')} / s</div></div>`;
+  }
+  $('#dfTtl').addEventListener('segchange', (e) => { cfg.ttl = +e.detail; render(); });
+  $('#dfHc').addEventListener('segchange', (e) => { cfg.hc = +e.detail; render(); });
+  $('#dfBad').addEventListener('segchange', (e) => { cfg.bad = +e.detail; render(); });
+  render();
+})();
+</script>
 </body>
 </html>
