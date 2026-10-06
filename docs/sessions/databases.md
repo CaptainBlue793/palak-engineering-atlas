@@ -65,3 +65,4 @@
 - DB 39: SQL Interview Drills: five classic questions built in three stages each, with results computed from small tables that contain the awkward case (ties, a same-day pair, an empty cell)
 - DB 40: Database Interview Playbook: assemble a two-minute answer to three questions from ten points each (four essential, three depth, three wrong), with a time bar and the interviewer's reaction
 - DB 41: Case Study: Designing an E-Commerce Schema: one order's invoice under two designs (joins to live rows, or facts copied at purchase) as the price, name and address change and the product is deleted
+- DB 42: Case Study: A Slow Query Made Fast: the planner's choice among three plans for three accounts, with extended statistics and a partial composite index switched on or off, and the rows read and time for each
