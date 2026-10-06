@@ -61,3 +61,4 @@
 - DB 35: Backups & Point-in-Time Recovery: four backup plans against three incidents on a five-day timeline, giving what is recovered, what is lost and how long the restore takes
 - DB 36: Distributed SQL: a five-node cluster with three replicas of every range (inserts split ranges, replicas rebalance, machines fail and are repaired, ranges without a majority stop)
 - DB 37: Performance Tuning Playbook: a day of pg_stat_statements for nine queries, ranked by mean time, calls or total time, with fixes applied from the top and the load removed
+- DB 38: ORMs & the N+1 Problem: one page of posts loaded lazily, joined, select-in or mixed, with the statements sent, rows returned and time for 10, 50 or 200 posts
