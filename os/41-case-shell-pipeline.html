@@ -6,34 +6,340 @@
 <title>Case Study: How the Shell Runs ls | grep</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sh-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:14px; }
+  @media (max-width:760px) { .sh-grid { grid-template-columns:1fr; } }
+  .sh-proc { border:1.5px solid var(--border); border-radius:12px; padding:9px 11px; background:var(--surface); transition:.2s; }
+  .sh-proc h6 { margin:0 0 2px; font-size:13px; }
+  .sh-proc small { display:block; margin-bottom:6px; font-size:12px; color:var(--muted); font-family:var(--mono); }
+  .sh-proc.sh-none { opacity:.4; border-style:dashed; }
+  .sh-proc.sh-act { border-color:var(--accent); }
+  .sh-proc.sh-dead { opacity:.55; }
+  .sh-proc.sh-stuck { border-color:var(--red); background:var(--red-soft); }
+  .sh-fd { display:flex; justify-content:space-between; gap:8px; font-family:var(--mono); font-size:12px; padding:3px 7px; border-radius:6px; margin-top:2px; background:var(--surface-2); }
+  .sh-fd.sh-r { background:color-mix(in srgb, var(--accent-2) 18%, var(--surface)); }
+  .sh-fd.sh-w { background:color-mix(in srgb, var(--green) 18%, var(--surface)); }
+  .sh-fd.sh-new { outline:2px solid var(--text); outline-offset:-1px; }
+  .sh-fd span { color:var(--muted); }
+  .sh-pipe { margin-top:10px; padding:9px 12px; border:1.5px dashed var(--border-strong); border-radius:12px; background:var(--surface-2); font-size:13px; color:var(--muted); display:flex; flex-wrap:wrap; gap:6px 18px; align-items:center; }
+  .sh-pipe b { font-family:var(--mono); color:var(--text); }
+  .sh-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:84px; }
+  .sh-desc code.sh-call { font-weight:700; }
+  .sh-desc.sh-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .sh-desc.sh-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="41">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 41</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
     <h1>Case Study: <span class="grad">How the Shell Runs ls | grep</span></h1>
-    <p class="lead">Parsing, pipe(), two forks, dup2, exec and wait: a pipeline traced syscall by syscall.</p>
+    <p class="lead">You type <code>ls | grep txt</code> and press Enter. Two programs start, the output of one becomes the input of the other, the matching names appear, and the prompt comes back. Neither program contains a line of code about the other. <code>ls</code> writes to its standard output as it always does; <code>grep</code> reads its standard input as it always does. Everything that joins them is done by the shell, in about fifteen system calls, using only pieces from the first ten chapters: <code>pipe</code>, <code>fork</code>, <code>dup2</code>, <code>close</code>, <code>exec</code> and <code>wait</code>. This case study follows every one of those calls, and shows why forgetting a single <code>close</code> leaves the command hanging for ever.</p>
+    <ul class="objectives">
+      <li>Describe what the shell does with a command line before any program starts</li>
+      <li>Trace the system calls that build a two-command pipeline</li>
+      <li>Explain what dup2 does to a process's descriptor table</li>
+      <li>Explain how a reader learns that a pipe has ended, and why every unused end must be closed</li>
+      <li>Explain exit statuses, and how the terminal's signals reach a pipeline</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>fork, exec and wait.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a>.</li>
+        <li><b>Pipes, and blocking on an empty or full one.</b> See <a href="09-ipc-pipes-signals-shm.html">Chapter 9</a>.</li>
+        <li><b>Descriptor tables, dup2, and what survives fork and exec.</b> See <a href="10-file-descriptors.html">Chapter 10</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Parsing the command line</li>
-    <li>pipe() and two forks</li>
-    <li>dup2 in each child</li>
-    <li>exec, and closing the right fds</li>
-    <li>wait and job control</li>
-  </ol>
+  <h2>Before anything runs: parsing</h2>
+  <p>The shell is an ordinary program in a loop: print a prompt, read a line, work out what it means, make it happen. Working out what it means is all done inside the shell, before any other program exists.</p>
+  <ul>
+    <li><b>Splitting.</b> The line becomes words: <code>ls</code>, <code>|</code>, <code>grep</code>, <code>txt</code>. The <code>|</code> marks the boundary between two commands whose output and input are to be joined.</li>
+    <li><b>Expansion.</b> Variables, wildcards and quotes are resolved now. If you type <code>ls *.c</code>, it is the shell that reads the directory and replaces <code>*.c</code> with the matching names. <code>ls</code> never sees a star.</li>
+    <li><b>Finding the programs.</b> <code>ls</code> isn't a path, so the shell looks through the directories in <code>$PATH</code> until it finds <code>/usr/bin/ls</code>.</li>
+    <li><b>Built-ins.</b> A few commands, <code>cd</code> and <code>exit</code> among them, must be done by the shell itself, because they change the shell's own state. A child process that changed <i>its</i> directory would help nobody.</li>
+  </ul>
+  <p>What comes out is a plan: run <code>/usr/bin/ls</code> with its standard output going into a pipe, and <code>/usr/bin/grep txt</code> with its standard input coming from the same pipe.</p>
+
+  <h2>The plan as code</h2>
+  <p>This is the whole of it, with error handling removed. A real shell does exactly this.</p>
+<pre class="code"><span class="t">int</span> pfd[<span class="m">2</span>];
+<span class="f">pipe</span>(pfd);                              <span class="c">/* pfd[0] = read end, pfd[1] = write end */</span>
+
+<span class="t">pid_t</span> a = <span class="f">fork</span>();
+<span class="k">if</span> (a == <span class="m">0</span>) {                           <span class="c">/* child A: will become ls */</span>
+    <span class="f">dup2</span>(pfd[<span class="m">1</span>], <span class="m">STDOUT_FILENO</span>);        <span class="c">/* descriptor 1 now refers to the pipe's write end */</span>
+    <span class="f">close</span>(pfd[<span class="m">0</span>]); <span class="f">close</span>(pfd[<span class="m">1</span>]);       <span class="c">/* the two spare references are no longer needed */</span>
+    <span class="f">execlp</span>(<span class="s">"ls"</span>, <span class="s">"ls"</span>, <span class="m">NULL</span>);           <span class="c">/* same descriptors, new program */</span>
+    <span class="f">_exit</span>(<span class="m">127</span>);                         <span class="c">/* only reached if exec failed */</span>
+}
+
+<span class="t">pid_t</span> b = <span class="f">fork</span>();
+<span class="k">if</span> (b == <span class="m">0</span>) {                           <span class="c">/* child B: will become grep */</span>
+    <span class="f">dup2</span>(pfd[<span class="m">0</span>], <span class="m">STDIN_FILENO</span>);         <span class="c">/* descriptor 0 now refers to the pipe's read end */</span>
+    <span class="f">close</span>(pfd[<span class="m">0</span>]); <span class="f">close</span>(pfd[<span class="m">1</span>]);
+    <span class="f">execlp</span>(<span class="s">"grep"</span>, <span class="s">"grep"</span>, <span class="s">"txt"</span>, <span class="m">NULL</span>);
+    <span class="f">_exit</span>(<span class="m">127</span>);
+}
+
+<span class="f">close</span>(pfd[<span class="m">0</span>]); <span class="f">close</span>(pfd[<span class="m">1</span>]);           <span class="c">/* the parent must close its copies too: see below */</span>
+<span class="t">int</span> status;
+<span class="f">waitpid</span>(a, <span class="m">NULL</span>, <span class="m">0</span>);
+<span class="f">waitpid</span>(b, &amp;status, <span class="m">0</span>);                 <span class="c">/* the pipeline's exit status is the last command's */</span></pre>
+  <p>Three facts from <a href="10-file-descriptors.html">Chapter 10</a> carry the design. <code>fork</code> copies the descriptor table, so each child starts with the pipe's ends already open. <code>dup2(old, new)</code> makes descriptor <code>new</code> refer to whatever <code>old</code> refers to. And <code>exec</code> replaces the program but keeps the descriptor table. So the shell arranges descriptors 0 and 1 <i>between</i> fork and exec, and the new program simply finds its standard input or output already connected.</p>
+
+  <h2>Step through it</h2>
+  <p>Follow each system call and watch the three descriptor tables and the pipe. Then choose the bug and step through again to the end.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">ls | grep txt, one system call at a time</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="shBug"><button class="active" data-v="none">correct shell</button><button data-v="leak">bug: the shell keeps the pipe's write end open</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="shNext">Next step →</button>
+        <button class="btn sm" id="shAll">Run to the end</button>
+        <button class="btn sm" id="shReset">↺ Reset</button>
+      </div>
+      <div class="sh-grid" id="shGrid"></div>
+      <div class="sh-pipe" id="shPipe"></div>
+      <div class="sh-desc" id="shDesc"></div>
+      <div class="stats" id="shStats"></div>
+    </div>
+    <div class="panel-foot">Each box is a process and its descriptor table. Green descriptors refer to the pipe's write end, blue ones to its read end. The pipe's two counts are how many open descriptors, in all processes together, refer to each end.</div>
+  </div>
+
+  <p>Things to notice. Straight after the second <code>fork</code> the pipe has three open write ends, in three different processes. Once both programs are running and the shell has closed its copies, exactly one write end and one read end remain. <code>grep</code> finishes because its <code>read</code> returns 0, and the kernel returns 0 only when the pipe is empty <i>and no descriptor anywhere refers to the write end</i>. In the buggy version the shell still holds one. <code>ls</code> has exited, the pipe is empty, <code>grep</code> waits for more data that can never come, and the shell waits for <code>grep</code>. Nothing is wrong with either program.</p>
+
+  <h2>Why every close matters</h2>
+  <p>A pipe has no "end of file" marker in it. End of file is a fact about the <i>writers</i>: there are none left. That makes the bookkeeping of open ends part of the protocol.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>If this is left open</th><th>What happens</th></tr></thead>
+      <tbody>
+        <tr><td>The <b>write end</b> in the shell</td><td><code>grep</code> never sees end of file. The pipeline hangs after <code>ls</code> finishes</td></tr>
+        <tr><td>The <b>write end</b> in the <code>grep</code> child</td><td>The same, and harder to spot: <code>grep</code> is waiting for a writer that is itself</td></tr>
+        <tr><td>The <b>read end</b> in the shell or in <code>ls</code></td><td>If <code>grep</code> exits early, <code>ls</code> isn't told. It should get <code>SIGPIPE</code> on its next write; with a reader still open it fills the 64 KiB pipe and blocks</td></tr>
+        <tr><td>Nothing: every spare end is closed</td><td><code>ls</code> exits → writers 0 → <code>grep</code> reads end of file → exits → the shell's <code>wait</code> returns</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The third row is what makes <code>yes | head -1</code> stop. <code>head</code> exits after one line, the read end's count drops to zero, and the next <code>write</code> by <code>yes</code> raises <code>SIGPIPE</code>, which kills it. A pipeline shuts down from the consumer's end backwards.</p>
+  <figure class="seq" data-actors="Shell|Kernel|ls|grep">
+    <ol>
+      <li data-m="0>1">pipe(), fork(), fork(), close() × 2</li>
+      <li data-m="2>1">dup2(write end → 1), close × 2, exec ls</li>
+      <li data-m="3>1">dup2(read end → 0), close × 2, exec grep</li>
+      <li data-m="2>1">write(1, "a.txt\nb.c\n…")</li>
+      <li data-m="1>3" data-k="reply">read(0) returns the bytes</li>
+      <li data-m="2>1">exit: the last write end closes</li>
+      <li data-m="1>3" data-k="reply">read(0) returns 0: end of file</li>
+      <li data-m="3>1">exit</li>
+      <li data-m="1>0" data-k="reply">waitpid returns twice: print the prompt</li>
+    </ol>
+    <figcaption><b>The pipeline's life.</b> The two programs run at the same time. If <code>grep</code> is slower, the pipe fills and <code>ls</code> blocks in <code>write</code>; if <code>ls</code> is slower, <code>grep</code> blocks in <code>read</code>. That is the bounded buffer of <a href="21-classic-sync-problems.html">Chapter 21</a>, provided by the kernel.</figcaption>
+  </figure>
+<pre class="code"><span class="c">$</span> strace -f -e trace=pipe2,clone,dup2,execve,wait4 sh -c <span class="s">'ls | grep txt'</span>      <span class="c"># the real thing, shortened</span>
+pipe2([<span class="m">3</span>, <span class="m">4</span>], <span class="m">0</span>)                         = <span class="m">0</span>
+clone(...)                              = <span class="m">4101</span>
+clone(...)                              = <span class="m">4102</span>
+[pid <span class="m">4101</span>] dup2(<span class="m">4</span>, <span class="m">1</span>)                    = <span class="m">1</span>
+[pid <span class="m">4101</span>] execve(<span class="s">"/usr/bin/ls"</span>, [<span class="s">"ls"</span>], ...) = <span class="m">0</span>
+[pid <span class="m">4102</span>] dup2(<span class="m">3</span>, <span class="m">0</span>)                    = <span class="m">0</span>
+[pid <span class="m">4102</span>] execve(<span class="s">"/usr/bin/grep"</span>, [<span class="s">"grep"</span>, <span class="s">"txt"</span>], ...) = <span class="m">0</span>
+wait4(-<span class="m">1</span>, ...)                          = <span class="m">4101</span>
+wait4(-<span class="m">1</span>, ...)                          = <span class="m">4102</span></pre>
+
+  <h2>wait, exit status and job control</h2>
+  <p>The shell collects both children with <code>wait</code>, which also removes their zombie entries (<a href="03-processes-fork-exec-wait.html">Chapter 3</a>). By convention the status of a pipeline is the status of its <i>last</i> command, so <code>false | true</code> succeeds, and a failed <code>ls</code> is invisible if <code>grep</code> was happy. In scripts, <code>set -o pipefail</code> changes that: the pipeline fails if any command in it did.</p>
+  <p>One more thing happens between the forks and the waits. An interactive shell puts both children in a new <b>process group</b>, a "job", and tells the terminal that this group is now in the foreground. That is how keys become signals for the right processes:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>You press or type</th><th>The terminal driver sends</th><th>To</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>Ctrl-C</td><td><code>SIGINT</code></td><td>Every process in the foreground group</td><td><code>ls</code> and <code>grep</code> both die; the shell, in another group, doesn't</td></tr>
+        <tr><td>Ctrl-Z</td><td><code>SIGTSTP</code></td><td>The foreground group</td><td>The whole pipeline is stopped; the shell takes the terminal back</td></tr>
+        <tr><td><code>bg</code></td><td><code>SIGCONT</code></td><td>That job's group</td><td>It resumes, in the background</td></tr>
+        <tr><td><code>fg</code></td><td><code>SIGCONT</code>, and the terminal is handed over</td><td>That job's group</td><td>It resumes in the foreground and the shell waits for it again</td></tr>
+        <tr><td><code>cmd &amp;</code></td><td>Nothing</td><td></td><td>The shell simply doesn't wait, and doesn't give the job the terminal</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🪢</div>
+    <div class="body"><div class="title">The deploy script that never returns</div><p>A script logs in to a server and starts a long-running program in the background: <code>ssh web1 'nohup ./server &amp;'</code>. The server starts, and the <code>ssh</code> command never comes back. People add <code>sleep</code>, try <code>disown</code>, and eventually kill the terminal. It is this chapter's bug in another setting. On the remote machine, <code>sshd</code> runs your command with its standard output and standard error connected to pipes, and copies whatever comes out of them back over the network. It decides the command has finished when those pipes reach end of file, which, as you now know, means when <i>nobody</i> holds their write ends any more. The background server inherited descriptors 1 and 2 from the shell that started it, and it is still running. The shell has exited and the server holds the pipe open, so <code>sshd</code> waits, and so does your script. <code>nohup</code> doesn't help, because it is about a signal, not about descriptors. The fix is to give the server descriptors of its own: <code>ssh web1 'nohup ./server &gt; server.log 2&gt;&amp;1 &lt; /dev/null &amp;'</code>. The same leak hangs CI jobs that start a helper daemon, command substitutions such as <code>$(start-service)</code>, and any program that waits for a child's output to end. When a command hangs after its work is plainly done, ask who still has the pipe.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Forgetting to close the pipe in the parent.</b> The reader never sees end of file. The most common pipeline bug there is.</li>
+      <li><b>Calling dup2 and not closing the original.</b> The child then holds two references to the same end, and one of them is the leak.</li>
+      <li><b>Creating the pipe after the fork.</b> Each process then has its own, unconnected pipe. The pipe must exist before the processes that share it.</li>
+      <li><b>Waiting for the first child before starting the second.</b> If the first writes more than 64 KiB it blocks on a full pipe that nobody is reading: a deadlock.</li>
+      <li><b>Expecting the program to expand <code>*</code> or <code>$HOME</code>.</b> The shell does that. A program started with <code>exec</code> directly gets the characters as they are.</li>
+      <li><b>Trusting a pipeline's exit status.</b> It is the last command's. Use <code>pipefail</code> where failures earlier in the pipe matter.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What does a shell do to run <code>ls | grep txt</code>?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It parses the line into two commands joined by a pipe, then creates the pipe with <code>pipe()</code>, which gives it a read descriptor and a write descriptor. It forks once for <code>ls</code>: in that child it calls <code>dup2</code> to make descriptor 1, standard output, refer to the pipe's write end, closes both original pipe descriptors, and calls <code>exec</code> to become <code>ls</code>. It forks again for <code>grep</code>: that child uses <code>dup2</code> to make descriptor 0 the pipe's read end, closes the originals, and execs <code>grep</code>. The parent closes both of its own pipe descriptors and waits for both children. This works because fork copies the descriptor table and exec preserves it, so the programs find their standard streams already connected and need no knowledge of pipes. The closes are essential: <code>grep</code> gets end of file only when every write end is closed, so if the shell kept its copy open, <code>grep</code> would wait for ever after <code>ls</code> exited.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why can't <code>cd</code> be an external program like <code>ls</code>?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because the current working directory is an attribute of a process, and a process can only change its own. If <code>cd</code> were a separate program, the shell would fork a child, the child would call <code>chdir</code> successfully, and then exit, leaving the shell's directory exactly where it was. So <code>cd</code> has to be a built-in that the shell executes in its own process with a direct <code>chdir</code> call. The same reasoning applies to anything that must alter the shell's own state: <code>exit</code>, <code>export</code> and <code>umask</code>, setting variables, <code>exec</code> itself, and <code>ulimit</code>. It is a consequence of process isolation: a child inherits copies of the parent's environment, directory and descriptors at fork time, and nothing it does to them flows back.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>The shell parses, expands wildcards and finds programs itself; then it is all <code>pipe</code>, <code>fork</code>, <code>dup2</code>, <code>close</code>, <code>exec</code>, <code>wait</code>.</li>
+      <li>Redirection is done between fork and exec, by rearranging descriptors 0, 1 and 2 in the child.</li>
+      <li>Programs in a pipeline don't know about each other; they just use their standard streams.</li>
+      <li>A reader sees end of file only when every descriptor for the write end is closed, in every process.</li>
+      <li>A writer gets <code>SIGPIPE</code> when no reader is left, which is how pipelines stop early.</li>
+      <li>The pipeline is one job: a process group that the terminal's Ctrl-C and Ctrl-Z are delivered to.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In <code>ls *.c | wc -l</code>, which program turns <code>*.c</code> into a list of file names?</p>
+      <div class="opts">
+        <button class="opt"><code>ls</code></button>
+        <button class="opt">The shell, before it starts <code>ls</code></button>
+        <button class="opt">The kernel, inside <code>execve</code></button>
+        <button class="opt"><code>wc</code></button>
+      </div>
+      <div class="explain">Wildcard expansion is done by the shell during parsing. <code>ls</code> receives the names as separate arguments.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does <code>dup2(pfd[1], 1)</code> do in the child that will become <code>ls</code>?</p>
+      <div class="opts">
+        <button class="opt">Copies the pipe's contents to the terminal</button>
+        <button class="opt">Creates a second pipe</button>
+        <button class="opt">Makes descriptor 1 refer to the pipe's write end, so anything written to standard output goes into the pipe</button>
+        <button class="opt">Closes the pipe</button>
+      </div>
+      <div class="explain">Descriptor 1 is closed if open and then made a duplicate of <code>pfd[1]</code>. <code>ls</code> keeps writing to 1 as usual.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">The shell forgets to close its copy of the pipe's write end. <code>ls</code> finishes and exits. What does <code>grep</code> do?</p>
+      <div class="opts">
+        <button class="opt">Blocks in <code>read</code> for ever, because a write end is still open and so there is no end of file</button>
+        <button class="opt">Exits normally</button>
+        <button class="opt">Receives <code>SIGPIPE</code></button>
+        <button class="opt">Reads its own output</button>
+      </div>
+      <div class="explain">End of file on a pipe means "no writers remain". The shell is still a potential writer, so the kernel keeps <code>grep</code> waiting.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why does <code>yes | head -1</code> terminate, although <code>yes</code> prints for ever?</p>
+      <div class="opts">
+        <button class="opt">The shell kills <code>yes</code> after one line</button>
+        <button class="opt">The pipe has a limit of one line</button>
+        <button class="opt"><code>yes</code> checks whether anyone is reading</button>
+        <button class="opt"><code>head</code> exits, no read end remains open, and the next write by <code>yes</code> raises <code>SIGPIPE</code></button>
+      </div>
+      <div class="explain">Writing to a pipe with no readers sends the writer <code>SIGPIPE</code>, whose default action is to terminate it.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">You press Ctrl-C while <code>ls -R / | grep txt</code> is running. Which processes receive <code>SIGINT</code>?</p>
+      <div class="opts">
+        <button class="opt">Only <code>ls</code></button>
+        <button class="opt">Every process in the foreground process group: both <code>ls</code> and <code>grep</code></button>
+        <button class="opt">Only the shell</button>
+        <button class="opt">Every process on the terminal, including the shell</button>
+      </div>
+      <div class="explain">The shell placed the pipeline in its own process group and made it the terminal's foreground group. The signal goes to that group, not to the shell.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  let bug = 'none', P, stepNo, last, hot, calls, flag;
+  const TTY = 'terminal', R = 'pipe: read end', W = 'pipe: write end';
+  const mk = (pid, name) => ({ pid, name, state: 'none', fds: {} });
+  function reset() {
+    P = { sh: mk(4100, 'shell'), a: mk(4101, 'child A'), b: mk(4102, 'child B') };
+    P.sh.state = 'run'; P.sh.fds = { 0: TTY, 1: TTY, 2: TTY };
+    stepNo = 0; last = null; hot = null; calls = 0; flag = {};
+  }
+  const count = (what) => Object.values(P).reduce((n, p) => n + (p.state === 'none' || p.state === 'dead' ? 0 : Object.values(p.fds).filter((x) => x === what).length), 0);
+  const copy = (o) => Object.assign({}, o);
+  // Each step: [who acts, system calls it stands for, what to do, explanation]
+  function steps() {
+    const S = [
+      ['sh', 0, () => {}, 'The shell reads the line and parses it: two commands, <code>ls</code> and <code>grep txt</code>, joined by a pipe. It finds both programs in <code>$PATH</code>. No system call for the pipeline has been made yet.'],
+      ['sh', 1, () => { P.sh.fds[3] = R; P.sh.fds[4] = W; hot = ['sh', 3, 4]; }, '<code class="sh-call">pipe(pfd)</code> The kernel creates a pipe and gives the shell two descriptors: 3 for reading from it and 4 for writing to it.'],
+      ['sh', 1, () => { P.a.state = 'run'; P.a.fds = copy(P.sh.fds); hot = ['a']; }, '<code class="sh-call">fork()</code> Child A is a copy of the shell, <b>descriptor table included</b>. Both ends of the pipe are now open in two processes.'],
+      ['a', 1, () => { P.a.fds[1] = W; hot = ['a', 1]; }, '<code class="sh-call">dup2(4, 1)</code> In child A, descriptor 1, standard output, is made to refer to the pipe\'s write end. Whatever this process prints from now on goes into the pipe.'],
+      ['a', 2, () => { delete P.a.fds[3]; delete P.a.fds[4]; hot = ['a']; }, '<code class="sh-call">close(3); close(4)</code> Child A drops the two spare references. It doesn\'t read from the pipe, and descriptor 1 is its write end now.'],
+      ['a', 1, () => { P.a.name = 'ls'; hot = ['a']; }, '<code class="sh-call">execve("/usr/bin/ls")</code> Child A becomes <code>ls</code>. The program is new; the descriptor table is untouched. <code>ls</code> has no idea that descriptor 1 is a pipe.'],
+      ['sh', 1, () => { P.b.state = 'run'; P.b.fds = copy(P.sh.fds); hot = ['b']; }, '<code class="sh-call">fork()</code> Child B, again a copy of the shell, with both pipe descriptors.'],
+      ['b', 1, () => { P.b.fds[0] = R; hot = ['b', 0]; }, '<code class="sh-call">dup2(3, 0)</code> In child B, descriptor 0, standard input, now refers to the pipe\'s read end.'],
+      ['b', 2, () => { delete P.b.fds[3]; delete P.b.fds[4]; hot = ['b']; }, '<code class="sh-call">close(3); close(4)</code> Child B drops its spares. Closing 4 matters most: a reader that also holds the write end can never see end of file.'],
+      ['b', 1, () => { P.b.name = 'grep txt'; hot = ['b']; }, '<code class="sh-call">execve("/usr/bin/grep")</code> Child B becomes <code>grep</code>, reading descriptor 0 as it always does.'],
+    ];
+    if (bug === 'none') S.push(['sh', 2, () => { delete P.sh.fds[3]; delete P.sh.fds[4]; hot = ['sh']; }, '<code class="sh-call">close(3); close(4)</code> The shell closes its own copies. Now exactly one process can write to the pipe, <code>ls</code>, and exactly one can read, <code>grep</code>.']);
+    else S.push(['sh', 0, () => { hot = ['sh', 4]; }, '<b>The bug:</b> the shell moves on without closing descriptors 3 and 4. Everything will appear to work for a while. Look at the count of write ends.']);
+    S.push(['a', 2, () => { hot = ['a', 'b']; }, '<code class="sh-call">write(1, …)</code> in <code>ls</code>, <code class="sh-call">read(0, …)</code> in <code>grep</code>. The listing flows through the pipe. <code>grep</code> prints the lines containing "txt" on its own descriptor 1, which is still the terminal.']);
+    S.push(['a', 1, () => { P.a.state = 'dead'; hot = ['a']; }, '<code class="sh-call">exit(0)</code> <code>ls</code> has listed everything and exits. The kernel closes its descriptors' + (bug === 'none' ? ', and the pipe\'s <b>last write end</b> is gone.' : '. But the pipe still has a write end open: <b>the shell\'s descriptor 4</b>.')]);
+    if (bug === 'none') {
+      S.push(['b', 2, () => { P.b.state = 'dead'; hot = ['b']; }, '<code class="sh-call">read(0, …) = 0</code> The pipe is empty and has no writers, so the kernel tells <code>grep</code> it has reached end of file. <code>grep</code> exits.']);
+      S.push(['sh', 2, () => { hot = ['sh']; flag.done = true; }, '<code class="sh-call">waitpid() × 2</code> The shell collects both children, records the exit status of <code>grep</code> as the pipeline\'s status, and prints the prompt. <b>Done.</b>']);
+    } else {
+      S.push(['b', 1, () => { P.b.state = 'stuck'; hot = ['b']; }, '<code class="sh-call">read(0, …)</code> The pipe is empty, but a write end is still open somewhere, so more data might arrive. The kernel puts <code>grep</code> to sleep to wait for it.']);
+      S.push(['sh', 1, () => { P.sh.state = 'stuck'; hot = ['sh']; flag.hung = true; }, '<code class="sh-call">waitpid()</code> The shell waits for <code>grep</code> to exit. <code>grep</code> is waiting for the pipe\'s writers to go away. The only writer is the shell. <b>Each is waiting for the other, and the command hangs for ever.</b>']);
+    }
+    return S;
+  }
+  function step() {
+    const S = steps();
+    if (stepNo >= S.length) return;
+    const [who, n, fn, text] = S[stepNo++];
+    hot = null; fn(); calls += n;
+    last = { who, text };
+  }
+  function render() {
+    const S = steps(), box = (key) => {
+      const p = P[key], act = last && last.who === key && p.state === 'run';
+      const fds = Object.keys(p.fds).map(Number).sort((x, y) => x - y);
+      const isHot = (fd) => hot && hot[0] === key && (hot.length === 1 || hot.slice(1).includes(fd));
+      return `<div class="sh-proc ${p.state === 'none' ? 'sh-none' : p.state === 'dead' ? 'sh-dead' : p.state === 'stuck' ? 'sh-stuck' : act ? 'sh-act' : ''}"><h6>${p.name}</h6><small>${p.state === 'none' ? 'not created yet' : 'pid ' + p.pid + (p.state === 'dead' ? ' · exited' : p.state === 'stuck' ? ' · blocked for ever' : '')}</small>` +
+        (p.state === 'none' || p.state === 'dead' ? '' : fds.map((fd) => `<div class="sh-fd ${p.fds[fd] === R ? 'sh-r' : p.fds[fd] === W ? 'sh-w' : ''} ${isHot(fd) ? 'sh-new' : ''}"><b>${fd}</b><span>${p.fds[fd]}</span></div>`).join('')) + '</div>';
+    };
+    $('#shGrid').innerHTML = box('sh') + box('a') + box('b');
+    const w = count(W), r = count(R);
+    $('#shPipe').innerHTML = stepNo < 2 ? '<span>No pipe yet.</span>' : `<span>The pipe</span><span>open write ends: <b>${w}</b></span><span>open read ends: <b>${r}</b></span>` + (w === 0 && stepNo > 10 ? '<span>→ a reader will see end of file</span>' : '');
+    const d = $('#shDesc');
+    d.className = 'sh-desc ' + (flag.done ? 'sh-ok' : flag.hung || (last && bug === 'leak' && stepNo >= 13) ? 'sh-bad' : '');
+    d.innerHTML = last ? last.text : 'The shell has printed its prompt and you have typed <code>ls | grep txt</code>. Press <b>Next step</b>.';
+    $('#shStats').innerHTML = `<div class="stat"><div class="k">Step</div><div class="v">${stepNo}<small> of ${S.length}</small></div></div>
+      <div class="stat"><div class="k">System calls</div><div class="v">${calls}</div></div>
+      <div class="stat ${flag.done ? 'good' : flag.hung ? 'bad' : ''}"><div class="k">Outcome</div><div class="v" style="font-size:16px">${flag.done ? 'prompt returns' : flag.hung ? 'hangs' : 'in progress'}</div></div>`;
+    $('#shNext').disabled = $('#shAll').disabled = stepNo >= S.length;
+  }
+  $('#shNext').onclick = () => { step(); render(); };
+  $('#shAll').onclick = () => { const n = steps().length; while (stepNo < n) step(); render(); };
+  $('#shReset').onclick = () => { reset(); render(); };
+  $('#shBug').addEventListener('segchange', (e) => { bug = e.detail; reset(); render(); });
+  reset(); render();
+})();
+</script>
 </body>
 </html>
