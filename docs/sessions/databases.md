@@ -37,3 +37,4 @@
 - DB 11: Pages, Tuples & Heap Files: slotted-page simulator (insert, update, delete, VACUUM; fillfactor 100 vs 70; HOT updates and redirects)
 - DB 12: The Buffer Pool: buffer-pool simulator (FIFO, LRU, clock sweep; 8 or 16 frames; hot pages with a scan, or random)
 - DB 13: B-Trees: growable B+ tree with four keys a page (ordered or random keys, middle or right-edge splits, search and range scan)
+- DB 14: LSM Trees: small LSM store (memtable, flushes, level 0 to 2 compaction, tombstones, real Bloom filters, write stall, amplification figures)
