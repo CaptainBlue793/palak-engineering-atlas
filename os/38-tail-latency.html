@@ -6,34 +6,318 @@
 <title>Tail Latency &amp; the OS</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ta-ctl { margin-top:12px; }
+  .ta-ctl label { display:block; font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .ta-ctl input { width:100%; accent-color:var(--accent); margin-top:6px; }
+  .ta-ctl .v { float:right; font-family:var(--mono); font-size:13px; color:var(--text); text-transform:none; letter-spacing:0; }
+  .ta-h { margin:14px 0 6px; font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .ta-dots { display:flex; flex-wrap:wrap; gap:4px; min-height:20px; }
+  .ta-dots i { display:block; width:16px; height:16px; border-radius:5px; background:var(--green); opacity:.75; }
+  .ta-dots i.ta-slow { background:var(--red); opacity:1; }
+  .ta-dots i.ta-saved { background:var(--amber); opacity:1; }
+  .ta-bar { height:26px; border-radius:7px; border:1px solid var(--border); background:var(--green-soft); overflow:hidden; }
+  .ta-bar i { display:block; height:100%; background:var(--red); transition:width .25s; }
+  .ta-key { margin-top:6px; font-size:12.5px; color:var(--muted); }
+  .ta-key i { display:inline-block; width:11px; height:11px; border-radius:3px; margin:0 4px 0 12px; vertical-align:-1px; }
+  .ta-key i:first-child { margin-left:0; }
+  .ta-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .ta-desc.ta-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .ta-desc.ta-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .ta-desc.ta-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="38">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 38</span><span class="pill">Expert</span><span class="pill">⏱ 45 min</span></div>
     <h1>Tail Latency &amp; the <span class="grad">OS</span></h1>
-    <p class="lead">Why p99 is slow: scheduling delays, page faults, GC pauses, noisy neighbours, and what to do about them.</p>
+    <p class="lead">A service answers in 10 ms on average, and its users complain that it is slow. Both are true. The average hides the one request in a hundred that took a second, and at scale that one in a hundred is not rare: a page that needs a hundred back-end calls will usually include one of them. The slow few are the <b>tail</b> of the latency distribution, and most of what puts requests there is not the application's code. It is the machinery of the previous thirty-seven chapters, each piece of which occasionally makes a thread wait: for a core, for a page, for a quota to refill, for a lock. This chapter is about seeing that tail, finding which mechanism is behind it, and designing so that it matters less.</p>
+    <ul class="objectives">
+      <li>Describe latency with percentiles and explain why averages mislead</li>
+      <li>Calculate how fan-out turns a rare slow call into a common slow request</li>
+      <li>Identify the main operating-system sources of tail latency and how to observe each</li>
+      <li>Explain CPU throttling under cgroup limits and why it produces latency cliffs</li>
+      <li>Choose mitigations, from headroom and pinning to hedged requests</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The standard tools, and off-CPU analysis.</b> See <a href="37-performance-tools.html">Chapter 37</a>.</li>
+        <li><b>cgroup CPU and memory limits.</b> See <a href="34-containers-namespaces-cgroups.html">Chapter 34</a>.</li>
+        <li><b>Run queues and time slices.</b> See <a href="07-scheduling-basics.html">Chapter 7</a> and <a href="08-scheduling-mlfq-cfs.html">Chapter 8</a>.</li>
+        <li><b>Major page faults and reclaim.</b> See <a href="14-page-faults-demand-paging.html">Chapter 14</a> and <a href="15-page-replacement.html">Chapter 15</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Percentiles and fan-out</li>
-    <li>Run-queue delay</li>
-    <li>Page faults and THP compaction</li>
-    <li>CPU throttling under cgroups</li>
-    <li>Mitigations: pinning, hedging</li>
-  </ol>
+  <h2>Percentiles, not averages</h2>
+  <p>Sort a million response times. The value halfway along is the <b>median</b>, or p50. The value 99% of the way along is <b>p99</b>: one request in a hundred is slower than this. p99.9 is one in a thousand. Latency is almost never spread evenly round its mean. It has a tight cluster of fast responses and a long, thin tail of slow ones.</p>
+<pre class="code">1,000,000 requests to one service
+
+mean        12 ms       <span class="c">dragged up by the tail; almost nobody experiences "12 ms"</span>
+p50          9 ms       <span class="c">the typical request</span>
+p99        180 ms       <span class="c">10,000 requests were slower than this</span>
+p99.9    1,100 ms       <span class="c">1,000 requests took over a second</span></pre>
+  <p>Report and alert on percentiles, never the mean. And never average percentiles from different machines or minutes: the p99 of the whole is not the average of the p99s. Keep histograms and combine those.</p>
+
+  <h2>Fan-out multiplies the tail</h2>
+  <p>One user request rarely touches one server. A search fans out to a hundred index shards; a product page calls dozens of services. The request is as slow as its <i>slowest</i> call. If each call independently has probability <code>p</code> of being slow, then with <code>N</code> calls:</p>
+<pre class="code">P(user request is slow) = 1 − (1 − p)^N
+
+p = 1% slow calls        N = 1      1.0%
+                         N = 10     9.6%
+                         N = 100   63.4%       <span class="c">most user requests hit at least one slow call</span>
+                         N = 1000  99.996%</pre>
+  <p>So a back end whose p99 is poor gives its users a poor <i>median</i>. To have 99% of user requests fast with a fan-out of 100, each back-end call must be fast 99.99% of the time. This is why large systems care about p99.9 and beyond, which sounds like perfectionism until you do the arithmetic.</p>
+
+  <h2>Feel the tail</h2>
+  <p>Each back-end call normally takes about 10 ms; occasionally one takes about a second. Move the fan-out and watch the share of slow user requests. Then switch on hedging.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One user request, many back-end calls</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="taP"><button data-v="0.001">1 call in 1,000 is slow</button><button class="active" data-v="0.01">1 in 100</button><button data-v="0.05">1 in 20</button></div>
+        <div class="seg" id="taH"><button class="active" data-v="off">wait for every call</button><button data-v="on">hedge: retry elsewhere after 20 ms</button></div>
+      </div>
+      <div class="ta-ctl"><label>Back-end calls per user request <span class="v" id="taNV"></span><input type="range" id="taN" min="1" max="100" value="10"></label></div>
+      <div class="controls">
+        <button class="btn sm primary" id="taSend">Send one request</button>
+        <span class="small muted" id="taOne" style="font-family:var(--mono)"></span>
+      </div>
+      <div class="ta-h">The calls of that one request</div>
+      <div class="ta-dots" id="taDots"></div>
+      <div class="ta-key"><i style="background:var(--green)"></i>fast<i style="background:var(--red)"></i>slow: the request waits for it<i style="background:var(--amber)"></i>slow, but a hedged copy answered</div>
+      <div class="ta-h">Share of 2,000 user requests that are slow (over 100 ms)</div>
+      <div class="ta-bar"><i id="taBar"></i></div>
+      <div class="ta-desc" id="taDesc"></div>
+      <div class="stats" id="taStats"></div>
+    </div>
+    <div class="panel-foot">A model: fast calls take 8 to 12 ms and slow ones 800 to 1,200 ms, independently of each other. A user request finishes when its last call does. With hedging, a call that hasn't answered after 20 ms is sent again to another replica, and the first answer wins. The same 2,000 random requests are used for every setting, so changes are due to the controls.</div>
+  </div>
+
+  <p>Things to notice. With one slow call in a hundred, a single call is slow 1% of the time, ten calls about 10%, and a hundred calls about 63%: the median user request is now a slow one, although 99% of back-end calls are fast. Hedging changes the picture completely. A call is slow only if both copies are, which is one in ten thousand, so even at a fan-out of 100 only about 1% of user requests are slow, and the cost is roughly 1% more back-end calls. It doesn't fix whatever makes calls slow. It stops one slow machine from deciding the answer.</p>
+
+  <h2>Where the operating system puts requests in the tail</h2>
+  <p>A slow call usually ran the same code as a fast one. The difference is that somewhere a thread had to wait, and each mechanism in this course has a way of making that happen now and then.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Source</th><th>What happens</th><th>Size of the hit</th><th>How to see it</th></tr></thead>
+      <tbody>
+        <tr><td><b>Run-queue delay</b></td><td>The thread is ready but every core is busy, so it waits its turn (<a href="08-scheduling-mlfq-cfs.html">Chapter 8</a>)</td><td>Up to several time slices: milliseconds to tens of ms</td><td><code>runqlat</code>; <code>/proc/pressure/cpu</code>; <code>r</code> in <code>vmstat</code></td></tr>
+        <tr><td><b>CPU throttling</b></td><td>The container has used its quota for this period; all its threads stop until the next (<a href="34-containers-namespaces-cgroups.html">Chapter 34</a>)</td><td>Up to the rest of the period: often 50 to 90 ms</td><td><code>nr_throttled</code> in the cgroup's <code>cpu.stat</code></td></tr>
+        <tr><td><b>Major page faults</b></td><td>A page of code or data was evicted and must be read from disk (<a href="14-page-faults-demand-paging.html">Chapter 14</a>)</td><td>0.1 to 10 ms each, and they come in bursts</td><td><code>majflt</code> in <code>pidstat -r</code>; <code>/proc/pressure/memory</code></td></tr>
+        <tr><td><b>Direct reclaim and compaction</b></td><td>An allocation finds memory short, and the allocating thread is made to free pages, or to shuffle memory to build a huge page (<a href="15-page-replacement.html">Chapter 15</a>, <a href="12-paging-page-tables.html">Chapter 12</a>)</td><td>Milliseconds to hundreds</td><td><code>pgscan_direct</code>, <code>compact_stall</code> in <code>/proc/vmstat</code></td></tr>
+        <tr><td><b>Writeback stalls</b></td><td>Too many dirty pages: <code>write()</code> blocks; or an <code>fsync</code> queues behind someone else's (<a href="31-page-cache-fsync.html">Chapter 31</a>)</td><td>Tens of ms to seconds</td><td><code>Dirty</code> in <code>/proc/meminfo</code>; <code>await</code> in <code>iostat</code></td></tr>
+        <tr><td><b>Lock waits</b></td><td>The holder was preempted or is slow; everyone queues behind it (<a href="18-mutexes-spinlocks.html">Chapter 18</a>)</td><td>Anything</td><td>Off-CPU profiles; <code>futex</code> time in <code>strace -c</code></td></tr>
+        <tr><td><b>Runtime pauses</b></td><td>A garbage collector stops the application's threads</td><td>Milliseconds to seconds</td><td>The runtime's own pause logs</td></tr>
+        <tr><td><b>Neighbours</b></td><td>Another tenant uses the shared core, cache or disk; on a VM, steal time (<a href="33-virtualization.html">Chapter 33</a>)</td><td>Varies</td><td><code>st</code> in <code>vmstat</code>; cache misses in <code>perf stat</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>CPU throttling: a cliff, not a slope</h2>
+  <p>The second row deserves a closer look, because it is the commonest self-inflicted cause in containers and it is easy to misread. A CPU limit is enforced in fixed periods, 100 ms by default. A limit of "2 CPUs" means 200 ms of CPU time per 100 ms of wall time, summed over <i>all</i> the container's threads.</p>
+<pre class="code">Limit: 2 CPUs = 200 ms of CPU time per 100 ms period.   The service has 8 busy threads.
+
+ 0 ms                 25 ms                                                   100 ms
+ |████████████████████|· · · · · · · · · · · · · · · · · · · · · · · · · · · · · |
+  8 threads run on 8 cores:   quota used up.   <span class="c">Every thread is frozen for 75 ms.</span>
+  8 × 25 ms = 200 ms          A request that arrives at 26 ms waits until 100 ms to start.</pre>
+<pre class="code"><span class="c">$</span> cat /sys/fs/cgroup/app/cpu.stat
+usage_usec <span class="m">9120440118</span>
+nr_periods <span class="m">204811</span>
+nr_throttled <span class="m">61322</span>             <span class="c"># throttled in 30% of all periods</span>
+throttled_usec <span class="m">2811440290</span>     <span class="c"># 47 minutes spent frozen, in total</span></pre>
+  <p>Average CPU use for that container may be well under its limit, and dashboards will say it has headroom, while a third of its periods end in a freeze. The cure is to match the number of busy threads to the quota (<a href="27-thread-pools.html">Chapter 27</a>), to raise or remove the limit and rely on shares instead, and to watch <code>nr_throttled</code>, not average CPU.</p>
+
+  <h2>Mitigations</h2>
+  <p>You can make slow events rarer, and you can make the system tolerate them. Do both.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Technique</th><th>Attacks</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><b>Headroom</b>: run at 50 to 60% utilisation, not 90%</td><td>All queueing. Waiting time rises steeply as a resource nears 100% busy</td><td>More machines</td></tr>
+        <tr><td><b>Pin and isolate</b>: dedicate cores to the latency-critical threads; keep interrupts and batch work off them</td><td>Run-queue delay, cache disturbance from neighbours</td><td>Less flexible use of the machine</td></tr>
+        <tr><td><b>Lock memory, pre-fault, set huge pages to <code>madvise</code></b></td><td>Page faults, reclaim and compaction stalls</td><td>Memory that can't be reclaimed</td></tr>
+        <tr><td><b>Size thread pools to the CPU quota</b></td><td>Throttling</td><td>None: it is simply correct</td></tr>
+        <tr><td><b>Separate batch from interactive work</b>: other machines, other cgroups, lower priority</td><td>Neighbours, writeback stalls</td><td>Operational complexity</td></tr>
+        <tr><td><b>Hedged requests</b>: after a short delay, ask a second replica; take the first answer</td><td>Any slowness confined to one replica, whatever its cause</td><td>A few per cent more load; requests must be safe to repeat</td></tr>
+        <tr><td><b>Timeouts, and retries with a budget</b></td><td>Calls that would never return</td><td>Retries can amplify an overload unless capped</td></tr>
+        <tr><td><b>Good-enough answers</b>: return what arrived by the deadline</td><td>The fan-out arithmetic itself</td><td>Slightly incomplete results</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <figure class="seq" data-actors="Client|Replica A|Replica B">
+    <ol>
+      <li data-m="0>1">request</li>
+      <li data-m="0>2">20 ms and no answer from A: send the same request to B</li>
+      <li data-m="2>0" data-k="reply">answer after 9 ms</li>
+      <li data-m="0>1">cancel</li>
+    </ol>
+    <figcaption><b>A hedged request.</b> The delay before hedging is set near the normal p95, so only about one request in twenty is sent twice. The client's wait is bounded by the delay plus one normal response.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">📊</div>
+    <div class="body"><div class="title">"The Tail at Scale"</div><p>In 2013 Jeffrey Dean and Luiz André Barroso of Google published a short paper with that title, and it changed how large services are designed. Its starting point was that slow responses in a big system can't be eliminated at the source, because the sources are too many and too ordinary: shared machines, background daemons, garbage collection, queueing, maintenance work, power management. Their own example is the fan-out arithmetic above: if one server in a hundred answers slowly, a request that touches a hundred servers is slow 63% of the time. So instead of only chasing causes, they proposed making the system <b>tail-tolerant</b>, the way systems are made fault-tolerant, by building a predictable whole out of unpredictable parts. Their best-known result came from a test on Bigtable, reading the values for 1,000 keys spread over 100 servers. Sending a hedged request to a second replica after a 10 ms delay cut the 99.9th-percentile latency from 1,800 ms to 74 ms, while sending just 2% more requests. The same paper introduced tied requests, where each copy tells the other server to cancel when it starts, and the idea of returning "good enough" results when a few shards are late. It is why a search page will sometimes show results from slightly fewer servers than exist, and nobody notices.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Monitoring the average.</b> A mean of 12 ms can hide a p99 of a second. Track p50, p99 and p99.9.</li>
+      <li><b>Averaging percentiles.</b> The mean of each server's p99 is not the fleet's p99. Merge histograms.</li>
+      <li><b>Treating the tail as noise.</b> With fan-out, the back end's tail is the user's typical case.</li>
+      <li><b>Reading average CPU as "not throttled".</b> A container can be throttled in a third of its periods at 40% average use. Read <code>nr_throttled</code>.</li>
+      <li><b>Hedging requests that aren't safe to repeat.</b> A hedged "charge the card" charges twice. Hedge reads, or make writes idempotent.</li>
+      <li><b>Retrying without a limit.</b> When a service is slow because it is overloaded, retries are more load. Cap them.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is tail latency and why does it matter more as systems grow?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Tail latency is the response time of the slowest requests: the 99th percentile and beyond, as opposed to the median or the mean. It matters because of fan-out. A single user action in a large system triggers many back-end calls, and the user waits for the slowest. If each call is slow with probability one per cent, a request needing 100 calls is slow with probability one minus 0.99 to the hundredth power, about 63%. So a back end's rare slow case becomes the common experience. Users also make many requests per session, so nearly everyone meets the tail sooner or later. That is why large services set targets at p99 or p99.9, why averages are close to useless as a health signal, and why they add techniques such as hedged requests that tolerate an occasional slow server instead of relying on every server being fast every time.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A containerised service has a p99 of 95 ms and a p50 of 4 ms. CPU usage averages 35% of its limit. What do you suspect and how do you confirm it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A p99 just under 100 ms with a tiny median is the signature of CPU throttling, because the default enforcement period for cgroup CPU limits is 100 ms. The limit is a quota of CPU time per period shared by all the container's threads. If the service has many more runnable threads than the quota covers, for example a runtime that sized its pools for the host's 32 cores under a 2-CPU limit, a burst of work spends the whole quota in the first part of the period and every thread is then frozen until the next one. Requests arriving during the freeze wait up to the remainder of the period, which gives a tail near 100 ms. Average usage looks fine because between bursts the service is idle. I'd confirm by reading <code>cpu.stat</code> in the container's cgroup: <code>nr_throttled</code> as a fraction of <code>nr_periods</code>, and <code>throttled_usec</code> rising. Fixes: size thread and GC pools to the quota, raise or remove the hard limit and rely on CPU shares, and alert on the throttled ratio. If <code>nr_throttled</code> were zero I'd move on to run-queue latency, major faults and lock waits with off-CPU tools.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Describe latency with percentiles. The mean describes almost no real request.</li>
+      <li>With fan-out N, a per-call slow probability p becomes 1 − (1 − p)<sup>N</sup> for the user: 1% turns into 63% at N = 100.</li>
+      <li>Most tail latency is waiting: for a core, a quota, a page, a disk or a lock. Each has a counter you can read.</li>
+      <li>cgroup CPU limits freeze a whole container when its quota runs out, producing tails close to the period length.</li>
+      <li>Reduce the tail with headroom, isolation, pre-faulted memory and correctly sized pools.</li>
+      <li>Tolerate what remains with hedged requests, timeouts and partial results.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A service reports a p99 latency of 200 ms. What does that mean?</p>
+      <div class="opts">
+        <button class="opt">99% of requests take exactly 200 ms</button>
+        <button class="opt">The average latency is 200 ms</button>
+        <button class="opt">1% of requests take longer than 200 ms</button>
+        <button class="opt">The slowest request took 200 ms</button>
+      </div>
+      <div class="explain">The 99th percentile is the value that 99% of requests are at or below. One in a hundred is slower.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Each back-end call is slow 1% of the time, independently. A user request makes 100 such calls and waits for all of them. Roughly how often is the user request slow?</p>
+      <div class="opts">
+        <button class="opt">1%</button>
+        <button class="opt">63%</button>
+        <button class="opt">10%</button>
+        <button class="opt">100%</button>
+      </div>
+      <div class="explain">1 − 0.99<sup>100</sup> ≈ 0.634. The chance that all hundred calls are fast is only about 37%.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A container is limited to 1 CPU with the default 100 ms period. Four of its threads become busy at the start of a period, on four free cores. What happens?</p>
+      <div class="opts">
+        <button class="opt">They each run at a quarter speed for the whole period</button>
+        <button class="opt">One thread runs and three wait</button>
+        <button class="opt">Nothing: the limit is only an average over minutes</button>
+        <button class="opt">They use the 100 ms quota in 25 ms, and are all stopped for the remaining 75 ms</button>
+      </div>
+      <div class="explain">The quota is CPU time summed over all threads. When it is gone, the whole group is throttled until the next period.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">How does a hedged request reduce tail latency?</p>
+      <div class="opts">
+        <button class="opt">If the first replica hasn't answered after a short delay, the request is also sent to another, and the first reply is used</button>
+        <button class="opt">It makes every server faster</button>
+        <button class="opt">It sends every request to all replicas at once</button>
+        <button class="opt">It drops slow requests</button>
+      </div>
+      <div class="explain">Waiting a little before duplicating keeps the extra load to a few per cent while removing most slow outliers, which are usually confined to one replica.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which of these is <i>not</i> a typical operating-system cause of tail latency?</p>
+      <div class="opts">
+        <button class="opt">A thread waiting in the run queue for a core</button>
+        <button class="opt">A major page fault on a page that was evicted</button>
+        <button class="opt">A function that takes the same 5 ms on every call</button>
+        <button class="opt">Direct reclaim during a memory allocation</button>
+      </div>
+      <div class="explain">A constant cost shifts the whole distribution. The tail comes from things that happen only sometimes: queueing, faults, throttling, lock waits.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const TRIALS = 2000, MAXN = 100, HEDGE = 20;
+  let p = 0.01, hedge = 'off', seedOne = 7, one = null;
+  function rng(seed) { let s = seed >>> 0; return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; }; }
+  // Two uniform numbers per call: is the first copy slow, is the hedged copy slow. Fixed across settings.
+  const R = rng(20261006), DRAW = [];
+  for (let t = 0; t < TRIALS; t++) { const row = []; for (let i = 0; i < MAXN; i++) row.push([R(), R(), R()]); DRAW.push(row); }
+  function call(d) {            // returns { ms, kind }
+    const fast = 8 + d[2] * 4, slow = 800 + d[2] * 400;
+    if (d[0] >= p) return { ms: fast, kind: 'fast', extra: 0 };
+    if (hedge === 'off') return { ms: slow, kind: 'slow', extra: 0 };
+    return d[1] >= p ? { ms: HEDGE + fast, kind: 'saved', extra: 1 } : { ms: slow, kind: 'slow', extra: 1 };
+  }
+  function simulate(N) {
+    const lat = []; let extra = 0;
+    for (let t = 0; t < TRIALS; t++) { let m = 0; for (let i = 0; i < N; i++) { const c = call(DRAW[t][i]); if (c.ms > m) m = c.ms; extra += c.extra; } lat.push(m); }
+    const s = lat.slice().sort((a, b) => a - b);
+    return { p50: s[TRIALS / 2], p99: s[Math.floor(TRIALS * 0.99)], slow: lat.filter((x) => x > 100).length / TRIALS, extra: extra / (TRIALS * N) };
+  }
+  const ms = (x) => x >= 100 ? Math.round(x) + '<small> ms</small>' : x.toFixed(0) + '<small> ms</small>';
+  function sendOne(N) {
+    const r = rng(Math.imul(seedOne++, 2654435761) + 12345), calls = [];
+    r(); r(); r();                                  // discard the first few values of a fresh seed
+    for (let i = 0; i < N; i++) calls.push(call([r(), r(), r()]));
+    one = { calls, ms: Math.max(...calls.map((c) => c.ms)) };
+  }
+  function render() {
+    const N = +$('#taN').value, sim = simulate(N);
+    $('#taNV').textContent = N;
+    if (!one || one.calls.length !== N) sendOne(N);
+    $('#taDots').innerHTML = one.calls.map((c) => `<i class="${c.kind === 'slow' ? 'ta-slow' : c.kind === 'saved' ? 'ta-saved' : ''}" title="${c.ms.toFixed(0)} ms"></i>`).join('');
+    const nSlow = one.calls.filter((c) => c.kind === 'slow').length;
+    $('#taOne').innerHTML = `this request: ${Math.round(one.ms)} ms` + (nSlow ? ` (${nSlow} slow call${nSlow > 1 ? 's' : ''})` : '');
+    $('#taBar').style.width = (sim.slow * 100).toFixed(1) + '%';
+    const pEff = hedge === 'on' ? p * p : p, theory = 1 - Math.pow(1 - pEff, N);
+    let cls, text;
+    const pct = (x) => x < 0.001 ? (x * 100).toFixed(3) + '%' : x < 0.1 ? (x * 100).toFixed(1) + '%' : (x * 100).toFixed(0) + '%';
+    if (hedge === 'off') {
+      cls = theory >= 0.5 ? 'ta-bad' : theory >= 0.1 ? 'ta-warn' : 'ta-ok';
+      text = `Each call is slow ${pct(p)} of the time. With ${N} call${N > 1 ? 's' : ''} per request, the chance that at least one is slow is 1 − ${(1 - p).toFixed(3)}<sup>${N}</sup> = <b>${pct(theory)}</b>.` + (theory >= 0.5 ? ' <b>The typical user request is now a slow one</b>, although nearly every individual call is fast.' : theory >= 0.1 ? ' The back end\'s rare case is no longer rare for its users.' : '');
+    } else {
+      cls = theory >= 0.1 ? 'ta-warn' : 'ta-ok';
+      text = `With hedging, a call is slow only if the original <i>and</i> its hedged copy are both slow: ${pct(p)} × ${pct(p)} = ${pct(p * p)}. For ${N} call${N > 1 ? 's' : ''} that makes <b>${pct(theory)}</b> of user requests slow, in exchange for about <b>${(sim.extra * 100).toFixed(1)}% more back-end calls</b>. A call that was rescued costs 20 ms plus one normal response, not a second.`;
+    }
+    const d = $('#taDesc'); d.className = 'ta-desc ' + cls; d.innerHTML = text;
+    $('#taStats').innerHTML = `<div class="stat ${sim.slow >= 0.5 ? 'bad' : sim.slow >= 0.1 ? 'warn' : 'good'}"><div class="k">Slow user requests</div><div class="v">${(sim.slow * 100).toFixed(sim.slow < 0.1 ? 1 : 0)}%</div></div>
+      <div class="stat ${sim.p50 > 100 ? 'bad' : 'good'}"><div class="k">User p50</div><div class="v">${ms(sim.p50)}</div></div>
+      <div class="stat ${sim.p99 > 100 ? 'bad' : 'good'}"><div class="k">User p99</div><div class="v">${ms(sim.p99)}</div></div>
+      <div class="stat"><div class="k">Slow back-end calls</div><div class="v" style="font-size:19px">${pct(pEff)}</div></div>
+      <div class="stat ${sim.extra ? 'acc' : ''}"><div class="k">Extra calls</div><div class="v">${(sim.extra * 100).toFixed(1)}%</div></div>`;
+  }
+  $('#taN').addEventListener('input', () => { one = null; render(); });
+  $('#taSend').onclick = () => { sendOne(+$('#taN').value); render(); };
+  $('#taP').addEventListener('segchange', (e) => { p = +e.detail; one = null; render(); });
+  $('#taH').addEventListener('segchange', (e) => { hedge = e.detail; one = null; render(); });
+  render();
+})();
+</script>
 </body>
 </html>

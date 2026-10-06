@@ -6,34 +6,360 @@
 <title>Case Study: What docker run Really Does</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .dk-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .dk-row > span { font-size:12.5px; color:var(--muted); min-width:150px; }
+  .dk-cols { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.25fr); gap:12px; margin-top:14px; }
+  @media (max-width:820px) { .dk-cols { grid-template-columns:1fr; } }
+  .dk-box { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; min-width:0; }
+  .dk-box h6 { margin:0 0 6px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .dk-ps { font-family:var(--mono); font-size:12.5px; line-height:1.75; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .dk-ps .dk-z { color:var(--amber); }
+  .dk-ps .dk-dead { color:var(--muted); text-decoration:line-through; }
+  .dk-ps .dk-h { color:var(--muted); }
+  .dk-log { list-style:none; margin:0; padding:0; font-size:13.5px; }
+  .dk-log li { display:grid; grid-template-columns:54px minmax(0,1fr); gap:8px; padding:3px 0; }
+  .dk-log li > b { font-family:var(--mono); font-size:12.5px; color:var(--accent-2); font-weight:600; }
+  .dk-log li.dk-bad > b { color:var(--red); }
+  .dk-log li.dk-ok > b { color:var(--green); }
+  .dk-log .dk-idle { color:var(--muted); display:block; }
+</style>
 </head>
 <body data-chapter="46">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 46</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
     <h1>Case Study: <span class="grad">What docker run Really Does</span></h1>
-    <p class="lead">From the CLI to containerd and runc: image layers, namespaces, cgroups, and PID 1.</p>
+    <p class="lead"><a href="34-containers-namespaces-cgroups.html">Chapter 34</a> showed that a container is an ordinary process with a restricted view and a budget, and built one from namespaces and cgroups by hand. This case study follows the real command. Between pressing Enter on <code>docker run</code> and the first instruction of your program, five other programs take part, an image is fetched and stacked into a file system, one system call creates a process that can see almost nothing, and a handful of files set its limits. Then your program starts as process number 1, a position with rules of its own, and those rules are behind the most common container complaint there is: "why does it take ten seconds to stop?"</p>
+    <ul class="objectives">
+      <li>Name the programs between the docker command and the container, and what each one does</li>
+      <li>Explain how an image becomes a root file system without being copied</li>
+      <li>List what the runtime sets up before it starts your program</li>
+      <li>Trace resource flags to the cgroup files they write</li>
+      <li>Explain why PID 1 treats signals and orphans differently, and how to stop a container cleanly</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Namespaces, cgroups and overlay file systems.</b> See <a href="34-containers-namespaces-cgroups.html">Chapter 34</a>. This chapter builds on it and doesn't repeat it.</li>
+        <li><b>fork, exec, wait and zombies.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a>.</li>
+        <li><b>Signals.</b> See <a href="09-ipc-pipes-signals-shm.html">Chapter 9</a>.</li>
+        <li><b>Capabilities and seccomp.</b> See <a href="36-os-security.html">Chapter 36</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>CLI, daemon, containerd, runc</li>
-    <li>Image layers and overlayfs</li>
-    <li>clone() with namespaces</li>
-    <li>cgroup limits</li>
-    <li>PID 1 and signals</li>
-  </ol>
+  <h2>CLI, daemon, containerd, runc</h2>
+<pre class="code"><span class="c">$</span> docker run -d --name web -m 256m --cpus <span class="m">1.5</span> -p <span class="m">8080</span>:<span class="m">80</span> nginx:<span class="m">1.27</span>
+3f2a9c81d0b2e6a4…</pre>
+  <p>The <code>docker</code> program you typed does almost nothing itself. It is a client, and the work passes down a chain, each link narrower in purpose than the one before:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Program</th><th>Its job</th><th>Talks to the next by</th></tr></thead>
+      <tbody>
+        <tr><td><b><code>docker</code></b> (the CLI)</td><td>Turns your flags into a JSON request</td><td>HTTP over the Unix socket <code>/var/run/docker.sock</code></td></tr>
+        <tr><td><b><code>dockerd</code></b> (the daemon)</td><td>Images, networks, volumes, the API. Sets up the container's network</td><td>gRPC to containerd</td></tr>
+        <tr><td><b><code>containerd</code></b></td><td>Pulls and stores image layers, prepares the root file system, supervises running containers</td><td>Starting a shim process</td></tr>
+        <tr><td><b><code>containerd-shim</code></b></td><td>One per container. Stays as the container's parent, holds its output, records its exit status</td><td>Running <code>runc</code></td></tr>
+        <tr><td><b><code>runc</code></b></td><td>Makes the system calls that create the container, starts your program, and exits</td><td>System calls</td></tr>
+        <tr><td><b>The kernel</b></td><td>Namespaces, cgroups, the overlay mount: the only part that enforces anything</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <figure class="seq" data-actors="docker CLI|dockerd|containerd|shim + runc">
+    <ol>
+      <li data-m="0>1">POST /containers/create, then /start</li>
+      <li data-m="1>2">pull nginx:1.27 if missing; create a container and a task</li>
+      <li data-m="2>3">unpack the layers, write config.json, start a shim, which runs runc</li>
+      <li data-m="3>2" data-k="reply">runc made the namespaces and cgroup, started nginx, and exited</li>
+      <li data-m="2>1" data-k="reply">task running, PID 4431</li>
+      <li data-m="1>0" data-k="reply">container ID</li>
+    </ol>
+    <figcaption><b>One <code>docker run</code>.</b> The split has a history: Docker was one large daemon until 2015–16, when the pieces below it were separated and given open specifications. Kubernetes now talks to containerd directly and doesn't use the top two at all.</figcaption>
+  </figure>
+<pre class="code"><span class="c">$</span> ps -e -o pid,ppid,cmd --forest          <span class="c"># afterwards, on the host (trimmed)</span>
+    PID    PPID CMD
+    <span class="m">812</span>       <span class="m">1</span> /usr/bin/containerd
+    <span class="m">870</span>       <span class="m">1</span> /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+   <span class="m">4410</span>       <span class="m">1</span> /usr/bin/containerd-shim-runc-v2 -namespace moby -id 3f2a9c81d0b2…
+   <span class="m">4431</span>    <span class="m">4410</span>  \_ nginx: master process nginx -g daemon off;
+   <span class="m">4478</span>    <span class="m">4431</span>      \_ nginx: worker process</pre>
+  <p>Two things in that listing are worth a second look. nginx is a normal process on the host with a normal host PID, 4431, as Chapter 34 said it would be. And its parent is the <b>shim</b>, not the daemon, while <code>runc</code> is nowhere, because it has already exited. That's deliberate. Since no container is a child of <code>dockerd</code>, the daemon can be upgraded or can crash without taking the containers with it.</p>
+
+  <h2>Image layers and overlayfs</h2>
+  <p>An image name such as <code>nginx:1.27</code> resolves to a <b>manifest</b>: a small JSON document listing the image's layers by the SHA-256 hash of their contents. Each layer is a compressed tar archive of the files one build step added or changed.</p>
+<pre class="code"><span class="c">$</span> docker pull nginx:<span class="m">1.27</span>
+1.27: Pulling from library/nginx
+a2318d6c47ec: Already exists              <span class="c"># the Debian base layer: another image brought it</span>
+095d327c79ae: Pull complete
+bbfaa25db775: Pull complete
+7bb6fb0cfb2b: Pull complete
+Digest: sha256:9d6b58feebd2…</pre>
+  <p>Because a layer is named by its hash, identical layers are downloaded once and stored once, however many images use them. To make a root file system, containerd unpacks each layer into its own directory, and the kernel stacks them with one <code>mount</code> call:</p>
+<pre class="code"><span class="c">$</span> mount | grep overlay
+overlay on /var/lib/docker/overlay2/9c1e…/merged type overlay
+  (rw,lowerdir=/var/lib/docker/overlay2/l/7BB6:/var/lib/docker/overlay2/l/BBFA:/var/lib/docker/overlay2/l/095D:/var/lib/docker/overlay2/l/A231,
+      upperdir=/var/lib/docker/overlay2/9c1e…/diff,workdir=/var/lib/docker/overlay2/9c1e…/work)</pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Image layers (<code>lowerdir</code>)</th><th>Container layer (<code>upperdir</code>)</th></tr></thead>
+      <tbody>
+        <tr><td><b>Writable</b></td><td>Never</td><td>Yes</td></tr>
+        <tr><td><b>Shared</b></td><td>By every container and image that uses the layer</td><td>Private to one container</td></tr>
+        <tr><td><b>Created</b></td><td>When the image is pulled</td><td>Empty, at <code>docker run</code></td></tr>
+        <tr><td><b>Changing a file from the image</b></td><td>Untouched</td><td>The whole file is copied up on the first write, then changed</td></tr>
+        <tr><td><b>Lifetime</b></td><td>Until the image is removed</td><td>Deleted with the container. Data that must survive belongs in a volume</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>So starting a container copies no files at all, which is why it takes a fraction of a second where booting a virtual machine takes many. A hundred containers from one image share one copy of its files on disk, and one copy in the page cache (<a href="31-page-cache-fsync.html">Chapter 31</a>), since they are reading the same files.</p>
+
+  <h2>clone() with namespaces</h2>
+  <p>containerd hands <code>runc</code> a directory holding that root file system and a file, <code>config.json</code>, written to an open standard, the OCI runtime specification. Everything about the container is in it:</p>
+<pre class="code">{
+  <span class="s">"process"</span>: { <span class="s">"args"</span>: [<span class="s">"nginx"</span>, <span class="s">"-g"</span>, <span class="s">"daemon off;"</span>], <span class="s">"user"</span>: { <span class="s">"uid"</span>: <span class="m">0</span> },
+               <span class="s">"capabilities"</span>: { <span class="s">"bounding"</span>: [<span class="s">"CAP_CHOWN"</span>, <span class="s">"CAP_NET_BIND_SERVICE"</span>, <span class="s">"…"</span>] }, <span class="s">"noNewPrivileges"</span>: <span class="k">false</span> },
+  <span class="s">"root"</span>:    { <span class="s">"path"</span>: <span class="s">"rootfs"</span> },
+  <span class="s">"hostname"</span>: <span class="s">"3f2a9c81d0b2"</span>,
+  <span class="s">"linux"</span>: {
+    <span class="s">"namespaces"</span>: [ {<span class="s">"type"</span>: <span class="s">"pid"</span>}, {<span class="s">"type"</span>: <span class="s">"mount"</span>}, {<span class="s">"type"</span>: <span class="s">"ipc"</span>}, {<span class="s">"type"</span>: <span class="s">"uts"</span>}, {<span class="s">"type"</span>: <span class="s">"cgroup"</span>},
+                    {<span class="s">"type"</span>: <span class="s">"network"</span>, <span class="s">"path"</span>: <span class="s">"/var/run/docker/netns/5d1c0a7e9b21"</span>} ],
+    <span class="s">"resources"</span>:  { <span class="s">"memory"</span>: { <span class="s">"limit"</span>: <span class="m">268435456</span> }, <span class="s">"cpu"</span>: { <span class="s">"quota"</span>: <span class="m">150000</span>, <span class="s">"period"</span>: <span class="m">100000</span> } },
+    <span class="s">"seccomp"</span>:    { <span class="s">"defaultAction"</span>: <span class="s">"SCMP_ACT_ERRNO"</span>, <span class="s">"syscalls"</span>: [ <span class="s">"…"</span> ] }
+  }
+}</pre>
+  <p><code>runc</code> turns that file into system calls, in an order that matters:</p>
+<pre class="code"><span class="c">/* What runc does, in outline */</span>
+pid = <span class="f">clone</span>(child, stack, CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWCGROUP | SIGCHLD, arg);
+<span class="f">write</span>(cgroup_procs_fd, pid_string, len);       <span class="c">/* parent: put the child in its cgroup before it runs anything */</span>
+
+<span class="c">/* in the child, which is already PID 1 of a new PID namespace: */</span>
+<span class="f">setns</span>(netns_fd, CLONE_NEWNET);                 <span class="c">/* join the network namespace dockerd prepared */</span>
+<span class="f">sethostname</span>(<span class="s">"3f2a9c81d0b2"</span>, <span class="m">12</span>);
+<span class="f">mount</span>(<span class="s">"overlay"</span>, rootfs, <span class="s">"overlay"</span>, <span class="m">0</span>, layers);  <span class="c">/* the stacked image */</span>
+<span class="f">mount</span>(<span class="s">"proc"</span>, <span class="s">"rootfs/proc"</span>, <span class="s">"proc"</span>, <span class="m">0</span>, <span class="k">NULL</span>);  <span class="c">/* a /proc that shows only this PID namespace */</span>
+<span class="f">pivot_root</span>(rootfs, old_root);                  <span class="c">/* swap the root; then unmount the old one so the host isn't reachable */</span>
+<span class="f">umount2</span>(old_root, MNT_DETACH);
+<span class="c">/* privileges go last, because the steps above needed them: */</span>
+<span class="f">drop_capabilities</span>();                           <span class="c">/* keep 14 of about 40 */</span>
+<span class="f">load_seccomp_filter</span>();                         <span class="c">/* refuse about 44 system calls */</span>
+<span class="f">execve</span>(<span class="s">"/usr/sbin/nginx"</span>, argv, envp);          <span class="c">/* the container's program replaces runc's code */</span></pre>
+  <p>The last line is the reason <code>runc</code> disappears: your program doesn't run <i>under</i> the runtime, it <i>replaces</i> it, keeping the namespaces, the cgroup and the reduced privileges that were set up around it (<a href="03-processes-fork-exec-wait.html">Chapter 3</a>). The network is prepared by <code>dockerd</code> beforehand: a virtual cable with one end inside the new network namespace as <code>eth0</code> and the other on a bridge on the host, and for <code>-p 8080:80</code> a rule sending the host's port 8080 to the container's port 80.</p>
+  <p>Because <code>runc</code> enters the container before handing over, it has to assume the container is hostile. In 2019 a flaw, CVE-2019-5736, let a malicious image overwrite the host's <code>runc</code> binary through <code>/proc/self/exe</code> at that moment and so gain root on the host. The fix has <code>runc</code> run from a sealed copy of itself held in memory, so there's no file on the host for a container to reach.</p>
+
+  <h2>cgroup limits</h2>
+  <p>The two resource flags in the command become three lines in files (<a href="34-containers-namespaces-cgroups.html">Chapter 34</a>):</p>
+<pre class="code"><span class="c">$</span> cd /sys/fs/cgroup/system.slice/docker-3f2a9c81d0b2….scope
+<span class="c">$</span> cat memory.max cpu.max cgroup.procs
+<span class="m">268435456</span>                  <span class="c"># -m 256m</span>
+<span class="m">150000</span> <span class="m">100000</span>              <span class="c"># --cpus 1.5: 150 ms of CPU time in every 100 ms period</span>
+<span class="m">4431</span>
+<span class="m">4478</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Flag</th><th>File</th><th>At the limit</th><th>How you see it</th></tr></thead>
+      <tbody>
+        <tr><td><code>-m 256m</code></td><td><code>memory.max</code></td><td>The kernel reclaims what it can, then kills a process in the cgroup</td><td>Exit status 137 and <code>"OOMKilled": true</code> in <code>docker inspect</code> (<a href="48-case-oom-killer.html">Chapter 48</a>)</td></tr>
+        <tr><td><code>--cpus 1.5</code></td><td><code>cpu.max</code></td><td>The threads are paused until the next period</td><td><code>nr_throttled</code> rising in <code>cpu.stat</code>; slow, not dead</td></tr>
+        <tr><td><code>--pids-limit 200</code></td><td><code>pids.max</code></td><td><code>fork</code> fails with <code>EAGAIN</code></td><td>"Resource temporarily unavailable"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>PID 1 and signals</h2>
+  <p>Inside its new PID namespace, the program <code>runc</code> started is process 1. On a normal system PID 1 is <code>init</code>, and the kernel gives that position three special rules. They apply to your program now.</p>
+  <ul>
+    <li><b>Signals without a handler are discarded.</b> For any other process, <code>SIGTERM</code> with no handler means "terminate". For PID 1 the kernel doesn't apply default actions, so a signal the program hasn't asked to handle does nothing. (<code>SIGKILL</code> sent from the host still works.)</li>
+    <li><b>Orphans arrive.</b> A process whose parent dies is re-parented to PID 1, which is expected to call <code>wait</code> for it. If it doesn't, each one stays behind as a zombie.</li>
+    <li><b>When PID 1 exits, the namespace ends.</b> The kernel kills every other process in it at once, with <code>SIGKILL</code>.</li>
+  </ul>
+  <p><code>docker stop</code> sends <code>SIGTERM</code> to PID 1, waits ten seconds, and then sends <code>SIGKILL</code>. What happens in those ten seconds depends entirely on which program is PID 1, and that is decided by how the image starts your application.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Stop the container</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="dk-row"><span>The image starts the app with</span><div class="seg" id="dkInit"><button class="active" data-v="app">ENTRYPOINT ["node", "server.js"]</button><button data-v="shell">a script that runs node</button><button data-v="tini">docker run --init</button></div></div>
+      <div class="dk-row"><span>The app handles SIGTERM</span><div class="seg" id="dkHandler"><button class="active" data-v="no">no</button><button data-v="yes">yes: finish requests, then exit</button></div></div>
+      <div class="controls" style="margin-top:12px">
+        <button class="btn sm primary" id="dkStop">docker stop</button>
+        <button class="btn sm" id="dkOrphan">An orphaned helper exits</button>
+        <button class="btn sm" id="dkReset">↺ Reset</button>
+      </div>
+      <div class="dk-cols">
+        <div class="dk-box"><h6>ps inside the container</h6><div class="dk-ps" id="dkPs"></div></div>
+        <div class="dk-box"><h6>What happened</h6><ul class="dk-log" id="dkLog"></ul></div>
+      </div>
+      <div class="stats" id="dkStats"></div>
+    </div>
+    <div class="panel-foot">The app is a web server with 12 requests in flight, each needing up to 2 seconds more. The script is a shell script whose last line is <code>node server.js</code>, without <code>exec</code>. <code>--init</code> puts a tiny init program, tini, at PID 1 with the app as its child.</div>
+  </div>
+
+  <p>Things to notice. With the app as PID 1 and no handler, the stop takes the full ten seconds and ends in a kill, with status 137 and twelve requests cut off. The program did nothing wrong by ordinary standards, since the default action would have ended it immediately anywhere else. Add a handler and the same container stops in two seconds with status 0. Now put the script in front. The handler makes no difference, because the shell is PID 1, discards the signal and doesn't pass it on. The app never learns that it was asked to stop. With <code>--init</code>, tini forwards the signal, and the app, no longer PID 1, gets ordinary behaviour: instant death by default, or a clean shutdown with a handler. The orphan button shows the other duty. A shell or tini collects orphans, and an application at PID 1 usually doesn't, so its zombies pile up.</p>
+<pre class="code"><span class="c"># The two fixes, in a Dockerfile and a start script</span>
+ENTRYPOINT [<span class="s">"node"</span>, <span class="s">"server.js"</span>]        <span class="c"># exec form: no shell in between. (ENTRYPOINT node server.js would add one)</span>
+
+<span class="c">#!/bin/sh</span>
+<span class="f">export</span> DB_URL=<span class="s">"$(cat /run/secrets/db_url)"</span>
+<span class="k">exec</span> node server.js                       <span class="c"># exec: node replaces the shell and becomes PID 1</span>
+
+<span class="c">$</span> docker inspect -f <span class="s">'{{.State.ExitCode}} {{.State.OOMKilled}}'</span> web
+137 false                                 <span class="c"># 128 + 9: killed by SIGKILL, and not for memory. A stop that timed out</span></pre>
+
+  <div class="callout usecase">
+    <div class="ico">⚖️</div>
+    <div class="body"><div class="title">The zombie reaping problem, and a flag added to fix it</div><p>In 2015 the makers of a popular base image, Phusion, published an article titled "Docker and the PID 1 zombie reaping problem". Their point was that almost every image of the time ran its application directly as PID 1, and almost no application was written to do an init system's job. Applications that started helper programs, and many do, for image conversion, health checks or shell commands, left zombies behind whenever a helper outlived the process that started it. Each zombie holds a slot in the process table, and a long-running container could collect thousands and finally fail to start new processes at all. The same images ignored <code>SIGTERM</code>, so every deployment waited out a ten-second timeout per container and then killed it mid-request. The article was widely read, and the ecosystem's response was a very small program: <b>tini</b>, a few hundred lines of C that starts one child, forwards signals to it and reaps every orphan. It was so widely added to images that Docker built it in, as <code>docker run --init</code>, in version 1.13 in 2017. The same rules now sit behind Kubernetes rolling updates. A pod is sent <code>SIGTERM</code> and given 30 seconds, and a service whose PID 1 never passes the signal on drops requests on every deployment.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Shell-form or wrapper-script entrypoints without <code>exec</code>.</b> A shell becomes PID 1 and your app never receives the stop signal.</li>
+      <li><b>No <code>SIGTERM</code> handler in a program that runs as PID 1.</b> The default action doesn't apply there. Every stop becomes a ten-second wait and a kill.</li>
+      <li><b>Reading exit status 137 as "out of memory".</b> It means <code>SIGKILL</code>. Check <code>OOMKilled</code> to tell a memory kill from a stop that timed out.</li>
+      <li><b>Writing data into the container layer.</b> It is slow for large files, because of the copy-up, and it is deleted with the container.</li>
+      <li><b>Thinking the daemon runs the container.</b> The kernel does. The daemon only set it up, which is why containers outlive it.</li>
+      <li><b>Treating root in a container as harmless, or as the same as root on the host.</b> It is root with fewer capabilities and a system-call filter, sharing the host's kernel.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What happens when you run <code>docker run nginx</code>?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The docker CLI sends an API request over a Unix socket to the Docker daemon. If the image isn't present, it is pulled: a manifest lists layers by content hash, and each missing layer is downloaded and unpacked. The daemon asks containerd to create the container; containerd prepares a root file system by stacking the read-only image layers with a new empty writable layer using overlayfs, and writes an OCI configuration describing the process, namespaces, limits and security settings. It starts a shim process, which invokes runc. runc creates a new process with <code>clone</code> in new PID, mount, network, UTS and IPC namespaces, places it in a new cgroup with the memory and CPU limits, switches its root to the overlay mount with <code>pivot_root</code>, drops capabilities and installs a seccomp filter, and finally calls <code>exec</code> on nginx. runc exits and the shim remains as the parent, so the container doesn't depend on the daemon staying up. The result is an ordinary host process that sees itself as PID 1 in an isolated environment.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A container takes exactly ten seconds to stop and exits with status 137. Why, and how do you fix it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div><code>docker stop</code> sends SIGTERM to the container's PID 1, waits for a grace period, ten seconds by default, and then sends SIGKILL; 137 is 128 plus 9, so the process was killed after ignoring the SIGTERM. There are two usual causes. One is that the application is PID 1 and has no SIGTERM handler: the kernel doesn't apply default signal actions to PID 1 of a namespace, so the signal is dropped. The other is that PID 1 isn't the application at all but a shell, from a shell-form entrypoint or a wrapper script that doesn't use <code>exec</code>, and shells don't forward signals to their children. The fixes are to use the exec form of ENTRYPOINT, to end wrapper scripts with <code>exec</code>, to add a SIGTERM handler that stops accepting work and finishes what is in flight, or to run a minimal init such as tini with <code>--init</code>, which forwards signals and also reaps orphaned zombies. I'd also check <code>OOMKilled</code> in <code>docker inspect</code>, because 137 from the memory limit looks the same but wouldn't take ten seconds.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li><code>docker run</code> passes through the CLI, dockerd, containerd, a shim and runc. Only the kernel enforces anything, and the container's parent is the shim.</li>
+      <li>An image is a list of content-addressed layers. A container's root is those layers stacked read-only under one empty writable layer, with nothing copied.</li>
+      <li>runc clones a process into new namespaces, puts it in a cgroup, pivots the root, drops privileges and then execs your program in its own place.</li>
+      <li>Resource flags are values in cgroup files: exceed memory and a process is killed, exceed CPU and it is throttled.</li>
+      <li>Your program is PID 1: unhandled signals are discarded, orphans are its to reap, and its exit ends the container.</li>
+      <li>Use exec-form entrypoints, <code>exec</code> in scripts, a SIGTERM handler, or <code>--init</code>. Status 137 means SIGKILL.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Once a container is running, which process is its parent on the host?</p>
+      <div class="opts">
+        <button class="opt"><code>dockerd</code></button>
+        <button class="opt"><code>runc</code></button>
+        <button class="opt">A <code>containerd-shim</code> process</button>
+        <button class="opt">The <code>docker</code> CLI</button>
+      </div>
+      <div class="explain">runc exits after starting the program, and the shim stays. That is why restarting the daemon doesn't kill containers.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Fifty containers are started from one 800 MB image. Roughly how much extra disk do they use at the start?</p>
+      <div class="opts">
+        <button class="opt">Almost none: each gets an empty writable layer over the shared read-only layers</button>
+        <button class="opt">40 GB: each gets a copy of the image</button>
+        <button class="opt">800 MB: one extra copy shared by all</button>
+        <button class="opt">It depends on the memory limit</button>
+      </div>
+      <div class="explain">Starting a container is a mount, not a copy. A file is copied only when a container first writes to it.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why does runc drop capabilities and install the seccomp filter last, just before <code>exec</code>?</p>
+      <div class="opts">
+        <button class="opt">They are the slowest steps</button>
+        <button class="opt">The kernel requires that order</button>
+        <button class="opt">Otherwise nginx couldn't bind port 80</button>
+        <button class="opt">The earlier steps, such as mounting and <code>pivot_root</code>, need the privileges that are being given up</button>
+      </div>
+      <div class="explain">Set up the environment with full privilege, reduce privilege, then hand over to the untrusted program.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">An application with no signal handlers runs as PID 1 in a container. What does <code>docker stop</code> do?</p>
+      <div class="opts">
+        <button class="opt">The SIGTERM terminates it immediately</button>
+        <button class="opt">The SIGTERM is discarded; ten seconds later it is killed with SIGKILL and exits with status 137</button>
+        <button class="opt">Nothing: the container can't be stopped</button>
+        <button class="opt">It exits with status 0 after ten seconds</button>
+      </div>
+      <div class="explain">The kernel applies no default action to PID 1's signals. Only the SIGKILL from outside the namespace ends it.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A start script ends with <code>node server.js</code>, and node has a careful SIGTERM handler. On <code>docker stop</code> the handler never runs. Why?</p>
+      <div class="opts">
+        <button class="opt">Handlers don't work inside containers</button>
+        <button class="opt">Docker sends SIGKILL first</button>
+        <button class="opt">The shell is PID 1 and receives the signal; it doesn't pass it to its child. Ending the script with <code>exec node server.js</code> fixes it</button>
+        <button class="opt">The cgroup blocks signals</button>
+      </div>
+      <div class="explain">With <code>exec</code>, node replaces the shell and is PID 1 itself, so it receives the signal directly.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const cfg = { init: 'app', handler: 'no' };
+  let S;
+  function reset() { S = { zombies: 0, reaped: 0, stopped: null, log: [] }; }
+  const PID1 = { app: 'node server.js', shell: '/bin/sh ./start.sh', tini: '/sbin/docker-init -- node server.js' };
+  function stop() {
+    const h = cfg.handler === 'yes', L = [];
+    L.push(['0.0 s', '', '<code>docker stop</code>: the daemon sends <b>SIGTERM</b> to PID 1.']);
+    let t, code, done;
+    const graceful = () => { L.push(['0.0 s', '', 'node\'s handler runs: it stops accepting connections and lets the 12 requests in flight finish.']); L.push(['2.0 s', 'dk-ok', 'node exits with status 0.' + (cfg.init === 'tini' ? ' tini exits with the same status.' : '')]); t = 2; code = 0; done = true; };
+    const timeout = (who) => { L.push(['10.0 s', 'dk-bad', 'The grace period is over. The daemon sends <b>SIGKILL</b> to PID 1, which can\'t be ignored.']); L.push(['10.0 s', 'dk-bad', who]); t = 10; code = 137; done = false; };
+    if (cfg.init === 'app') {
+      if (h) graceful();
+      else { L.push(['0.0 s', '', 'node is PID 1 and has no handler for SIGTERM. The kernel applies no default action for PID 1, so the signal is <b>discarded</b>. node carries on serving.']); timeout('node dies in the middle of its requests. Exit status 137 (128 + 9).'); }
+    } else if (cfg.init === 'shell') {
+      L.push(['0.0 s', '', 'PID 1 is the shell. It has no handler, so the signal is <b>discarded</b>, and a shell doesn\'t pass signals on to its children. node (PID 7) never hears of it' + (h ? ', so its handler is never called.' : '.')]);
+      timeout('The shell dies. With PID 1 gone the kernel kills everything left in the namespace, so node gets SIGKILL too. Exit status 137.');
+    } else {
+      L.push(['0.0 s', '', 'PID 1 is tini, which does have a handler: it <b>forwards</b> SIGTERM to node (PID 7).']);
+      if (h) graceful();
+      else { L.push(['0.0 s', 'dk-bad', 'node is not PID 1 here, so the default action applies and it is terminated at once, mid-request. tini exits with status 143 (128 + 15).']); t = 0; code = 143; done = false; }
+    }
+    S.stopped = { t, code, done }; S.log = L;
+  }
+  function orphan() {
+    const pid = 20 + (S.zombies + S.reaped) * 3;
+    const head = `A helper (PID ${pid}) lost its parent, was re-parented to PID 1, and then exited.`;
+    if (cfg.init === 'app') { S.zombies++; S.log = [['', 'dk-bad', head + ' node only waits for children it started itself, so nobody collects this one\'s exit status. It stays in the process table as a <b>zombie</b> until the container stops.']]; }
+    else { S.reaped++; S.log = [['', 'dk-ok', head + (cfg.init === 'shell' ? ' The shell is sitting in <code>wait</code> for any child, so it collected the exit status. No zombie.' : ' Collecting orphans is half of what tini is for: it called <code>wait</code>, and the process is gone.')]]; }
+  }
+  function render() {
+    const st = S.stopped, dead = st ? 'dk-dead' : '';
+    let ps = '<span class="dk-h">PID  COMMAND</span>\n' + `<span class="${dead}">  1  ${PID1[cfg.init]}</span>\n`;
+    if (cfg.init !== 'app') ps += `<span class="${dead}">  7  node server.js</span>\n`;
+    for (let i = 0; i < Math.min(S.zombies, 4); i++) ps += `<span class="${st ? 'dk-dead' : 'dk-z'}"> ${20 + i * 3}  [convert] &lt;defunct&gt;</span>\n`;
+    if (S.zombies > 4) ps += `<span class="dk-z">     … and ${S.zombies - 4} more zombies</span>\n`;
+    if (st) ps += '<span class="dk-h">(the container has exited)</span>';
+    $('#dkPs').innerHTML = ps;
+    $('#dkLog').innerHTML = S.log.length ? S.log.map(([t, cls, text]) => `<li class="${cls}"><b>${t}</b><span>${text}</span></li>`).join('')
+      : '<li><b></b><span class="dk-idle">The container is running and serving requests. Stop it, or let a helper process be orphaned.</span></li>';
+    $('#dkStats').innerHTML = `<div class="stat ${!st ? '' : st.t >= 10 ? 'bad' : 'good'}"><div class="k">Time to stop</div><div class="v">${st ? st.t.toFixed(1) + ' s' : '–'}</div></div>
+      <div class="stat ${!st ? '' : st.code ? 'bad' : 'good'}"><div class="k">Exit status</div><div class="v">${st ? st.code : '–'}</div></div>
+      <div class="stat ${!st ? '' : st.done ? 'good' : 'bad'}"><div class="k">Requests in flight</div><div class="v">${st ? (st.done ? '12 finished' : '12 cut off') : '12'}</div></div>
+      <div class="stat ${S.zombies ? 'warn' : ''}"><div class="k">Zombies</div><div class="v">${st ? 0 : S.zombies}</div></div>`;
+    $('#dkStop').disabled = $('#dkOrphan').disabled = !!st;
+  }
+  $('#dkStop').onclick = () => { stop(); render(); };
+  $('#dkOrphan').onclick = () => { orphan(); render(); };
+  $('#dkReset').onclick = () => { reset(); render(); };
+  $('#dkInit').addEventListener('segchange', (e) => { cfg.init = e.detail; reset(); render(); });
+  $('#dkHandler').addEventListener('segchange', (e) => { cfg.handler = e.detail; reset(); render(); });
+  reset(); render();
+})();
+</script>
 </body>
 </html>
