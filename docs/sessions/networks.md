@@ -84,3 +84,11 @@
 - Release prepared (2026-10-07, with the owner's go-ahead): the shared edits above are made on this branch (`assets/atlas.js`: `soon`
   removed, `hours` already 40; `README.md`: Networks row, totals, folder tree). Checks: content audit 0 errors across all courses,
   bundle check, palette check, hub check in light, dark and at 390 px all pass. The `.objectives li` fix is left for later.
+
+## 2026-10-07 — merged
+- Release prepared with the owner's go-ahead: `assets/atlas.js` (`soon` removed; 56 lessons, 40 hours) and `README.md` (Networks row,
+  totals of 340 chapters and ~249 hours, folder tree). Content audit, bundle, palette and hub checks (light, dark, 390 px) all passed.
+- Pull request #3 merged into `main` (merge commit 9b5b61d); the course is live on the Atlas hub and on GitHub Pages.
+- Pull request #4 (merge commit de54cda) put the course cards and the progress tracker in the recommended learning order:
+  DSA, OS, Networks, Databases, LLD, System Design, Distributed Systems, Cloud & DevOps, ML & AI Systems.
+- Still open: release `networks-v1.0.0` is not published (the owner asked for the merge only); the `.objectives li` fix in `style.css`.

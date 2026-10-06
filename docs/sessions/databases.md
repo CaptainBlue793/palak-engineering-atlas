@@ -27,3 +27,10 @@
 - DB 8: Constraints & Integrity: constraint gatekeeper (FK ON DELETE modes, CHECK, lower() unique, exclusion, deferrable)
 - DB 9: Indexes: A First Look: index lab (7 queries x 5 indexes: seq/index/bitmap/index-only, write cost)
 - DB 10: Transactions & ACID: crash lab (txn vs autocommit, failing credit, synchronous_commit off)
+
+## 2026-10-07 — session 2 (standalone clone)
+- Setup: work continues in a standalone clone at `C:\Users\palak\atlas-courses\databases` (branch `feature/databases-course`), with
+  `main` merged in (OS and Networks released, shared tools). 18 of 56 lessons were written (P1–P8, Ch 1–10); Ch 11–48 remain.
+- Decisions: objectives are written `<li><span>…</span></li>` from Ch 11 on, so that an objective containing `<code>` doesn't split
+  into columns (`.objectives li` is a flex row). Each chapter's panel is driven headlessly and its text checked against the panel's
+  numbers before the commit; wide tables go in `.table-wrap`.
