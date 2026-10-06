@@ -43,3 +43,4 @@
 - Ch 18 HTTP/3 & QUIC: round-trip comparison of TCP + TLS 1.3 against QUIC (50 / 150 / 300 ms; first visit or returning with 0-RTT) for time to first byte, and for a Wi-Fi to mobile network change (reconnect against connection migration)
 - Ch 19 DHCP: café lease simulator (five addresses, one-hour leases; devices join with DORA, walk out without releasing, 30-minute steps with renewals and expiry) showing the lease table, pool exhaustion and 169.254 self-assigned addresses
 - Ch 20 IPv6: address workbench (type or pick an address; full and shortest forms, kind, /64 network and interface ID split, MAC recovered from an EUI-64 interface ID, and precise messages for invalid input)
+- Ch 21 WebSockets & Server-Sent Events: one minute of server events delivered five ways (polling every 5 s or 1 s, long polling, SSE, WebSocket; 5 events or 120) with a happens/received timeline, request count, header overhead and delay
