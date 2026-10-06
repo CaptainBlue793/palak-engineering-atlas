@@ -72,5 +72,4 @@
   - Ch 34 Containers (36 KB): build-a-container panel (switch on PID, mount, network, UTS and user namespaces and memory and CPU limits one at a time; run ps, hostname, ip addr, ls /, id; allocate memory until the cgroup OOM kill; spin threads into throttling)
   - Ch 35 Booting, Kernel Modules & Drivers (36 KB): boot stepper through seven stages with a console log and five injectable faults (boot loader config lost, disk driver missing, wrong root=, bad fstab line, failed service), each stopping at the right stage with the real message and the fix
   - Ch 36 OS Security (33 KB): exploit-versus-defences panel (four attacker inputs against a stack overflow; stack canary, NX, ASLR and a seccomp sandbox as switches) showing the overwritten stack frame, which defence stops which attack, and what the attacker ends up controlling
-- Status after Ch 36: 44 of 56 lessons written (P1-P8, Ch 1-36). Prerequisites, Beginner, Intermediate and Advanced are complete.
-- Next: Ch 37 Performance Tools, then the rest of Expert (38-40) and the case studies (41-48).
+  - Ch 37 Performance Tools (40 KB): diagnose-five-servers game (run uptime, vmstat, mpstat, free, iostat, top, strace -c and perf top on five slow servers, then pick among CPU saturation, swapping, disk saturation, lock contention and one pinned thread)
