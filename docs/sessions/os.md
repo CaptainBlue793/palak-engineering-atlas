@@ -52,3 +52,4 @@
     your own, 1-7 frames, faults-by-frames chart that flags Belady's anomaly)
   - Ch 16 The Heap: How malloc Works (38 KB): free-list allocator (first/best/worst fit, splitting, coalescing on/off,
     brk growth, a one-click fragmented heap)
+  - Ch 17 Race Conditions & Critical Sections (33 KB): be-the-scheduler stepper for two threads doing counter++ (load/add/store), exhaustive search of all 20 schedules, mutex on/off
