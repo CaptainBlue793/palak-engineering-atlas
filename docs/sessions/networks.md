@@ -59,3 +59,4 @@
 - Ch 34 Kernel Networking: one-core receive-path model (10 thousand to 10 million packets a second; interrupt per packet, NAPI, or kernel bypass; 1 / 4 / 8 RSS queues) showing where each core's time goes, packets delivered and dropped, interrupts, and receive livelock
 - Ch 35 Firewalls, iptables & Security Groups: first-match rule list judged against six packets (state rule, drop-all at top, policy)
 - Ch 36 DDoS & Network Attacks: reflection/amplification calculator (protocol, attacker uplink, victim link, BCP 38 or scrubbing)
+- Ch 37 Packet-Level Debugging: six tcpdump captures to diagnose (dropped SYN, closed port, loss, zero window, slow server, idle reset)
