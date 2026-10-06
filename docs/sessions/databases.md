@@ -47,3 +47,4 @@
 - DB 21: Isolation Levels & Anomalies: two-session stepper for five anomalies at four isolation levels (results, errors and retries per level)
 - DB 22: Locking & Two-Phase Locking: three-session lock-conflict panel on PostgreSQL's table and row locks (with the lock-queue pile-up behind ALTER TABLE)
 - DB 23: MVCC: one row's versions with xmin/xmax, a writer, held reader snapshots and VACUUM limited by the oldest snapshot
+- DB 24: Deadlocks in Databases: two opposite transfers stepped through with row locks and a wait-for graph (sender-first vs id order)
