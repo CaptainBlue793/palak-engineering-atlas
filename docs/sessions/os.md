@@ -91,3 +91,6 @@
   to the course table, drop OS from "On the way", change the totals to 284 chapters (244 main + 40 prerequisites) and ~209 hours, and add
   `os/` to the folder tree. `gh` is not installed on this machine, so the release tag has to be made another way.
 - Next: the owner's go-ahead, then Step 4 (shared edits, hub and palette checks, merge into main, release). After that, the next course.
+- Release prepared (2026-10-06, with the owner's go-ahead): the shared edits above are made on this branch (`assets/atlas.js`: `soon` removed,
+  `hours: 41`; `README.md`: OS row, totals, folder tree). Checks: content audit 0 errors across all courses, bundle check, palette check,
+  hub check in light, dark and at 390 px all pass. A pull request into `main` is opened for the merge; the release tag is still to do.
