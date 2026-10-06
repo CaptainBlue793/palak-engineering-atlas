@@ -6,34 +6,298 @@
 <title>Case Study: GitHub’s MySQL Failover Incident</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .gh-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .gh-row > span { font-size:12.5px; color:var(--muted); min-width:92px; }
+  .gh-sites { display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); gap:8px; align-items:stretch; margin-top:14px; }
+  @media (max-width:640px) { .gh-sites { grid-template-columns:1fr; } .gh-link { padding:2px 0; } }
+  .gh-site { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; min-width:0; font-size:13px; }
+  .gh-site h6 { margin:0 0 4px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .gh-site b { display:block; font-size:14px; }
+  .gh-site small { display:block; color:var(--muted); font-size:11.5px; margin-top:3px; }
+  .gh-site.gh-ok { border-color:var(--green); background:var(--green-soft); }
+  .gh-site.gh-bad { border-color:var(--red); background:var(--red-soft); }
+  .gh-site.gh-warn { border-color:var(--amber, var(--accent)); background:var(--amber-soft, var(--surface-2)); }
+  .gh-site.gh-off { opacity:.5; }
+  .gh-link { display:flex; align-items:center; justify-content:center; font-size:11.5px; color:var(--muted); text-align:center; min-width:74px; }
+  .gh-steps { margin:12px 0 0; padding-left:20px; font-size:13.5px; }
+  .gh-steps li { padding:2px 0; }
+  .gh-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .gh-msg.gh-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .gh-msg.gh-warn { background:var(--amber-soft, var(--surface-2)); border-left-color:var(--amber, var(--accent)); }
+</style>
 </head>
 <body data-chapter="44">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
-    <div class="eyebrow"><span class="pill accent">Chapter 44</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Case Study: <span class="grad">GitHub’s MySQL Failover Incident</span></h1>
-    <p class="lead">A 43-second network partition and a 24-hour recovery: cross-region failover gone wrong.</p>
+    <div class="eyebrow"><span class="pill accent">Chapter 44</span><span class="pill">Case Study</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Case Study: GitHub's <span class="grad">MySQL Failover Incident</span></h1>
+    <p class="lead">At 22:52 UTC on Sunday 21 October 2018, engineers replacing a failing piece of optical networking equipment cut the connection between GitHub's main data centre on the East Coast of the United States and the rest of its network. The connection was back 43 seconds later. In those seconds the system that manages GitHub's databases did what it had been built to do: it concluded that the primary databases had failed, and promoted replicas on the West Coast in their place. When the link returned there were two sets of databases, each holding writes the other had never seen. Putting that right took 24 hours and 11 minutes, during which the site showed stale data and millions of webhooks went undelivered. No component malfunctioned, and the automation followed its configuration exactly. GitHub published a detailed account, and it is the clearest real example of what <a href="25-replication.html">Chapter 25</a> called split brain, and of how a failover can do more damage than the fault that triggered it.</p>
+    <ul class="objectives">
+      <li><span>Reconstruct how a 43-second partition produced two primaries with different data</span></li>
+      <li><span>Explain why neither side could simply be discarded, and what the recovery involved</span></li>
+      <li><span>Weigh automatic failover against waiting, when the length of an outage isn't known in advance</span></li>
+      <li><span>Say what a failover system has to check besides "is the primary reachable?"</span></li>
+      <li><span>Take the lessons GitHub drew, and apply them to a design of your own</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Replication, lag, failover and split brain:</b> <a href="25-replication.html">Chapter 25</a>. This case is that chapter's last section, in production.</li>
+        <li><b>Majorities:</b> <a href="36-distributed-sql.html">Chapter 36</a>.</li>
+        <li><b>Backups, and how long a restore takes:</b> <a href="35-backups-pitr.html">Chapter 35</a>.</li>
+        <li><b>The binary log and logical replication:</b> <a href="43-case-uber-postgres-mysql.html">Chapter 43</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The partition</li>
-    <li>Orchestrator's failover</li>
-    <li>Writes on both sides</li>
-    <li>The recovery</li>
-    <li>Lessons</li>
-  </ol>
+  <h2>The setup</h2>
+  <p>GitHub stored its metadata, the issues, pull requests, comments, users and permissions, in several MySQL clusters. Git repositories themselves are kept in a separate system and weren't affected. Each cluster had one primary taking all writes and dozens of replicas serving reads. The primaries, and the application servers that wrote to them, were in the East Coast data centre. Replicas were spread across that site, a West Coast data centre and public cloud regions, with replication between the coasts asynchronous.</p>
+  <p>Failover was automatic, managed by an open-source tool called Orchestrator, whose author worked on GitHub's database team. Orchestrator watches the replication topology, and when a primary stops responding and its replicas agree that they can't reach it either, it chooses the most up-to-date replica and promotes it. To avoid acting on one node's mistaken view, Orchestrator itself ran as a group of nodes in different sites that had to reach a majority before acting.</p>
+
+  <h2>The partition</h2>
+  <figure class="seq" data-actors="East: primary|Network|West: replica|Orchestrator majority">
+    <ol>
+      <li data-m="0>2">asynchronous replication, as normal<small>the West replicas are a fraction of a second behind</small></li>
+      <li data-m="1>1" data-k="fail">22:52:00  the link between the East data centre and everything else goes down</li>
+      <li data-m="0>0">still running, still accepting writes<small>the application servers beside it can reach it, and they keep writing</small></li>
+      <li data-m="3>0" data-k="fail">health check: no answer</li>
+      <li data-m="3>2">can you see the primary?<small>no: its replicas outside the East agree it is gone</small></li>
+      <li data-m="3>2">promote<small>the Orchestrator nodes in the West and the cloud are a majority, and they act</small></li>
+      <li data-m="2>2">now a primary, accepting writes</li>
+      <li data-m="1>1" data-k="reply">22:52:43  the link is restored</li>
+      <li data-m="0-3" data-k="note">Two primaries. The East holds writes from the 43 seconds that never reached the West. The West is taking new writes the East has never seen</li>
+    </ol>
+    <figcaption><b>Forty-three seconds.</b> Each participant acted correctly on what it could see.</figcaption>
+  </figure>
+  <p>Look at it from each side. From the West, the primary had vanished: no heartbeat, no replication stream. The Orchestrator nodes there and in the cloud were a majority of the group, so they were entitled to decide, and the rule they had been given was to promote the best replica available. They did, in every cluster. From the East, nothing had happened. The primaries were healthy, the application servers next to them could reach them, and writes went on being accepted. They were written to the East's binary logs and to nowhere else.</p>
+  <p>When the link came back, traffic was directed to the new primaries in the West. The East's old primaries now held a few seconds of committed writes that existed nowhere else, and the West was accumulating writes of its own. The two histories had forked.</p>
+
+  <h2>Writes on both sides</h2>
+  <p>A fork is what makes split brain so much worse than an outage. Had the East simply been behind, it could have been pointed at the West and caught up. Had the West taken no writes, the failover could have been reversed. With writes on both sides there were three options, and each was bad.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Option</th><th>What it costs</th></tr></thead>
+      <tbody>
+        <tr><td><b>Fail back to the East at once</b></td><td>Everything written in the West since the failover is discarded: by the time the situation was understood, that was the best part of an hour of users' issues, comments and pushes</td></tr>
+        <tr><td><b>Stay in the West, and throw away the East's extra writes</b></td><td>Those writes are lost. And the application servers are still in the East, now reaching their database across a continent for every query, which the application wasn't built to tolerate. The site is barely usable</td></tr>
+        <tr><td><b>Keep both: rebuild the East from backups, replicate the West's writes into it, fail back, and then reconcile the East's stranded writes by hand</b></td><td>No data lost. Many hours of degraded service while terabytes are restored and replicas catch up</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>GitHub chose the third, and said why in so many words: the integrity of users' data mattered more than how quickly the site was back to normal. Why couldn't the old East primaries simply be re-attached as replicas of the West? Each held transactions the West's history didn't contain. A replica applies its primary's log on top of its own data, and that only works if the replica's data is a prefix of the primary's. So the East's servers had to be rebuilt from backups taken before the fork, and the stranded writes kept aside as binary logs for later.</p>
+
+  <h2>The recovery</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Time, UTC</th><th>What happened</th></tr></thead>
+      <tbody>
+        <tr><td><b>22:52</b></td><td>The link drops for 43 seconds. Orchestrator promotes West Coast replicas in every cluster</td></tr>
+        <tr><td><b>22:54 to 23:13</b></td><td>Alerts fire. Engineers find the topology in a state nobody expected, lock deployments, and raise the status to red</td></tr>
+        <tr><td><b>23:19</b></td><td>Webhook deliveries and Pages builds are paused on purpose, so that no more work is done against data that may change</td></tr>
+        <tr><td><b>00:05</b></td><td>The plan is agreed: restore the East from backups, replicate from the West, fail back, reconcile</td></tr>
+        <tr><td><b>00:41</b></td><td>Restores begin. Each cluster's backup is several terabytes and has to be fetched from remote storage, decompressed, verified and loaded: hours for each</td></tr>
+        <tr><td><b>06:51</b></td><td>The first restored clusters start replicating the night's changes from the West</td></tr>
+        <tr><td><b>11:12</b></td><td>All primaries are back in the East. The site is fast again, and its read replicas are still hours behind, so users see stale pages</td></tr>
+        <tr><td><b>13:15</b></td><td>The working day's peak arrives and replication lag grows instead of shrinking. Extra replicas are brought up in the cloud to spread the reads</td></tr>
+        <tr><td><b>16:24</b></td><td>Replicas are in step. Normal topology is restored</td></tr>
+        <tr><td><b>16:45 to 23:03</b></td><td>The backlog is worked through: over five million webhook events and eighty thousand Pages builds. Status returns to green</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Three things lengthened it, and each is a lesson from an earlier chapter. The restores took as long as copying terabytes takes, and nobody had needed to know that figure so urgently before (<a href="35-backups-pitr.html">Chapter 35</a>). The replicas couldn't catch up under daytime load, since a replica applying a backlog is also serving reads (<a href="25-replication.html">Chapter 25</a>). And the stranded writes had to be dealt with afterwards: GitHub reported that one of its busiest clusters had 954 writes in the affected window, and each had to be examined to see whether it could be applied safely or conflicted with something written in the West since.</p>
+
+  <h2>Try it: was failing over the right call?</h2>
+  <p>The difficulty in a failover policy is that it has to decide within seconds, without knowing how long the fault will last. Choose a policy and a fault, and see how the policy fares.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Three failover policies against three faults</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="gh-row"><span>Failover policy</span><div class="seg" id="ghP"><button data-v="none">people decide</button><button data-v="region">automatic, within the region</button><button class="active" data-v="cross">automatic, to any region</button></div></div>
+      <div class="gh-row"><span>The fault</span><div class="seg" id="ghF"><button class="active" data-v="blip">the East is cut off for 43 seconds</button><button data-v="server">the primary server dies</button><button data-v="dc">the East data centre is lost for 2 hours</button></div></div>
+      <div class="gh-sites" id="ghSites"></div>
+      <ol class="gh-steps" id="ghSteps"></ol>
+      <div class="gh-msg" id="ghMsg"></div>
+      <div class="stats" id="ghStats"></div>
+    </div>
+    <div class="panel-foot">Assumptions: replication between the coasts is asynchronous; within the East there is a replica that confirms each commit; automatic failover acts after about 30 seconds; a person paged at night needs about 20 minutes to assess and decide. "Automatic, to any region" was GitHub's configuration in October 2018, and "automatic, within the region" is roughly what it changed to afterwards.</div>
+  </div>
+
+  <p>Things to notice. No policy wins on all three faults. Promoting across regions is the best answer to losing a whole data centre: writes are back in about a minute where the other two policies need a person and twenty. It is the worst answer by far to a 43-second partition, where the other two do nothing and the incident is over before anyone is paged. The single dead server is the easy case, and both automatic policies handle it in half a minute with nothing lost. The trouble is that from the West, during the first thirty seconds, a brief partition and a lost data centre look exactly alike, and brief partitions are far more common. A policy tuned for the rare disaster will fire on the common blip. GitHub's change afterwards was to stop the automation promoting across regions, and to make that one decision a human's.</p>
+
+  <h2>Lessons</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Lesson</th><th>In practice</th></tr></thead>
+      <tbody>
+        <tr><td><b>"Unreachable" doesn't mean "dead"</b></td><td>A primary that can't be seen may be serving clients happily. Before promoting, a failover system must make sure the old primary can't accept writes: fence it, or have it step down by itself when it loses contact with a majority</td></tr>
+        <tr><td><b>A majority decides who may act. It doesn't decide whether acting is wise</b></td><td>Orchestrator's quorum was correctly formed. The policy it carried out, promote across the continent after a short timeout, was the problem</td></tr>
+        <tr><td><b>Failover has a cost, so the threshold should reflect it</b></td><td>If a wrong failover costs a day and waiting costs a minute, wait longer than 30 seconds for the expensive kind</td></tr>
+        <tr><td><b>A failover target must be able to carry the load</b></td><td>The West had the data. The applications were in the East, and couldn't work with a database 60 ms away</td></tr>
+        <tr><td><b>Asynchronous replication means a failover can strand writes</b></td><td>Decide in advance whether those writes are discarded or reconciled, and how</td></tr>
+        <tr><td><b>Recovery time is restore time</b></td><td>Know how long a full restore takes, and keep backups where they can be reached quickly</td></tr>
+        <tr><td><b>Practise</b></td><td>GitHub committed to injecting faults deliberately, so that the next partition would be the hundredth one its systems had met</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>GitHub's longer-term answer was structural: to run each site with its own complete stack, so that application servers and their databases fail over together, and losing any one site leaves the others whole.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧭</div>
+    <div class="body"><div class="title">Four months earlier: the design, described by its authors</div><p>In June 2018 GitHub's database team had published a long article on how its MySQL high availability worked, and read after the incident it shows how carefully the system had been thought through. It described Orchestrator running as a group of nodes that reach agreement by a consensus protocol, so that no single node's view of the network can trigger a failover. It described how a failover is announced to the rest of the system through a service-discovery store, and how proxies redirect writes to the new primary, with the whole process expected to take between ten and thirty seconds. It described semi-synchronous replication, in which the primary waits for at least one replica to confirm each commit before acknowledging it, used within a data centre so that a failover there loses nothing. And it discussed limitations openly, among them the case of a data centre cut off from the rest: the primary inside it might go on accepting writes from clients inside it while the outside world elected a replacement, and the team wrote that it was looking at ways to shut such a primary off. Every mechanism in the article worked as described on 21 October. The majority was formed properly and the promotion was clean, and the old primaries kept taking writes for those seconds exactly as the article had warned they might. What had received less attention was the cost of that scenario: the hours a restore takes, an application tier that couldn't follow its databases to another coast, and the reconciliation afterwards. A design review asks whether each mechanism is correct. An incident like this one adds a second question, which is what the system as a whole does when every mechanism is correct and the situation is one its designers ranked as unlikely.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Promoting a replica without fencing the old primary.</b> If it is alive, there are now two.</li>
+      <li><b>A short failover timeout for an expensive failover.</b> Most network faults end within a minute.</li>
+      <li><b>Failing over the database and not the application,</b> leaving them a continent apart.</li>
+      <li><b>Re-attaching a diverged primary as a replica.</b> It has to be rebuilt, or rewound to the fork.</li>
+      <li><b>Not knowing how long a restore takes</b> until it is the only way out.</li>
+      <li><b>Blaming the tool.</b> Orchestrator followed its configuration. The configuration encoded a choice nobody had examined closely.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is split brain in a replicated database, and how do you prevent it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Split brain is when two nodes both believe they are the primary and both accept writes, so the data forks into two histories that can't be merged automatically. It usually comes from a network partition combined with automatic failover: the replicas and the failover manager can't reach the primary and promote a replacement, while the old primary is still alive and still reachable by some clients. Prevention has three parts. First, only a majority may promote: the failover decision is taken by a quorum of nodes in different failure domains, so that the minority side can't elect its own leader. Second, and this is the part that gets missed, the old primary must stop: either it is fenced from outside, by cutting its power, revoking its virtual IP or blocking it at the proxy, or it demotes itself when it can no longer reach a majority, typically with a lease that expires. A quorum alone doesn't stop an isolated primary from accepting writes from clients on its side. Third, with synchronous or semi-synchronous replication to a quorum, an isolated primary can't commit at all, since it can't get acknowledgements, which is how consensus-based databases avoid the problem by construction. If it happens anyway, one side's writes have to be chosen and the other's reconciled by hand.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You run a primary in one region with asynchronous replicas in another. Should failover to the other region be automatic?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I'd make it automatic within a region and a human decision across regions, and I'd explain it as a matter of asymmetric costs. Within a region, a replica can be kept synchronous or semi-synchronous, so promotion loses nothing; the application servers stay close to the new primary; and the failure it handles, a dead host, is common and unambiguous. Automating that gives recovery in tens of seconds at little risk. Across regions, three things change. Replication is asynchronous, so promotion strands whatever the old primary committed and hadn't shipped. The most likely cause of losing contact with a whole region is a network partition, not the region's destruction, so the old primary is probably alive, and unless it is reliably fenced I get split brain. And the application may not work well with its database in another region. So a wrong cross-region failover is very expensive, while a right one saves perhaps twenty minutes over a human decision, and the event is rare. With those figures I'd page a person, give them a tested runbook and a one-command failover, and accept twenty minutes of write outage in a real regional loss. If the business needs automatic regional failover, the honest route is a different architecture: synchronous replication across three regions with a consensus protocol, so that a minority side can't accept writes, and the application deployed in each region. That removes the split-brain risk at the price of cross-region latency on every commit.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A 43-second partition became a 24-hour incident, since automatic failover across regions created two primaries with different writes.</li>
+      <li>Split brain is worse than downtime: neither side can be discarded without losing data, and the two can't be merged mechanically.</li>
+      <li>A quorum decides who may promote. Something else must make sure the old primary has stopped.</li>
+      <li>A failover policy acts without knowing how long the fault will last. Set its threshold by what a wrong failover costs.</li>
+      <li>Fail over the application and the database together, or not at all.</li>
+      <li>Know the restore time, and decide in advance what happens to writes stranded on an old primary.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">During the 43 seconds, why did the old East Coast primaries keep accepting writes?</p>
+      <div class="opts">
+        <button class="opt">Orchestrator told them to</button>
+        <button class="opt">They were configured as read-only</button>
+        <button class="opt">They were healthy, and the application servers in the same data centre could still reach them. Nothing told them they had been replaced</button>
+        <button class="opt">Replication was synchronous</button>
+      </div>
+      <div class="explain">Being unreachable from outside is different from being down. Nothing fenced them.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">After the link returned, why couldn't the old East primaries be attached as replicas of the new West primaries?</p>
+      <div class="opts">
+        <button class="opt">They held committed writes that the West's history didn't contain, so their data was no longer a prefix of the new primary's</button>
+        <button class="opt">MySQL doesn't allow a former primary to become a replica</button>
+        <button class="opt">They were too far behind</button>
+        <button class="opt">Their disks were full</button>
+      </div>
+      <div class="explain">A replica must start from a point on its primary's history. They had to be rebuilt from backups taken before the fork.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Orchestrator's nodes formed a proper majority before acting. What does that show?</p>
+      <div class="opts">
+        <button class="opt">That the failover was the right decision</button>
+        <button class="opt">That the quorum mechanism was faulty</button>
+        <button class="opt">That split brain was impossible</button>
+        <button class="opt">That a majority settles who is allowed to act, and says nothing about whether the configured action is wise or whether the old primary has stopped</button>
+      </div>
+      <div class="explain">The mechanism was correct. The policy it executed, and the lack of fencing, were the problems.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why did recovery take about a day and not an hour?</p>
+      <div class="opts">
+        <button class="opt">The network stayed down</button>
+        <button class="opt">Multi-terabyte restores from backup took hours for each cluster, and replicas then had to catch up under daytime load</button>
+        <button class="opt">Engineers couldn't be reached</button>
+        <button class="opt">MySQL had to be upgraded first</button>
+      </div>
+      <div class="explain">Choosing to keep both sides' data meant rebuilding the East, and restore time set the pace.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which change most directly prevents this incident from recurring?</p>
+      <div class="opts">
+        <button class="opt">A shorter failover timeout</button>
+        <button class="opt">More replicas on the West Coast</button>
+        <button class="opt">Not promoting across regions automatically, and making sure an isolated primary stops taking writes</button>
+        <button class="opt">Switching from MySQL to another database</button>
+      </div>
+      <div class="explain">The fork needed two things: a promotion on one side and a live primary on the other. Remove either.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  // Each outcome: sites [east, west] as { cls, role, note }, link text, steps, message, and four stats.
+  const E = (cls, role, note) => ({ cls, role, note });
+  const OUT = {
+    blip: {
+      none: { east: E('gh-ok', 'primary', 'kept serving the applications beside it'), west: E('gh-ok', 'replica', 'a few seconds behind, then caught up'), link: 'down 43 s, then back',
+        steps: ['The link drops. Requests from outside the East fail.', 'The pager goes off. Nobody has opened a laptop yet.', 'The link returns after 43 seconds. Replication resumes and catches up by itself.'],
+        kind: 'good', msg: '<b>Over before anyone could act.</b> The East carried on for clients inside it, and the West caught up in seconds once the link returned. Nothing forked, since nothing was promoted.', un: '43 s, for outside clients', deg: '43 s', strand: 'none', human: 'no' },
+      region: { east: E('gh-ok', 'primary', 'kept serving the applications beside it'), west: E('gh-ok', 'replica', 'not eligible for promotion'), link: 'down 43 s, then back',
+        steps: ['The link drops. The failover manager\'s majority, outside the East, can\'t see the primary.', 'It looks for a replica to promote in the primary\'s own region. It can\'t reach any of those either, so it does nothing.', 'The link returns after 43 seconds. Replication catches up.'],
+        kind: 'good', msg: '<b>The automation held back, and that was right.</b> Its rule allows promotion only inside the primary\'s region, and from outside there was no candidate it could reach. A partition that hides a whole site can\'t trigger it.', un: '43 s, for outside clients', deg: '43 s', strand: 'none', human: 'no' },
+      cross: { east: E('gh-bad', 'primary, as far as it knows', 'holds writes from the 43 seconds that the West never received'), west: E('gh-bad', 'primary, newly promoted', 'taking writes the East has never seen'), link: 'back, with a fork on either side',
+        steps: ['The link drops. The majority outside the East can\'t see the primary.', 'After about 30 seconds it promotes the most up-to-date replica it can reach, in the West.', 'The East\'s primary is alive and still taking writes from the applications beside it.', 'The link returns. There are two primaries with different histories.', 'Rebuild the East from backups, replicate from the West, fail back, and reconcile the stranded writes.'],
+        kind: 'bad', msg: '<b>This is 21 October 2018.</b> A fault that would have cleared in 43 seconds was turned into a fork. Keeping both sides\' data meant restoring terabytes from backup, and the service was degraded for 24 hours and 11 minutes.', un: 'about 30 s', deg: '24 h 11 min', strand: '954 in one busy cluster', human: 'yes, for a day' },
+    },
+    server: {
+      none: { east: E('gh-warn', 'replica, promoted by hand', 'had every commit'), west: E('gh-ok', 'replica', 'repointed to the new primary'), link: 'up',
+        steps: ['The primary\'s hardware fails. Writes stop.', 'A person is paged, confirms the server is dead, and chooses the in-region replica that has every commit.', 'They promote it, about 20 minutes after the failure.'],
+        kind: 'warn', msg: '<b>Twenty minutes of failed writes, for the simplest fault there is.</b> A dead server is unambiguous, and a replica beside it has every commit. This is the case automation handles well.', un: 'about 20 min', deg: 'about 20 min', strand: 'none', human: 'yes' },
+      region: { east: E('gh-ok', 'replica, promoted', 'had every commit'), west: E('gh-ok', 'replica', 'repointed to the new primary'), link: 'up',
+        steps: ['The primary\'s hardware fails. Writes stop.', 'The other replicas confirm they have lost it too.', 'After about 30 seconds the in-region replica that confirmed every commit is promoted.', 'Applications reconnect. They are still in the same data centre as their database.'],
+        kind: 'good', msg: '<b>Thirty seconds, nothing lost, nobody woken.</b> The fault is unambiguous, the candidate has every commit, and the applications stay beside it.', un: 'about 30 s', deg: 'about 30 s', strand: 'none', human: 'no' },
+      cross: { east: E('gh-ok', 'replica, promoted', 'had every commit, so it was the most up to date'), west: E('gh-ok', 'replica', 'repointed to the new primary'), link: 'up',
+        steps: ['The primary\'s hardware fails. Writes stop.', 'After about 30 seconds the most up-to-date replica anywhere is promoted.', 'That is the in-region replica, which confirms every commit, so the outcome matches the in-region policy.'],
+        kind: 'good', msg: '<b>The same good result.</b> With the network intact, the in-region replica is the most up to date and gets chosen. The permission to cross regions made no difference here. It matters only when the East can\'t be seen.', un: 'about 30 s', deg: 'about 30 s', strand: 'none', human: 'no' },
+    },
+    dc: {
+      none: { east: E('gh-off', 'offline', 'back in 2 hours, with a few stranded writes'), west: E('gh-warn', 'primary, promoted by hand', 'serving, with the surviving applications'), link: 'down for 2 hours',
+        steps: ['The East data centre goes dark. Everything stops.', 'A person is paged, and establishes that the site is really gone and not merely unreachable.', 'They promote the West, about 20 minutes in, knowing the last moments of the East\'s writes aren\'t there.', 'When the East returns, its servers are rebuilt as replicas and its stranded writes are reviewed.'],
+        kind: 'warn', msg: '<b>Twenty minutes down, by a decision someone made knowingly.</b> A person could check what the automation couldn\'t: that the site was truly lost. The cost of that check is the twenty minutes.', un: 'about 20 min', deg: '2 h, on one site', strand: 'the last second or so', human: 'yes' },
+      region: { east: E('gh-off', 'offline', 'back in 2 hours, with a few stranded writes'), west: E('gh-warn', 'primary, promoted by hand', 'serving, with the surviving applications'), link: 'down for 2 hours',
+        steps: ['The East data centre goes dark. Everything stops.', 'The automation finds no candidate in the primary\'s region, and pages a person.', 'They confirm the site is lost and promote the West, about 20 minutes in.', 'When the East returns, its servers are rebuilt as replicas and its stranded writes are reviewed.'],
+        kind: 'warn', msg: '<b>The same as having no automation, for this fault.</b> That is the price of the in-region rule: the rare loss of a whole site waits for a person. GitHub judged it worth paying.', un: 'about 20 min', deg: '2 h, on one site', strand: 'the last second or so', human: 'yes' },
+      cross: { east: E('gh-off', 'offline', 'back in 2 hours, with a few stranded writes'), west: E('gh-ok', 'primary, promoted', 'serving, with the surviving applications'), link: 'down for 2 hours',
+        steps: ['The East data centre goes dark. Everything stops.', 'After about 30 seconds the majority promotes the West.', 'Writes resume within a minute, without the last moments of the East\'s commits.', 'When the East returns, its servers are rebuilt as replicas and its stranded writes are reviewed.'],
+        kind: 'good', msg: '<b>The case this policy was designed for.</b> Writes are back in about a minute with nobody involved. The stranded writes are few, and the East really was gone, so there is no second primary. The policy can\'t tell this fault from the 43-second one until long after it has acted.', un: 'about 1 min', deg: '2 h, on one site', strand: 'the last second or so', human: 'no' },
+    },
+  };
+  function draw() {
+    const o = OUT[$('#ghF').dataset.value][$('#ghP').dataset.value];
+    const site = (name, s) => `<div class="gh-site ${s.cls}"><h6>${name}</h6><b>${s.role}</b><small>${s.note}</small></div>`;
+    $('#ghSites').innerHTML = site('East Coast data centre', o.east) + `<div class="gh-link">⇄<br>${o.link}</div>` + site('West Coast data centre', o.west);
+    $('#ghSteps').innerHTML = o.steps.map((s) => `<li>${s}</li>`).join('');
+    const m = $('#ghMsg'); m.className = 'gh-msg ' + (o.kind === 'bad' ? 'gh-bad' : o.kind === 'warn' ? 'gh-warn' : ''); m.innerHTML = o.msg;
+    const c = o.kind === 'bad' ? 'bad' : o.kind === 'warn' ? 'warn' : 'good';
+    $('#ghStats').innerHTML = `<div class="stat ${c}"><div class="k">Writes failing for</div><div class="v" style="font-size:15px">${o.un}</div></div>
+      <div class="stat ${c}"><div class="k">Service degraded for</div><div class="v" style="font-size:15px">${o.deg}</div></div>
+      <div class="stat ${o.strand === 'none' ? 'good' : o.kind === 'bad' ? 'bad' : 'warn'}"><div class="k">Writes stranded</div><div class="v" style="font-size:15px">${o.strand}</div></div>
+      <div class="stat"><div class="k">Needs a person</div><div class="v" style="font-size:15px">${o.human}</div></div>`;
+  }
+  $('#ghP').addEventListener('segchange', draw);
+  $('#ghF').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
