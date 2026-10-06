@@ -67,3 +67,4 @@
 - Ch 42 Case Study: A WebRTC Video Call: ICE path finder (candidates and checks for each pairing of NAT kinds; direct or TURN)
 - Ch 43 Case Study: A CDN Serves a Viral Video: cache-stampede model for a new live segment (viewers, coalescing, origin shield)
 - Ch 44 Case Study: Facebook's 2021 BGP Outage: dependency model (backbone, DNS self-withdrawal, out-of-band repair path) over eight components
+- Ch 45 Case Study: The 2016 Dyn DNS Attack: share of users still resolving a name through a 130-minute outage (TTL, second provider, serve-stale)
