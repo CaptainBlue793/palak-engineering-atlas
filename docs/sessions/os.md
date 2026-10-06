@@ -41,7 +41,7 @@
   standalone clone of `feature/os-course` at `C:\Users\palak\atlas-courses\os`, outside OneDrive, so its `.git`
   is not synced. The owner's plan is now one course at a time: finish OS, release it, then the next course.
 - Decisions: the glossary gains a few terms as chapters land (Ch 13: ASID, TLB reach, Effective access time;
-  Ch 14: VMA, Zero page, Swap cache). Chapters are checked headlessly with a driver script that clicks the panel
+  Ch 14: VMA, Zero page, Swap cache; Ch 15: Reference string, kswapd, Direct reclaim). Chapters are checked headlessly with a driver script that clicks the panel
   and prints its stats, at 1100 px and 390 px wide.
 - Blocked: `git push` needs a GitHub sign-in on this machine (Git Credential Manager can't prompt from the
   session). Commits are local until the owner signs in once.
@@ -49,3 +49,5 @@
   - Ch 13 The TLB (40 KB): 8-entry TLB simulator (4 workloads, 4 KiB vs 2 MiB pages, process switch with PCIDs off/on)
   - Ch 14 Page Faults & Demand Paging (42 KB): demand-paging simulator (heap/code/unmapped pages, 4/6/12 frames,
     SSD vs hard disk, zero page, swap and swap cache, thrashing)
+  - Ch 15 Page Replacement: FIFO, LRU & Clock (35 KB): replacement simulator (FIFO/LRU/Clock/Optimal, 4 preset strings or
+    your own, 1-7 frames, faults-by-frames chart that flags Belady's anomaly)
