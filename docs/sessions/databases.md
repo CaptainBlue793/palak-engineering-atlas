@@ -68,3 +68,4 @@
 - DB 42: Case Study: A Slow Query Made Fast: the planner's choice among three plans for three accounts, with extended statistics and a partial composite index switched on or off, and the rows read and time for each
 - DB 43: Case Study: Uber's Move from Postgres to MySQL: the structures one UPDATE writes with 2, 6 or 12 secondary indexes, for a PostgreSQL heap-only update, a PostgreSQL update to a new location, and InnoDB, with bytes replicated and read cost
 - DB 44: Case Study: GitHub's MySQL Failover Incident: three failover policies against three faults (a 43-second partition, a dead primary, a lost data centre), with the state of both sites and the cost of each
+- DB 45: Case Study: Discord's Trillions of Messages: three partition keys and three bucket lengths against four channels, giving the largest partition and the partitions read for the latest 50 messages
