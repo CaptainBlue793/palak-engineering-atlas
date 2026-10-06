@@ -2,7 +2,7 @@
 
 **[captainblue793.github.io/palak-engineering-atlas](https://captainblue793.github.io/palak-engineering-atlas/)**
 
-Every interactive engineering course I've written, in one place — **284 chapters (244 main chapters plus a 40-chapter Prerequisites level), ~209 hours,
+Every interactive engineering course I've written, in one place — **340 chapters (292 main chapters plus a 48-chapter Prerequisites level), ~249 hours,
 zero dependencies**. No walls of text: every chapter has animated diagrams, simulators you can
 break, an interview drill and a quiz. It all runs in your browser, offline, with no account and
 no build step.
@@ -14,8 +14,9 @@ no build step.
 | **[DSA](dsa/)** | 8 prerequisites + 56 | Every structure and algorithm, in one consistent C++ house style |
 | **[Low-Level Design](lld/)** | 8 prerequisites + 46 | SOLID, design patterns, concurrency and 16 case studies in Java |
 | **[OS & Concurrency](os/)** | 8 prerequisites + 48 | Processes, virtual memory, file systems, locks, epoll and containers in C — plus 8 case studies |
+| **[Computer Networks](networks/)** | 8 prerequisites + 48 | TCP/IP layer by layer, DNS, TLS, HTTP/2 and 3, BGP, CDNs and packet-level debugging in Python and the CLI — plus 8 case studies |
 
-**On the way:** Computer Networks · Database Internals & SQL · Distributed Systems ·
+**On the way:** Database Internals & SQL · Distributed Systems ·
 Cloud & DevOps — see [the plan](docs/superpowers/specs/2026-09-30-atlas-expansion-design.md). The Atlas home
 page also suggests an order through the courses for each kind of role.
 
@@ -34,7 +35,8 @@ palak-engineering-atlas/
 ├── ml-ai-systems/
 ├── dsa/
 ├── lld/
-└── os/
+├── os/
+└── networks/
 ```
 
 ## What the Atlas adds
