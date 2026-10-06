@@ -44,3 +44,4 @@
 - DB 18: Join Algorithms: cost comparison of nested loop, index nested loop, hash and merge join (outer rows, index, sorted inputs, work_mem)
 - DB 19: The Cost-Based Optimiser: estimate, plan and reality for four filters (common value, stale statistics, correlated columns, expression), with each remedy
 - DB 20: WAL & Crash Recovery: log, buffer pool and data files with update, commit, page write, checkpoint, crash and redo (LSN test, redo point)
+- DB 21: Isolation Levels & Anomalies: two-session stepper for five anomalies at four isolation levels (results, errors and retries per level)
