@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: How PostgreSQL Relies on the OS</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pg-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:14px; }
+  @media (max-width:760px) { .pg-grid { grid-template-columns:1fr; } }
+  .pg-col { border:1.5px solid var(--border); border-radius:12px; padding:9px 11px; background:var(--surface); transition:.2s; }
+  .pg-col h6 { margin:0; font-size:13px; }
+  .pg-col small { display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
+  .pg-col.pg-lost { opacity:.45; border-style:dashed; }
+  .pg-cell { border:1px solid var(--border); border-radius:9px; padding:6px 9px; margin-top:6px; font-size:12.5px; color:var(--muted); background:var(--surface-2); }
+  .pg-cell b { display:block; font-family:var(--mono); font-size:13.5px; color:var(--text); min-height:20px; }
+  .pg-cell.pg-new { border-color:var(--accent-2); }
+  .pg-cell.pg-new b { color:var(--accent-2); }
+  .pg-cell i { font-style:normal; font-size:11px; font-weight:600; padding:1px 7px; border-radius:99px; margin-left:6px; background:var(--amber-soft); color:var(--amber); }
+  .pg-cell i.pg-clean { background:var(--surface-3); color:var(--muted); }
+  .pg-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:88px; }
+  .pg-desc.pg-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .pg-desc.pg-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .pg-desc.pg-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
+</head>
+<body data-chapter="43">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 43</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Case Study: <span class="grad">How PostgreSQL Relies on the OS</span></h1>
+    <p class="lead">PostgreSQL leans on the operating system harder than almost any other database, which makes it a good one to take apart. It forks a process for every client connection. Its cache is one region of shared memory mapped by all of those processes. It reads and writes its files through the kernel's page cache instead of going round it, and its promise that a committed transaction survives a power cut comes down to one system call returning an honest answer. In 2018 its developers discovered that the call had not meant what they had assumed for twenty years. This case study follows one <code>UPDATE</code> from the client to the disk and looks at every place the kernel is involved on the way.</p>
+    <ul class="objectives">
+      <li>Describe the processes of a running PostgreSQL server and why each connection gets its own</li>
+      <li>Explain shared buffers, and why a page is often in memory twice</li>
+      <li>Follow a commit through the write-ahead log to the disk, and say when it becomes durable</li>
+      <li>Explain what went wrong with fsync errors in 2018 and how it was fixed</li>
+      <li>Explain why huge pages and overcommit settings matter to a database server</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>fork, and shared memory between processes.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a> and <a href="09-ipc-pipes-signals-shm.html">Chapter 9</a>.</li>
+        <li><b>The page cache, dirty pages and fsync.</b> See <a href="31-page-cache-fsync.html">Chapter 31</a>.</li>
+        <li><b>Write-ahead logging.</b> See <a href="24-journaling-crash-consistency.html">Chapter 24</a>.</li>
+        <li><b>Page tables and the TLB.</b> See <a href="12-paging-page-tables.html">Chapter 12</a> and <a href="13-tlb.html">Chapter 13</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>A running server</h2>
+<pre class="code"><span class="c">$</span> ps -o pid,ppid,rss,cmd -u postgres
+    PID    PPID     RSS CMD
+   <span class="m">2101</span>       <span class="m">1</span>   <span class="m">28412</span> /usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main
+   <span class="m">2140</span>    <span class="m">2101</span> <span class="m">3812344</span> postgres: checkpointer
+   <span class="m">2141</span>    <span class="m">2101</span>  <span class="m">914980</span> postgres: background writer
+   <span class="m">2143</span>    <span class="m">2101</span>   <span class="m">21044</span> postgres: walwriter
+   <span class="m">2144</span>    <span class="m">2101</span>    <span class="m">8120</span> postgres: autovacuum launcher
+   <span class="m">4312</span>    <span class="m">2101</span> <span class="m">2945728</span> postgres: app shop 10.0.0.12(51234) idle
+   <span class="m">4313</span>    <span class="m">2101</span> <span class="m">2876540</span> postgres: app shop 10.0.0.12(51236) UPDATE
+   <span class="m">4318</span>    <span class="m">2101</span>  <span class="m">512220</span> postgres: app shop 10.0.0.14(40112) idle in transaction</pre>
+  <p>There are no threads here. Every line is a separate process, and all of them are children of the first one, which PostgreSQL calls the <b>postmaster</b>.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Process</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><b>Postmaster</b></td><td>Listens on port 5432, forks a process for each new connection, and restarts the rest if one of them dies. It touches no data itself</td></tr>
+        <tr><td><b>Backend</b> (one per connection)</td><td>Parses, plans and runs one client's queries. Its title shows the user, database, client address and what it is doing</td></tr>
+        <tr><td><b>WAL writer</b></td><td>Writes the write-ahead log out to disk in the background</td></tr>
+        <tr><td><b>Background writer</b></td><td>Writes dirty pages from the cache to their files a few at a time, so backends find free buffers</td></tr>
+        <tr><td><b>Checkpointer</b></td><td>Every few minutes, writes all remaining dirty pages and calls <code>fsync</code> on the data files</td></tr>
+        <tr><td><b>Autovacuum launcher</b></td><td>Starts workers that clean up dead row versions</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Look at the <code>RSS</code> column before moving on. Three processes appear to be using 3 to 4 GB each on a machine that may only have 8. They aren't. This server has a 4 GB cache in shared memory, and RSS counts every shared page a process has touched. Adding up the RSS of PostgreSQL's processes counts the same memory over and over, a point that comes back in <a href="48-case-oom-killer.html">Chapter 48</a>.</p>
+
+  <h2>A process per connection</h2>
+  <p>The postmaster's main loop is the oldest server design there is, the one from <a href="03-processes-fork-exec-wait.html">Chapter 3</a>:</p>
+<pre class="code"><span class="c">/* The shape of the postmaster's loop, much simplified */</span>
+<span class="k">for</span> (;;) {
+    <span class="t">int</span> client = <span class="f">accept</span>(listen_fd, <span class="k">NULL</span>, <span class="k">NULL</span>);
+    <span class="t">pid_t</span> pid = <span class="f">fork</span>();
+    <span class="k">if</span> (pid == <span class="m">0</span>) {                 <span class="c">/* child: the backend for this client */</span>
+        <span class="f">close</span>(listen_fd);
+        <span class="f">backend_main</span>(client);       <span class="c">/* log the client in, then run its queries until it leaves */</span>
+        <span class="f">_exit</span>(<span class="m">0</span>);
+    }
+    <span class="f">close</span>(client);                  <span class="c">/* parent: straight back to accept */</span>
+}</pre>
+  <p>This is the opposite choice to nginx in <a href="42-case-nginx-connections.html">Chapter 42</a>, and it suits a database for the same reason it didn't suit a web server. A query is allowed to block: on the disk, on a lock held by another transaction, on a sort that takes a minute. With a process each, a backend's code can simply wait, and the kernel's scheduler shares the cores out. Separate address spaces also contain damage. A backend that follows a bad pointer can't scribble on another backend's private memory.</p>
+  <p>It can still scribble on the <i>shared</i> memory, though, and that decides what happens when a backend dies:</p>
+<pre class="code">LOG:  server process (PID 4313) was terminated by signal 9: Killed
+LOG:  terminating any other active server processes
+LOG:  all server processes terminated; reinitializing
+LOG:  database system was interrupted; last known up at 2026-03-02 09:14:07 UTC
+LOG:  redo starts at 2/3A000028
+LOG:  database system is ready to accept connections</pre>
+  <p>One backend was killed, and the postmaster responded by stopping <b>every</b> backend, throwing the shared memory away and recovering from the log. It has no way to know whether the dead process was halfway through changing a shared structure, so it trusts none of it. Every client is disconnected because of one process's death. Keep that in mind for the section on the OOM killer.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>What a process per connection costs</th></tr></thead>
+      <tbody>
+        <tr><td><b>Opening a connection</b></td><td>A <code>fork</code>, a login, and filling the new backend's private caches of table definitions: a few milliseconds, which can be longer than the query that follows</td></tr>
+        <tr><td><b>Memory per connection</b></td><td>A few megabytes of private memory at first, growing to tens or hundreds as the backend caches metadata and plans</td></tr>
+        <tr><td><b>Thousands of connections</b></td><td>Thousands of processes for the scheduler, and contention on the shared structures. Throughput falls well before the limit</td></tr>
+        <tr><td><b>The usual answer</b></td><td><code>max_connections</code> stays low (the default is 100), and a <b>connection pooler</b> such as PgBouncer holds the thousands of client connections and shares a few dozen real backends among them</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>A pooler in front of PostgreSQL is the same arrangement as nginx in front of an application server: an event loop holds the many idle connections, and a small set of processes that are allowed to block does the work.</p>
+
+  <h2>Shared buffers and the page cache</h2>
+  <p>Tables and indexes are files made of 8 kB pages. Before forking anything, the postmaster asks the kernel for one large region of shared memory with <code>mmap(MAP_SHARED | MAP_ANONYMOUS)</code>. Children inherit the mapping, so every backend sees the same memory at the same address. Most of it is the <b>shared buffers</b>: PostgreSQL's own cache of pages, with its own locks and its own eviction policy (a clock sweep, as in <a href="15-page-replacement.html">Chapter 15</a>).</p>
+  <p>When a backend needs a page that isn't in shared buffers, it calls <code>pread</code> on the file. That is ordinary buffered I/O, so the kernel reads the page from disk <i>into the page cache</i>, and then copies it into the shared buffer. The page is now in RAM twice. This is <b>double buffering</b>, and it's the direct result of running a cache on top of a cache.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Shared buffers</th><th>Kernel page cache</th></tr></thead>
+      <tbody>
+        <tr><td><b>Owned by</b></td><td>PostgreSQL</td><td>The kernel</td></tr>
+        <tr><td><b>Size</b></td><td>Fixed at start-up by <code>shared_buffers</code> (default 128 MB)</td><td>Whatever RAM is free; shrinks under pressure</td></tr>
+        <tr><td><b>A hit costs</b></td><td>A lookup in a hash table, no system call</td><td>A system call and an 8 kB copy</td></tr>
+        <tr><td><b>Knows about</b></td><td>Transactions, which pages are dirty and which log records cover them</td><td>Files and offsets only</td></tr>
+        <tr><td><b>Survives a PostgreSQL restart</b></td><td>No</td><td>Yes: a restarted server finds its files still warm</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>This is why the usual advice is to give shared buffers about a <b>quarter of the machine's RAM</b> and leave the rest to the kernel, and not the 70 to 80% that a database doing direct I/O would take. MySQL's InnoDB is normally run with <code>O_DIRECT</code>, bypassing the page cache, so its buffer pool is the only cache and should be as big as possible. PostgreSQL has always relied on the kernel for read-ahead and for writing dirty pages back, and that reliance is what the rest of this chapter is about. (PostgreSQL 18, in 2025, added asynchronous reads, with <code>io_uring</code> from <a href="29-event-loops-io-uring.html">Chapter 29</a> as one method, but its I/O is still buffered by default.)</p>
+<pre class="code"><span class="c"># postgresql.conf on a machine with 64 GB of RAM</span>
+shared_buffers        = 16GB     <span class="c"># PostgreSQL's cache: about a quarter</span>
+effective_cache_size  = 48GB     <span class="c"># a hint to the planner: shared buffers + the page cache it can expect</span>
+max_connections       = 200      <span class="c"># and a pooler in front</span></pre>
+
+  <h2>WAL and fsync: what COMMIT waits for</h2>
+  <p>Writing a changed 8 kB page to its place in a data file on every commit would be slow, and a crash halfway through several pages would leave the tables inconsistent. So PostgreSQL uses a <b>write-ahead log</b> (<a href="24-journaling-crash-consistency.html">Chapter 24</a>). Every change is first described in a compact record appended to the WAL. The rule is that <b>the log record must be on disk before the changed page may be</b>, and a transaction is committed at the moment its commit record is on disk. The data files catch up minutes later.</p>
+  <figure class="seq" data-actors="Client|Backend|Kernel|Disk">
+    <ol>
+      <li data-m="0>1">UPDATE accounts SET balance = 70 …</li>
+      <li data-m="1>0" data-k="reply">UPDATE 1 (changed in memory only)</li>
+      <li data-m="0>1">COMMIT</li>
+      <li data-m="1>2">pwrite(wal): the records go into the page cache</li>
+      <li data-m="1>2">fdatasync(wal)</li>
+      <li data-m="2>3">write the WAL blocks; flush the drive's cache</li>
+      <li data-m="3>2" data-k="reply">done</li>
+      <li data-m="2>1" data-k="reply">returns 0</li>
+      <li data-m="1>0" data-k="reply">COMMIT</li>
+    </ol>
+    <figcaption><b>One commit.</b> The only thing the client waits for is one sequential write to the log and one <code>fdatasync</code>. The table's own file isn't touched at all.</figcaption>
+  </figure>
+<pre class="code"><span class="c">$</span> strace -p <span class="m">4313</span> -e trace=recvfrom,pwrite64,fdatasync,sendto      <span class="c"># the same commit, as the kernel sees it</span>
+recvfrom(<span class="m">9</span>, <span class="s">"Q\0\0\0\vCOMMIT\0"</span>, <span class="m">8192</span>, <span class="m">0</span>, NULL, NULL) = <span class="m">12</span>
+pwrite64(<span class="m">5</span>, <span class="s">"\x13\xd1\x05\0\x01\0\0\0\0\x40\x3a\0"</span>..., <span class="m">8192</span>, <span class="m">2318336</span>) = <span class="m">8192</span>
+fdatasync(<span class="m">5</span>)                            = <span class="m">0</span>
+sendto(<span class="m">9</span>, <span class="s">"C\0\0\0\vCOMMIT\0Z\0\0\0\5I"</span>, <span class="m">18</span>, <span class="m">0</span>, NULL, <span class="m">0</span>) = <span class="m">18</span></pre>
+  <p>Three details make this fast enough to live with. Appending to a log is sequential I/O, the cheapest kind. Many backends committing at the same moment share one <code>fdatasync</code> (group commit, from <a href="31-page-cache-fsync.html">Chapter 31</a>). And the expensive random writes to the data files are deferred to the <b>checkpoint</b>, which runs every five minutes by default, writes every dirty page with ordinary <code>write</code> calls, and then calls <code>fsync</code> on each data file. Once a checkpoint finishes, the log before it is no longer needed and its files are recycled.</p>
+
+  <h2>Follow one UPDATE to the disk</h2>
+  <p>The change below can be in up to six places. Step through it, and pull the plug wherever you like.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One UPDATE, from shared buffers to the disk</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="pgMode"><button class="active" data-v="normal">default settings</button><button data-v="async">synchronous_commit = off</button><button data-v="retry">disk error, fsync retried</button><button data-v="panic">disk error, PANIC</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="pgNext">Next</button>
+        <button class="btn sm" id="pgKill">kill -9 a backend</button>
+        <button class="btn sm" id="pgPower">⚡ Power cut</button>
+        <button class="btn sm" id="pgReset">↺ Reset</button>
+      </div>
+      <div class="pg-grid" id="pgGrid"></div>
+      <div class="pg-desc" id="pgDesc"></div>
+      <div class="stats" id="pgStats"></div>
+    </div>
+    <div class="panel-foot">One transaction changes a balance from 100 to 70 on page 7 of a table. The page was read earlier, so at the start it is already in shared buffers and in the page cache. "Disk error, fsync retried" is how PostgreSQL 11 and earlier behaved; "PANIC" is the behaviour since 2019.</div>
+  </div>
+
+  <p>Things to notice. With the default settings there are two system calls between the client and safety: after the <code>write</code>, the change survives PostgreSQL crashing, and after the <code>fdatasync</code> it survives a power cut. From that moment nothing you can do loses it, although the table's file on disk still says 100 until the checkpoint. With <code>synchronous_commit = off</code> the client is told first, and for a short time a crash loses a transaction the client believes is committed. The database is still consistent, just a fraction of a second behind, and for some workloads that is a fair trade. The third scenario is the alarming one: a committed change disappears with no crash at all. The next section explains it. Last, count the copies of page 7 in RAM. There are two almost the whole time.</p>
+
+  <h2>The 2018 fsync bug</h2>
+  <div class="callout usecase">
+    <div class="ico">⚖️</div>
+    <div class="body"><div class="title">"fsyncgate": twenty years of a wrong assumption</div><p>In March 2018 Craig Ringer, a PostgreSQL developer, reported a case of corruption on a server whose storage had briefly returned errors. Tracing it led to an assumption built into the checkpointer since the 1990s: <i>if <code>fsync</code> fails, call it again later, and when it succeeds the data is safe.</i> On Linux that isn't true. When the kernel fails to write a dirty page, it reports the error from <code>fsync</code> once, and then marks the page <b>clean</b>, because a kernel that kept every unwritable page dirty would run out of memory when a disk was unplugged. So the retry had nothing left to write. It returned 0. PostgreSQL concluded the checkpoint was complete and recycled the WAL that could have repaired the page. The database now had a committed change that existed only in memory, marked clean, to be silently dropped whenever the kernel wanted the space. It was worse on older kernels, where the error could be delivered to a different process that happened to have the file open, or to nobody. The kernel developers pointed out that POSIX allows this behaviour, and it does. The fix, in PostgreSQL 12 and in updates to every supported version in February 2019, was to stop trusting a retry: any <code>fsync</code> failure on a data file is now a <b>PANIC</b>. The server crashes itself on purpose and replays the WAL, which rewrites the affected pages from a source that is known to be on disk. Linux, for its part, improved its error tracking from 4.13 so that every process with the file open sees the error once. Other storage engines, MongoDB's WiredTiger among them, made the same change after reading the thread.</p></div>
+  </div>
+<pre class="code"><span class="c"># PostgreSQL 11.1 and earlier: logged, retried, and believed</span>
+ERROR:  could not fsync file "base/16384/16397": Input/output error
+LOG:    checkpoint complete: wrote 3170 buffers (2.4%) ...
+
+<span class="c"># Since 11.2 / 12: the server stops and recovers from the WAL</span>
+PANIC:  could not fsync file "base/16384/16397": Input/output error
+LOG:    checkpointer process (PID 2140) was terminated by signal 6: Aborted
+LOG:    all server processes terminated; reinitializing
+LOG:    redo starts at 2/3A000028</pre>
+  <p>The general lesson goes beyond databases: <b>after a failed <code>fsync</code> you don't know what is on disk, and calling it again tells you nothing.</b> The only safe responses are to rebuild the data from another durable copy or to stop. A 2020 study of this exact question (Rebello and others, "Can Applications Recover from fsync Failures?") found that file systems disagree about what a failed write leaves in memory, and that most of the applications tested got it wrong on at least one of them.</p>
+
+  <h2>Huge pages and the OOM killer</h2>
+  <p>Two pieces of kernel tuning follow from the design, and both matter on a large server.</p>
+  <p><b>Huge pages.</b> Shared memory is mapped by every backend, and each process has its <i>own</i> page tables for it (<a href="12-paging-page-tables.html">Chapter 12</a>). With 4 KiB pages the arithmetic is unkind:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>32 GB of shared buffers</th><th>4 KiB pages</th><th>2 MiB huge pages</th></tr></thead>
+      <tbody>
+        <tr><td><b>Mappings needed</b></td><td>8,388,608</td><td>16,384</td></tr>
+        <tr><td><b>Page-table memory per backend</b> (8 bytes per entry)</td><td>64 MiB</td><td>128 KiB</td></tr>
+        <tr><td><b>For 300 backends that have each touched the whole cache</b></td><td>About 19 GiB of page tables</td><td>About 38 MiB</td></tr>
+        <tr><td><b>Memory one TLB entry covers</b></td><td>4 KiB</td><td>2 MiB</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Nineteen gigabytes of RAM spent describing where 32 gigabytes are is a real failure seen on busy servers: memory "disappears", and the <code>PageTables</code> line of <code>/proc/meminfo</code> is where it went. Huge pages remove it, and cut TLB misses as well (<a href="13-tlb.html">Chapter 13</a>). They have to be reserved from the kernel in advance:</p>
+<pre class="code"><span class="c">$</span> grep PageTables /proc/meminfo
+PageTables:     <span class="m">18734080</span> kB                          <span class="c"># the symptom</span>
+
+<span class="c">$</span> sysctl -w vm.nr_hugepages=<span class="m">16800</span>                    <span class="c"># 16,384 for the buffers, plus a margin</span>
+<span class="c">$</span> grep -E <span class="s">'^huge_pages'</span> postgresql.conf
+huge_pages = on                                      <span class="c"># 'try' (the default) silently falls back to 4 KiB pages</span></pre>
+  <p><b>The OOM killer.</b> You saw what one <code>SIGKILL</code> does: every connection is dropped and the server goes through recovery. The kernel's out-of-memory killer (<a href="48-case-oom-killer.html">Chapter 48</a>) sends exactly that signal, and it picks victims partly by RSS, which for PostgreSQL's processes is inflated by the shared buffers. PostgreSQL's documentation recommends two defences:</p>
+<pre class="code"><span class="c"># 1. Don't promise memory that doesn't exist: allocations fail cleanly with ENOMEM instead</span>
+vm.overcommit_memory = <span class="m">2</span>
+
+<span class="c"># 2. In the service unit: never kill the postmaster, but leave the backends killable</span>
+[Service]
+OOMScoreAdjust=<span class="m">-1000</span>
+Environment=PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj
+Environment=PG_OOM_ADJUST_VALUE=<span class="m">0</span></pre>
+  <p>With strict overcommit (<a href="14-page-faults-demand-paging.html">Chapter 14</a>), a query that asks for too much gets an error from <code>malloc</code>, and PostgreSQL turns that into an ordinary "out of memory" failure of one query. The second setting protects the one process that can't be replaced. If the postmaster itself were killed, nothing would be left to restart the others. Each backend resets its own score to 0 after the fork, so that if something must die, it is a backend.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Adding up RSS to find PostgreSQL's memory use.</b> Every backend's RSS includes the shared buffers it has touched. Use <code>Pss</code> from <code>/proc/PID/smaps_rollup</code>, or count shared memory once.</li>
+      <li><b>Giving shared buffers most of the RAM.</b> With buffered I/O that starves the page cache and leaves no room for the backends' own memory.</li>
+      <li><b>Raising <code>max_connections</code> into the thousands.</b> Each connection is a process. Put a pooler in front instead.</li>
+      <li><b>Turning <code>fsync = off</code> for speed.</b> A crash can then corrupt the database beyond repair. <code>synchronous_commit = off</code> gets most of the speed and only risks the last moments of commits.</li>
+      <li><b>Retrying a failed <code>fsync</code>.</b> In your own code too. Success on the second call doesn't mean the first write happened.</li>
+      <li><b>Leaving <code>huge_pages = try</code> on a big server and never checking.</b> If the kernel has no huge pages reserved, PostgreSQL starts anyway, on 4 KiB pages.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What happens inside PostgreSQL and the kernel when a client sends COMMIT?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>By the time of the commit, the transaction's changes have already been made to pages in shared buffers, which is PostgreSQL's cache in shared memory, and a record of each change has been appended to the WAL buffers. On COMMIT the backend adds a commit record, writes the WAL buffers to the log file with <code>write</code>, which puts them in the kernel's page cache, and then calls <code>fdatasync</code>, which makes the kernel push those blocks to the disk and flush the drive's cache. Only when that returns does the backend reply to the client. The modified data pages are not written at this point. They go to the data files later, written by the background writer or the checkpointer, and the checkpoint calls <code>fsync</code> on the data files. If the server crashes in between, recovery replays the WAL from the last checkpoint and reapplies the changes. So durability depends on one sequential write and one sync of the log, and several concurrent commits can share that sync.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why does PostgreSQL crash itself when fsync on a data file fails, instead of retrying?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because on Linux a retry gives a false answer. When writeback of a dirty page fails, the kernel reports the error to <code>fsync</code> once and then marks the page clean, so it won't hold unwritable pages in memory for ever. A second <code>fsync</code> finds nothing dirty and returns success, although the data never reached the disk. Before 2019 PostgreSQL retried the checkpoint, saw success, and recycled the WAL covering those pages, so the only durable record of committed changes was deleted while the data files were stale. That was the 2018 fsync bug. Now a failed <code>fsync</code> causes a PANIC. All processes exit, shared memory is discarded, and recovery replays the WAL from the last checkpoint that really completed, which marks the pages dirty again so they are written and synced again. If the disk is still failing, the server fails again visibly, which is the right outcome: the choice is between stopping and silently losing committed data.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>PostgreSQL forks one process per connection. It makes blocking simple and isolates private memory, but connections are expensive, so a pooler sits in front.</li>
+      <li>All processes map one shared memory region. If any backend dies abnormally, the postmaster restarts everything and recovers from the log.</li>
+      <li>Its I/O is buffered, so pages live in shared buffers and in the page cache: double buffering. Shared buffers get about a quarter of RAM.</li>
+      <li>A commit is durable when its WAL record has been written and synced. Data files are updated later and synced at checkpoints.</li>
+      <li>After a failed <code>fsync</code> the kernel may have marked the pages clean. Retrying proves nothing; PostgreSQL now panics and replays the WAL.</li>
+      <li>Huge pages keep per-process page tables for shared memory small, and overcommit and OOM settings keep the kernel from killing a backend.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">With default settings, at what point does PostgreSQL tell the client that its transaction is committed?</p>
+      <div class="opts">
+        <button class="opt">When the changed page has been written to the table's file</button>
+        <button class="opt">When the commit record in the WAL has been synced to disk</button>
+        <button class="opt">When the change has been made in shared buffers</button>
+        <button class="opt">After the next checkpoint</button>
+      </div>
+      <div class="explain">The log is the durable copy. The data file may not be updated for minutes.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why is a table page often held in RAM twice on a PostgreSQL server?</p>
+      <div class="opts">
+        <button class="opt">Each backend keeps a private copy</button>
+        <button class="opt">The WAL keeps a copy of every page</button>
+        <button class="opt">Huge pages duplicate small ones</button>
+        <button class="opt">PostgreSQL reads files with buffered I/O, so the page is in the kernel's page cache and in shared buffers</button>
+      </div>
+      <div class="explain">Double buffering: a cache on top of a cache. It is why shared buffers are sized at about a quarter of RAM.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A backend process is killed with SIGKILL. What does the postmaster do?</p>
+      <div class="opts">
+        <button class="opt">Stops all other backends, reinitialises shared memory and runs crash recovery</button>
+        <button class="opt">Forks a replacement and carries on</button>
+        <button class="opt">Nothing: the other connections are unaffected</button>
+        <button class="opt">Exits</button>
+      </div>
+      <div class="explain">The dead process might have left shared memory half-changed, so none of it is trusted. Every client is disconnected.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A checkpoint's <code>fsync</code> on a data file returns <code>EIO</code>. A second call returns 0. What can you conclude?</p>
+      <div class="opts">
+        <button class="opt">The data is now safely on disk</button>
+        <button class="opt">The first error was a false alarm</button>
+        <button class="opt">Nothing: the kernel may have marked the failed pages clean, so the second call had nothing to write</button>
+        <button class="opt">The file system repaired itself</button>
+      </div>
+      <div class="explain">This was the 2018 bug. The safe response is to recover from the WAL, not to retry.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A server has 32 GB of shared buffers and 300 connections, and tens of gigabytes show up as <code>PageTables</code>. What is the fix?</p>
+      <div class="opts">
+        <button class="opt">Add swap</button>
+        <button class="opt">Use huge pages for the shared memory, so each backend needs thousands of mappings instead of millions</button>
+        <button class="opt">Turn off the page cache</button>
+        <button class="opt">Raise <code>max_connections</code></button>
+      </div>
+      <div class="explain">Each process has its own page tables for the shared region. 2 MiB pages make them about 500 times smaller.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const SEQ = {
+    normal: ['update', 'walwrite', 'walsync', 'bgwrite', 'ckpt'],
+    async:  ['update', 'ack', 'walwrite', 'walsync', 'bgwrite', 'ckpt'],
+    retry:  ['update', 'walwrite', 'walsync', 'bgwrite', 'ckptfail', 'ckptretry', 'reboot'],
+    panic:  ['update', 'walwrite', 'walsync', 'bgwrite', 'ckptpanic'],
+  };
+  const LABEL = {
+    update: 'Run the UPDATE', ack: 'Client sends COMMIT', walwrite: 'Client sends COMMIT', walsync: 'fdatasync the WAL', bgwrite: 'Background writer runs',
+    ckpt: 'Checkpoint', ckptfail: 'Checkpoint (the disk fails)', ckptretry: 'Checkpoint again', reboot: 'Reboot the machine', ckptpanic: 'Checkpoint (the disk fails)',
+  };
+  let mode = 'normal', S;
+  function reset() {
+    S = { i: 0, sb: { v: 100, dirty: false }, wb: false, pcWal: { has: false, dirty: false }, pcData: { v: 100, dirty: false }, dWal: false, dData: 100,
+          recycled: false, told: false, down: null, done: false, fsyncs: 0, text: null, cls: '' };
+  }
+  const STEP = {
+    update() { S.sb = { v: 70, dirty: true }; S.wb = true;
+      return ['', 'The backend changed page 7 in <b>shared buffers</b> and marked it dirty, and put a record of the change in the <b>WAL buffers</b>. Both are in PostgreSQL\'s shared memory. No system call has been made, and nothing outside the first column knows about the change.']; },
+    ack() { S.told = true;
+      return ['pg-warn', 'With <code>synchronous_commit = off</code> the backend adds a commit record to the WAL buffers and <b>replies at once</b>. The client believes the transaction is committed. The WAL writer will push the record out within about 200 ms.']; },
+    walwrite() { S.wb = false; S.pcWal = { has: true, dirty: true };
+      return ['', mode === 'async' ? 'The WAL writer called <code>write()</code> on the log file. The records are in the kernel\'s page cache: safe from a crash of PostgreSQL, not yet from a power cut.'
+        : 'The client sent <code>COMMIT</code>. The backend added a commit record and called <code>write()</code> on the log file. The records are now in the kernel\'s page cache. A crash of PostgreSQL can no longer lose them, but a power cut can, and the client is still waiting.']; },
+    walsync() { S.pcWal.dirty = false; S.dWal = true; S.fsyncs++; if (mode !== 'async') S.told = true;
+      return ['pg-ok', mode === 'async' ? '<code>fdatasync()</code> on the log returned. The transaction is durable now, a moment after the client was told so.'
+        : '<code>fdatasync()</code> on the log returned 0, and only now is the client told <code>COMMIT</code>. Look at what hasn\'t happened: page 7 on disk still says 100. The log is the only durable copy of this change.']; },
+    bgwrite() { S.sb.dirty = false; S.pcData = { v: 70, dirty: true };
+      return ['', 'Some time later the background writer called <code>write()</code> for page 7. PostgreSQL\'s copy is clean now and the kernel\'s copy is dirty. The same 8 kB is in RAM twice, and still not in the table\'s file on disk.']; },
+    ckpt() { S.pcData.dirty = false; S.dData = 70; S.fsyncs++; S.recycled = true; S.pcWal = { has: false, dirty: false }; S.dWal = false;
+      return ['pg-ok', 'Checkpoint: <code>fsync()</code> on the data file returned 0, so page 7 on disk says 70. PostgreSQL records the checkpoint, and the log before it is no longer needed and is recycled.']; },
+    ckptfail() { S.pcData.dirty = false; S.fsyncs++;
+      return ['pg-warn', 'Checkpoint. The kernel tried to write page 7 and the disk returned an error, so <code>fsync()</code> returned <code>EIO</code>. The kernel then marked its copy of the page <b>clean</b>, although it never reached the disk. PostgreSQL logs the error and will try the checkpoint again.']; },
+    ckptretry() { S.fsyncs++; S.recycled = true; S.pcWal = { has: false, dirty: false }; S.dWal = false;
+      return ['pg-bad', 'The checkpoint ran again. <code>fsync()</code> found no dirty pages in the file and <b>returned 0</b>. PostgreSQL took that to mean page 7 was safe, recorded the checkpoint and recycled the log. Both copies in RAM say 70 and are marked clean; the disk says 100; and the log record that could repair it is gone.']; },
+    reboot() { S.sb = { v: S.dData, dirty: false }; S.pcData = { v: S.dData, dirty: false }; S.done = true;
+      return ['pg-bad', 'A routine reboot: a clean shutdown and a clean start, with nothing to recover. Page 7 is read from disk and says <b>100</b>. A transaction the client was told was committed has vanished, with no crash and no message beyond one error line in the log days ago.']; },
+    ckptpanic() { S.pcData.dirty = false; S.fsyncs++; S.down = 'panic'; S.sb = null; S.wb = false;
+      return ['pg-warn', 'Checkpoint. The kernel failed to write page 7, <code>fsync()</code> returned <code>EIO</code>, and the kernel marked its copy clean. PostgreSQL doesn\'t retry. It stops with a <b>PANIC</b>: every process exits and shared memory is thrown away, because it can no longer trust what the kernel says is on disk. The log has not been recycled.']; },
+  };
+  function crash(kind) {
+    const at = S.i ? SEQ[mode][S.i - 1] : null;
+    S.down = kind; S.sb = null; S.wb = false;
+    if (kind === 'power') { S.pcWal = { has: S.dWal, dirty: false }; S.pcData = { v: S.dData, dirty: false }; }
+    S.cls = 'pg-warn';
+    S.text = kind === 'power' ? '<b>Power cut.</b> Everything in RAM is gone: shared buffers, WAL buffers and the page cache. Only the disk column is left. Restart to see what recovery makes of it.'
+      : '<b>kill -9.</b> A backend died, so the postmaster stopped all the others and threw away the shared memory. The kernel is still running, so the page cache is untouched. Restart to see what recovery makes of it.';
+    S.crashedAfter = at;
+  }
+  function recover() {
+    const replay = S.pcWal.has, base = S.pcData.v, v = replay ? 70 : base, ghost = !replay && S.pcData.v !== S.dData;
+    S.sb = { v, dirty: replay };
+    const how = replay ? 'Recovery read the log from the last checkpoint, found the record for page 7 and its commit record, and <b>replayed</b> it: page 7 says 70 again and is dirty, so it will be written and synced again. '
+      : 'Recovery found <b>nothing in the log</b> to replay, so page 7 is whatever the file gives back: ' + v + '. ';
+    let out;
+    if (ghost) { S.cls = 'pg-bad'; out = 'That 70 comes from the kernel\'s copy, which was never written and is marked clean. It will vanish when the kernel needs the memory, and the disk says 100. The committed change is as good as lost.'; }
+    else if (S.told && v === 70) { S.cls = 'pg-ok'; out = S.down === 'panic' ? 'The committed change is intact, rebuilt from a copy that is known to be on disk. If the disk fails again at the next checkpoint, the server will stop again instead of pretending.'
+        : (mode === 'retry' && S.crashedAfter === 'ckptfail') ? 'The committed change is intact. Notice that the crash is what saved it: it happened before the retry could recycle the log. Crashing at this point on purpose is exactly what newer versions do.'
+        : 'The client was told <code>COMMIT</code>, and the change is there. Nothing was lost.'; }
+    else if (S.told) { S.cls = 'pg-bad'; out = mode === 'async' ? 'The client was told <code>COMMIT</code> and the change is <b>gone</b>. This is the risk <code>synchronous_commit = off</code> accepts: the last fraction of a second of commits can be lost, though the database is consistent.'
+        : 'The client was told <code>COMMIT</code> and the change is <b>gone</b>.'; }
+    else if (v === 70) { S.cls = 'pg-ok'; out = 'The client never received its reply, but the commit record survived, so the transaction <b>is</b> committed. A client that reconnects has to check, not assume.'; }
+    else { S.cls = ''; out = S.i ? 'The change is gone, and that\'s correct: the client was never told <code>COMMIT</code>, so nothing was promised.' : 'Nothing had happened yet, so nothing was lost.'; }
+    S.text = how + out; S.down = null; S.done = true;
+  }
+  function cell(label, val, isNew, tag) { return `<div class="pg-cell ${isNew ? 'pg-new' : ''}">${label}<b>${val}${tag || ''}</b></div>`; }
+  const DIRTY = '<i>dirty</i>', CLEAN = '<i class="pg-clean">clean</i>';
+  function render() {
+    const seq = SEQ[mode], ramGone = S.down != null, pcGone = S.down === 'power';
+    const rec = 'page 7: 100 → 70', none = '(empty)', old = S.recycled ? '(recycled)' : none;
+    $('#pgGrid').innerHTML =
+      `<div class="pg-col ${ramGone ? 'pg-lost' : ''}"><h6>PostgreSQL shared memory</h6><small>RAM · lost if PostgreSQL crashes</small>` +
+        cell('WAL buffers', ramGone ? '(gone)' : S.wb ? rec + (S.told ? ' + commit' : '') : none, S.wb && !ramGone) +
+        cell('Shared buffers: page 7', S.sb ? 'balance = ' + S.sb.v : '(gone)', S.sb && S.sb.v === 70, S.sb ? (S.sb.dirty ? DIRTY : CLEAN) : '') + '</div>' +
+      `<div class="pg-col ${pcGone ? 'pg-lost' : ''}"><h6>Kernel page cache</h6><small>RAM · lost in a power cut</small>` +
+        cell('Log file', S.pcWal.has ? rec + ' + commit' : pcGone && !S.recycled ? '(gone)' : old, S.pcWal.has, S.pcWal.has ? (S.pcWal.dirty ? DIRTY : CLEAN) : '') +
+        cell('Table file: page 7', 'balance = ' + S.pcData.v, S.pcData.v === 70, S.pcData.dirty ? DIRTY : CLEAN) + '</div>' +
+      '<div class="pg-col"><h6>Disk</h6><small>survives everything</small>' +
+        cell('Log file', S.dWal ? rec + ' + commit' : old, S.dWal) +
+        cell('Table file: page 7', 'balance = ' + S.dData, S.dData === 70) + '</div>';
+    const d = $('#pgDesc');
+    d.className = 'pg-desc ' + S.cls;
+    d.innerHTML = S.text || 'A client has opened a transaction. Page 7 holds a balance of 100, in shared buffers, in the page cache and on disk.';
+    const copies = (S.sb ? 1 : 0) + (pcGone ? 0 : 1), onDisk = S.dData === 70 ? 'in the table file' : S.dWal ? 'in the log only' : 'no';
+    $('#pgStats').innerHTML = `<div class="stat ${S.told ? 'acc' : ''}"><div class="k">Client</div><div class="v">${S.told ? 'told COMMIT' : S.done || S.down ? 'disconnected' : S.i ? 'waiting' : '–'}</div></div>
+      <div class="stat ${!S.i ? '' : onDisk === 'no' ? (S.told ? 'bad' : 'warn') : 'good'}"><div class="k">Change on disk</div><div class="v">${S.i ? onDisk : '–'}</div></div>
+      <div class="stat"><div class="k">Copies of page 7 in RAM</div><div class="v">${copies}</div></div>
+      <div class="stat"><div class="k">Sync calls</div><div class="v">${S.fsyncs}</div></div>`;
+    const nx = $('#pgNext');
+    nx.disabled = S.done || (!S.down && S.i >= seq.length);
+    nx.textContent = S.down ? 'Restart PostgreSQL' : S.done || S.i >= seq.length ? 'Finished' : (mode === 'async' && seq[S.i] === 'walwrite' ? 'WAL writer runs' : LABEL[seq[S.i]]) + ' ▸';
+    $('#pgKill').disabled = $('#pgPower').disabled = S.done || S.down != null;
+  }
+  $('#pgNext').onclick = () => {
+    if (S.down) recover();
+    else { const r = STEP[SEQ[mode][S.i]](); S.i++; S.cls = r[0]; S.text = r[1]; }
+    render();
+  };
+  $('#pgKill').onclick = () => { crash('proc'); render(); };
+  $('#pgPower').onclick = () => { crash('power'); render(); };
+  $('#pgReset').onclick = () => { reset(); render(); };
+  $('#pgMode').addEventListener('segchange', (e) => { mode = e.detail; reset(); render(); });
+  reset(); render();
+})();
+</script>
+</body>
+</html>

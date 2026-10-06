@@ -21,28 +21,34 @@ const CHROME = [process.env.CHROME,
 if (!CHROME) { console.error('No Chrome found; set CHROME=/path/to/chrome'); process.exit(2); }
 
 /* Chapter numbers of a released course, read from its generated study-data.js. */
-function chapters(dir, v) {
+function chapters(c) {
   const w = {};
-  new Function('window', fs.readFileSync(path.join(ROOT, dir, 'assets/study-data.js'), 'utf8'))(w);
-  return w[v].map((c) => c.n);
+  new Function('window', fs.readFileSync(path.join(ROOT, c.dir, 'assets/study-data.js'), 'utf8'))(w);
+  return w[c.indexVar].map((x) => x.n);
 }
-const RELEASED = [['system-design', 'SD_INDEX'], ['ml-ai-systems', 'ML_INDEX'], ['dsa', 'DSA_INDEX'], ['lld', 'LLD_INDEX']];
-const LLD_ALL = chapters('lld', 'LLD_INDEX');
-const TOTAL = RELEASED.reduce((s, [d, v]) => s + chapters(d, v).length, 0);
+// Everything expected below comes from the Atlas registry (assets/atlas.js), so releasing a course
+// (removing `soon`) needs no change here.
+const REG = require('./registry.cjs');
+const LIVE = REG.COURSES.filter((c) => !c.soon), SOON = REG.COURSES.filter((c) => c.soon);
+const COMPLETE = REG.byId('lld').soon ? LIVE[LIVE.length - 1] : REG.byId('lld');   // one released course marked complete
+const PARTIAL = LIVE.find((c) => c !== COMPLETE);                                   // one with 3 chapters read
+const STALE = SOON[0];                                                              // progress saved for an unreleased course
+const COMPLETE_ALL = chapters(COMPLETE);
+const TOTAL = LIVE.reduce((n, c) => n + chapters(c).length, 0);
 
 const FIXTURE = {
   'atlas-theme': JSON.stringify(THEME),
-  'sd-done': '[1,2,3]',
-  'lld-done': JSON.stringify(LLD_ALL),   // LLD complete
-  'os-done': '[1,2,3,4,5]',              // not released yet: must be ignored everywhere
+  [PARTIAL.store + '-done']: '[1,2,3]',
+  [COMPLETE.store + '-done']: JSON.stringify(COMPLETE_ALL),
 };
+if (STALE) FIXTURE[STALE.store + '-done'] = '[1,2,3,4,5]';   // must be ignored everywhere
 
 const PROBE = `<script>
 localStorage.clear();
 Object.entries(${JSON.stringify(FIXTURE)}).forEach(function (e) { localStorage.setItem(e[0], e[1]); });
 /* The page loads each released course's chapter index when the browser is idle; summarise only once
    all four have arrived (plus one tick for the repaint), or after 12 s so a broken load still reports. */
-var INDEXES = ['SD_INDEX', 'ML_INDEX', 'DSA_INDEX', 'LLD_INDEX'], waited = 0;
+var INDEXES = ${JSON.stringify(LIVE.map((c) => c.indexVar))}, waited = 0;
 function whenIndexed(f) {
   var ready = INDEXES.every(function (k) { return window[k]; });
   if (ready || waited >= 12000) return setTimeout(f, 100);
@@ -56,9 +62,8 @@ window.addEventListener('load', function () { whenIndexed(function () {
     fg: cs.color, k1: cs.getPropertyValue('--k1').trim(), k2: cs.getPropertyValue('--k2').trim(),
     text: ch.textContent.replace(/[ \\t\\n]+/g, ' ').trim() }; };
   var grid = document.getElementById('pathGrid');
-  var devops = document.querySelector('#courseGrid [data-course="cloud-devops"]');
   var s = {
-    cards: q('#courseGrid article.course').map(function (a) { return { id: a.dataset.course, soon: a.classList.contains('soon'), links: q('a[href]', a).length }; }),
+    cards: q('#courseGrid article.course').map(function (a) { return { id: a.dataset.course, soon: a.classList.contains('soon'), links: q('a[href]', a).length, k1: getComputedStyle(a).getPropertyValue('--k1').trim() }; }),
     featured: q('#pathFeatured .pchip').map(chip),
     paths: q('#pathGrid .path').map(function (p) { return { id: p.dataset.path, chips: q('.pchip', p).map(chip), prog: ((p.querySelector('.pprog') || {}).textContent || '').trim() }; }),
     pathsHidden: grid ? grid.hidden : true,
@@ -70,7 +75,6 @@ window.addEventListener('load', function () { whenIndexed(function () {
         size: (function () { var f = g.querySelector('.mosaic > *'); return f ? Math.round(f.getBoundingClientRect().width * 10) / 10 : 0; })() }; }),
     filters: q('#palFilters [data-f]').map(function (c) { return c.dataset.f; }),
     studyScripts: q('script[src]').map(function (x) { return x.getAttribute('src'); }).filter(function (x) { return /study-data/.test(x); }),
-    devopsK1: devops ? getComputedStyle(devops).getPropertyValue('--k1').trim() : '',
     scrollW: document.documentElement.scrollWidth, innerW: window.innerWidth,
     theme: document.documentElement.getAttribute('data-theme'),
     lead: ((document.getElementById('leadCount') || {}).textContent || '').trim(),
@@ -130,23 +134,30 @@ function check(name, ok, detail) {
   else { failed++; console.log('  ✗', name, detail === undefined ? '' : JSON.stringify(detail)); }
 }
 
-const ORDER = ['system-design', 'ml-ai-systems', 'dsa', 'lld', 'os', 'networks', 'databases', 'distributed-systems', 'cloud-devops'];
-const SOON = ORDER.slice(4);
+const isSoon = (id) => SOON.some((c) => c.id === id);
+const WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve'];
+const word = (n) => WORDS[n] || String(n);
+// The same rule as atlas.js pathProgress: released required steps complete, plus unreleased ones counted.
+function expectedProg(p) {
+  const req = p.steps.map(REG.byId).filter(Boolean), live = req.filter((c) => !c.soon);
+  if (!live.length) return 'Coming soon';
+  const done = live.filter((c) => c === COMPLETE).length, soon = req.length - live.length;
+  return done + ' of ' + live.length + ' courses complete' + (soon ? ' · ' + soon + ' coming soon' : '');
+}
 
 function checks(s) {
   console.log('courses (' + WIDTH + 'px, ' + THEME + ')');
-  check('nine course cards in palette order', eq(s.cards.map((c) => c.id), ORDER), s.cards.map((c) => c.id));
-  check('the five new courses are "coming soon"', eq(s.cards.filter((c) => c.soon).map((c) => c.id), SOON));
+  check('every course card, in registry order', eq(s.cards.map((c) => c.id), REG.COURSES.map((c) => c.id)), s.cards.map((c) => c.id));
+  check('unreleased courses are "coming soon"', eq(s.cards.filter((c) => c.soon).map((c) => c.id), SOON.map((c) => c.id)));
   check('coming-soon cards have no links', s.cards.filter((c) => c.soon).every((c) => c.links === 0), s.cards);
   check('released cards keep their links', s.cards.filter((c) => !c.soon).every((c) => c.links >= 3), s.cards);
-  check('combined progress counts released courses only', s.progTxt === (3 + LLD_ALL.length) + ' of ' + TOTAL + ' chapters read', s.progTxt);
-  check('tracker lists all nine courses in order', eq(s.mosaic.map((g) => g.name), ['System Design', 'ML & AI Systems', 'DSA', 'Low-Level Design',
-    'OS & Concurrency', 'Computer Networks', 'Database Internals & SQL', 'Distributed Systems', 'Cloud & DevOps']), s.mosaic.map((g) => g.name));
+  check('combined progress counts released courses only', s.progTxt === (3 + COMPLETE_ALL.length) + ' of ' + TOTAL + ' chapters read', s.progTxt);
+  check('tracker lists every course in order', eq(s.mosaic.map((g) => g.name), REG.COURSES.map((c) => c.title)), s.mosaic.map((g) => g.name));
   const soonRows = s.mosaic.filter((g) => g.soon);
-  check('the five upcoming rows are marked "Soon"', soonRows.length === 5 && soonRows.every((g) => g.ct === 'Soon'), soonRows);
+  check('upcoming rows are marked "Soon"', soonRows.length === SOON.length && soonRows.every((g) => g.ct === 'Soon'), soonRows);
   check('upcoming rows have no links and one ghost square per planned chapter',
-    soonRows.every((g) => g.links === 0 && g.squares === 56), soonRows.map((g) => [g.name, g.links, g.squares]));
-  check('stale progress never fills an upcoming row (os-done is set)', soonRows.every((g) => g.done === 0), soonRows.map((g) => g.done));
+    soonRows.every((g, i) => g.links === 0 && g.squares === SOON[i].chapters), soonRows.map((g) => [g.name, g.links, g.squares]));
+  check('stale progress never fills an upcoming row' + (STALE ? ' (' + STALE.store + '-done is set)' : ''), soonRows.every((g) => g.done === 0), soonRows.map((g) => g.done));
   check('released rows are unchanged', s.mosaic.filter((g) => !g.soon).every((g) => g.links === g.squares + 1), s.mosaic.filter((g) => !g.soon));
   // Laptop and wider: one line of squares per course, all rows the same square size, big enough to click.
   // Phones wrap (64 squares on one 390 px line would be ~4 px each).
@@ -155,30 +166,27 @@ function checks(s) {
     const sizes = [...new Set(s.mosaic.map((g) => g.size))];
     check('every row uses the same square size, at least 7 px', sizes.length === 1 && sizes[0] >= 7, sizes);
   }
-  check('search filters list released courses only', eq(s.filters, ['all', 'system-design', 'ml-ai-systems', 'dsa', 'lld']), s.filters);
-  check('no study-data requested for unreleased courses',
-    s.studyScripts.length === 4 && s.studyScripts.every((x) => !SOON.some((d) => x.startsWith(d + '/'))), s.studyScripts);
-  check('theme colours: Cloud & DevOps uses its ' + THEME + ' pair',
-    s.devopsK1.toLowerCase() === (THEME === 'dark' ? '#94a3b8' : '#334155'), s.devopsK1);
+  check('search filters list released courses only', eq(s.filters, ['all'].concat(LIVE.map((c) => c.id))), s.filters);
+  check('study data requested for released courses only',
+    s.studyScripts.length === LIVE.length && s.studyScripts.every((x) => !SOON.some((c) => x.startsWith(c.dir + '/'))), s.studyScripts);
+  const last = REG.COURSES[REG.COURSES.length - 1], k1 = (s.cards.find((c) => c.id === last.id) || {}).k1 || '';
+  check('theme colours: ' + last.title + ' uses its ' + THEME + ' pair', k1.toLowerCase() === (THEME === 'dark' ? last.d1 : last.c1), k1);
   check('viewport is ' + WIDTH + 'px wide (±24 px of window chrome)', Math.abs(s.innerW - WIDTH) <= 24, s.innerW);
   check('no horizontal scroll', s.scrollW <= s.innerW, [s.scrollW, s.innerW]);
+
   console.log('paths');
-  const GENERAL = ['dsa', 'os', 'networks', 'databases', 'lld', 'system-design', 'distributed-systems', 'cloud-devops', 'ml-ai-systems'];
   check('paths section is visible', !s.pathsHidden);
-  check('featured path is the complete order', eq(s.featured.map((c) => c.id), GENERAL), s.featured.map((c) => c.id));
+  check('featured path is the complete order', eq(s.featured.map((c) => c.id), REG.FEATURED.steps), s.featured.map((c) => c.id));
   check('featured: released steps link, unreleased ones are faded spans',
-    s.featured.every((c) => c.link === !SOON.includes(c.id) && c.soon === SOON.includes(c.id)), s.featured);
-  check('nine role paths in order', eq(s.paths.map((p) => p.id),
-    ['campus', 'interview', 'backend', 'sre', 'data', 'ml', 'mlops', 'fundamentals', 'architect']), s.paths.map((p) => p.id));
+    s.featured.every((c) => c.link === !isSoon(c.id) && c.soon === isSoon(c.id)), s.featured);
+  check('role paths in order', eq(s.paths.map((p) => p.id), REG.PATHS.map((p) => p.id)), s.paths.map((p) => p.id));
   const P = Object.fromEntries(s.paths.map((p) => [p.id, p]));
-  const ids = (p) => (P[p] ? P[p].chips.map((c) => c.id) : null);
-  check('campus path steps', eq(ids('campus'), ['dsa', 'os', 'databases', 'networks', 'lld']), ids('campus'));
-  check('backend path steps', eq(ids('backend'), ['databases', 'networks', 'os', 'lld', 'system-design', 'distributed-systems']), ids('backend'));
-  check('optional steps are marked', P.interview && eq(P.interview.chips.filter((c) => c.opt).map((c) => c.id), ['distributed-systems']));
-  check('a completed course shows a tick', P.interview && P.interview.chips.find((c) => c.id === 'lld').done &&
-    !P.interview.chips.find((c) => c.id === 'dsa').done, P.interview);
-  check('progress counts released required steps', P.campus && P.campus.prog === '1 of 2 courses complete · 3 coming soon', P.campus && P.campus.prog);
-  check('progress with everything released', P.interview && P.interview.prog === '1 of 3 courses complete', P.interview && P.interview.prog);
+  check('each path lists its steps, then its optional steps', REG.PATHS.every((p) => P[p.id] &&
+    eq(P[p.id].chips.map((c) => c.id), p.steps.concat(p.optional)) && eq(P[p.id].chips.filter((c) => c.opt).map((c) => c.id), p.optional)),
+    REG.PATHS.filter((p) => !P[p.id] || !eq(P[p.id].chips.map((c) => c.id), p.steps.concat(p.optional))).map((p) => p.id));
+  check('a completed course shows a tick, others do not', s.featured.every((c) => c.done === (c.id === COMPLETE.id)), s.featured.map((c) => [c.id, c.done]));
+  const wrong = REG.PATHS.filter((p) => !P[p.id] || P[p.id].prog !== expectedProg(p)).map((p) => [p.id, P[p.id] && P[p.id].prog, expectedProg(p)]);
+  check('every path counts released required steps', wrong.length === 0, wrong);
 
   // Filled chips put text on the course gradient: it must stay readable at both ends of it.
   // Dark mode: 4.5:1 (WCAG AA). Light mode: 3:1 (AA for bold UI labels), since some light-mode
@@ -190,15 +198,17 @@ function checks(s) {
 
   // Chip states must be in the text, not only in fading and dashes, so screen readers announce them.
   const F = Object.fromEntries(s.featured.map((c) => [c.id, c.text]));
-  check('unreleased chips say "coming soon"', /\(coming soon\)/.test(F.os || ''), F.os);
-  check('completed chips say "complete"', /\(complete\)/.test(F.lld || ''), F.lld);
-  const dist = P.interview && P.interview.chips.find((c) => c.id === 'distributed-systems');
-  check('optional chips say "optional"', dist && /\(optional/.test(dist.text), dist && dist.text);
+  if (STALE) check('unreleased chips say "coming soon"', /\(coming soon\)/.test(F[STALE.id] || ''), F[STALE.id]);
+  check('completed chips say "complete"', /\(complete\)/.test(F[COMPLETE.id] || ''), F[COMPLETE.id]);
+  const optChip = s.paths.flatMap((p) => p.chips).find((c) => c.opt);
+  check('optional chips say "optional"', optChip && /\(optional/.test(optChip.text), optChip && optChip.text);
 
   console.log('copy');
-  // Derived from the registry, so releasing a course (removing `soon`) updates it.
-  check('hero lead counts courses from the registry', s.lead === 'Nine courses, four out now and five on the way,', s.lead);
-  check('stats show released and upcoming courses', s.stats[0] === '4 courses' && s.stats[1] === '5 on the way', s.stats);
+  const all = word(REG.COURSES.length);
+  const lead = all[0].toUpperCase() + all.slice(1) + ' courses' + (SOON.length ? ', ' + word(LIVE.length) + ' out now and ' + word(SOON.length) + ' on the way,' : ',');
+  check('hero lead counts courses from the registry', s.lead === lead, [s.lead, lead]);
+  check('stats show released and upcoming courses', s.stats[0] === LIVE.length + ' courses' &&
+    (SOON.length ? s.stats[1] === SOON.length + ' on the way' : !s.stats.some((x) => /on the way/.test(x))), s.stats);
   check('hero title keeps clear of the tracker (≥ 24 px)', s.titleGap === null || s.titleGap >= 24, s.titleGap);
 }
 

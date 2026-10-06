@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Process States &amp; the Process Control Block</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ps-grid { display:grid; grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr); gap:14px; margin-top:14px; }
+  @media (max-width:860px) { .ps-grid { grid-template-columns:1fr; } }
+  .ps-svg { width:100%; height:auto; display:block; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; }
+  .ps-svg .ps-n rect { fill:var(--surface); stroke:var(--border-strong); stroke-width:1.5; transition:.25s; }
+  .ps-svg .ps-n text { fill:var(--text); font-size:13px; font-weight:700; text-anchor:middle; }
+  .ps-svg .ps-n .ps-cnt { font-family:var(--mono); font-size:11px; fill:var(--muted); font-weight:600; }
+  .ps-svg .ps-n.ps-hot rect { stroke:var(--accent); fill:color-mix(in srgb, var(--accent) 14%, var(--surface)); }
+  .ps-svg .ps-e { stroke:var(--border-strong); stroke-width:1.6; fill:none; }
+  .ps-svg .ps-e.ps-hot { stroke:var(--accent); stroke-width:3; }
+  .ps-svg .ps-el { font-size:10.5px; fill:var(--muted); font-family:var(--mono); }
+  .ps-q { border:1px solid var(--border); border-radius:12px; background:var(--surface); padding:8px 10px; margin-bottom:8px; }
+  .ps-q h5 { margin:0 0 6px; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .ps-tasks { display:flex; flex-wrap:wrap; gap:6px; min-height:28px; }
+  .ps-t { font-family:var(--mono); font-size:12px; border:1.5px solid var(--border); border-radius:8px; padding:3px 8px; background:var(--surface-2); cursor:pointer; color:var(--text); }
+  .ps-t.ps-sel { box-shadow:0 0 0 3px color-mix(in srgb, var(--accent-2) 45%, transparent); }
+  .ps-t.ps-R { border-color:var(--green); } .ps-t.ps-S { border-color:var(--amber); } .ps-t.ps-D { border-color:var(--pink); } .ps-t.ps-Z { border-color:var(--red); }
+  .ps-empty { font-size:12px; color:var(--muted); font-style:italic; }
+  .ps-pcb { font-family:var(--mono); font-size:12px; background:#0d1117; color:#e6edf3; border-radius:12px; padding:10px 12px; white-space:pre; overflow-x:auto; border:1px solid var(--border); margin-top:8px; }
+  .ps-act { display:flex; flex-wrap:wrap; gap:6px; margin-top:12px; }
+</style>
+</head>
+<body data-chapter="4">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 4</span><span class="pill">Beginner</span><span class="pill">⏱ 35 min</span></div>
+    <h1>Process States &amp; the <span class="grad">Process Control Block</span></h1>
+    <p class="lead">A machine with 8 cores and 600 processes has at most 8 of them running at any instant. The rest are waiting: for a turn on a CPU, for a disk read, for a network packet, for a timer, or for their parent to collect their exit status. The kernel tracks every one of them in a record called the process control block, and moves it between a handful of states and queues as events happen. Knowing that state machine is what lets you read <code>ps</code> and <code>top</code> properly, and explain why a machine can have a load average of 200 while its CPUs sit idle.</p>
+    <ul class="objectives">
+      <li>Draw the five-state process model and name the event behind each transition</li>
+      <li>Map the model onto Linux's state letters: R, S, D, T, Z</li>
+      <li>List what the PCB (Linux's <code>task_struct</code>) holds and why</li>
+      <li>Explain run queues and wait queues, and what "waking up" a task means</li>
+      <li>Read a process's state from <code>/proc/&lt;pid&gt;/status</code></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>How a blocking system call puts a thread to sleep.</b> See <a href="02-kernel-user-mode-syscalls.html">Chapter 2</a>.</li>
+        <li><b>fork, exec, exit and zombies.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>The five-state model</h2>
+  <p>Textbooks describe a process's life with five states. A process is <b>new</b> while the kernel is building it; <b>ready</b> when it could run but no CPU is free; <b>running</b> on a CPU; <b>blocked</b> (also called waiting or sleeping) when it can't continue until some event happens; and <b>terminated</b> once it has exited. Every transition is caused by something specific:</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>New → Ready</b> <code>fork()</code> finished building the child; it joins a run queue.</li>
+      <li><b>Ready → Running</b> The scheduler picks it ("dispatch") and switches the CPU to it.</li>
+      <li data-k="decision"><b>Running → ?</b> Three ways out: the timer says its slice is over (back to <b>Ready</b>), it asks for something it must wait for (<b>Blocked</b>), or it exits (<b>Terminated</b>).</li>
+      <li><b>Blocked → Ready</b> The event happens (disk interrupt, packet, timer, lock released) and the kernel "wakes" it: it goes back to a run queue, not straight onto a CPU.</li>
+      <li data-k="end"><b>Terminated → gone</b> Once the parent reaps the exit status (<a href="03-processes-fork-exec-wait.html">Chapter 3</a>), the PCB is freed.</li>
+    </ol>
+    <figcaption><b>Every arrow is an event.</b> Note there is no arrow from Blocked to Running: a woken process always waits in line for the scheduler first.</figcaption>
+  </figure>
+  <p>Linux uses its own names, which <code>ps</code> and <code>top</code> show as single letters. "Ready" and "running" share one letter, because to the kernel both mean "wants a CPU":</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Letter</th><th>Kernel name</th><th>Five-state model</th><th>Typical cause</th><th>Can a signal end it?</th></tr></thead>
+      <tbody>
+        <tr><td><code>R</code></td><td>TASK_RUNNING</td><td>Ready or Running</td><td>Computing, or waiting for a CPU</td><td>Yes</td></tr>
+        <tr><td><code>S</code></td><td>TASK_INTERRUPTIBLE</td><td>Blocked</td><td><code>read()</code> on a socket, <code>sleep()</code>, waiting for a lock or a child</td><td>Yes: the wait is interrupted (<code>EINTR</code>)</td></tr>
+        <tr><td><code>D</code></td><td>TASK_UNINTERRUPTIBLE</td><td>Blocked</td><td>Disk I/O in progress, some file-system and NFS waits</td><td>No, not until the wait ends</td></tr>
+        <tr><td><code>T</code></td><td>TASK_STOPPED / traced</td><td>(paused)</td><td>Ctrl+Z (<code>SIGTSTP</code>), <code>SIGSTOP</code>, a debugger</td><td>SIGKILL yes; resumes on <code>SIGCONT</code></td></tr>
+        <tr><td><code>Z</code></td><td>EXIT_ZOMBIE</td><td>Terminated</td><td>Exited, not yet reaped</td><td>Already dead</td></tr>
+        <tr><td><code>I</code></td><td>TASK_IDLE</td><td>Blocked</td><td>Idle kernel threads (not counted in load)</td><td>Kernel threads only</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>The process control block</h2>
+  <p>The <b>process control block</b> (PCB) is the kernel's record of one process: everything it needs to pause the process and resume it later, and to manage its resources. In Linux the PCB is <code>struct task_struct</code>, and there is one per <i>thread</i>; threads of the same process point at shared sub-structures for memory and files (<a href="05-threads.html">Chapter 5</a>). It is large (several kilobytes), so here is the shape, heavily simplified:</p>
+<pre class="code"><span class="c">/* Simplified from include/linux/sched.h: the fields this course keeps coming back to. */</span>
+<span class="k">struct</span> task_struct {
+	<span class="k">unsigned</span> <span class="k">int</span>          __state;        <span class="c">/* TASK_RUNNING, TASK_INTERRUPTIBLE, ... */</span>
+	<span class="t">pid_t</span>                 pid, tgid;      <span class="c">/* thread ID; thread-group (process) ID */</span>
+	<span class="k">struct</span> task_struct   *real_parent;    <span class="c">/* who gets SIGCHLD and reaps us */</span>
+	<span class="k">struct</span> list_head      children;
+
+	<span class="k">int</span>                   prio;           <span class="c">/* scheduling priority (Chapter 8) */</span>
+	<span class="k">struct</span> sched_entity   se;             <span class="c">/* run-queue node, virtual runtime */</span>
+	<span class="k">int</span>                   on_cpu;
+
+	<span class="k">struct</span> mm_struct     *mm;             <span class="c">/* address space: page tables, mappings (Chapter 11) */</span>
+	<span class="k">struct</span> files_struct  *files;          <span class="c">/* the file-descriptor table (Chapter 10) */</span>
+	<span class="k">struct</span> fs_struct     *fs;             <span class="c">/* current directory, root */</span>
+	<span class="k">struct</span> signal_struct *signal;         <span class="c">/* pending signals, handlers (Chapter 9) */</span>
+	<span class="k">const</span> <span class="k">struct</span> cred    *cred;           <span class="c">/* user and group IDs, capabilities (Chapter 36) */</span>
+	<span class="k">struct</span> nsproxy       *nsproxy;        <span class="c">/* namespaces (Chapter 34) */</span>
+
+	<span class="k">struct</span> thread_struct  thread;         <span class="c">/* saved CPU state: rsp, registers (Chapter 6) */</span>
+	<span class="k">void</span>                 *stack;          <span class="c">/* this thread's kernel stack */</span>
+};</pre>
+  <p>Notice how many fields are pointers to separate structures. That's what makes <code>fork</code> and threads cheap to express: a new thread is a new <code>task_struct</code> sharing the same <code>mm</code> and <code>files</code>; a new process gets copies. The table of contents of this course is, more or less, a tour of those pointers.</p>
+
+  <h2>Run queues and wait queues</h2>
+  <p>States are implemented as membership in queues. Each CPU has a <b>run queue</b> holding its runnable tasks (in Linux's fair scheduler, a red-black tree ordered by how much CPU time each has had, <a href="08-scheduling-mlfq-cfs.html">Chapter 8</a>). Every thing a task can wait for has a <b>wait queue</b>: each socket, each pipe, each locked page under I/O, each child-exit event. Blocking means taking the task off the run queue and putting it on a wait queue; <b>waking</b> means the reverse.</p>
+  <figure class="seq" data-actors="worker thread|kernel|socket wait queue|run queue (CPU 2)|NIC">
+    <ol>
+      <li data-m="0>1">recv(fd): no data yet</li>
+      <li data-m="1>2">add task, state = S (interruptible)</li>
+      <li data-m="1>1">schedule(): switch to another task</li>
+      <li data-m="4>1" data-k="async">interrupt: packet for this socket</li>
+      <li data-m="1>2">wake_up(): take the waiters off</li>
+      <li data-m="2>3">state = R, enqueue</li>
+      <li data-m="3>0" data-k="reply">scheduler picks it; recv() copies the data and returns</li>
+    </ol>
+    <figcaption><b>Blocking and waking.</b> A sleeping task costs no CPU at all; it's just an entry on a list until the event arrives.</figcaption>
+  </figure>
+
+  <h2>Drive the state machine</h2>
+  <p>Four processes share one CPU. Use the buttons to generate events and watch tasks move between the run queue and wait queues; the diagram highlights the transition that just happened. Click any task to see its PCB.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Process state machine: queues, transitions and PCBs</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="ps-grid">
+        <div>
+          <svg class="ps-svg" id="psSvg" viewBox="0 0 520 300" role="img" aria-label="Five-state process diagram"></svg>
+        </div>
+        <div>
+          <div class="ps-q"><h5>Running on the CPU</h5><div class="ps-tasks" id="psRun"></div></div>
+          <div class="ps-q"><h5>Run queue (ready, R)</h5><div class="ps-tasks" id="psReady"></div></div>
+          <div class="ps-q"><h5>Wait queue: disk I/O (D)</h5><div class="ps-tasks" id="psDisk"></div></div>
+          <div class="ps-q"><h5>Wait queue: socket :443 (S)</h5><div class="ps-tasks" id="psSock"></div></div>
+          <div class="ps-q"><h5>Exited, not yet reaped (Z)</h5><div class="ps-tasks" id="psZomb"></div></div>
+        </div>
+      </div>
+      <div class="ps-act">
+        <button class="btn sm primary" data-ev="tick">⏱ Timer tick (slice over)</button>
+        <button class="btn sm" data-ev="disk">Running task: read() from disk</button>
+        <button class="btn sm" data-ev="sock">Running task: recv() on socket</button>
+        <button class="btn sm" data-ev="diskirq">💾 Disk interrupt: I/O done</button>
+        <button class="btn sm" data-ev="pkt">📨 Packet arrives on :443</button>
+        <button class="btn sm" data-ev="exit">Running task: exit()</button>
+        <button class="btn sm" data-ev="fork">fork() a new process</button>
+        <button class="btn sm" data-ev="reap">Parent calls wait()</button>
+      </div>
+      <div class="log" id="psLog" style="margin-top:12px;height:110px"></div>
+      <div class="ps-pcb" id="psPcb"></div>
+    </div>
+    <div class="panel-foot">One CPU, so at most one task is running. "Load" counts tasks that are running, ready or in D state, the way Linux's load average does.</div>
+  </div>
+
+  <h2>Reading state from /proc</h2>
+  <p>Linux exposes each task's PCB, read-only, under <code>/proc/&lt;pid&gt;/</code>. The <code>status</code> file is the readable summary:</p>
+<pre class="code"><span class="c">$</span> grep -E <span class="s">'Name|State|Pid|PPid|Threads|VmRSS|ctxt'</span> /proc/<span class="m">1734</span>/status
+Name:	nginx
+State:	S (sleeping)                 <span class="c"># blocked in epoll_wait, waiting for connections</span>
+Pid:	<span class="m">1734</span>
+PPid:	<span class="m">1730</span>
+Threads:	<span class="m">1</span>
+VmRSS:	   <span class="m">48212</span> kB                  <span class="c"># physical memory in use (Chapter 14)</span>
+voluntary_ctxt_switches:	  <span class="m">913442</span>  <span class="c"># times it blocked and gave up the CPU</span>
+nonvoluntary_ctxt_switches:	    <span class="m">2104</span>  <span class="c"># times it was preempted while still runnable</span>
+<span class="c">$</span> cat /proc/<span class="m">1734</span>/wchan; echo          <span class="c"># the kernel function it is sleeping in</span>
+do_epoll_wait</pre>
+  <p>The two context-switch counters are a quick diagnostic. A process with many <b>voluntary</b> switches spends its life blocking on I/O; one with many <b>non-voluntary</b> switches is CPU-bound and being preempted, often because there are more runnable tasks than cores.</p>
+
+  <div class="callout usecase">
+    <div class="ico">📈</div>
+    <div class="body"><div class="title">Load average 200, CPUs idle: the D state</div><p>Linux's load average counts tasks that are runnable <i>or</i> in uninterruptible sleep (D). That second part, a Linux choice dating from 1993, means load reflects demand for disk as well as CPU. It also produces a classic incident: an NFS server stops responding, every process that touches the mounted directory blocks in D state, and load average climbs into the hundreds while <code>top</code> shows the CPUs almost idle. Those processes can't be killed, not even with <code>kill -9</code>, until the I/O completes or times out, because D-state waits deliberately ignore signals. The diagnosis is <code>ps -eo pid,stat,wchan:30,cmd | awk '$2 ~ /D/'</code>: every stuck task, and the kernel function it's stuck in. Brendan Gregg's 2017 article "Linux Load Averages: Solving the Mystery" traces the history.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Reading <code>R</code> as "running right now".</b> It means running <i>or ready</i>; with more R tasks than cores, some are waiting in line.</li>
+      <li><b>Thinking a woken task runs immediately.</b> Waking moves it to a run queue; the scheduler decides when it gets a CPU.</li>
+      <li><b>Reading high load as high CPU.</b> On Linux, load includes D-state tasks; check CPU utilisation and I/O wait separately.</li>
+      <li><b>Expecting <code>kill -9</code> to clear D-state processes.</b> They die only when the uninterruptible wait ends.</li>
+      <li><b>Assuming one PCB per process.</b> Linux has one <code>task_struct</code> per thread; <code>ps -L</code> or <code>/proc/&lt;pid&gt;/task/</code> shows them.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What states can a process be in, and what moves it between them?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>New while it's being created; ready when it can run but has no CPU; running on a CPU; blocked when it's waiting for an event like I/O; terminated after exit until its parent reaps it. The scheduler moves ready to running; a timer interrupt ending its time slice moves running back to ready; a blocking call moves running to blocked; the event's interrupt or a wake-up moves blocked to ready, never directly to running; and exit moves running to terminated. Linux shows these as R (ready or running), S and D (interruptible and uninterruptible sleep), T (stopped) and Z (zombie).</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> What's in a PCB, and why does a context switch need it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The PCB, Linux's <code>task_struct</code>, holds the task's identity (PID, parent), its state and scheduling data (priority, run-queue node, CPU time used), pointers to its resources (address space and page tables, file-descriptor table, signal handlers, credentials, namespaces), and the saved CPU context: the kernel stack pointer and registers. A context switch saves the outgoing task's registers into its PCB and kernel stack, switches page tables if the next task is in a different process, and restores the incoming task's saved state, so it resumes exactly where it stopped. Without the PCB there'd be nowhere to keep a paused task.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Five states: new, ready, running, blocked, terminated; every transition is triggered by an event.</li>
+      <li>Linux letters: R (ready or running), S (interruptible sleep), D (uninterruptible), T (stopped), Z (zombie).</li>
+      <li>The PCB (<code>task_struct</code>, one per thread) holds identity, state, scheduling data, resource pointers and saved registers.</li>
+      <li>Ready tasks sit in per-CPU run queues; blocked tasks sit in per-event wait queues; waking moves them back.</li>
+      <li>Linux load average counts R and D tasks, so it can be high with idle CPUs.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A blocked process's disk read completes. Which state does it move to?</p>
+      <div class="opts">
+        <button class="opt">Running, immediately</button>
+        <button class="opt">Terminated</button>
+        <button class="opt">Ready: it joins a run queue and waits for the scheduler</button>
+        <button class="opt">New</button>
+      </div>
+      <div class="explain">Waking makes a task runnable, not running. Another task may hold the CPU, and the scheduler chooses.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What causes a running process to go back to ready without doing anything wrong?</p>
+      <div class="opts">
+        <button class="opt">A timer interrupt ends its time slice and the scheduler preempts it</button>
+        <button class="opt">It calls read() on a socket</button>
+        <button class="opt">It calls exit()</button>
+        <button class="opt">Its parent calls wait()</button>
+      </div>
+      <div class="explain">Preemption: still runnable, but its turn is over. A blocking call would move it to blocked instead.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q"><code>ps</code> shows a process in state <code>D</code> that ignores <code>kill -9</code>. Why?</p>
+      <div class="opts">
+        <button class="opt">It is a zombie</button>
+        <button class="opt">It has a SIGKILL handler</button>
+        <button class="opt">It is running as root</button>
+        <button class="opt">It's in an uninterruptible wait (often disk or NFS I/O), and signals are only acted on when that wait ends</button>
+      </div>
+      <div class="explain">D-state sleeps don't wake for signals. The kill is queued and takes effect once the I/O finishes or fails.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which of these is NOT something the PCB (task_struct) points to?</p>
+      <div class="opts">
+        <button class="opt">The file-descriptor table</button>
+        <button class="opt">The program's source code</button>
+        <button class="opt">The address space (mm_struct)</button>
+        <button class="opt">Credentials (user and group IDs)</button>
+      </div>
+      <div class="explain">The kernel knows nothing about source code. It tracks resources and saved CPU state.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A 16-core server shows load average 180 and 3% CPU utilisation. What's the most likely explanation?</p>
+      <div class="opts">
+        <button class="opt">180 threads are spinning on locks</button>
+        <button class="opt">The load average is broken</button>
+        <button class="opt">Many tasks are stuck in uninterruptible (D) waits, e.g. on a hung NFS mount or slow disk, which Linux counts in load</button>
+        <button class="opt">There are 180 zombie processes</button>
+      </div>
+      <div class="explain">Linux load counts R and D tasks. Spinning threads would show high CPU; zombies aren't counted.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const NODES = { new: [70, 50, 'New'], ready: [210, 150, 'Ready'], run: [380, 50, 'Running'], blk: [380, 250, 'Blocked'], term: [470, 150, 'Terminated'] };
+  const EDGES = {
+    admit: ['M110,62 Q170,90 190,128', 'admit (fork done)', 120, 108],
+    dispatch: ['M250,138 Q300,90 340,66', 'dispatch', 280, 92],
+    preempt: ['M350,74 Q300,140 262,150', 'timer: preempt', 248, 128],
+    block: ['M390,72 L390,226', 'block (I/O, recv)', 276, 196],
+    wake: ['M342,248 Q270,230 228,172', 'event: wake', 230, 230],
+    exit: ['M418,62 Q470,90 470,128', 'exit', 470, 92],
+  };
+  let tasks, cpu, ready, disk, sock, zomb, sel, nextPid, hotE, hotN, ticks;
+  function mk(pid, name, rip) { return { pid, name, st: 'R', rip, rsp: '0xffffc900' + (pid * 37).toString(16).padStart(5, '0').slice(-5) + 'f58', vol: 0, inv: 0, fds: 3 + (pid % 4) }; }
+  function reset() {
+    tasks = {};
+    [[1734, 'nginx', '0x4a2c10'], [2215, 'python3 worker', '0x5bd0e4'], [2604, 'gcc', '0x4011f0'], [2901, 'rsync', '0x40a9c2']].forEach(([p, n, r]) => (tasks[p] = mk(p, n, r)));
+    cpu = 1734; ready = [2215, 2604, 2901]; disk = []; sock = []; zomb = []; sel = 1734; nextPid = 3100; hotE = null; hotN = 'run'; ticks = 0;
+    $('#psLog').innerHTML = '';
+    OS.log($('#psLog'), 'nginx is running; three tasks are ready. Generate an event.', 'acc');
+    render();
+  }
+  function dispatch() {
+    if (cpu || !ready.length) return;
+    cpu = ready.shift(); tasks[cpu].st = 'R';
+    OS.log($('#psLog'), `schedule(): dispatch ${tasks[cpu].name} (${cpu}) from the run queue`);
+  }
+  function ev(e) {
+    const t = cpu ? tasks[cpu] : null;
+    hotE = null;
+    const need = (msg) => { OS.toast(msg); return false; };
+    if (['tick', 'disk', 'sock', 'exit'].includes(e) && !t) { need('Nothing is running: the CPU is idle. Wake or fork something.'); return; }
+    if (e === 'tick') {
+      t.inv++; ready.push(cpu); OS.log($('#psLog'), `timer interrupt: ${t.name} preempted → back of run queue (still R)`, 'warn'); cpu = null; hotE = 'preempt'; hotN = 'ready'; dispatch();
+    } else if (e === 'disk') {
+      t.vol++; t.st = 'D'; disk.push(cpu); OS.log($('#psLog'), `${t.name}: read() misses the page cache → state D, on the disk wait queue`); cpu = null; hotE = 'block'; hotN = 'blk'; dispatch();
+    } else if (e === 'sock') {
+      t.vol++; t.st = 'S'; sock.push(cpu); OS.log($('#psLog'), `${t.name}: recv() finds no data → state S, on the socket wait queue`); cpu = null; hotE = 'block'; hotN = 'blk'; dispatch();
+    } else if (e === 'diskirq') {
+      if (!disk.length) { need('No task is waiting for the disk.'); return; }
+      const p = disk.shift(); tasks[p].st = 'R'; ready.push(p); OS.log($('#psLog'), `disk interrupt → wake_up(): ${tasks[p].name} D → R, joins the run queue (not the CPU)`, 'ok'); hotE = 'wake'; hotN = 'ready'; dispatch();
+    } else if (e === 'pkt') {
+      if (!sock.length) { need('No task is waiting on the socket.'); return; }
+      const woken = sock.splice(0); woken.forEach((p) => { tasks[p].st = 'R'; ready.push(p); });
+      OS.log($('#psLog'), `NIC interrupt → wake_up(): ${woken.map((p) => tasks[p].name).join(', ')} S → R`, 'ok'); hotE = 'wake'; hotN = 'ready'; dispatch();
+    } else if (e === 'exit') {
+      t.st = 'Z'; zomb.push(cpu); OS.log($('#psLog'), `${t.name} exits → Z: memory freed, PCB kept for the parent's wait()`, 'bad'); cpu = null; hotE = 'exit'; hotN = 'term'; dispatch();
+    } else if (e === 'fork') {
+      const p = nextPid++; tasks[p] = mk(p, 'worker-' + (p - 3099), '0x401a30'); ready.push(p); sel = p;
+      OS.log($('#psLog'), `fork(): new task_struct for PID ${p}, admitted to the run queue`, 'acc'); hotE = 'admit'; hotN = 'ready'; dispatch();
+    } else if (e === 'reap') {
+      if (!zomb.length) { need('No zombies to reap.'); return; }
+      const p = zomb.shift(); OS.log($('#psLog'), `parent's wait() collects ${tasks[p].name}'s status → PCB freed, PID ${p} reusable`, 'ok'); delete tasks[p]; if (sel === p) sel = cpu || ready[0]; hotN = 'term';
+    }
+
+    render();
+  }
+  function chip(p) { const t = tasks[p]; return `<span class="ps-t ps-${t.st} ${p === sel ? 'ps-sel' : ''}" data-p="${p}">${p} ${t.name}</span>`; }
+  function render() {
+    const counts = { new: 0, ready: ready.length, run: cpu ? 1 : 0, blk: disk.length + sock.length, term: zomb.length };
+    let s = `<defs><marker id="psAh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--border-strong)"/></marker><marker id="psAhH" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>`;
+    for (const k in EDGES) { const [d, l, x, y] = EDGES[k]; s += `<path class="ps-e ${k === hotE ? 'ps-hot' : ''}" d="${d}" marker-end="url(#${k === hotE ? 'psAhH' : 'psAh'})"/><text class="ps-el" x="${x}" y="${y}">${l}</text>`; }
+    for (const k in NODES) { const [x, y, l] = NODES[k]; s += `<g class="ps-n ${k === hotN ? 'ps-hot' : ''}"><rect x="${x - 48}" y="${y - 22}" width="96" height="44" rx="10"/><text x="${x}" y="${y - 2}">${l}</text><text class="ps-cnt" x="${x}" y="${y + 14}">${counts[k]} task${counts[k] === 1 ? '' : 's'}</text></g>`; }
+    $('#psSvg').innerHTML = s;
+    const fill = (id, list) => ($(id).innerHTML = list.length ? list.map(chip).join('') : '<span class="ps-empty">empty</span>');
+    fill('#psRun', cpu ? [cpu] : []); fill('#psReady', ready); fill('#psDisk', disk); fill('#psSock', sock); fill('#psZomb', zomb);
+    const t = tasks[sel];
+    const load = (cpu ? 1 : 0) + ready.length + disk.length;
+    $('#psPcb').textContent = t ? `task_struct for PID ${t.pid}   (load right now: ${load})
+  comm        = "${t.name}"
+  __state     = ${({ R: 'TASK_RUNNING', S: 'TASK_INTERRUPTIBLE', D: 'TASK_UNINTERRUPTIBLE', Z: 'EXIT_ZOMBIE' })[t.st]}   (${t.st}${t.pid === cpu ? ', on the CPU' : t.st === 'R' ? ', in the run queue' : ''})
+  thread.sp   = ${t.rsp}     saved kernel stack pointer
+  saved rip   = ${t.st === 'Z' ? '(none: will never run again)' : t.rip}
+  mm          = ${t.st === 'Z' ? 'NULL  (address space already freed)' : '0xffff8881' + (t.pid * 4099).toString(16).slice(-6) + ' (mm_struct)'}
+  files       = ${t.st === 'Z' ? 'NULL  (fds closed at exit)' : t.fds + ' open file descriptors'}
+  nvcsw/nivcsw= ${t.vol} voluntary / ${t.inv} involuntary context switches` : 'Click a task to inspect its PCB.';
+  }
+  $('.ps-act').addEventListener('click', (e) => { const b = e.target.closest('[data-ev]'); if (b) ev(b.dataset.ev); });
+  $('.panel').addEventListener('click', (e) => { const c = e.target.closest('[data-p]'); if (c) { sel = +c.dataset.p; render(); } });
+  reset();
+})();
+</script>
+</body>
+</html>

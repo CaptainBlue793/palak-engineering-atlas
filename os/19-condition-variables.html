@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Condition Variables</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .cv-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(235px,1fr)); gap:10px; margin-top:14px; align-items:start; }
+  .cv-th { border:1.5px solid var(--border); border-radius:12px; padding:9px 10px; background:var(--surface); }
+  .cv-th h6 { margin:0 0 6px; font-size:13px; }
+  .cv-ln { font-family:var(--mono); font-size:11.5px; padding:4px 7px; border-radius:7px; border:1px solid transparent; color:var(--text-2); white-space:pre; overflow:hidden; text-overflow:ellipsis; }
+  .cv-ln.cv-cur { border-color:var(--accent); background:color-mix(in srgb, var(--accent) 10%, var(--surface)); color:var(--text); }
+  .cv-st { margin-top:6px; font-size:12px; color:var(--muted); }
+  .cv-st.cv-wait { color:var(--amber); font-weight:700; }
+  .cv-st.cv-done { color:var(--green); font-weight:700; }
+  .cv-sh { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:10px; }
+  .cv-sh div { border:1.5px dashed var(--border-strong); border-radius:10px; padding:7px 10px; background:var(--surface-2); font-size:12px; color:var(--muted); }
+  .cv-sh b { display:block; font-family:var(--mono); font-size:15px; color:var(--text); }
+  .cv-trace { margin-top:10px; font-family:var(--mono); font-size:12.5px; color:var(--text-2); overflow-wrap:anywhere; }
+  .cv-desc { margin-top:10px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .cv-desc.cv-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .cv-desc.cv-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
+</head>
+<body data-chapter="19">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 19</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Condition <span class="grad">Variables</span></h1>
+    <p class="lead">A mutex answers "may I touch this data now?". It can't answer "tell me when the data is in the state I need". A worker thread wants a job from a queue that happens to be empty; a producer wants to add to a buffer that happens to be full. Each needs to wait for something another thread will do, without burning CPU and without missing the moment. A <b>condition variable</b> is the tool: a place to sleep until someone signals that the shared state has changed. The interface is three calls. The rules for using them correctly are short, and each one exists because of a specific bug that this chapter lets you cause.</p>
+    <ul class="objectives">
+      <li>Explain why waiting for a condition needs more than a mutex</li>
+      <li>Use wait, signal and broadcast in the standard pattern</li>
+      <li>Explain the lost wake-up and why wait takes the mutex as an argument</li>
+      <li>Explain why the condition must be rechecked in a while loop</li>
+      <li>Compare Mesa and Hoare semantics, and choose between signal and broadcast</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Mutexes, and how a thread sleeps and is woken.</b> See <a href="18-mutexes-spinlocks.html">Chapter 18</a>.</li>
+        <li><b>Check-then-act races and interleavings.</b> See <a href="17-race-conditions.html">Chapter 17</a>.</li>
+        <li><b>Blocked and ready states.</b> See <a href="04-process-states-pcb.html">Chapter 4</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Why a mutex isn't enough</h2>
+  <p>A worker takes jobs from a shared queue. The queue is protected by a mutex, so adding and removing are safe. But what should the worker do when the queue is empty? With only a mutex, it can poll:</p>
+<pre class="code"><span class="k">for</span> (;;) {
+    <span class="f">pthread_mutex_lock</span>(&amp;m);
+    <span class="k">if</span> (count &gt; <span class="m">0</span>) { job = <span class="f">dequeue</span>(); count--; <span class="f">pthread_mutex_unlock</span>(&amp;m); <span class="k">break</span>; }
+    <span class="f">pthread_mutex_unlock</span>(&amp;m);
+    <span class="c">/* nothing yet: go round again */</span>
+}</pre>
+  <p>This is correct and terrible. An idle worker uses 100% of a core and takes the lock millions of times a second, getting in the way of the thread trying to add a job. Adding a <code>usleep(1000)</code> to the loop trades the CPU for latency: every job now waits up to a millisecond for no reason. What the worker wants is to sleep until the exact moment the queue stops being empty, and that means the thread that adds a job has to wake it.</p>
+
+  <h2>wait, signal, broadcast</h2>
+  <p>A condition variable is a queue of sleeping threads. It holds no data and no state of its own. It is always used together with a mutex and with some <b>condition</b> on shared data (also called a predicate), such as <code>count &gt; 0</code>.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Call</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>pthread_cond_wait(&amp;cv, &amp;m)</code></td><td>Releases <code>m</code> and puts the caller to sleep on <code>cv</code>, as one atomic step. When woken, takes <code>m</code> again before returning</td></tr>
+        <tr><td><code>pthread_cond_signal(&amp;cv)</code></td><td>Wakes one thread sleeping on <code>cv</code>, if there is one. If nobody is waiting, nothing happens and nothing is remembered</td></tr>
+        <tr><td><code>pthread_cond_broadcast(&amp;cv)</code></td><td>Wakes every thread sleeping on <code>cv</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The whole of correct usage fits in one pattern. Learn it as a unit:</p>
+<pre class="code"><span class="t">pthread_mutex_t</span> m = <span class="m">PTHREAD_MUTEX_INITIALIZER</span>;
+<span class="t">pthread_cond_t</span> not_empty = <span class="m">PTHREAD_COND_INITIALIZER</span>;
+<span class="t">int</span> count;                                      <span class="c">/* jobs in the queue: the shared state */</span>
+
+<span class="t">void</span> <span class="f">put</span>(<span class="t">job_t</span> j)
+{
+    <span class="f">pthread_mutex_lock</span>(&amp;m);
+    <span class="f">enqueue</span>(j); count++;                        <span class="c">/* 1. change the state, holding the mutex */</span>
+    <span class="f">pthread_cond_signal</span>(&amp;not_empty);            <span class="c">/* 2. tell a waiter that it changed */</span>
+    <span class="f">pthread_mutex_unlock</span>(&amp;m);
+}
+
+<span class="t">job_t</span> <span class="f">get</span>(<span class="t">void</span>)
+{
+    <span class="f">pthread_mutex_lock</span>(&amp;m);
+    <span class="k">while</span> (count == <span class="m">0</span>)                          <span class="c">/* check the condition, holding the mutex, in a loop */</span>
+        <span class="f">pthread_cond_wait</span>(&amp;not_empty, &amp;m);      <span class="c">/* unlocks m, sleeps, relocks m */</span>
+    <span class="t">job_t</span> j = <span class="f">dequeue</span>(); count--;               <span class="c">/* here the condition is true and we hold the mutex */</span>
+    <span class="f">pthread_mutex_unlock</span>(&amp;m);
+    <span class="k">return</span> j;
+}</pre>
+  <figure class="seq" data-actors="Worker|mutex m|cv not_empty|Producer">
+    <ol>
+      <li data-m="0>1">lock</li>
+      <li data-m="0>2">count is 0: wait (releases m and sleeps, atomically)</li>
+      <li data-m="3>1">lock: free, because the worker gave it up</li>
+      <li data-m="3>2">enqueue, count = 1, signal</li>
+      <li data-m="2>0" data-k="reply">woken, but must get m back first</li>
+      <li data-m="3>1">unlock</li>
+      <li data-m="0>1">relock: wait returns. Check again: count is 1. Dequeue, unlock</li>
+    </ol>
+    <figcaption><b>One wait and one signal.</b> The worker holds the mutex whenever it looks at <code>count</code>, and holds nothing while it sleeps, which is what lets the producer get in.</figcaption>
+  </figure>
+
+  <h2>Why wait takes the mutex: the lost wake-up</h2>
+  <p>It seems odd that <code>wait</code> needs to know about the mutex. The reason is one particular interleaving. Suppose releasing the lock and going to sleep were two separate steps:</p>
+<pre class="code">Worker                                   Producer
+lock; count == 0, so decide to sleep
+unlock
+                                         lock; enqueue; count = 1
+                                         signal            <span class="c">&lt;- nobody is asleep yet: does nothing</span>
+                                         unlock
+sleep                                    <span class="c">&lt;- sleeps for ever, with a job in the queue</span></pre>
+  <p>The signal arrived in the gap between "decided to sleep" and "asleep", and since a condition variable remembers nothing, it was lost. This is the <b>lost wake-up</b>, the same check-then-act shape as every race in Chapter 17. <code>pthread_cond_wait</code> closes the gap by doing the unlock and the sleep atomically: the caller is on the wait queue before any other thread can take the mutex, so a producer that changes the state afterwards is certain to find it there. It is also why the signaller must change the state while holding the mutex.</p>
+
+  <h2>Always wait in a while loop</h2>
+  <p>When <code>wait</code> returns, the condition is <i>probably</i> true. It isn't guaranteed, for three reasons:</p>
+  <ul>
+    <li><b>Another thread got there first.</b> A signalled thread doesn't run at once. It becomes runnable and then has to take the mutex like anyone else. In between, a third thread can lock the mutex, find a job and take it. When the woken thread finally runs, the queue is empty again.</li>
+    <li><b>Spurious wake-ups.</b> POSIX allows <code>pthread_cond_wait</code> to return even though nobody signalled. Implementations are allowed this slack because ruling it out would make every wait slower.</li>
+    <li><b>Broadcasts.</b> A broadcast wakes every waiter although there may be work for only one.</li>
+  </ul>
+  <p>One rule covers all three: <b>recheck the condition after waking, by putting the wait inside a <code>while</code></b>. Then a wake-up is only ever a hint to look again, and an unnecessary one costs a little time but can't cause a wrong result. With an <code>if</code>, the thread carries on with a condition that no longer holds.</p>
+
+  <h2>Cause the bugs</h2>
+  <p>Two workers each take one job; a producer adds two. You choose who runs. In the first variant, try to strand a worker asleep with jobs in the queue. In the second, make a worker take a job from an empty queue. Then check that you can't break the third, and press <b>Try every schedule</b> on each.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Two workers, one producer: three ways to wait</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="cvVar"><button class="active" data-v="nolock">check and sleep, no mutex</button><button data-v="if">wait in an if</button><button data-v="while">wait in a while</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="cvW1">Step worker 1 →</button>
+        <button class="btn sm primary" id="cvW2">Step worker 2 →</button>
+        <button class="btn sm primary" id="cvP">Step producer →</button>
+        <button class="btn sm" id="cvAll">Try every schedule</button>
+        <button class="btn sm" id="cvReset">↺ Reset</button>
+      </div>
+      <div class="cv-grid" id="cvGrid"></div>
+      <div class="cv-sh" id="cvShared"></div>
+      <div class="cv-trace" id="cvTrace"></div>
+      <div class="cv-desc" id="cvDesc"></div>
+    </div>
+    <div class="panel-foot">The queue is shown only as its <code>count</code>, which starts at 0. The producer runs its loop twice. A run is correct if both workers finish with one job each and <code>count</code> ends at 0. Spurious wake-ups aren't modelled; the bugs here need none. "Try every schedule" follows every choice the scheduler could make.</div>
+  </div>
+
+  <p>Things to notice. In the first variant the fatal order is: a worker tests <code>count</code>, the producer does all its work, and only then does the worker sleep. Both signals have gone and nobody will send another. In the second, let worker 1 wait, let the producer add one job and signal, then run worker 2 through before worker 1 gets the mutex back: worker 1 returns from <code>wait</code> and decrements a count of zero. The third variant is correct on every schedule, and the only change is one word: <code>if</code> became <code>while</code>.</p>
+
+  <h2>Mesa and Hoare semantics</h2>
+  <p>The need for <code>while</code> comes from a design decision about what <code>signal</code> means. There are two classic answers.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Hoare semantics (1974)</th><th>Mesa semantics (1980)</th></tr></thead>
+      <tbody>
+        <tr><td><b>On signal</b></td><td>The signaller stops; the lock and the CPU pass straight to the waiter</td><td>The waiter is made runnable; the signaller carries on</td></tr>
+        <tr><td><b>When the waiter resumes</b></td><td>The condition is guaranteed to be true</td><td>The condition may have changed: the signal was a hint</td></tr>
+        <tr><td><b>Waiting code</b></td><td><code>if (!cond) wait();</code> is enough</td><td><code>while (!cond) wait();</code> is required</td></tr>
+        <tr><td><b>Cost</b></td><td>Two forced context switches per signal; awkward to implement</td><td>None beyond the wake-up</td></tr>
+        <tr><td><b>Used by</b></td><td>Textbooks and a few research systems</td><td>Essentially everything: pthreads, Java, C++, Go, Rust, the Linux kernel</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Tony Hoare's version is easier to reason about on paper. The version built by Butler Lampson and David Redell for the Mesa language at Xerox is easier to implement efficiently and more forgiving: since every waiter rechecks, extra or early wake-ups are harmless. Every system you are likely to use is Mesa-style, so treat the loop as part of the syntax.</p>
+
+  <h2>signal or broadcast?</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th><code>signal</code></th><th><code>broadcast</code></th></tr></thead>
+      <tbody>
+        <tr><td><b>Wakes</b></td><td>One waiter</td><td>All waiters</td></tr>
+        <tr><td><b>Safe when</b></td><td>Every waiter is waiting for the same condition, and one state change can satisfy only one of them</td><td>Always, provided waiters use <code>while</code></td></tr>
+        <tr><td><b>Risk</b></td><td>Waking a thread that can't use the change, while the one that could stays asleep</td><td>A "thundering herd": all wake, all fight for the mutex, all but one go back to sleep</td></tr>
+        <tr><td><b>Typical use</b></td><td>One job added to a queue</td><td>Shutdown flags, configuration reloads, a pool's capacity changing</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The classic way to get <code>signal</code> wrong is to use <b>one condition variable for two conditions</b>. In a bounded buffer, producers wait for "not full" and consumers for "not empty". If both sleep on the same condition variable, a consumer that removes an item may signal and wake <i>another consumer</i>, which finds nothing and sleeps again, while the producer that could have used the free slot is never woken. Everything stops. The fix is one condition variable per condition, <code>not_full</code> and <code>not_empty</code>, or, failing that, <code>broadcast</code>. <a href="21-classic-sync-problems.html">Chapter 21</a> builds that buffer in full.</p>
+
+  <div class="callout usecase">
+    <div class="ico">☕</div>
+    <div class="body"><div class="title">Java's ArrayBlockingQueue: one lock, two conditions</div><p>The bounded queue behind many Java thread pools is this chapter in about thirty lines. <code>ArrayBlockingQueue</code> has a single <code>ReentrantLock</code> and two condition objects created from it, named <code>notEmpty</code> and <code>notFull</code>. Its <code>put</code> method locks, runs <code>while (count == items.length) notFull.await();</code>, stores the element and calls <code>notEmpty.signal()</code>. Its <code>take</code> method is the mirror image: <code>while (count == 0) notEmpty.await();</code>, remove, then <code>notFull.signal()</code>. Every rule is visible: the state is only read and changed under the lock, each wait is in a <code>while</code>, and there is one condition per predicate so that <code>signal</code> can never wake the wrong kind of thread. Java's documentation for the older <code>Object.wait()</code> says in so many words that waits "should always occur in loops". Go's <code>sync.Cond</code>, C++'s <code>std::condition_variable</code> (whose <code>wait</code> can take the predicate and do the loop for you) and Rust's <code>Condvar</code> all have the same shape, because all are Mesa-style.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Waiting in an <code>if</code>.</b> After waking, the condition may be false again. Always <code>while</code>.</li>
+      <li><b>Checking the condition without the mutex.</b> The check and the sleep must be one critical section, or a signal can fall in between and be lost.</li>
+      <li><b>Changing the state without the mutex.</b> For the same reason: the waiter must not be able to miss the change.</li>
+      <li><b>Treating a signal as a message.</b> It carries no information and isn't stored. The truth is in the shared state; the signal only says "look again".</li>
+      <li><b>One condition variable for two different conditions.</b> <code>signal</code> may wake a thread that can't proceed. Use one per condition.</li>
+      <li><b>Forgetting to signal on every path.</b> Each code path that could make the condition true must signal, including error paths and shutdown.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why must <code>pthread_cond_wait</code> be called in a while loop?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because returning from <code>wait</code> doesn't guarantee the condition is true. Pthreads uses Mesa semantics: <code>signal</code> only makes the waiter runnable, and it then has to reacquire the mutex. Between the signal and that moment another thread can take the mutex and consume whatever the signal was about, so the woken thread finds the queue empty again. POSIX also permits spurious wake-ups, where <code>wait</code> returns with no signal at all, and a broadcast wakes all waiters when only some can proceed. Rechecking in a <code>while</code> handles all of these: a wake-up becomes a hint to re-test, and if the condition is false the thread simply waits again. With an <code>if</code>, it would continue on a false assumption, for example dequeuing from an empty queue.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why does <code>pthread_cond_wait</code> take a mutex, and what goes wrong without it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>To prevent a lost wake-up. The waiter checks a condition on shared state and, if it is false, sleeps. If checking and sleeping aren't atomic with respect to the thread that changes the state, this can happen: the waiter sees the queue empty and decides to sleep; before it is actually asleep, a producer adds an item and signals; the signal finds no sleeper and is discarded, because condition variables keep no memory; then the waiter goes to sleep and never wakes, though the queue has an item. <code>pthread_cond_wait</code> avoids it by requiring the caller to hold the mutex while checking, and by releasing the mutex and enqueuing the thread as a sleeper in one atomic step. The producer must hold the same mutex to change the state, so it can only run either before the check, in which case the waiter sees the item, or after the waiter is on the queue, in which case the signal wakes it.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A condition variable lets a thread sleep until another thread says the shared state has changed.</li>
+      <li><code>wait</code> atomically releases the mutex and sleeps, and retakes the mutex before returning.</li>
+      <li>The pattern: lock; <code>while (!condition) wait;</code> use the state; unlock. The signaller changes the state under the same lock, then signals.</li>
+      <li>A signal isn't stored. Checking or changing the state outside the mutex allows lost wake-ups.</li>
+      <li>Real systems use Mesa semantics: a wake-up is a hint, so the condition must be rechecked in a loop.</li>
+      <li>Use one condition variable per condition; use <code>broadcast</code> when a change may matter to several waiters.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does <code>pthread_cond_wait(&amp;cv, &amp;m)</code> do with the mutex?</p>
+      <div class="opts">
+        <button class="opt">Keeps it locked while the thread sleeps</button>
+        <button class="opt">Destroys it</button>
+        <button class="opt">Releases it atomically as the thread goes to sleep, and reacquires it before returning</button>
+        <button class="opt">Nothing; the mutex argument is only for error checking</button>
+      </div>
+      <div class="explain">If the sleeper kept the mutex, no other thread could change the state it is waiting for. Releasing and sleeping atomically prevents a lost wake-up.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A thread calls <code>pthread_cond_signal</code> on a condition variable that no thread is waiting on. What happens?</p>
+      <div class="opts">
+        <button class="opt">Nothing. The signal is not remembered</button>
+        <button class="opt">The next thread to wait returns immediately</button>
+        <button class="opt">The caller blocks until someone waits</button>
+        <button class="opt">It is an error and the program aborts</button>
+      </div>
+      <div class="explain">Condition variables have no memory. That is the key difference from a semaphore, and why the shared state, not the signal, must carry the information.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">With Mesa semantics, which statement about a thread that has just returned from <code>wait</code> is true?</p>
+      <div class="opts">
+        <button class="opt">The condition it waited for is guaranteed to hold</button>
+        <button class="opt">It no longer holds the mutex</button>
+        <button class="opt">The signalling thread is blocked until it finishes</button>
+        <button class="opt">It holds the mutex, but the condition may be false and must be rechecked</button>
+      </div>
+      <div class="explain">Between the signal and the waiter reacquiring the mutex, other threads can run and change the state. Hence the while loop.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A worker checks <code>count == 0</code> without holding the mutex, then calls a function that sleeps. What bug is possible?</p>
+      <div class="opts">
+        <button class="opt">A spurious wake-up</button>
+        <button class="opt">A lost wake-up: a producer adds a job and signals after the check but before the sleep</button>
+        <button class="opt">A double free</button>
+        <button class="opt">Priority inversion</button>
+      </div>
+      <div class="explain">The signal finds nobody asleep and vanishes; the worker then sleeps for ever although the queue isn't empty.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In a bounded buffer, producers and consumers all wait on a single condition variable, and the code uses <code>signal</code>. What can go wrong?</p>
+      <div class="opts">
+        <button class="opt">Nothing, as long as waits are in a while loop</button>
+        <button class="opt">Two threads can hold the mutex at once</button>
+        <button class="opt">A consumer's signal can wake another consumer instead of a producer, and every thread ends up asleep</button>
+        <button class="opt">The buffer overflows</button>
+      </div>
+      <div class="explain">The woken thread can't use the change and waits again; the one that could is never woken. Use separate condition variables, or broadcast.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const LOCK = ['lock', 'pthread_mutex_lock(&m);'], UNLOCK = ['unlock', 'pthread_mutex_unlock(&m);'];
+  const PROG = {
+    nolock: { W: [['test', 'if (count == 0)'], ['sleep', '    sleep_on(&cv);'], ['take', 'count--;        /* take a job */']],
+              P: [['put', 'count++;        /* add a job */'], ['signal', 'wake_up(&cv);']] },
+    if: { W: [LOCK, ['test', 'if (count == 0)'], ['wait', '    pthread_cond_wait(&cv, &m);'], ['take', 'count--;        /* take a job */'], UNLOCK],
+          P: [LOCK, ['put', 'count++;        /* add a job */'], ['signal', 'pthread_cond_signal(&cv);'], UNLOCK] },
+  };
+  PROG.while = { W: PROG.if.W.map((l) => l[0] === 'test' ? ['test', 'while (count == 0)'] : l), P: PROG.if.P };
+  const IDS = ['W1', 'W2', 'P'], NAME = { W1: 'worker 1', W2: 'worker 2', P: 'the producer' }, JOBS = 2;
+  let variant = 'nolock', s, last, summary;
+  const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const code = (id) => PROG[variant][id === 'P' ? 'P' : 'W'];
+  const fresh = () => ({ th: { W1: { pc: 0, st: 'run' }, W2: { pc: 0, st: 'run' }, P: { pc: 0, st: 'run', made: 0 } }, count: 0, owner: null, q: [], bug: false });
+  const done = (z, id) => z.th[id].pc >= code(id).length;
+  function canRun(z, id) {
+    const t = z.th[id];
+    if (z.bug || done(z, id) || t.st === 'sleep') return false;
+    const op = code(id)[t.pc][0];
+    if ((op === 'lock' || (op === 'wait' && t.st === 'woken')) && z.owner !== null && z.owner !== id) return false;
+    return true;
+  }
+  // Run one step of thread id. Returns a description of what happened.
+  function exec(z, id) {
+    const t = z.th[id], op = code(id)[t.pc][0], N = NAME[id], Cap = N[0].toUpperCase() + N.slice(1);
+    if (op === 'lock') { z.owner = id; t.pc++; return `${Cap} locks the mutex.`; }
+    if (op === 'unlock') {
+      z.owner = null; t.pc++;
+      if (id === 'P' && ++t.made < JOBS) { t.pc = 0; return 'The producer unlocks the mutex and goes round its loop for the second job.'; }
+      return `${Cap} unlocks the mutex${id === 'P' ? ' and has finished' : ' and has finished with its job'}.`;
+    }
+    if (op === 'test') {
+      if (z.count === 0) { t.pc++; return `${Cap} tests <code>count == 0</code>: true, so it will go to sleep next.` + (variant === 'nolock' ? ' But it isn\'t asleep yet, and nothing stops the producer running first.' : ''); }
+      t.pc += 2; return `${Cap} tests <code>count == 0</code>: false (count is ${z.count}), so it goes on to take a job.`;
+    }
+    if (op === 'wait' || op === 'sleep') {
+      if (t.st === 'run') {
+        t.st = 'sleep'; z.q.push(id);
+        if (op === 'wait') { z.owner = null; return `${Cap} calls <code>wait</code>: it releases the mutex and goes to sleep on the condition variable, in one atomic step.`; }
+        return `${Cap} goes to sleep on the condition variable.` + (z.count > 0 ? ` But <code>count</code> is already ${z.count}: the wake-up it is waiting for has been and gone.` : '');
+      }
+      t.st = 'run';
+      if (op === 'wait') z.owner = id;
+      if (variant === 'while') { t.pc--; return `${Cap} gets the mutex back and <code>wait</code> returns. Because the wait is in a <code>while</code>, it tests the condition again.`; }
+      t.pc++; return `${Cap} ${op === 'wait' ? 'gets the mutex back, <code>wait</code> returns, and' : 'wakes up and'} carries straight on to take a job, <b>without looking at <code>count</code> again</b>.`;
+    }
+    if (op === 'take') {
+      if (z.count === 0) { z.bug = true; return `${Cap} takes a job, but <code>count</code> is 0: <b>it has taken from an empty queue</b>. Another thread used the job between the signal and this point, and nothing rechecked.`; }
+      z.count--; t.pc++;
+      if (variant === 'nolock') return `${Cap} takes a job: count is now ${z.count}. It has finished.`;
+      return `${Cap} takes a job: count is now ${z.count}.`;
+    }
+    if (op === 'put') { z.count++; t.pc++; return `The producer adds a job: count is now ${z.count}.`; }
+    // signal
+    let text;
+    if (z.q.length) { const w = z.q.shift(); z.th[w].st = 'woken'; text = `The producer signals: ${NAME[w]} is woken` + (variant === 'nolock' ? '.' : ', but can\'t return from <code>wait</code> until it gets the mutex back.'); }
+    else text = 'The producer signals, but nobody is asleep on the condition variable. <b>The signal does nothing and is not remembered.</b>';
+    t.pc++;
+    if (variant === 'nolock') { if (++t.made < JOBS) t.pc = 0; else text += ' The producer has finished.'; }
+    return text;
+  }
+  const verdictOf = (z) => z.bug ? 'bug' : IDS.every((id) => done(z, id)) ? 'ok' : IDS.some((id) => canRun(z, id)) ? null : 'stuck';
+  // Count the schedules that end each way, memoised on the state.
+  function explore() {
+    const memo = new Map();
+    const go = (z) => {
+      const v = verdictOf(z);
+      if (v) return { ok: +(v === 'ok'), bug: +(v === 'bug'), stuck: +(v === 'stuck') };
+      const key = JSON.stringify(z);
+      if (memo.has(key)) return memo.get(key);
+      const r = { ok: 0, bug: 0, stuck: 0 };
+      IDS.filter((id) => canRun(z, id)).forEach((id) => { const c = JSON.parse(key); exec(c, id); const x = go(c); r.ok += x.ok; r.bug += x.bug; r.stuck += x.stuck; });
+      memo.set(key, r); return r;
+    };
+    return go(fresh());
+  }
+  function reset() { s = fresh(); s.trace = []; last = null; summary = null; }
+  function step(id) {
+    if (!canRun(s, id)) return;
+    const tr = s.trace; delete s.trace;
+    let text = exec(s, id);
+    const v = verdictOf(s);
+    tr.push(id); s.trace = tr;
+    if (v === 'ok') text += ' <b>Everyone has finished and count is 0: a correct run.</b>';
+    if (v === 'stuck') { const sl = IDS.filter((x) => s.th[x].st === 'sleep').map((x) => NAME[x]); text += ` <b>Nothing can run any more: ${sl.join(' and ')} ${sl.length > 1 ? 'are' : 'is'} asleep for ever</b>, with count = ${s.count} and nobody left to signal. A lost wake-up.`; }
+    last = { text, cls: v === 'ok' ? 'cv-ok' : v ? 'cv-bad' : '' }; summary = null;
+  }
+  function status(id) {
+    const t = s.th[id];
+    if (done(s, id)) return ['finished', 'cv-done'];
+    if (t.st === 'sleep') return ['asleep on the condition variable', 'cv-wait'];
+    const op = code(id)[t.pc][0];
+    if (t.st === 'woken') return [variant === 'nolock' ? 'woken: ready to run' : s.owner && s.owner !== id ? 'woken, but waiting for the mutex' : 'woken: ready to retake the mutex', s.owner && s.owner !== id && variant !== 'nolock' ? 'cv-wait' : ''];
+    if (op === 'lock' && s.owner && s.owner !== id) return ['blocked: waiting for the mutex', 'cv-wait'];
+    return ['ready to run', ''];
+  }
+  function render() {
+    $('#cvGrid').innerHTML = IDS.map((id) => {
+      const [txt, cls] = status(id), t = s.th[id];
+      return `<div class="cv-th"><h6>${id === 'P' ? 'Producer' : 'Worker ' + id[1]}${id === 'P' ? ` <span class="small muted">· job ${Math.min(t.made + 1, JOBS)} of ${JOBS}</span>` : ''}</h6>` +
+        code(id).map(([, src], i) => `<div class="cv-ln ${i === t.pc ? 'cv-cur' : ''}">${esc(src)}</div>`).join('') + `<div class="cv-st ${cls}">${txt}</div></div>`;
+    }).join('');
+    $('#cvShared').innerHTML = `<div>count<b>${s.count}</b></div><div>mutex<b>${variant === 'nolock' ? 'not used' : s.owner ? 'held by ' + NAME[s.owner] : 'free'}</b></div><div>asleep on cv<b>${s.q.length ? s.q.map((x) => NAME[x]).join(', ') : 'nobody'}</b></div>`;
+    $('#cvTrace').textContent = 'schedule so far: ' + (s.trace.length ? s.trace.join(' ') : '(nothing has run)');
+    const d = $('#cvDesc'), show = summary || last;
+    d.className = 'cv-desc ' + (show ? show.cls : '');
+    d.innerHTML = show ? show.text : 'Nothing has run. Step the threads in any order you like.';
+    $('#cvW1').disabled = !canRun(s, 'W1'); $('#cvW2').disabled = !canRun(s, 'W2'); $('#cvP').disabled = !canRun(s, 'P');
+  }
+  $('#cvW1').onclick = () => { step('W1'); render(); };
+  $('#cvW2').onclick = () => { step('W2'); render(); };
+  $('#cvP').onclick = () => { step('P'); render(); };
+  $('#cvReset').onclick = () => { reset(); render(); };
+  $('#cvVar').addEventListener('segchange', (e) => { variant = e.detail; reset(); render(); });
+  $('#cvAll').onclick = () => {
+    const r = explore(), n = r.ok + r.bug + r.stuck, f = (x) => x.toLocaleString('en-GB');
+    summary = r.bug + r.stuck
+      ? { cls: 'cv-bad', text: `Of <b>${f(n)}</b> possible schedules, <b>${f(r.ok)}</b> end correctly` + (r.stuck ? `, <b>${f(r.stuck)}</b> leave a worker asleep for ever` : '') + (r.bug ? `, and <b>${f(r.bug)}</b> take a job from an empty queue` : '') + '. A test would have to hit one of the bad ones to notice anything.' }
+      : { cls: 'cv-ok', text: `All <b>${f(n)}</b> possible schedules end correctly: both workers get a job, and nobody is left asleep. Holding the mutex for the check and rechecking in a <code>while</code> leaves no bad interleaving to find.` };
+    render();
+  };
+  reset(); render();
+})();
+</script>
+</body>
+</html>

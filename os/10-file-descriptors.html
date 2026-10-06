@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>File Descriptors &amp; "Everything Is a File"</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .fd-stage { position:relative; margin-top:14px; }
+  .fd-cols { display:grid; grid-template-columns:minmax(0,.9fr) minmax(0,1.2fr) minmax(0,1fr); gap:36px; position:relative; z-index:1; }
+  @media (max-width:760px) { .fd-cols { gap:14px; } }
+  .fd-col h5 { margin:0 0 6px; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .fd-grp { border:1px solid var(--border); border-radius:10px; background:var(--surface); padding:6px; margin-bottom:8px; }
+  .fd-grp b { display:block; font-size:12px; margin:0 0 4px 2px; }
+  .fd-row { font-family:var(--mono); font-size:11.5px; padding:4px 7px; border-radius:6px; background:var(--surface-2); border:1px solid var(--border); margin:3px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .fd-row.fd-new { border-color:var(--accent); box-shadow:0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
+  .fd-svg { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:0; }
+  .fd-file { margin-top:12px; }
+  .fd-file h5 { margin:0 0 4px; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); display:flex; justify-content:space-between; }
+  .fd-strip { display:flex; height:26px; border-radius:7px; overflow:hidden; border:1px solid var(--border); background:var(--surface-2); }
+  .fd-strip span { display:grid; place-items:center; font-family:var(--mono); font-size:10.5px; font-weight:700; color:#fff; border-right:1px solid rgba(0,0,0,.25); overflow:hidden; white-space:nowrap; }
+  .fd-acts { display:flex; flex-wrap:wrap; gap:6px; margin-top:12px; }
+  .fd-res { margin-top:10px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); }
+  .fd-res.fd-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
+</head>
+<body data-chapter="10">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 10</span><span class="pill">Beginner</span><span class="pill">⏱ 40 min</span></div>
+    <h1>File Descriptors &amp; <span class="grad">"Everything Is a File"</span></h1>
+    <p class="lead">A file descriptor is just a small integer, 0, 1, 2, 3…, but almost everything a Unix program does with the outside world goes through one: files, pipes, terminals, network sockets, timers, even other processes. Behind that integer sit three kernel tables, and how they point at each other explains a surprising number of real behaviours: why <code>2&gt;&amp;1</code> works, why a child process's log lines don't overwrite its parent's, why a deleted log file can keep filling the disk, and why a busy server suddenly fails with "Too many open files".</p>
+    <ul class="objectives">
+      <li>Describe the three tables: per-process fd table, open file descriptions, inodes</li>
+      <li>Use <code>open</code>, <code>read</code>, <code>write</code> and <code>close</code> correctly, including short reads</li>
+      <li>Explain <code>dup2</code> and how shells implement redirection</li>
+      <li>Predict what is shared after <code>fork</code> and what survives <code>exec</code></li>
+      <li>Diagnose fd leaks and <code>EMFILE</code>, and the deleted-but-open file</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Redirection and pipes from the shell.</b> See <a href="p7-linux-shell-files.html">P7</a>.</li>
+        <li><b>Return values, errno and strace.</b> See <a href="p8-syscalls-man-pages.html">P8</a>.</li>
+        <li><b>fork and exec; pipes.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a> and <a href="09-ipc-pipes-signals-shm.html">Chapter 9</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Three tables behind one integer</h2>
+  <p>When a process calls <code>open("app.log", O_WRONLY)</code> and gets back 3, the kernel has set up a chain of three objects:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Table</th><th>One per</th><th>Holds</th><th>Shared by</th></tr></thead>
+      <tbody>
+        <tr><td>File-descriptor table</td><td>Process (threads share it)</td><td>Slots 0, 1, 2…, each pointing at an open file description, plus the close-on-exec flag</td><td>Nobody; but <code>fork</code> copies it</td></tr>
+        <tr><td>Open file description (<code>struct file</code>)</td><td>Each call to <code>open()</code></td><td>The current <b>offset</b>, the access mode and status flags (<code>O_APPEND</code>, <code>O_NONBLOCK</code>), a reference count, a pointer to the inode and to its <code>file_operations</code></td><td>Every fd that came from the same <code>open</code>: via <code>dup</code>, <code>dup2</code>, <code>fork</code> or fd passing</td></tr>
+        <tr><td>Inode (in-memory <code>struct inode</code>)</td><td>Each file on disk, pipe, socket…</td><td>Size, owner, permissions, where the data lives (<a href="23-file-systems.html">Chapter 23</a>)</td><td>Every open of the same file, by any process</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The middle layer is the one people forget, and it's the key to everything below. The <b>offset lives in the open file description</b>, not in the fd and not in the file. Two descriptors that share a description share a position; two separate <code>open</code>s of the same file have independent positions.</p>
+
+  <h2>open, read, write, close</h2>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;errno.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;fcntl.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;unistd.h&gt;</span>
+
+<span class="c">/* Copy one file to another. Both fds are owned (and closed) by this function. */</span>
+<span class="k">int</span> <span class="f">copy_file</span>(<span class="k">const</span> <span class="k">char</span> *src, <span class="k">const</span> <span class="k">char</span> *dst) {
+	<span class="k">int</span> in = <span class="f">open</span>(src, <span class="m">O_RDONLY</span> | <span class="m">O_CLOEXEC</span>);
+	<span class="k">if</span> (in &lt; <span class="m">0</span>) <span class="k">return</span> -<span class="m">1</span>;
+	<span class="k">int</span> out = <span class="f">open</span>(dst, <span class="m">O_WRONLY</span> | <span class="m">O_CREAT</span> | <span class="m">O_TRUNC</span> | <span class="m">O_CLOEXEC</span>, <span class="m">0644</span>);
+	<span class="k">if</span> (out &lt; <span class="m">0</span>) { <span class="k">int</span> e = errno; <span class="f">close</span>(in); errno = e; <span class="k">return</span> -<span class="m">1</span>; }
+
+	<span class="k">char</span> buf[<span class="m">64</span> * <span class="m">1024</span>];
+	<span class="k">for</span> (;;) {
+		<span class="t">ssize_t</span> n = <span class="f">read</span>(in, buf, <span class="k">sizeof</span> buf);
+		<span class="k">if</span> (n == <span class="m">0</span>) <span class="k">break</span>;                                   <span class="c">/* end of file */</span>
+		<span class="k">if</span> (n &lt; <span class="m">0</span>) { <span class="k">if</span> (errno == <span class="m">EINTR</span>) <span class="k">continue</span>; <span class="k">goto</span> fail; }
+		<span class="k">for</span> (<span class="t">ssize_t</span> done = <span class="m">0</span>; done &lt; n; ) {                  <span class="c">/* write() may be short too */</span>
+			<span class="t">ssize_t</span> w = <span class="f">write</span>(out, buf + done, (<span class="t">size_t</span>)(n - done));
+			<span class="k">if</span> (w &lt; <span class="m">0</span>) { <span class="k">if</span> (errno == <span class="m">EINTR</span>) <span class="k">continue</span>; <span class="k">goto</span> fail; }
+			done += w;
+		}
+	}
+	<span class="f">close</span>(in);
+	<span class="k">return</span> <span class="f">close</span>(out);            <span class="c">/* close can report a delayed write error: check it */</span>
+fail:
+	<span class="f">close</span>(in); <span class="f">close</span>(out);
+	<span class="k">return</span> -<span class="m">1</span>;
+}</pre>
+  <p><code>open</code> always returns the <b>lowest free</b> descriptor number. That rule sounds trivial, and it is exactly what old shells relied on to redirect output: <code>close(1); open("out.txt", …)</code> made the new file land on slot 1. It's also why a use-after-close bug is dangerous: after you close fd 7, the next <code>open</code> or <code>accept</code> anywhere in the process may get 7, and a stale write goes to the wrong file or the wrong client.</p>
+
+  <h2>Explore the tables</h2>
+  <p>A parent process writes a log. Open it twice, write through each descriptor, <code>dup</code> it onto stdout, fork a child and write from both, then close things. The bar at the bottom shows what ends up in the file, coloured by writer; later writes overwrite earlier ones at the same offset.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">fd table → open file description → inode</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="fd-acts" id="fdActs"></div>
+      <div class="fd-stage" id="fdStage">
+        <svg class="fd-svg" id="fdSvg"></svg>
+        <div class="fd-cols">
+          <div class="fd-col"><h5>Per-process fd tables</h5><div id="fdTabs"></div></div>
+          <div class="fd-col"><h5>Open file descriptions</h5><div id="fdOfds"></div></div>
+          <div class="fd-col"><h5>Inodes</h5><div id="fdInodes"></div></div>
+        </div>
+      </div>
+      <div class="fd-file"><h5><span>Contents of app.log</span><span id="fdSize"></span></h5><div class="fd-strip" id="fdStrip"></div></div>
+      <div class="fd-res" id="fdRes"></div>
+    </div>
+    <div class="panel-foot">Each write is 100 bytes. Offsets and sizes are in bytes. "refs" counts how many descriptors (in any process) point at an open file description; it is freed when that reaches 0. The inode stays while any description, or a directory entry, refers to it.</div>
+  </div>
+
+  <h2>dup2 and redirection</h2>
+  <p><code>dup2(oldfd, newfd)</code> makes <code>newfd</code> point at the same open file description as <code>oldfd</code>, closing whatever <code>newfd</code> pointed at first. That one call is how shells redirect. For <code>./server &gt; out.log 2&gt;&amp;1</code>, the shell does this in the child, between <code>fork</code> and <code>exec</code>:</p>
+<pre class="code"><span class="k">int</span> fd = <span class="f">open</span>(<span class="s">"out.log"</span>, <span class="m">O_WRONLY</span> | <span class="m">O_CREAT</span> | <span class="m">O_TRUNC</span>, <span class="m">0644</span>);   <span class="c">/* say it returns 3 */</span>
+<span class="k">if</span> (fd &lt; <span class="m">0</span>) { <span class="f">perror</span>(<span class="s">"out.log"</span>); <span class="f">_exit</span>(<span class="m">1</span>); }
+<span class="f">dup2</span>(fd, <span class="m">1</span>);          <span class="c">/* "&gt; out.log":  fd 1 now shares fd 3's description */</span>
+<span class="f">dup2</span>(<span class="m">1</span>, <span class="m">2</span>);           <span class="c">/* "2&gt;&amp;1":       fd 2 now shares whatever fd 1 points at, the same description */</span>
+<span class="f">close</span>(fd);            <span class="c">/* fd 3 isn't needed any more; 1 and 2 keep the description alive */</span>
+<span class="f">execvp</span>(<span class="s">"./server"</span>, argv);</pre>
+  <figure class="seq" data-actors="shell (child)|kernel|out.log description|./server">
+    <ol>
+      <li data-m="0>1">open("out.log") → 3</li>
+      <li data-m="1>2">new description, offset 0, refs 1</li>
+      <li data-m="0>1">dup2(3, 1); dup2(1, 2)</li>
+      <li data-m="1>2">refs 3: fds 1, 2 and 3 share one offset</li>
+      <li data-m="0>1">close(3); execve("./server")</li>
+      <li data-m="3>2">printf and perror both append in order: one shared offset</li>
+    </ol>
+    <figcaption><b>Why <code>&gt; f 2&gt;&amp;1</code> interleaves correctly.</b> stdout and stderr share one open file description, so they share one offset. Writing <code>&gt; f 2&gt; f</code> instead opens the file twice: two offsets, and the two streams overwrite each other.</figcaption>
+  </figure>
+
+  <h2>Descriptors across fork and exec</h2>
+  <p><code>fork()</code> copies the fd table, so parent and child have the same numbers pointing at the <b>same</b> open file descriptions, with shared offsets. That's why a parent and child both writing to an inherited log file append after each other rather than overwriting. <code>exec()</code> keeps the fd table too, except descriptors flagged close-on-exec. Forgetting <code>O_CLOEXEC</code> is a real leak: a server that forks helper programs hands them its listening socket and database connections, the helpers hold them open, and a port stays "in use" after the server dies. Modern code opens everything with <code>O_CLOEXEC</code> (or <code>SOCK_CLOEXEC</code>, <code>pipe2(fds, O_CLOEXEC)</code>).</p>
+
+  <h2>"Everything is a file"</h2>
+  <p>Because <code>read</code> and <code>write</code> dispatch through the description's <code>file_operations</code> table (<a href="p2-structs-arrays-strings.html">P2</a>), the kernel can put anything behind a descriptor. Sockets, pipes, terminals and devices are the classic cases, and Linux keeps adding more: <code>eventfd</code> (a counter you can wait on), <code>timerfd</code> (a timer that becomes readable when it fires), <code>signalfd</code> (signals delivered as reads), <code>pidfd</code> (a handle to a process that can't be confused by PID reuse), <code>epoll</code> itself. One mechanism, <code>epoll</code> (<a href="28-io-multiplexing-epoll.html">Chapter 28</a>), can then wait on all of them at once.</p>
+<pre class="code"><span class="c">$</span> ls -l /proc/<span class="m">1734</span>/fd                         <span class="c"># what does nginx have open?</span>
+lr-x------ <span class="m">1</span> www-data www-data <span class="m">64</span> Oct  <span class="m">1</span> <span class="m">09</span>:<span class="m">12</span> <span class="m">0</span> -&gt; /dev/null
+l-wx------ <span class="m">1</span> www-data www-data <span class="m">64</span> Oct  <span class="m">1</span> <span class="m">09</span>:<span class="m">12</span> <span class="m">2</span> -&gt; /var/log/nginx/error.log
+lrwx------ <span class="m">1</span> www-data www-data <span class="m">64</span> Oct  <span class="m">1</span> <span class="m">09</span>:<span class="m">12</span> <span class="m">6</span> -&gt; socket:[<span class="m">48211</span>]
+lrwx------ <span class="m">1</span> www-data www-data <span class="m">64</span> Oct  <span class="m">1</span> <span class="m">09</span>:<span class="m">12</span> <span class="m">9</span> -&gt; anon_inode:[eventpoll]
+<span class="c">$</span> ulimit -n                                   <span class="c"># this shell's soft limit on open descriptors</span>
+<span class="m">1024</span>
+<span class="c">$</span> ls /proc/<span class="m">1734</span>/fd | wc -l                    <span class="c"># how many are open right now</span>
+<span class="m">412</span></pre>
+
+  <div class="callout usecase">
+    <div class="ico">🗑️</div>
+    <div class="body"><div class="title">The deleted log file that kept filling the disk</div><p>An on-call engineer sees a disk 98% full, finds a 40 GB <code>app.log</code>, deletes it with <code>rm</code>, and… <code>df</code> still says 98%, while <code>du</code> says the directory is tiny. The application still has the file open. <code>rm</code> only removes the directory entry; the inode, and its blocks, live on until the last open file description pointing at it is closed. The process keeps writing into a file nobody can see. <code>lsof +L1</code> (or <code>ls -l /proc/*/fd | grep deleted</code>) finds it. The fixes are to make the application reopen its log (most daemons do it on <code>SIGHUP</code>, which is what logrotate's <code>postrotate</code> step sends), to truncate it in place with <code>: &gt; app.log</code> instead of deleting it, or, in an emergency, <code>: &gt; /proc/&lt;pid&gt;/fd/&lt;n&gt;</code>. It's the three tables, showing up as a production incident.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Leaking descriptors on error paths.</b> Every <code>open</code>, <code>socket</code> and <code>accept</code> needs a <code>close</code> on every path; leaks end in <code>EMFILE: Too many open files</code>.</li>
+      <li><b>Opening the same file twice and expecting a shared position.</b> Two <code>open</code>s mean two offsets; use <code>dup</code>, or <code>O_APPEND</code> for logs.</li>
+      <li><b>Using an fd after closing it.</b> The number is reused by the next open; the stale write goes somewhere else.</li>
+      <li><b>Forgetting <code>O_CLOEXEC</code></b> before exec'ing helpers: they inherit sockets and files they shouldn't hold.</li>
+      <li><b>Ignoring short reads and writes,</b> and the return value of <code>close</code>.</li>
+      <li><b>Raising <code>ulimit -n</code> to hide a leak.</b> Raise it for genuine load (servers commonly need tens of thousands), but find the leak too.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is a file descriptor, really?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>An index into the process's file-descriptor table. Each slot points to an open file description, the kernel object created by an <code>open</code> call, which holds the current offset, the open flags and a reference count, and points to the inode (or socket, or pipe) plus the function table that implements read and write for that type. Several descriptors, even in different processes after <code>fork</code> or <code>dup</code>, can share one description and therefore one offset. Because every kind of object sits behind the same interface, the same <code>read</code>, <code>write</code>, <code>close</code> and <code>epoll</code> work on files, sockets, pipes, timers and devices.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why does <code>cmd &gt; out 2&gt;&amp;1</code> work while <code>cmd 2&gt;&amp;1 &gt; out</code> sends errors to the terminal?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Redirections are applied left to right, each as a <code>dup2</code>. In the first, <code>&gt; out</code> points fd 1 at the file, then <code>2&gt;&amp;1</code> makes fd 2 a copy of fd 1, so both share the file's description. In the second, <code>2&gt;&amp;1</code> runs first and copies fd 1 while it still points at the terminal, then <code>&gt; out</code> repoints only fd 1. <code>2&gt;&amp;1</code> copies where fd 1 points <i>at that moment</i>; it isn't a lasting link.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>fd → open file description → inode: the offset and flags live in the middle object.</li>
+      <li><code>open</code> returns the lowest free number; closed numbers are reused immediately.</li>
+      <li><code>dup2</code> makes two fds share a description; shells build redirection from it, applied left to right.</li>
+      <li><code>fork</code> shares descriptions (and offsets) with the child; <code>exec</code> keeps fds unless <code>O_CLOEXEC</code>.</li>
+      <li>Sockets, pipes, timers and devices are all fds, so one API and one <code>epoll</code> cover them.</li>
+      <li>Deleted-but-open files keep their space; fd leaks end in <code>EMFILE</code>.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Where is the current file offset stored?</p>
+      <div class="opts">
+        <button class="opt">In the file descriptor number</button>
+        <button class="opt">In the open file description, shared by every fd duplicated from the same open()</button>
+        <button class="opt">In the inode, shared by everyone</button>
+        <button class="opt">In the process's PCB</button>
+      </div>
+      <div class="explain">That's why dup'd and inherited fds share a position, while two separate opens of the same file don't.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A process has fds 0, 1, 2 and 4 open. It calls <code>open("a.txt", O_RDONLY)</code>. Which number does it get?</p>
+      <div class="opts">
+        <button class="opt">5</button>
+        <button class="opt">4</button>
+        <button class="opt">A random free number</button>
+        <button class="opt">3: the lowest unused descriptor</button>
+      </div>
+      <div class="explain">POSIX requires the lowest available number.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A parent opens a log file, forks, and both processes write to the inherited fd. What happens to their output?</p>
+      <div class="opts">
+        <button class="opt">Their writes follow each other, because both fds share one open file description and one offset</button>
+        <button class="opt">The child's writes overwrite the parent's from offset 0</button>
+        <button class="opt">The child's writes fail with EBADF</button>
+        <button class="opt">The kernel creates a separate copy of the file for the child</button>
+      </div>
+      <div class="explain">fork copies the fd table, not the descriptions. (For many writers with no coordination at all, O_APPEND is the robust choice.)</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">You delete a 40 GB log file but <code>df</code> shows no space freed. Why?</p>
+      <div class="opts">
+        <button class="opt">The file system needs a reboot to update</button>
+        <button class="opt">rm only works on small files</button>
+        <button class="opt">A process still has it open; the inode and blocks live until the last open file description is closed</button>
+        <button class="opt">The data was moved to swap</button>
+      </div>
+      <div class="explain">rm removes the name. Restart or signal the process to reopen its log, or truncate instead of deleting.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does <code>O_CLOEXEC</code> do?</p>
+      <div class="opts">
+        <button class="opt">Closes the file when the process exits</button>
+        <button class="opt">Marks the descriptor to be closed automatically when the process calls exec</button>
+        <button class="opt">Prevents the file from being executed</button>
+        <button class="opt">Closes the file after one read</button>
+      </div>
+      <div class="explain">Without it, programs you exec inherit the descriptor: sockets and files leak into children.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const ACTS = [
+    ['open1', 'P: open("app.log") → fd 3'],
+    ['open2', 'P: open("app.log") again'],
+    ['w3', 'P: write(3, 100 B)'],
+    ['w4', 'P: write(4, 100 B)'],
+    ['dup', 'P: dup2(3, 1)'],
+    ['w1', 'P: printf → write(1, 100 B)'],
+    ['fork', 'P: fork()'],
+    ['cw3', 'C: write(3, 100 B)'],
+    ['pc3', 'P: close(3)'],
+    ['cc3', 'C: close(3)'],
+    ['reset', '↺ Reset'],
+  ];
+  const WCOL = { 'P fd3': 'var(--accent)', 'P fd4': 'var(--accent-2)', 'P fd1': 'var(--pink)', 'C fd3': 'var(--green)' };
+  let S, fresh;
+  function reset() {
+    S = { procs: { P: { 0: 'tty', 1: 'tty', 2: 'tty' } }, ofds: { tty: { id: 'tty', ino: 'pts', off: 0, flags: 'O_RDWR', ref: 3 } }, inodes: { pts: { name: '/dev/pts/0 (terminal)', size: '–' } }, nextOfd: 1, data: [] };
+    fresh = []; say('Process P (PID 4101) starts with fds 0, 1 and 2 all pointing at one description of its terminal. Click an action.'); render();
+  }
+  let msg = '', bad = false;
+  function say(m, b) { msg = m; bad = !!b; }
+  function lowest(t) { let n = 0; while (t[n] !== undefined) n++; return n; }
+  function write(proc, fd) {
+    const t = S.procs[proc]; if (!t) return say(`Process ${proc} doesn't exist yet.`, true);
+    const id = t[fd]; if (id === undefined) return say(`write(${fd}) = -1 EBADF: ${proc} has no fd ${fd}.`, true);
+    const o = S.ofds[id];
+    if (o.ino !== 'log') { say(`fd ${fd} points at the terminal: the 100 bytes appear on screen, not in app.log.`); return; }
+    const who = `${proc} fd${fd}`, start = o.off;
+    const before = S.data.filter((d) => d.s < start + 100 && d.s + 100 > start).map((d) => d.who);
+    S.data = S.data.filter((d) => !(d.s >= start && d.s < start + 100));
+    S.data.push({ s: start, who }); o.off += 100;
+    S.inodes.log.size = Math.max(S.inodes.log.size, o.off);
+    fresh = [`o${id}`];
+    if (before.length && !before.includes(who)) say(`<b>Overwrite!</b> ${who} wrote at offset ${start}, on top of what ${before.join(', ')} wrote there. Its description has its own offset, so it didn't know the file had grown. Two separate <code>open</code>s = two offsets. (<code>O_APPEND</code> would make every write go to the current end.)`, true);
+    else say(`${who} wrote 100 bytes at offset ${start}; description #${id}'s offset is now ${o.off}${o.ref > 1 ? `, and every fd sharing it (${o.ref} references) sees the new offset` : ''}.`);
+  }
+  function close(proc, fd) {
+    const t = S.procs[proc]; if (!t) return say(`Process ${proc} doesn't exist.`, true);
+    const id = t[fd]; if (id === undefined) return say(`close(${fd}) = -1 EBADF: already closed.`, true);
+    delete t[fd]; const o = S.ofds[id]; o.ref--;
+    if (o.ref === 0) { delete S.ofds[id]; say(`${proc} closed fd ${fd}; description #${id} had no references left, so it was freed. The inode stays: the file still has a name in its directory.`); }
+    else say(`${proc} closed fd ${fd}; description #${id} still has ${o.ref} reference(s), so it stays open and keeps its offset (${o.off}).`);
+  }
+  function act(a) {
+    fresh = [];
+    if (a === 'reset') return reset();
+    const P = S.procs.P;
+    if (a === 'open1' || a === 'open2') {
+      if (a === 'open2' && !Object.values(S.ofds).some((o) => o.ino === 'log')) { act('open1'); return; }
+      if (!S.inodes.log) S.inodes.log = { name: 'inode 81920: app.log', size: 0 };
+      const id = S.nextOfd++, fd = lowest(P);
+      S.ofds[id] = { id, ino: 'log', off: 0, flags: 'O_WRONLY|O_CREAT', ref: 1 }; P[fd] = id; fresh = [`P${fd}`, `o${id}`];
+      say(`open() returned <b>${fd}</b>, the lowest free number, and created description #${id} with its own offset 0.${Object.values(S.ofds).filter((o) => o.ino === 'log').length > 1 ? ' Same inode as the first open, but a separate offset.' : ''}`);
+    } else if (a === 'w3') write('P', 3);
+    else if (a === 'w4') write('P', 4);
+    else if (a === 'w1') write('P', 1);
+    else if (a === 'dup') {
+      if (P[3] === undefined) return say('P has no fd 3. Open the file first.', true), render();
+      const old = P[1]; S.ofds[old].ref--; if (!S.ofds[old].ref) delete S.ofds[old];
+      P[1] = P[3]; S.ofds[P[3]].ref++; fresh = ['P1', `o${P[3]}`];
+      say(`dup2(3, 1): fd 1 (stdout) now shares description #${P[3]} with fd 3: <b>one offset for both</b>. This is <code>&gt; app.log</code>. Anything the program prints now lands in the file.`);
+    } else if (a === 'fork') {
+      if (S.procs.C) return say('Already forked.', true), render();
+      S.procs.C = Object.assign({}, P); Object.values(S.procs.C).forEach((id) => S.ofds[id].ref++); fresh = Object.keys(P).map((k) => 'C' + k);
+      say('fork(): the child C (PID 4102) gets a <b>copy of the fd table</b>: same numbers, pointing at the <b>same</b> descriptions, whose reference counts went up. No file was reopened, so offsets are shared.');
+    } else if (a === 'cw3') write('C', 3);
+    else if (a === 'pc3') close('P', 3);
+    else if (a === 'cc3') close('C', 3);
+    render();
+  }
+  function render() {
+    const lbl = (id) => (id === 'tty' ? 'tty' : '#' + id);
+    $('#fdTabs').innerHTML = Object.entries(S.procs).map(([p, t]) => `<div class="fd-grp"><b>${p === 'P' ? 'P · PID 4101' : 'C · PID 4102 (child)'}</b>${Object.keys(t).sort((a, b) => a - b).map((fd) => `<div class="fd-row ${fresh.includes(p + fd) ? 'fd-new' : ''}" id="fd-${p}${fd}">fd ${fd} → ${lbl(t[fd])}</div>`).join('')}</div>`).join('');
+    $('#fdOfds').innerHTML = `<div class="fd-grp">${Object.values(S.ofds).map((o) => `<div class="fd-row ${fresh.includes('o' + o.id) ? 'fd-new' : ''}" id="fd-o${o.id}">${lbl(o.id)} off=${o.ino === 'pts' ? '–' : o.off} refs=${o.ref} ${o.flags}</div>`).join('')}</div>`;
+    $('#fdInodes').innerHTML = `<div class="fd-grp">${Object.entries(S.inodes).map(([k, n]) => `<div class="fd-row" id="fd-i${k}">${n.name}${k === 'log' ? ` · size ${n.size}` : ''}</div>`).join('')}</div>`;
+    const sz = S.inodes.log ? S.inodes.log.size : 0;
+    $('#fdSize').textContent = S.inodes.log ? `${sz} bytes` : 'not created yet';
+    const segs = S.data.slice().sort((a, b) => a.s - b.s);
+    $('#fdStrip').innerHTML = segs.length ? segs.map((d) => `<span style="flex:1;background:${WCOL[d.who]}" title="offset ${d.s}">${d.who} @${d.s}</span>`).join('') : '<span style="flex:1;color:var(--muted)">empty</span>';
+    $('#fdRes').className = 'fd-res' + (bad ? ' fd-bad' : '');
+    $('#fdRes').innerHTML = msg;
+    requestAnimationFrame(lines);
+  }
+  function lines() {
+    const st = $('#fdStage'), svg = $('#fdSvg'), b = st.getBoundingClientRect();
+    const pt = (el, side) => { const r = el.getBoundingClientRect(); return [side === 'r' ? r.right - b.left : r.left - b.left, r.top + r.height / 2 - b.top]; };
+    let s = '';
+    const path = (a, c, col) => { const [x1, y1] = pt(a, 'r'), [x2, y2] = pt(c, 'l'); const mx = (x1 + x2) / 2; s += `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" fill="none" stroke="${col}" stroke-width="1.6" opacity=".8"/>`; };
+    Object.entries(S.procs).forEach(([p, t]) => Object.entries(t).forEach(([fd, id]) => { const a = $('#fd-' + p + fd), c = $('#fd-o' + id); if (a && c) path(a, c, id === 'tty' ? 'var(--border-strong)' : 'var(--accent)'); }));
+    Object.values(S.ofds).forEach((o) => { const a = $('#fd-o' + o.id), c = $('#fd-i' + o.ino); if (a && c) path(a, c, 'var(--accent-2)'); });
+    svg.setAttribute('viewBox', `0 0 ${b.width} ${b.height}`);
+    svg.innerHTML = s;
+  }
+  $('#fdActs').innerHTML = ACTS.map(([a, l]) => `<button class="btn sm ${a === 'reset' ? '' : ''}" data-a="${a}">${l}</button>`).join('');
+  $('#fdActs').addEventListener('click', (e) => { const x = e.target.closest('[data-a]'); if (x) act(x.dataset.a); });
+  addEventListener('resize', () => requestAnimationFrame(lines));
+  reset();
+})();
+</script>
+</body>
+</html>

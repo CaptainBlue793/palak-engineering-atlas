@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Heap: How malloc Works</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .hp-h { margin:14px 0 6px; font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .hp-bar { display:flex; gap:2px; height:58px; padding:3px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); }
+  .hp-b { flex-shrink:1; min-width:0; overflow:hidden; border:1.5px solid var(--border-strong); border-radius:8px; padding:0; font-family:var(--mono); font-size:12px; font-weight:700; line-height:1.25; color:var(--text); background:var(--surface); cursor:default; transition:.15s; }
+  .hp-b small { display:block; font-size:10px; font-weight:500; color:var(--muted); }
+  .hp-b.hp-used { background:color-mix(in srgb, var(--accent) 22%, var(--surface)); border-color:var(--accent); cursor:pointer; }
+  .hp-b.hp-used:hover { background:color-mix(in srgb, var(--accent) 36%, var(--surface)); }
+  .hp-b.hp-free { border-style:dashed; background:transparent; }
+  .hp-b.hp-new { outline:2px solid var(--text); outline-offset:-4px; }
+  .hp-list { margin-top:8px; font-family:var(--mono); font-size:12.5px; color:var(--text-2); overflow-wrap:anywhere; }
+  .hp-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .hp-desc.hp-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .hp-desc.hp-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
+</head>
+<body data-chapter="16">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 16</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
+    <h1>The Heap: <span class="grad">How malloc Works</span></h1>
+    <p class="lead">The kernel hands out memory a page at a time, and getting it costs a system call. Programs want 24 bytes for a list node, a million times a second. <code>malloc</code> sits between the two: a library that takes big pieces from the kernel and deals them out in small ones, and takes them back with <code>free</code>. How it finds a block, what it writes next to your data, and why a server's memory use creeps upwards for days without a leak all come from a handful of ideas: chunk headers, free lists, fragmentation and size classes.</p>
+    <ul class="objectives">
+      <li>Explain how the allocator gets memory from the kernel, and when it gives it back</li>
+      <li>Describe a chunk header and how a free list turns freed chunks into new allocations</li>
+      <li>Tell internal from external fragmentation and say why C allocators can't compact</li>
+      <li>Explain size classes, per-thread caches and arenas, and why jemalloc and tcmalloc exist</li>
+      <li>Recognise what a heap overflow and a double free do to the allocator's own data</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Using malloc and free; leaks and dangling pointers.</b> See <a href="p1-c-for-systems.html">P1</a>.</li>
+        <li><b>Where the heap sits in the address space.</b> See <a href="11-address-spaces.html">Chapter 11</a>.</li>
+        <li><b>Lazy allocation, anonymous mappings and RSS.</b> See <a href="14-page-faults-demand-paging.html">Chapter 14</a>.</li>
+        <li><b>What a system call costs.</b> See <a href="02-kernel-user-mode-syscalls.html">Chapter 2</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>malloc is a library, not a system call</h2>
+  <p>The kernel offers two ways to get memory, both in whole pages. <code>brk</code> moves the <b>program break</b>, the end of the heap region, up or down. <code>mmap</code> creates a fresh anonymous mapping anywhere in the address space. Neither is suitable for a 24-byte request: a system call costs hundreds of nanoseconds and the smallest unit is 4 KiB.</p>
+  <p>So the allocator, which is ordinary user-space code inside the C library, asks for memory in large pieces and manages it itself. Most <code>malloc</code> calls never enter the kernel. Watching glibc's allocator with <code>strace</code> shows the two sources:</p>
+<pre class="code"><span class="c">$</span> strace -e trace=brk,mmap,munmap ./demo        <span class="c"># output trimmed to the calls malloc made</span>
+brk(NULL)                         = <span class="m">0x55d0c8a4b000</span>     <span class="c"># where does the heap end?</span>
+brk(<span class="m">0x55d0c8a6c000</span>)               = <span class="m">0x55d0c8a6c000</span>     <span class="c"># first malloc(100): grow the heap by 132 KiB</span>
+                                                       <span class="c"># the next thousand small mallocs: no system calls</span>
+mmap(NULL, <span class="m">1052672</span>, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -<span class="m">1</span>, <span class="m">0</span>) = <span class="m">0x7f3a1c0ff000</span>
+                                                       <span class="c"># malloc(1 MiB): too big for the heap, gets its own mapping</span>
+munmap(<span class="m">0x7f3a1c0ff000</span>, <span class="m">1052672</span>)   = <span class="m">0</span>                  <span class="c"># free() of that block returns it at once</span></pre>
+  <p>glibc sends requests of 128 KiB and above straight to <code>mmap</code> (the threshold adapts upwards as the program runs) and serves everything smaller from the heap. The difference matters when memory is freed. A mapped block goes back to the kernel immediately. Heap memory mostly doesn't: <code>free</code> puts the block on a list for reuse, and the heap can only shrink from its <i>top</i>, by moving the break down. One long-lived allocation near the top keeps everything below it, however empty.</p>
+
+  <h2>Inside a chunk</h2>
+  <p><code>free(p)</code> takes a pointer and no size. It knows how much to free because the allocator wrote the size just <i>before</i> the address it gave you. Every allocation is a <b>chunk</b>: a small header, then your bytes.</p>
+<pre class="code">        chunk start            the pointer malloc returned
+        ↓                      ↓
+        ┌──────────────────────┬─────────────────────────────────────┐
+        │ header: size + flags │ your data (at least what you asked) │  next chunk's header …
+        └──────────────────────┴─────────────────────────────────────┘
+          8–16 bytes             rounded up to a multiple of 16</pre>
+  <p>Sizes are rounded up so that every pointer is aligned to 16 bytes, and there is a minimum chunk size. In glibc on 64-bit Linux, <code>malloc(24)</code> occupies a 32-byte chunk and <code>malloc(25)</code> a 48-byte one. When a chunk is free, the allocator reuses its data area for its own bookkeeping: the pointers that link it into a <b>free list</b>.</p>
+  <p>This is a complete allocator in forty lines. It is first fit with splitting, and it is the one the simulator below runs:</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;stddef.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;unistd.h&gt;</span>
+
+<span class="k">struct</span> <span class="t">chunk</span> {
+    <span class="t">size_t</span> size;              <span class="c">/* size of the whole chunk; the low bit means "in use" */</span>
+    <span class="t">size_t</span> pad;               <span class="c">/* keeps the data 16-byte aligned */</span>
+    <span class="k">struct</span> <span class="t">chunk</span> *next;       <span class="c">/* next free chunk: lives in the data area, valid only while free */</span>
+};
+<span class="k">#define</span> <span class="m">HDR</span>   <span class="m">16</span>
+<span class="k">#define</span> <span class="m">MIN</span>   <span class="m">32</span>
+<span class="k">#define</span> <span class="f">ALIGN</span>(n) (((n) + <span class="m">15</span>) &amp; ~(<span class="t">size_t</span>)<span class="m">15</span>)
+
+<span class="k">static</span> <span class="k">struct</span> <span class="t">chunk</span> *free_list;
+
+<span class="t">void</span> *<span class="f">my_malloc</span>(<span class="t">size_t</span> n)
+{
+    <span class="t">size_t</span> need = <span class="f">ALIGN</span>(n + <span class="m">HDR</span>);
+    <span class="k">if</span> (need &lt; <span class="m">MIN</span>) need = <span class="m">MIN</span>;
+
+    <span class="k">for</span> (<span class="k">struct</span> <span class="t">chunk</span> **p = &amp;free_list; *p; p = &amp;(*p)-&gt;next) {    <span class="c">/* first fit */</span>
+        <span class="k">struct</span> <span class="t">chunk</span> *c = *p;
+        <span class="k">if</span> (c-&gt;size &lt; need) <span class="k">continue</span>;
+        <span class="k">if</span> (c-&gt;size - need &gt;= <span class="m">MIN</span>) {                 <span class="c">/* split: the tail stays on the list */</span>
+            <span class="k">struct</span> <span class="t">chunk</span> *rest = (<span class="k">struct</span> <span class="t">chunk</span> *)((<span class="t">char</span> *)c + need);
+            rest-&gt;size = c-&gt;size - need;
+            rest-&gt;next = c-&gt;next;
+            *p = rest;
+            c-&gt;size = need;
+        } <span class="k">else</span> {
+            *p = c-&gt;next;                            <span class="c">/* too little left to split: hand over all of it */</span>
+        }
+        c-&gt;size |= <span class="m">1</span>;
+        <span class="k">return</span> (<span class="t">char</span> *)c + <span class="m">HDR</span>;                      <span class="c">/* the caller's pointer starts after the header */</span>
+    }
+
+    <span class="k">struct</span> <span class="t">chunk</span> *c = <span class="f">sbrk</span>(need);                    <span class="c">/* nothing fits: grow the heap */</span>
+    <span class="k">if</span> (c == (<span class="t">void</span> *)-<span class="m">1</span>) <span class="k">return</span> <span class="m">NULL</span>;
+    c-&gt;size = need | <span class="m">1</span>;
+    <span class="k">return</span> (<span class="t">char</span> *)c + <span class="m">HDR</span>;
+}
+
+<span class="t">void</span> <span class="f">my_free</span>(<span class="t">void</span> *ptr)
+{
+    <span class="k">if</span> (!ptr) <span class="k">return</span>;
+    <span class="k">struct</span> <span class="t">chunk</span> *c = (<span class="k">struct</span> <span class="t">chunk</span> *)((<span class="t">char</span> *)ptr - <span class="m">HDR</span>);   <span class="c">/* step back to the header */</span>
+    c-&gt;size &amp;= ~(<span class="t">size_t</span>)<span class="m">1</span>;
+    c-&gt;next = free_list;                             <span class="c">/* push on the free list */</span>
+    free_list = c;
+}</pre>
+  <p>It works, and it shows the two weaknesses that the rest of the chapter is about. Every <code>malloc</code> walks a list, which is slow. And <code>my_free</code> never joins neighbouring free chunks back together, so the heap gradually turns into crumbs.</p>
+
+  <h2>Which hole? Placement policies</h2>
+  <p>When several free chunks are big enough, the allocator must choose one.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Policy</th><th>Chooses</th><th>Cost per malloc</th><th>Tends to</th></tr></thead>
+      <tbody>
+        <tr><td><b>First fit</b></td><td>The first chunk on the list that is big enough</td><td>Stops early; fast</td><td>Leave small leftovers near the start of the heap</td></tr>
+        <tr><td><b>Next fit</b></td><td>First fit, but starting where the last search ended</td><td>Fast</td><td>Spread allocations and holes across the whole heap</td></tr>
+        <tr><td><b>Best fit</b></td><td>The smallest chunk that is big enough</td><td>Searches everything, unless the list is sorted by size</td><td>Waste least per allocation, but leave slivers too small to use</td></tr>
+        <tr><td><b>Worst fit</b></td><td>The largest chunk</td><td>Searches everything</td><td>Destroy the large chunks that big requests need. Mostly a cautionary example</td></tr>
+        <tr><td><b>Segregated fit</b></td><td>A chunk from a list that holds only that size</td><td>Constant: take the head of the list</td><td>Be what real allocators do; see size classes below</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Fragmentation</h2>
+  <p>Memory is wasted in two different ways, and the fixes are different.</p>
+  <ul>
+    <li><b>Internal fragmentation</b> is waste <i>inside</i> a chunk: the header, and the padding between what you asked for and what you got. A program making millions of 17-byte allocations pays for 32 bytes each.</li>
+    <li><b>External fragmentation</b> is waste <i>between</i> chunks: free memory split into holes that are each too small. The total is enough for a request and yet no single hole is.</li>
+  </ul>
+  <p>The first defence against external fragmentation is <b>coalescing</b>: when a chunk is freed, merge it with a free neighbour on either side, so holes grow back together. Real allocators keep a size tag at both ends of a chunk so that <code>free</code> can find its neighbours in constant time.</p>
+  <p>The defence a C allocator <i>can't</i> use is <b>compaction</b>, sliding the live chunks together to squeeze the holes out. The program holds raw addresses to its blocks, in variables, in other heap objects and in registers, and the allocator can't find and update them. A chunk stays where it was put until it is freed. Runtimes with managed references, such as the JVM, Go's and .NET's, know where every pointer is, and several of their collectors do compact.</p>
+
+  <h2>Break a heap</h2>
+  <p>A 512-byte heap. Choose a size and press <b>malloc</b>; click an allocated chunk to free it. Start with <b>Fragment it</b>, then try <code>malloc(100)</code>. Then turn coalescing off and free two neighbours.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A free-list allocator: placement, splitting, coalescing</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="hpPol"><button class="active" data-v="first">first fit</button><button data-v="best">best fit</button><button data-v="worst">worst fit</button></div>
+        <div class="seg" id="hpMerge"><button class="active" data-v="on">coalescing on</button><button data-v="off">coalescing off</button></div>
+      </div>
+      <div class="controls">
+        <div class="seg" id="hpReq"><button data-v="16">16</button><button class="active" data-v="48">48</button><button data-v="100">100</button><button data-v="200">200</button></div>
+        <button class="btn sm primary" id="hpMalloc">malloc(48)</button>
+        <button class="btn sm" id="hpFrag">Fragment it</button>
+        <button class="btn sm" id="hpBrk">brk: grow by 256</button>
+        <button class="btn sm" id="hpReset">↺ Reset</button>
+      </div>
+      <div class="hp-h">The heap (click a coloured chunk to free it)</div>
+      <div class="hp-bar" id="hpBar"></div>
+      <div class="hp-list" id="hpList"></div>
+      <div class="hp-desc" id="hpDesc"></div>
+      <div class="stats" id="hpStats"></div>
+    </div>
+    <div class="panel-foot">The allocator from the listing, plus optional coalescing: a 16-byte header, sizes rounded up to 16, a 32-byte minimum chunk. The number in each chunk is its full size, header included. "Internal waste" is headers plus padding. External fragmentation is the share of free memory that is not in the largest hole. The heap can grow to 1,024 bytes.</div>
+  </div>
+
+  <p>Things to notice. After <b>Fragment it</b>, 256 bytes are free and <code>malloc(100)</code> still fails: it needs 128 in one piece and the largest hole is 64. Coalescing can't help, because no two holes touch. With coalescing off, free two neighbouring chunks and the heap keeps two 64-byte holes where there should be one of 128, so the same request fails for no good reason. Best fit and worst fit differ most when holes of several sizes exist: free a few chunks of different sizes and allocate 16 bytes with each policy.</p>
+
+  <h2>Size classes, thread caches and arenas</h2>
+  <p>Production allocators avoid searching altogether. They round every small request up to one of a fixed set of <b>size classes</b> (16, 32, 48, 64 … bytes, getting sparser as they grow) and keep a separate free list, or <b>bin</b>, per class. Allocation is "take the first chunk from the right bin"; freeing is "put it back". Any chunk in a bin fits any request for that class, so there is no search and no splitting. The price is internal fragmentation, bounded by the gap between classes.</p>
+  <p>The second problem is threads. One heap shared by 64 threads needs a lock, and <code>malloc</code> is called so often that the lock becomes the bottleneck (<a href="18-mutexes-spinlocks.html">Chapter 18</a>). The fix is to give each thread memory of its own:</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>malloc(n)</b> Round n up to a chunk size.</li>
+      <li data-k="decision"><b>At least 128 KiB?</b> Yes: give it its own <code>mmap</code> region and return.</li>
+      <li data-k="decision"><b>A free chunk of that size in this thread's cache?</b> Yes: pop it. No lock, about 20 ns. Most calls end here.</li>
+      <li><b>Lock the arena and look in its bins</b> First the bin for exactly this size, then larger chunks that can be split.</li>
+      <li data-k="decision"><b>Nothing suitable?</b> Carve the chunk from the unused top of the heap, growing it with <code>brk</code> if it is too small.</li>
+      <li data-k="end"><b>Return the pointer</b> It points just past the chunk's header.</li>
+    </ol>
+    <figcaption><b>The path of a malloc call in glibc, simplified.</b> Since version 2.26 (2017) each thread has a small cache, the tcache, holding up to seven free chunks for each of 64 small sizes.</figcaption>
+  </figure>
+  <p>Behind the thread caches glibc keeps several <b>arenas</b>, independent heaps each with its own lock, up to eight per core, so threads rarely wait for one another. Google's <b>tcmalloc</b> and <b>jemalloc</b> (from FreeBSD, developed further at Facebook, and used by Redis and Firefox) are built on the same three layers: thread or per-CPU caches, shared structures per size class, and a page-level allocator underneath. They differ in how tightly they pack memory and how readily they return it to the kernel, and they are the usual choice for large multithreaded servers. The kernel uses the same ideas for its own objects: the <b>slab</b> allocator keeps caches of fixed-size objects such as <code>task_struct</code> on top of a page allocator.</p>
+
+  <div class="callout usecase">
+    <div class="ico">💎</div>
+    <div class="body"><div class="title">The Ruby "memory leak" that was really arenas</div><p>Around 2017, many teams running multithreaded Ruby servers such as Puma and Sidekiq on Linux saw memory use climb to two or three times what the application needed. Heap profilers found no leak, and the Ruby objects were being freed. The cause was in glibc. With many threads allocating, glibc had created many arenas. Each arena keeps its own free chunks and can't lend them to the others, and each fragments separately, so memory freed in one sat unused while another grew. Two fixes spread through the community. Setting the environment variable <code>MALLOC_ARENA_MAX=2</code> limits glibc to two arenas, trading some lock contention for much less waste; Heroku made that the default for new Ruby applications. The other was replacing the allocator with jemalloc, which needs no code change: <code>LD_PRELOAD</code> loads it in front of the C library. The same symptom, RSS that grows with no leak, is why Redis reports a fragmentation ratio and why "try another allocator" is a standard step when a long-running service's memory won't come down.</p></div>
+  </div>
+
+  <h2>Heap bugs, seen from the allocator</h2>
+  <p>P1 covered these mistakes from the programmer's side. Knowing the chunk layout explains why they fail so strangely: the allocator's bookkeeping lives in the same memory as your data, right next to it.</p>
+<pre class="code"><span class="t">char</span> *a = <span class="f">malloc</span>(<span class="m">24</span>);
+<span class="t">char</span> *b = <span class="f">malloc</span>(<span class="m">24</span>);
+<span class="f">strcpy</span>(a, <span class="s">"a string that is longer than 24 bytes"</span>);   <span class="c">/* overflow: runs into b's header */</span>
+<span class="f">free</span>(b);                                           <span class="c">/* glibc reads a nonsense size and aborts here */</span>
+
+<span class="t">char</span> *c = <span class="f">malloc</span>(<span class="m">64</span>);
+<span class="f">free</span>(c);
+<span class="f">free</span>(c);                                           <span class="c">/* double free: c is on the free list twice */</span>
+<span class="t">char</span> *x = <span class="f">malloc</span>(<span class="m">64</span>), *y = <span class="f">malloc</span>(<span class="m">64</span>);              <span class="c">/* without checks, x == y: two owners of one chunk */</span></pre>
+  <ul>
+    <li><b>Overflow.</b> Writing past the end of <code>a</code> overwrites the header of the next chunk. Nothing fails at the bad write. The crash comes later, inside some unrelated <code>malloc</code> or <code>free</code> that trusts the damaged size, with a message such as <code>free(): invalid size</code> or <code>malloc(): corrupted top size</code>.</li>
+    <li><b>Double free.</b> The chunk is linked into a free list twice, so two later allocations return the same address and silently overwrite each other. Modern glibc catches the simple cases and aborts with <code>free(): double free detected in tcache 2</code>.</li>
+    <li><b>Use after free.</b> A freed chunk's first bytes now hold the allocator's list pointers, and soon the chunk belongs to someone else. Reads return rubbish; writes corrupt the free list or another object.</li>
+  </ul>
+  <p>These are also the raw material of many security exploits, which <a href="36-os-security.html">Chapter 36</a> returns to. In development, don't debug them by reading crashes. Build with AddressSanitizer, which surrounds every allocation with poisoned bytes and reports the faulty access itself:</p>
+<pre class="code"><span class="c">$</span> gcc -g -fsanitize=address overflow.c -o overflow &amp;&amp; ./overflow
+==<span class="m">41233</span>==ERROR: AddressSanitizer: heap-buffer-overflow on address <span class="m">0x502000000028</span>
+WRITE of size <span class="m">38</span> at <span class="m">0x502000000028</span> thread T0
+    #<span class="m">0</span> strcpy
+    #<span class="m">1</span> main overflow.c:<span class="m">8</span>
+<span class="m">0x502000000028</span> is located <span class="m">0</span> bytes after <span class="m">24</span>-byte region [<span class="m">0x502000000010</span>,<span class="m">0x502000000028</span>)
+allocated by thread T0 here:
+    #<span class="m">0</span> malloc
+    #<span class="m">1</span> main overflow.c:<span class="m">6</span></pre>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Calling malloc a system call.</b> It is a library function. It makes a system call only when it needs more memory from the kernel.</li>
+      <li><b>Expecting free to lower RSS.</b> Freed heap memory goes back to the allocator for reuse, not to the kernel, unless it was a large mapped block or sits at the very top of the heap.</li>
+      <li><b>Diagnosing a leak from RSS alone.</b> Growth with no leaked objects is usually fragmentation or allocator caching. Compare the allocator's own statistics with RSS.</li>
+      <li><b>Assuming the crash is where the bug is.</b> Heap corruption is detected long after the bad write, in innocent code. Use AddressSanitizer or Valgrind to find the write.</li>
+      <li><b>Ignoring allocation size.</b> Millions of tiny allocations pay a header and rounding each. One array of structs is smaller and faster than a million nodes.</li>
+      <li><b>Forgetting the lock.</b> Allocation-heavy code that scales badly across threads is often queuing on the allocator. Reuse buffers, or use an allocator built for threads.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What happens when you call <code>malloc(100)</code>?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div><code>malloc</code> is a user-space library function. It rounds the request up to a chunk size that includes a small header and alignment padding, here 112 bytes in glibc. It first looks in a per-thread cache of free chunks of that size, with no locking; if that is empty it takes a lock on an arena and looks in that arena's bins, splitting a larger free chunk if necessary. Only if nothing is available does it go to the kernel, extending the heap with <code>brk</code>, or using <code>mmap</code> for very large requests. It returns a pointer just past the header, which is how <code>free</code> later finds the size. The memory isn't physically allocated until I touch it: the kernel maps pages on first write, through page faults.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A service's RSS grows for days, but heap profiling shows no leak. What could explain it and what would you check?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Fragmentation or allocator retention. The live data may be constant while the heap holds more and more free memory in pieces that can't be reused or returned: external fragmentation when allocation sizes vary over time, a long-lived chunk pinning the top of the heap so it can't shrink, or, with glibc and many threads, many arenas each keeping its own free memory. I'd compare the allocator's view with the kernel's: <code>malloc_stats</code> or <code>mallinfo2</code> for bytes in use against bytes held, and RSS from <code>/proc/PID/smaps</code>. A big gap confirms it. Then I'd try limiting arenas with <code>MALLOC_ARENA_MAX</code>, calling <code>malloc_trim</code> to see how much is releasable, or running under jemalloc or tcmalloc, which keep size classes in separate regions and return unused pages on a timer. Longer term, reducing allocation churn with pooled or reused buffers treats the cause.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>malloc is a library that buys memory wholesale from the kernel (<code>brk</code>, <code>mmap</code>) and retails it in chunks.</li>
+      <li>Each chunk has a header with its size, which is how free works without being told a size.</li>
+      <li>Internal fragmentation is waste inside chunks; external fragmentation is free memory in holes too small to use.</li>
+      <li>Coalescing merges free neighbours. Compaction is impossible in C because blocks can't be moved.</li>
+      <li>Real allocators use size classes, per-thread caches and multiple arenas to be fast and to scale across threads.</li>
+      <li>Heap bugs corrupt the allocator's own data, so the crash arrives later and elsewhere; use AddressSanitizer.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A program calls <code>malloc(32)</code> ten thousand times in a loop. About how many system calls does that cause?</p>
+      <div class="opts">
+        <button class="opt">Ten thousand, one per call</button>
+        <button class="opt">Twenty thousand: a <code>brk</code> and an <code>mmap</code> each</button>
+        <button class="opt">A handful: the allocator grows the heap in large steps and serves the rest from memory it already has</button>
+        <button class="opt">None, ever</button>
+      </div>
+      <div class="explain">malloc is a library function. It calls <code>brk</code> only when its heap runs out, typically in steps of 132 KiB or more.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A heap has 256 bytes free in four separate 64-byte holes. A request needing a 128-byte chunk fails. What is this called?</p>
+      <div class="opts">
+        <button class="opt">External fragmentation</button>
+        <button class="opt">Internal fragmentation</button>
+        <button class="opt">A memory leak</button>
+        <button class="opt">Thrashing</button>
+      </div>
+      <div class="explain">Enough memory is free in total, but not in one piece. Internal fragmentation is waste inside allocated chunks.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">How does <code>free(p)</code> know how many bytes to release?</p>
+      <div class="opts">
+        <button class="opt">The compiler passes the size as a hidden argument</button>
+        <button class="opt">The kernel keeps a table of every allocation</button>
+        <button class="opt">It scans forward until it finds a zero byte</button>
+        <button class="opt">The allocator stored the chunk's size in a header just before <code>p</code></button>
+      </div>
+      <div class="explain">Each chunk begins with a header holding its size. That is also why overflowing a buffer into the next chunk's header breaks later calls.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why can't a C allocator fix fragmentation by moving the live chunks together?</p>
+      <div class="opts">
+        <button class="opt">Moving memory is too slow</button>
+        <button class="opt">The program holds raw addresses of its blocks, and the allocator can't find and update them</button>
+        <button class="opt">The kernel forbids changing heap contents</button>
+        <button class="opt">Chunk headers can't be copied</button>
+      </div>
+      <div class="explain">Compaction needs every pointer to a moved block to be updated. Managed runtimes know where their references are; C does not.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What is the main reason modern allocators give each thread its own cache of free chunks?</p>
+      <div class="opts">
+        <button class="opt">To reduce internal fragmentation</button>
+        <button class="opt">To let threads share objects safely</button>
+        <button class="opt">So most allocations take no lock, avoiding contention between threads</button>
+        <button class="opt">To make <code>free</code> return memory to the kernel sooner</button>
+      </div>
+      <div class="explain">A single locked heap becomes a bottleneck with many threads. A thread-local cache serves the common case with no synchronisation at all.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const HDR = 16, MIN = 32, STEP = 256, MAX = 1024;
+  const POL = { first: 'First fit takes the first hole that is big enough', best: 'Best fit takes the smallest hole that is big enough', worst: 'Worst fit takes the largest hole' };
+  let policy = 'first', merge = 'on', req = 48;
+  let blocks, size, nextId, last, fresh;
+  const need = (n) => Math.max(MIN, (n + HDR + 15) & ~15);
+  const holes = () => blocks.filter((b) => b.free);
+  function reset() { size = 512; blocks = [{ off: 0, size: 512, free: true }]; nextId = 0; last = null; fresh = null; }
+  function coalesce() { for (let i = 0; i < blocks.length - 1;) { const a = blocks[i], b = blocks[i + 1]; if (a.free && b.free) { a.size += b.size; blocks.splice(i + 1, 1); } else i++; } }
+  function alloc(n) {
+    const want = need(n), fit = holes().filter((b) => b.size >= want);
+    if (!fit.length) {
+      const tot = holes().reduce((a, b) => a + b.size, 0), big = Math.max(0, ...holes().map((b) => b.size));
+      last = { bad: true, text: `malloc(${n}) needs a ${want}-byte chunk. ${tot} bytes are free, but the largest hole is ${big}: <b>the request fails</b>. ` + (tot >= want ? 'That is external fragmentation: enough memory, in pieces too small to use. ' : 'The heap is simply too full. ') + (size < MAX ? 'A real allocator would now ask the kernel for more: press <b>brk</b>.' : 'And this heap has reached its limit.') };
+      fresh = null; return null;
+    }
+    let h = fit[0];
+    if (policy === 'best') fit.forEach((b) => { if (b.size < h.size) h = b; });
+    if (policy === 'worst') fit.forEach((b) => { if (b.size > h.size) h = b; });
+    const i = blocks.indexOf(h), rest = h.size - want, was = h.size;
+    const blk = { off: h.off, size: rest >= MIN ? want : h.size, free: false, req: n, name: String.fromCharCode(97 + nextId++ % 26) };
+    if (rest >= MIN) blocks.splice(i, 1, blk, { off: h.off + want, size: rest, free: true }); else blocks[i] = blk;
+    fresh = blk;
+    last = { text: `malloc(${n}) needs a ${want}-byte chunk: ${n} bytes plus a 16-byte header, rounded up to a multiple of 16. ${POL[policy]}: the one at offset ${h.off} (${was} bytes)` + (rest >= MIN ? `. It is split, and ${rest} bytes stay free.` : rest ? `. The ${rest} bytes left over are too small to be a chunk, so the caller gets them as well: internal fragmentation.` : ', an exact fit.') };
+    return blk;
+  }
+  function release(b) {
+    const i = blocks.indexOf(b), l = i > 0 && blocks[i - 1].free, r = i < blocks.length - 1 && blocks[i + 1].free;
+    const name = b.name, sz = b.size;
+    b.free = true; delete b.req; delete b.name; fresh = null;
+    let tail = '';
+    if (l || r) {
+      if (merge === 'on') { coalesce(); const m = blocks.find((x) => x.free && x.off <= b.off && x.off + x.size > b.off); tail = ` Its free neighbour${l && r ? 's on both sides are' : ' is'} merged with it into one hole of ${m.size} bytes.`; }
+      else tail = ` Coalescing is off, so it stays separate from the free chunk${l && r ? 's' : ''} next to it, although together they would make a bigger hole.`;
+    }
+    last = { text: `free(${name}): the allocator steps back 16 bytes to the header, reads the size (${sz}) and puts the chunk on the free list.` + tail };
+  }
+  function render() {
+    $('#hpMalloc').textContent = `malloc(${req})`;
+    $('#hpBar').innerHTML = blocks.map((b, i) => `<button class="hp-b ${b.free ? 'hp-free' : 'hp-used'} ${b === fresh ? 'hp-new' : ''}" style="flex:${b.size} 1 0" data-i="${i}" title="${b.free ? 'free' : 'malloc(' + b.req + ')'}: ${b.size} bytes at offset ${b.off}">${b.free ? '' : b.name}<small>${b.size}</small></button>`).join('');
+    const H = holes();
+    $('#hpList').innerHTML = 'free list → ' + (H.length ? H.map((b) => `[@${b.off}: ${b.size} B]`).join(' → ') : 'empty');
+    const d = $('#hpDesc');
+    d.className = 'hp-desc' + (!last ? '' : last.bad ? ' hp-bad' : ' hp-ok');
+    d.innerHTML = last ? last.text : 'One free chunk of 512 bytes. Allocate a few blocks, or press <b>Fragment it</b>.';
+    const used = blocks.filter((b) => !b.free), reqd = used.reduce((a, b) => a + b.req, 0), held = used.reduce((a, b) => a + b.size, 0);
+    const tot = H.reduce((a, b) => a + b.size, 0), big = Math.max(0, ...H.map((b) => b.size)), ext = tot ? (1 - big / tot) * 100 : 0;
+    $('#hpStats').innerHTML = `<div class="stat"><div class="k">Heap size</div><div class="v">${size}<small> B</small></div></div>
+      <div class="stat acc"><div class="k">Requested</div><div class="v">${reqd}<small> B</small></div></div>
+      <div class="stat"><div class="k">Internal waste</div><div class="v">${held - reqd}<small> B</small></div></div>
+      <div class="stat"><div class="k">Free</div><div class="v">${tot}<small> B</small></div></div>
+      <div class="stat"><div class="k">Largest hole</div><div class="v">${big}<small> B</small></div></div>
+      <div class="stat ${ext >= 50 ? 'bad' : ext > 0 ? 'warn' : 'good'}"><div class="k">External frag.</div><div class="v">${ext.toFixed(0)}%</div></div>`;
+    $('#hpBrk').disabled = size >= MAX;
+  }
+  $('#hpBar').addEventListener('click', (e) => { const el = e.target.closest('.hp-used'); if (!el) return; release(blocks[+el.dataset.i]); render(); });
+  $('#hpMalloc').onclick = () => { alloc(req); render(); };
+  $('#hpFrag').onclick = () => {
+    reset();
+    const made = []; for (let i = 0; i < 8; i++) made.push(alloc(48));
+    made.forEach((b, i) => { if (i % 2) release(b); });
+    last = { text: 'Eight 48-byte allocations filled the heap with 64-byte chunks, then every other one was freed. <b>256 bytes are free</b>, in four holes of 64 that don\'t touch. Now try <code>malloc(100)</code>.' };
+    render();
+  };
+  $('#hpBrk').onclick = () => {
+    blocks.push({ off: size, size: STEP, free: true }); size += STEP; fresh = null;
+    if (merge === 'on') coalesce();
+    last = { text: `brk moves the end of the heap up by ${STEP} bytes: one system call, and the new space joins the free list. The heap is now ${size} bytes. Notice that the old holes are still there.` };
+    render();
+  };
+  $('#hpPol').addEventListener('segchange', (e) => { policy = e.detail; });
+  $('#hpReq').addEventListener('segchange', (e) => { req = +e.detail; render(); });
+  $('#hpMerge').addEventListener('segchange', (e) => {
+    merge = e.detail;
+    if (merge === 'on') { const n = blocks.length; coalesce(); fresh = null; last = { text: 'Coalescing on. ' + (blocks.length < n ? 'Free chunks that were side by side have been merged.' : 'From now on a freed chunk is merged with any free neighbour.') }; }
+    else last = { text: 'Coalescing off: freed chunks are never merged with their neighbours, as in the listing above.' };
+    render();
+  });
+  $('#hpReset').onclick = () => { reset(); render(); };
+  reset(); render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Redis — One Thread and fork() Snapshots</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rd-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .rd-row > span { font-size:12.5px; color:var(--muted); min-width:150px; }
+  .rd-chart { margin-top:14px; border:1px solid var(--border); border-radius:12px; background:var(--surface); padding:8px 8px 2px; }
+  .rd-chart svg { display:block; width:100%; height:auto; }
+  .rd-chart text { font-size:11px; fill:var(--muted); font-family:var(--mono); }
+  .rd-chart .rd-data { fill:var(--accent-2); opacity:.55; }
+  .rd-chart .rd-cow { fill:var(--amber); opacity:.85; }
+  .rd-chart .rd-lim { stroke:var(--red); stroke-width:1.5; stroke-dasharray:6 4; }
+  .rd-chart .rd-grid { stroke:var(--border); stroke-width:1; }
+  .rd-chart .rd-x { fill:var(--red); font-size:13px; font-weight:700; font-family:inherit; }
+  .rd-key { display:flex; flex-wrap:wrap; gap:6px 16px; font-size:12px; color:var(--muted); padding:6px 4px; }
+  .rd-key i { display:inline-block; width:11px; height:11px; border-radius:3px; margin-right:5px; vertical-align:-1px; }
+  .rd-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .rd-desc.rd-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .rd-desc.rd-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .rd-desc.rd-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
+</head>
+<body data-chapter="44">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 44</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Case Study: <span class="grad">Redis — One Thread and fork() Snapshots</span></h1>
+    <p class="lead">Redis answers a hundred thousand requests a second from a single thread, and it saves a consistent copy of tens of gigabytes of changing data to disk without taking a lock. Both are operating-system ideas from earlier chapters, used very directly: an event loop on epoll for the first, and <code>fork</code> with copy-on-write for the second. The second also explains the failures Redis is best known for in production: the server that freezes for a moment whenever a snapshot starts, the one that suddenly refuses every write, and the one whose memory doubles until the kernel kills it. This case study covers how the design works and where its costs appear.</p>
+    <ul class="objectives">
+      <li>Explain why a single thread is enough for an in-memory store, and what it costs</li>
+      <li>Describe the Redis event loop and why one slow command stalls every client</li>
+      <li>Explain how fork and copy-on-write give a snapshot of a point in time</li>
+      <li>Predict the extra memory and the pause a snapshot causes, and how huge pages and overcommit change them</li>
+      <li>Say what the I/O threads added in Redis 6 do and don't do</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Event loops on epoll.</b> See <a href="28-io-multiplexing-epoll.html">Chapter 28</a> and <a href="29-event-loops-io-uring.html">Chapter 29</a>.</li>
+        <li><b>fork and copy-on-write.</b> See <a href="30-mmap-copy-on-write.html">Chapter 30</a>.</li>
+        <li><b>Overcommit, and huge pages.</b> See <a href="14-page-faults-demand-paging.html">Chapter 14</a> and <a href="13-tlb.html">Chapter 13</a>.</li>
+        <li><b>fsync and atomic rename.</b> See <a href="31-page-cache-fsync.html">Chapter 31</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Why one thread is enough</h2>
+  <p>Redis keeps all its data in memory, in ordinary data structures: a hash table of keys whose values are strings, lists, sets and so on. Looking up a key costs well under a microsecond of CPU time. Almost everything else spent on a request goes on reading it from a socket and writing the reply, which is system calls and the kernel's network stack. So the commands themselves are never the bottleneck, and running them one at a time on a single thread gives something valuable for free:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>One thread runs every command (Redis)</th><th>Many threads share the data (memcached and others)</th></tr></thead>
+      <tbody>
+        <tr><td><b>Locks</b></td><td>None on the data</td><td>A lock, or lock-free code, round every structure</td></tr>
+        <tr><td><b>Atomicity</b></td><td>Every command is atomic, and so is a whole script or transaction. <code>INCR</code> can't lose an update</td><td>Per operation only, and only where the locking provides it</td></tr>
+        <tr><td><b>Data structures</b></td><td>Plain, simple code: no reasoning about interleavings (<a href="17-race-conditions.html">Chapter 17</a>)</td><td>Every structure must be made safe for concurrent use</td></tr>
+        <tr><td><b>Throughput</b></td><td>About 100,000 requests a second for simple commands; over a million with requests batched together</td><td>Scales with cores until the locks contend</td></tr>
+        <tr><td><b>Ceiling</b></td><td>One core. Beyond it you run more Redis processes and split the keys among them</td><td>The whole machine</td></tr>
+        <tr><td><b>A slow operation</b></td><td>Stalls every client</td><td>Stalls one thread</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c">$</span> ps -T -o spid,comm,pcpu -p <span class="m">1201</span>          <span class="c"># the threads of a busy redis-server</span>
+   SPID COMMAND         %CPU
+   <span class="m">1201</span> redis-server    <span class="m">96.2</span>          <span class="c"># the one thread that runs commands: this is the ceiling</span>
+   <span class="m">1203</span> bio_close_file   <span class="m">0.0</span>
+   <span class="m">1204</span> bio_aof          <span class="m">0.1</span>
+   <span class="m">1205</span> bio_lazy_free    <span class="m">0.0</span></pre>
+  <p>"Single-threaded" means one thread executes commands. There have always been a few helpers for jobs that would block, such as closing files, syncing the log and freeing large values, and they never touch the data set the main thread is using.</p>
+
+  <h2>The event loop</h2>
+  <p>The main thread is the loop of <a href="29-event-loops-io-uring.html">Chapter 29</a>. In outline the whole server is this:</p>
+<pre class="code"><span class="c">/* ae.c and server.c, much simplified */</span>
+<span class="k">while</span> (!stop) {
+    <span class="f">beforeSleep</span>();                                   <span class="c">/* send replies that are ready; sync the log if due */</span>
+    <span class="t">int</span> n = <span class="f">epoll_wait</span>(epfd, events, MAX, ms_until_next_timer);
+    <span class="k">for</span> (<span class="t">int</span> i = <span class="m">0</span>; i &lt; n; i++) {
+        <span class="k">if</span> (events[i].events &amp; EPOLLIN)
+            <span class="f">readQueryFromClient</span>(conn);               <span class="c">/* read, parse, RUN THE COMMAND, queue the reply */</span>
+        <span class="k">if</span> (events[i].events &amp; EPOLLOUT)
+            <span class="f">sendReplyToClient</span>(conn);
+    }
+    <span class="f">processTimeEvents</span>();                             <span class="c">/* 10 times a second: expire keys, check on a snapshot child */</span>
+}</pre>
+  <p>The command runs to completion inside the loop, between one <code>epoll_wait</code> and the next. That is the source of the atomicity, and of the one rule every Redis user learns sooner or later: <b>a command that takes a second stops the server for a second</b>.</p>
+<pre class="code"><span class="c">$</span> redis-cli slowlog get <span class="m">2</span>
+<span class="m">1</span>) <span class="m">1</span>) (integer) <span class="m">412</span>
+   <span class="m">3</span>) (integer) <span class="m">3811204</span>                 <span class="c"># microseconds: 3.8 s in which nobody else was served</span>
+   <span class="m">4</span>) <span class="m">1</span>) <span class="s">"KEYS"</span>  <span class="m">2</span>) <span class="s">"session:*"</span>          <span class="c"># walks all 40 million keys; use SCAN, which does a few per call</span>
+<span class="m">2</span>) <span class="m">1</span>) (integer) <span class="m">411</span>
+   <span class="m">3</span>) (integer) <span class="m">902377</span>
+   <span class="m">4</span>) <span class="m">1</span>) <span class="s">"DEL"</span>   <span class="m">2</span>) <span class="s">"feed:all"</span>           <span class="c"># freeing a list of 8 million items; UNLINK frees it on a helper thread</span></pre>
+
+  <h2>BGSAVE: fork and copy-on-write</h2>
+  <p>Data in memory is lost when the process stops, so Redis periodically writes all of it to a file, <code>dump.rdb</code>. That poses a hard problem. Writing 24 GB takes minutes. The file must be a consistent picture of one instant, the server has to keep accepting writes the whole time, and there's only one thread and no locks.</p>
+  <p>The answer is one system call. <code>fork</code> creates a child whose memory is, logically, a copy of the parent's at that instant. Physically nothing is copied except the page tables (<a href="30-mmap-copy-on-write.html">Chapter 30</a>): both processes point at the same frames, now marked read-only. The child walks the data set and writes the file, seeing a frozen world. The parent goes on serving clients, and whenever it writes to a page for the first time, the kernel copies that one page for it. The operating system's virtual memory is being used as a snapshot mechanism.</p>
+  <figure class="seq" data-actors="Clients|Redis|Kernel|Child">
+    <ol>
+      <li data-m="1>2">fork()</li>
+      <li data-m="2>1" data-k="reply">child's PID (page tables copied; every page shared and read-only)</li>
+      <li data-m="2>3">the child starts, with the same pages</li>
+      <li data-m="0>1">SET user:42 … (a write during the snapshot)</li>
+      <li data-m="1>2">store to a shared page: page fault</li>
+      <li data-m="2>1" data-k="reply">page copied; Redis writes to its own copy</li>
+      <li data-m="3>2">write temp-8820.rdb, fsync, rename to dump.rdb</li>
+      <li data-m="3>2">exit(0)</li>
+      <li data-m="2>1" data-k="reply">wait() reports the child: snapshot complete</li>
+    </ol>
+    <figcaption><b>A background save.</b> The child never sees the <code>SET</code>. Its view is the instant of the fork. The file is written under a temporary name and renamed, so a crash mid-way leaves the old snapshot intact (<a href="31-page-cache-fsync.html">Chapter 31</a>).</figcaption>
+  </figure>
+<pre class="code"><span class="c">/* rdb.c, simplified */</span>
+<span class="t">int</span> <span class="f">rdbSaveBackground</span>(<span class="t">char</span> *filename) {
+    <span class="t">pid_t</span> child = <span class="f">fork</span>();
+    <span class="k">if</span> (child == <span class="m">0</span>) {                        <span class="c">/* child: a frozen copy of everything */</span>
+        <span class="f">closeListeningSockets</span>();
+        <span class="t">int</span> ok = <span class="f">rdbSave</span>(filename);           <span class="c">/* write temp file, fsync, rename */</span>
+        <span class="f">_exit</span>(ok ? <span class="m">0</span> : <span class="m">1</span>);
+    }
+    <span class="k">if</span> (child == <span class="m">-1</span>) <span class="k">return</span> C_ERR;            <span class="c">/* "Can't save in background: fork: Cannot allocate memory" */</span>
+    server.child_pid = child;                <span class="c">/* parent: carry on; the timer will call wait later */</span>
+    <span class="k">return</span> C_OK;
+}</pre>
+<pre class="code"><span class="m">1201</span>:M 02 Mar 2026 09:14:07.112 * Background saving started by pid 8820
+<span class="m">8820</span>:C 02 Mar 2026 09:18:07.530 * DB saved on disk
+<span class="m">8820</span>:C 02 Mar 2026 09:18:07.642 * Fork CoW for RDB: current 1806 MB, peak 1806 MB, average 912 MB
+<span class="m">1201</span>:M 02 Mar 2026 09:18:07.790 * Background saving terminated with success</pre>
+  <p>The third line is the bill: 1.8 GB of pages were copied because the parent modified them while the child was working. Redis uses the same trick to compact its other persistence format, the append-only file, and to send a full copy of the data to a new replica.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>RDB snapshot</th><th>Append-only file (AOF)</th></tr></thead>
+      <tbody>
+        <tr><td><b>On disk</b></td><td>A compact image of one instant</td><td>A log of every write command</td></tr>
+        <tr><td><b>Written by</b></td><td>A forked child</td><td>The main thread appends; a helper thread calls <code>fsync</code></td></tr>
+        <tr><td><b>Lost in a crash</b></td><td>Everything since the last snapshot: minutes</td><td>About a second with <code>appendfsync everysec</code>; nothing acknowledged with <code>always</code>, at one sync per write</td></tr>
+        <tr><td><b>Needs fork</b></td><td>For every snapshot</td><td>Only to rewrite the log when it grows too long</td></tr>
+        <tr><td><b>Restart</b></td><td>Fast: load the image</td><td>Slower: replay the commands</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Memory spikes and overcommit</h2>
+  <p>The fork is cheap, and it has three costs, each controlled by something in the kernel.</p>
+  <ul>
+    <li><b>The pause.</b> Copying the page tables happens inside <code>fork</code>, on the main thread. A 24 GB process has about 48 MB of page-table entries, and copying them takes roughly 10 to 15 ms per gigabyte of data. Nothing is served during it.</li>
+    <li><b>The copies.</b> Every page the parent writes to during the snapshot is duplicated. How much that comes to depends on how many <i>different</i> pages are touched before the child finishes.</li>
+    <li><b>The promise.</b> At the moment of the fork the kernel has, in principle, promised both processes their own copy of everything. Whether it is willing to make that promise is the overcommit setting (<a href="14-page-faults-demand-paging.html">Chapter 14</a>).</li>
+  </ul>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A background save on a 64 GB machine</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="rd-row"><span>Data set in memory</span><div class="seg" id="rdD"><button data-v="10">10 GB</button><button class="active" data-v="24">24 GB</button><button data-v="44">44 GB</button></div></div>
+      <div class="rd-row"><span>Writes to random keys</span><div class="seg" id="rdW"><button data-v="200">200 / s</button><button class="active" data-v="2000">2,000 / s</button><button data-v="20000">20,000 / s</button></div></div>
+      <div class="rd-row"><span>Transparent huge pages</span><div class="seg" id="rdThp"><button class="active" data-v="off">off (4 KiB pages)</button><button data-v="on">on (2 MiB pages)</button></div></div>
+      <div class="rd-row"><span>vm.overcommit_memory</span><div class="seg" id="rdOc"><button data-v="0">0 (heuristic)</button><button class="active" data-v="1">1 (always allow)</button></div></div>
+      <div class="rd-chart"><div id="rdChart"></div>
+        <div class="rd-key"><span><i style="background:var(--accent-2);opacity:.55"></i>the data set (shared by parent and child)</span><span><i style="background:var(--amber)"></i>pages copied because the parent wrote to them</span><span><i style="background:var(--red)"></i>memory available</span></div></div>
+      <div class="rd-desc" id="rdDesc"></div>
+      <div class="stats" id="rdStats"></div>
+    </div>
+    <div class="panel-foot">A model: the child needs 10 s per gigabyte to write the file, each write lands on a random page, and 2 GB of the machine is kept for everything else. The overcommit heuristic here is the classic one, which refuses a fork when free memory is less than the parent's size. Recent kernels are more lenient, but Redis still asks for the setting to be 1.</div>
+  </div>
+
+  <p>Things to notice. At 24 GB and 2,000 writes a second the snapshot costs 1.8 GB of copies, 7% of the data, and a pause of about 0.3 s. Raise the writes tenfold and over half the data is copied. Now switch huge pages on at the <i>lowest</i> write rate: nearly the whole data set is copied, because a one-byte change to any key now duplicates 2 MiB instead of 4 KiB, and there are only 12,288 huge pages to hit. The fork itself gets much quicker, since the page tables are tiny, which is exactly why this trap is easy to walk into. Then try 44 GB. With the heuristic overcommit setting the fork is refused outright, and with it allowed, a heavy write load runs the machine out of memory part-way through. A write-heavy instance needs its data set to be well under half of RAM.</p>
+<pre class="code"><span class="c"># What Redis prints at start-up when the kernel is set against it</span>
+# WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition.
+# WARNING You have Transparent Huge Pages (THP) support enabled in your kernel. This will create latency and memory usage issues with Redis.
+
+<span class="c">$</span> sysctl -w vm.overcommit_memory=<span class="m">1</span>
+<span class="c">$</span> echo madvise &gt; /sys/kernel/mm/transparent_hugepage/enabled
+
+<span class="c">$</span> redis-cli info | grep -E <span class="s">'latest_fork_usec|rdb_last_cow_size|rdb_last_bgsave_status'</span>
+latest_fork_usec:<span class="m">288412</span>                   <span class="c"># the pause: 288 ms</span>
+rdb_last_cow_size:<span class="m">1894252544</span>              <span class="c"># the copies: 1.8 GB</span>
+rdb_last_bgsave_status:ok</pre>
+  <p>Compare the overcommit advice with <a href="43-case-postgres-on-os.html">Chapter 43</a>. PostgreSQL asks for mode 2, strict accounting, because it would rather have an allocation fail cleanly than be killed. Redis asks for mode 1, because its design depends on the kernel agreeing to a fork whose worst case it could never honour. Neither is wrong. The right setting follows from how the program uses memory, which is a good reason to give each its own machine or container. Since version 6.2 Redis also switches transparent huge pages off for its own process where the system-wide setting is <code>always</code>.</p>
+  <p>When the fork does fail, the effect on clients is more dramatic than a missing backup. By default Redis then <b>refuses all writes</b>, on the reasoning that silently running without persistence is worse than stopping:</p>
+<pre class="code"><span class="m">1201</span>:M 02 Mar 2026 09:14:07.112 # Can't save in background: fork: Cannot allocate memory
+
+<span class="c">$</span> redis-cli set user:42 x
+(error) MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk.
+Commands that may modify the data set are disabled, because this instance is configured to report errors
+during writes if RDB snapshotting fails (stop-writes-on-bgsave-error option).</pre>
+
+  <div class="callout usecase">
+    <div class="ico">⚖️</div>
+    <div class="body"><div class="title">The same fork, twenty times slower</div><p>Redis's documentation on latency includes measurements of <code>fork</code> on different machines, and they explain a problem that plagued Redis on cloud servers in its early years. On physical hardware, and on VMware, forking took about 13 ms per gigabyte of data. On the Xen-based virtual machines that Amazon EC2 used at the time, the same call took <b>239 ms per gigabyte</b>. Page-table updates on those instances had to go through the hypervisor (<a href="33-virtualization.html">Chapter 33</a>), and <code>fork</code> is millions of page-table updates. By those figures a 24 GB instance stops for a third of a second on bare metal and for nearly six seconds on such a VM, every time a snapshot begins, with every client timing out together. Nothing in Redis was different. The remedies people used were all about the fork: moving to instance types with hardware support for nested page tables, where the cost fell back to about 10 ms per gigabyte; splitting the data over several smaller instances so each fork was short; and taking snapshots only on a replica, so that the server answering clients never forks at all. That last arrangement is still common.</p></div>
+  </div>
+
+  <h2>I/O threads in Redis 6 and later</h2>
+  <p>If commands cost a microsecond and the socket work costs ten, the socket work is the place to add cores. Redis 6 (2020) added optional <b>I/O threads</b> that do exactly that and nothing more:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Work</th><th>Who does it</th></tr></thead>
+      <tbody>
+        <tr><td><b>Waiting for ready sockets</b> (<code>epoll_wait</code>)</td><td>Main thread</td></tr>
+        <tr><td><b>Reading requests and parsing them</b></td><td>I/O threads, in parallel, if <code>io-threads-do-reads yes</code></td></tr>
+        <tr><td><b>Executing the commands</b></td><td>Main thread, one at a time, as before</td></tr>
+        <tr><td><b>Writing replies to sockets</b></td><td>I/O threads, in parallel</td></tr>
+        <tr><td><b>Closing files, syncing the log, freeing big values</b></td><td>Background helper threads</td></tr>
+        <tr><td><b>Snapshots and log rewrites</b></td><td>A forked child process</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>In each turn of the loop the main thread hands the ready sockets out to the I/O threads, waits for them to finish reading and parsing, runs every command itself, and then hands the replies back for writing. The data set is still touched by exactly one thread, so nothing about atomicity or locking changed. The gain is up to about double the throughput on a machine with spare cores, and it only helps when the network work really is the limit. A workload of slow commands gains nothing.</p>
+<pre class="code"><span class="c"># redis.conf</span>
+io-threads <span class="m">4</span>                  <span class="c"># total, including the main thread; leave cores free for the kernel's network work</span>
+io-threads-do-reads yes       <span class="c"># reads and parsing too, not only writes</span></pre>
+  <p>Projects that wanted more than that took other routes: KeyDB and Dragonfly run commands on many threads and pay for it with locking or with partitioned data, and Redis Cluster stays single-threaded and runs many processes with the keys divided among them.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Running slow commands on a live server.</b> <code>KEYS</code>, huge range reads, deleting an enormous key, long scripts: each stops every client for its whole duration.</li>
+      <li><b>Sizing the machine to the data set.</b> A snapshot can need a large fraction of the data again. Leave that headroom, or snapshot on a replica.</li>
+      <li><b>Leaving transparent huge pages on <code>always</code>.</b> Faster forks, but each first write copies 2 MiB and memory can double.</li>
+      <li><b>Ignoring the overcommit warning.</b> The first sign is usually the <code>MISCONF</code> error, with all writes refused.</li>
+      <li><b>Expecting I/O threads to speed up commands.</b> They parallelise socket reads and writes only.</li>
+      <li><b>Treating Redis as durable by default.</b> With snapshots alone, a crash loses everything since the last one.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Redis is single-threaded. Why is it still fast, and what is the downside?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>All the data is in memory, so a command is a few memory accesses, well under a microsecond. Most of the time per request is network I/O, and Redis handles that with an event loop on epoll: one thread waits for whichever sockets are ready, reads the requests, runs each command to completion and writes the replies. With one thread running commands there are no locks on the data and no context switches between workers, and every command is atomic, which keeps the code simple and the per-request overhead very low. A single thread manages on the order of a hundred thousand simple requests a second, more with pipelining. The downsides are that it can use only one core for command execution, so you scale by running several instances and sharding, and that any slow command blocks every other client for its whole duration. Since Redis 6, extra threads can do the socket reading and writing, but commands still run on the main thread.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How does Redis write a consistent snapshot while still accepting writes, and what can go wrong on a large instance?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It calls <code>fork</code>. The child gets a copy-on-write view of the parent's memory as it was at that instant, iterates over the data set and writes it to a temporary file, syncs it and renames it over the old snapshot. The parent keeps serving; when it modifies a page, the kernel copies that page first, so the child's view never changes. Three things go wrong at scale. First, <code>fork</code> copies the page tables on the main thread, roughly 10 ms per gigabyte, so a large instance pauses for hundreds of milliseconds, and much longer on some virtual machines. Second, memory: every page written during the snapshot is duplicated, so a write-heavy instance can need a large part of its data set again, and with transparent huge pages each write copies 2 MiB so usage can double. If the machine has no headroom the OOM killer steps in. Third, with <code>vm.overcommit_memory</code> at 0 the kernel may refuse the fork, and Redis then rejects writes with a MISCONF error. The mitigations are to set overcommit to 1, disable THP, keep the data set well under half of RAM for write-heavy loads, use smaller shards, and take snapshots on a replica.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>One thread runs every Redis command, so there are no locks on the data and every command is atomic. The limit is one core.</li>
+      <li>That thread is an epoll event loop. A slow command stops every client until it finishes.</li>
+      <li>A snapshot is a <code>fork</code>: the child sees a frozen copy-on-write image and writes it to disk while the parent keeps serving.</li>
+      <li>The costs are a pause while page tables are copied, and one copied page for each page the parent writes to during the snapshot.</li>
+      <li>Transparent huge pages make each of those copies 2 MiB, and the wrong overcommit setting makes the fork fail and Redis refuse writes.</li>
+      <li>I/O threads parallelise reading and writing sockets only. Commands still run on the main thread.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why can Redis run <code>INCR counter</code> from thousands of clients without a lock and never lose an update?</p>
+      <div class="opts">
+        <button class="opt">It uses compare-and-swap on each key</button>
+        <button class="opt">The kernel serialises writes to the same socket</button>
+        <button class="opt">One thread executes all commands, each to completion, so two never interleave</button>
+        <button class="opt">Each client has its own copy of the data</button>
+      </div>
+      <div class="explain">A command runs between one <code>epoll_wait</code> and the next with nothing else touching the data.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A client runs a command that takes two seconds on a production Redis. What do the other clients see?</p>
+      <div class="opts">
+        <button class="opt">Their requests wait for two seconds</button>
+        <button class="opt">Nothing: other threads serve them</button>
+        <button class="opt">The kernel preempts the command to serve them</button>
+        <button class="opt">They are redirected to a replica</button>
+      </div>
+      <div class="explain">The loop is not in <code>epoll_wait</code> while a command runs, so no other socket is read or written.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">During a background save, the parent overwrites a value. Why doesn't the child's snapshot include the change?</p>
+      <div class="opts">
+        <button class="opt">The parent holds a lock until the child finishes</button>
+        <button class="opt">The child copied all the memory at the start</button>
+        <button class="opt">Writes are queued until the snapshot ends</button>
+        <button class="opt">The page was shared copy-on-write, so the kernel gave the parent a new copy and left the child's page untouched</button>
+      </div>
+      <div class="explain">Nothing is copied at fork time except page tables. Pages are copied one at a time, when the parent first writes to them.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why can transparent huge pages make a snapshot use far more memory?</p>
+      <div class="opts">
+        <button class="opt">The child's file is written in 2 MiB blocks</button>
+        <button class="opt">A write to any byte of a 2 MiB page copies the whole 2 MiB, so scattered writes soon copy everything</button>
+        <button class="opt">Huge pages can't be shared after fork</button>
+        <button class="opt">The page tables become larger</button>
+      </div>
+      <div class="explain">Copy-on-write works a page at a time. Bigger pages mean bigger copies and far fewer pages to hit.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">With <code>io-threads 4</code>, which work is done in parallel?</p>
+      <div class="opts">
+        <button class="opt">Executing commands on different keys</button>
+        <button class="opt">Writing the snapshot file</button>
+        <button class="opt">Reading and parsing requests and writing replies; commands still run one at a time on the main thread</button>
+        <button class="opt">Everything: Redis becomes fully multi-threaded</button>
+      </div>
+      <div class="explain">The I/O threads take the socket work. The data set is still touched by one thread only.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const RAM = 64, AVAIL = 62;
+  const cfg = { d: 24, w: 2000, thp: 'off', oc: '1' };
+  const gb = (x) => x < 0.95 ? Math.round(x * 1024) + ' MB' : x.toFixed(1) + ' GB';
+  function model() {
+    const D = cfg.d, thp = cfg.thp === 'on';
+    const N = D * (thp ? 512 : 262144);             // pages that hold the data
+    const T = D * 10;                               // seconds the child takes
+    const cow = (t) => D * (1 - Math.exp(-cfg.w * t / N));   // distinct pages touched so far, in GB
+    const forkFails = cfg.oc === '0' && D > AVAIL - D;
+    const tOom = !forkFails && D + cow(T) > AVAIL ? -Math.log(1 - (AVAIL - D) / D) * N / cfg.w : null;
+    const end = tOom == null ? T : tOom;
+    return { D, thp, N, T, cow, forkFails, tOom, end, extra: forkFails ? 0 : cow(end), forkMs: D * (thp ? 0.5 : 12) };
+  }
+  function chart(m) {
+    const W = 640, H = 200, L = 46, R = 8, Tp = 10, B = 24, top = 72;
+    const x = (t) => L + (W - L - R) * t / m.T, y = (g) => Tp + (H - Tp - B) * (1 - g / top);
+    let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Memory used during the snapshot">`;
+    for (const g of [0, 16, 32, 48, 64]) s += `<line class="rd-grid" x1="${L}" x2="${W - R}" y1="${y(g)}" y2="${y(g)}"/><text x="${L - 6}" y="${y(g) + 4}" text-anchor="end">${g} GB</text>`;
+    const xe = m.forkFails ? x(m.T) : x(m.end);
+    s += `<rect class="rd-data" x="${L}" y="${y(m.D)}" width="${xe - L}" height="${y(0) - y(m.D)}"/>`;
+    if (!m.forkFails) {
+      const pts = [];
+      for (let i = 0; i <= 60; i++) { const t = m.end * i / 60; pts.push(x(t).toFixed(1) + ',' + y(m.D + m.cow(t)).toFixed(1)); }
+      pts.push(xe.toFixed(1) + ',' + y(m.D), L + ',' + y(m.D));
+      s += `<polygon class="rd-cow" points="${pts.join(' ')}"/>`;
+    }
+    s += `<line class="rd-lim" x1="${L}" x2="${W - R}" y1="${y(AVAIL)}" y2="${y(AVAIL)}"/>`;
+    if (m.forkFails) s += `<text class="rd-x" x="${(L + W - R) / 2}" y="${y(m.D) - 10}" text-anchor="middle">fork() refused: no snapshot</text>`;
+    if (m.tOom != null) s += `<text class="rd-x" x="${Math.min(xe + 8, W - 150)}" y="${y(AVAIL) + 18}">✕ killed at ${Math.round(m.tOom)} s</text>`;
+    s += `<text x="${L}" y="${H - 6}">fork</text><text x="${W - R}" y="${H - 6}" text-anchor="end">${m.T} s: child finishes</text></svg>`;
+    return s;
+  }
+  function render() {
+    const m = model(), pct = (m.extra / m.D * 100);
+    $('#rdChart').innerHTML = chart(m);
+    const d = $('#rdDesc');
+    let cls, text;
+    if (m.forkFails) { cls = 'rd-bad'; text = `<b>The fork was refused.</b> The parent is ${m.D} GB and only ${AVAIL - m.D} GB is free, so the kernel won't promise the child a possible second ${m.D} GB and <code>fork</code> returns <code>ENOMEM</code>. No snapshot is taken, and with the default settings Redis now rejects every write with a <code>MISCONF</code> error. In practice the child would have needed only a fraction of that memory.`; }
+    else if (m.tOom != null) { cls = 'rd-bad'; text = `<b>Out of memory after ${Math.round(m.tOom)} s.</b> The parent had copied ${gb(m.extra)} of pages and the machine had nothing left. The OOM killer picks the largest process, and the largest process is Redis. The snapshot is lost, and so is everything in memory since the last one that succeeded.`; }
+    else if (pct > 60) { cls = 'rd-warn'; text = `The snapshot finished, but the parent copied <b>${gb(m.extra)}</b>, ${pct.toFixed(0)}% of the data set, and memory use ${pct > 99.5 ? 'doubled' : pct > 90 ? 'almost doubled' : 'grew by more than half'}. ${m.thp ? 'With 2 MiB pages there are only ' + m.N.toLocaleString('en-GB') + ' pages, so scattered writes soon touch every one, and each first touch stalls the only thread while 2 MiB is copied.' : ''}`; }
+    else if (pct > 25) { cls = 'rd-warn'; text = `The snapshot finished, but the parent copied <b>${gb(m.extra)}</b>, ${pct.toFixed(0)}% of the data set. That headroom has to exist for the ${m.T} seconds the child needs.`; }
+    else { cls = 'rd-ok'; text = `The snapshot finished in ${m.T} s. The parent wrote to few enough different pages that only <b>${gb(m.extra)}</b> was copied, ${pct < 1 ? pct.toFixed(1) : pct.toFixed(0)}% of the data set. This is the case the design is built for.`; }
+    d.className = 'rd-desc ' + cls; d.innerHTML = text;
+    const peak = m.D + m.extra;
+    $('#rdStats').innerHTML = `<div class="stat ${m.forkFails ? '' : m.forkMs >= 250 ? 'warn' : ''}"><div class="k">Pause for the fork</div><div class="v">${m.forkFails ? '–' : Math.round(m.forkMs) + ' ms'}</div></div>
+      <div class="stat"><div class="k">Pages holding the data</div><div class="v">${m.N.toLocaleString('en-GB')}</div></div>
+      <div class="stat ${m.forkFails ? '' : pct > 25 ? 'warn' : 'good'}"><div class="k">Copied during the save</div><div class="v">${m.forkFails ? '–' : gb(m.extra)}</div></div>
+      <div class="stat ${m.forkFails || m.tOom != null ? 'bad' : peak > 56 ? 'warn' : 'good'}"><div class="k">Peak memory of ${RAM} GB</div><div class="v">${m.forkFails ? 'no save' : m.tOom != null ? 'killed' : gb(peak)}</div></div>`;
+  }
+  $('#rdD').addEventListener('segchange', (e) => { cfg.d = +e.detail; render(); });
+  $('#rdW').addEventListener('segchange', (e) => { cfg.w = +e.detail; render(); });
+  $('#rdThp').addEventListener('segchange', (e) => { cfg.thp = e.detail; render(); });
+  $('#rdOc').addEventListener('segchange', (e) => { cfg.oc = e.detail; render(); });
+  render();
+})();
+</script>
+</body>
+</html>

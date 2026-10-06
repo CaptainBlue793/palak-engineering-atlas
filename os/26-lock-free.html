@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lock-Free Data Structures (CAS, ABA)</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .lf-chain { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:14px; padding:10px 12px; border:1.5px dashed var(--border-strong); border-radius:12px; background:var(--surface-2); font-family:var(--mono); font-size:13px; min-height:54px; }
+  .lf-top { font-weight:700; color:var(--accent); }
+  .lf-n { padding:5px 12px; border-radius:9px; border:1.5px solid var(--green); background:var(--green-soft); font-weight:700; }
+  .lf-n.lf-freed { border-color:var(--red); background:var(--red-soft); text-decoration:line-through; }
+  .lf-n.lf-held { border-color:var(--amber); background:var(--amber-soft); }
+  .lf-arrow { color:var(--muted); }
+  .lf-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px; margin-top:10px; align-items:start; }
+  @media (max-width:760px) { .lf-grid { grid-template-columns:1fr; } }
+  .lf-th { border:1.5px solid var(--border); border-radius:12px; padding:9px 10px; background:var(--surface); }
+  .lf-th h6 { margin:0 0 6px; font-size:13px; }
+  .lf-ln { font-family:var(--mono); font-size:12px; padding:4px 8px; border-radius:7px; border:1px solid transparent; color:var(--text-2); white-space:pre; overflow:hidden; text-overflow:ellipsis; }
+  .lf-ln.lf-ran { color:var(--muted); }
+  .lf-ln.lf-cur { border-color:var(--accent); background:color-mix(in srgb, var(--accent) 10%, var(--surface)); color:var(--text); }
+  .lf-loc { margin-top:8px; font-size:12.5px; color:var(--muted); }
+  .lf-loc b { font-family:var(--mono); color:var(--text); }
+  .lf-row { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:6px; font-size:12.5px; color:var(--muted); min-height:30px; }
+  .lf-desc { margin-top:10px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .lf-desc.lf-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .lf-desc.lf-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .lf-desc.lf-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
+</head>
+<body data-chapter="26">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 26</span><span class="pill">Advanced</span><span class="pill">⏱ 55 min</span></div>
+    <h1>Lock-Free Data Structures (CAS, <span class="grad">ABA)</span></h1>
+    <p class="lead">A lock has one weakness that no tuning removes: if the thread holding it stops, everyone waiting stops too. It may have been preempted, or page-faulted, or killed. A <b>lock-free</b> data structure has no holder to wait for. Every thread works on its own copy of a small change and tries to install it with a single compare-and-swap; if another thread got there first, it tries again. Twelve lines give you a stack that many threads can use with no lock at all. They also contain one of the most famous bugs in concurrent programming, and fixing it leads to the real difficulty of the subject, which is not updating shared memory but knowing when it is safe to free it.</p>
+    <ul class="objectives">
+      <li>Define lock-free and wait-free, and say what they do and don't promise</li>
+      <li>Write a compare-and-swap retry loop</li>
+      <li>Implement a lock-free stack and find its two bugs</li>
+      <li>Explain the ABA problem and fix it with a version tag</li>
+      <li>Describe hazard pointers and RCU as answers to "when may I free this?"</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Compare-and-swap, and what locks cost.</b> See <a href="18-mutexes-spinlocks.html">Chapter 18</a>.</li>
+        <li><b>Atomics, memory orders and publishing a pointer.</b> See <a href="25-atomics-memory-models.html">Chapter 25</a>.</li>
+        <li><b>How freed memory is reused by the allocator.</b> See <a href="16-heap-malloc.html">Chapter 16</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>What "lock-free" promises</h2>
+  <p>The terms describe <b>progress guarantees</b>, not implementation techniques. They say what is certain even if the scheduler behaves as badly as possible.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Guarantee</th><th>Promise</th><th>Can one stalled thread block the rest?</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><b>Blocking</b></td><td>None, if a lock holder stops</td><td>Yes</td><td>Anything built on a mutex</td></tr>
+        <tr><td><b>Lock-free</b></td><td>At every moment, <i>some</i> thread completes its operation in a bounded number of steps</td><td>No. But one unlucky thread may retry for a long time</td><td>The stack and counters in this chapter</td></tr>
+        <tr><td><b>Wait-free</b></td><td><i>Every</i> thread completes in a bounded number of steps</td><td>No, and nobody starves</td><td><code>atomic_fetch_add</code> on x86; reading under RCU</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Notice what is absent: speed. Lock-free code is not automatically faster than a well-used mutex, and under heavy contention it is often slower, since every failed attempt is wasted work. People use it for the guarantee: no deadlock, no thread able to stall the others, safe in places where sleeping is forbidden, such as interrupt and signal handlers.</p>
+
+  <h2>The CAS retry loop</h2>
+  <p>Every lock-free update has the same shape. Read the current value. Work out the new value privately. Then compare-and-swap: "if it is still what I read, replace it". If the CAS fails, another thread changed it in between, so start again from the fresh value.</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;stdatomic.h&gt;</span>
+
+<span class="c">/* Raise *m to v if v is larger. There is no "atomic max" instruction, so build one. */</span>
+<span class="t">void</span> <span class="f">store_max</span>(<span class="t">atomic_long</span> *m, <span class="t">long</span> v)
+{
+    <span class="t">long</span> cur = <span class="f">atomic_load</span>(m);
+    <span class="k">while</span> (cur &lt; v &amp;&amp; !<span class="f">atomic_compare_exchange_weak</span>(m, &amp;cur, v))
+        ;       <span class="c">/* a failed CAS writes the value it found into cur, so the loop re-tests with fresh data */</span>
+}</pre>
+  <p>If the loop goes round again, it is because some other thread's CAS <i>succeeded</i>. That is the lock-free guarantee in miniature: one thread's failure is always another thread's progress. (<code>_weak</code> may fail occasionally for no reason on some CPUs, which is harmless inside a loop and cheaper than <code>_strong</code>.)</p>
+
+  <h2>A lock-free stack</h2>
+  <p>The simplest lock-free structure is a linked stack, published by R. Kent Treiber in 1986. The only shared variable is the pointer to the top node.</p>
+<pre class="code"><span class="k">struct</span> <span class="t">node</span> { <span class="k">struct</span> <span class="t">node</span> *next; <span class="t">int</span> value; };
+<span class="k">static</span> <span class="k">_Atomic</span>(<span class="k">struct</span> <span class="t">node</span> *) top;
+
+<span class="t">void</span> <span class="f">push</span>(<span class="k">struct</span> <span class="t">node</span> *n)
+{
+    n-&gt;next = <span class="f">atomic_load</span>(&amp;top);                            <span class="c">/* link the new node in front, privately */</span>
+    <span class="k">while</span> (!<span class="f">atomic_compare_exchange_weak</span>(&amp;top, &amp;n-&gt;next, n))
+        ;                                                    <span class="c">/* top moved: n-&gt;next now holds the new top */</span>
+}
+
+<span class="k">struct</span> <span class="t">node</span> *<span class="f">pop</span>(<span class="t">void</span>)
+{
+    <span class="k">struct</span> <span class="t">node</span> *old = <span class="f">atomic_load</span>(&amp;top);
+    <span class="k">while</span> (old &amp;&amp; !<span class="f">atomic_compare_exchange_weak</span>(&amp;top, &amp;old, old-&gt;next))
+        ;                                                    <span class="c">/* "if top is still old, make it old-&gt;next" */</span>
+    <span class="k">return</span> old;
+}</pre>
+  <p><code>push</code> is correct. <code>pop</code> looks just as innocent and is broken in two ways, both hiding in the expression <code>old-&gt;next</code>:</p>
+  <ul>
+    <li><b>It reads a node it doesn't own.</b> Between loading <code>old</code> and reading <code>old-&gt;next</code>, another thread may have popped that node and freed it. This thread then reads freed memory.</li>
+    <li><b>The CAS checks the wrong thing.</b> It verifies that <code>top</code> holds the same <i>address</i> as before. It concludes that nothing has changed. Those are not the same statement.</li>
+  </ul>
+
+  <h2>The ABA problem</h2>
+  <p>A thread reads the value A from a shared variable and is interrupted. While it is away, other threads change the variable to B and then back to A. The first thread resumes, its CAS finds A as expected, and succeeds, although everything it worked out from the earlier state is now out of date. With pointers this happens naturally, because allocators hand out recently freed addresses again (<a href="16-heap-malloc.html">Chapter 16</a>): a different node, or the same node pushed back, at the same address.</p>
+  <figure class="seq" data-actors="Thread 1 (pop)|top|Thread 2">
+    <ol>
+      <li data-m="0>1">read top = A; read A's next = B. Then preempted</li>
+      <li data-m="2>1">pop → A (top = B)</li>
+      <li data-m="2>1">pop → B (top = C), and free B</li>
+      <li data-m="2>1">push A back (top = A, and A's next is now C)</li>
+      <li data-m="0>1">CAS(top: A → B) succeeds, because top is A again</li>
+    </ol>
+    <figcaption><b>ABA on a stack.</b> Thread 1 installs B as the top. B has been freed, and C, which really is on the stack, is no longer reachable.</figcaption>
+  </figure>
+
+  <h2>Cause it yourself</h2>
+  <p>The stack holds A, B and C. Thread 1 pops in three separate steps, and thread 2 can run whole operations in between. Use <b>Play the ABA schedule</b>, then let thread 1 finish. Then turn on version tags and do the same.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A lock-free stack and two threads</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="lfTag"><button class="active" data-v="off">plain CAS on the pointer</button><button data-v="on">CAS on pointer + version</button></div>
+        <button class="btn sm" id="lfPlay">Play the ABA schedule</button>
+        <button class="btn sm" id="lfReset">↺ Reset</button>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="lfT1">Thread 1: next step →</button>
+        <button class="btn sm" id="lfPop">Thread 2: pop</button>
+        <button class="btn sm" id="lfFree">Thread 2: free</button>
+        <button class="btn sm" id="lfPush">Thread 2: push back</button>
+      </div>
+      <div class="lf-chain" id="lfChain"></div>
+      <div class="lf-grid">
+        <div class="lf-th"><h6>Thread 1: pop()</h6><div id="lfCode"></div><div class="lf-loc" id="lfLoc"></div></div>
+        <div class="lf-th"><h6>Thread 2</h6><div class="lf-row" id="lfHeld"></div><div class="lf-row" id="lfFreed"></div></div>
+      </div>
+      <div class="lf-desc" id="lfDesc"></div>
+      <div class="stats" id="lfStats"></div>
+    </div>
+    <div class="panel-foot">Thread 2's buttons each run a complete, correct operation. "Push back" pushes the node thread 2 has held longest; "free" releases the one it popped most recently. With version tags, every successful change to <code>top</code> also adds 1 to a counter stored beside the pointer, and the CAS compares both.</div>
+  </div>
+
+  <p>Things to notice. With a plain CAS the final step succeeds and leaves <code>top</code> pointing at freed memory: no crash, no error, a corrupted stack that fails later somewhere else. With a version tag the same CAS fails, because although the pointer is A again the version has moved on by three; thread 1 retries and pops correctly. Also try freeing A itself before thread 1's second step: thread 1 then reads <code>next</code> out of freed memory, and no tag can fix that.</p>
+
+  <h2>Fix one: version tags</h2>
+  <p>The CAS should fail whenever <code>top</code> has been <i>modified</i>, not merely when it holds a different address. So keep a counter next to the pointer, add one on every update, and compare-and-swap the pair as a unit.</p>
+<pre class="code"><span class="k">struct</span> <span class="t">tagged</span> { <span class="k">struct</span> <span class="t">node</span> *ptr; <span class="t">uintptr_t</span> version; };
+<span class="k">static</span> <span class="k">_Atomic</span>(<span class="k">struct</span> <span class="t">tagged</span>) top;                 <span class="c">/* 16 bytes: needs a double-width CAS (cmpxchg16b) */</span>
+
+<span class="k">struct</span> <span class="t">node</span> *<span class="f">pop</span>(<span class="t">void</span>)
+{
+    <span class="k">struct</span> <span class="t">tagged</span> old = <span class="f">atomic_load</span>(&amp;top), new;
+    <span class="k">do</span> {
+        <span class="k">if</span> (!old.ptr) <span class="k">return</span> <span class="m">NULL</span>;
+        new.ptr = old.ptr-&gt;next;                     <span class="c">/* still reads a node we don't own: see below */</span>
+        new.version = old.version + <span class="m">1</span>;
+    } <span class="k">while</span> (!<span class="f">atomic_compare_exchange_weak</span>(&amp;top, &amp;old, new));
+    <span class="k">return</span> old.ptr;
+}</pre>
+  <p>On x86-64 the pair is swapped with <code>lock cmpxchg16b</code>. Where no double-width CAS exists, the tag is squeezed into bits of the pointer that are unused: the low bits, which alignment keeps at zero, or the top 16 bits of a 64-bit address. Storing array indexes with a counter instead of pointers is another common form.</p>
+
+  <h2>Fix two, the hard one: when may a node be freed?</h2>
+  <p>Tags stop the bad CAS. They do nothing about the other bug: a thread still dereferences <code>old.ptr</code> after another thread may have freed it. With a lock this can't happen, since nobody frees a node while someone is in the critical section. Without one, "is anyone still looking at this?" is a real question, called <b>safe memory reclamation</b>, and it is the hardest part of lock-free programming in a language without garbage collection.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Approach</th><th>Idea</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><b>Never free</b></td><td>Nodes go back to a private pool and are only ever reused as nodes, so a stale read sees a valid node, not garbage. Tags handle the ABA</td><td>Memory is never returned; fine for fixed-size pools</td></tr>
+        <tr><td><b>Hazard pointers</b></td><td>Before dereferencing a node, a thread publishes its address in a per-thread "hazard" slot. Before freeing a node, a thread checks every slot, and defers the free if the node is listed</td><td>A store and a barrier on every access; bounded garbage</td></tr>
+        <tr><td><b>Epochs / RCU</b></td><td>Readers announce "I am reading" cheaply. A removed node is freed only after every reader that could have seen it has finished</td><td>Almost free for readers; garbage can pile up if a reader stalls</td></tr>
+        <tr><td><b>Garbage collection</b></td><td>The runtime frees a node only when no reference to it exists anywhere</td><td>A garbage collector. It is why lock-free code is far easier in Java and Go, and why ABA from reused addresses can't occur there</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🐧</div>
+    <div class="body"><div class="title">RCU: how the Linux kernel reads without locking</div><p>The most widely used lock-free technique in practice is <b>read-copy-update</b>, added to Linux in 2002 by Paul McKenney and others and now used in well over ten thousand places in the kernel: the routing tables, the list of processes, the dentry cache that speeds up every path lookup. It suits data that is read constantly and changed rarely. A reader does no atomic operation on the data at all. It marks the start and end of its read, which in the kernel costs about as much as nothing, and follows pointers freely in between. A writer never modifies a structure that readers can see. It makes a copy, changes the copy, and swings one pointer to it with an atomic store, exactly the publish pattern of Chapter 25, so a reader sees the complete old version or the complete new one. The writer then waits for a <b>grace period</b>, the time it takes for every reader that was already running to finish, and only then frees the old version. No reader ever waits or retries, and reads scale perfectly with the number of cores, because readers write nothing shared. The price is paid by writers, who must copy and wait, and by memory, which holds two versions for a while.</p></div>
+  </div>
+<pre class="code"><span class="c">/* Linux kernel style. Readers: */</span>
+<span class="f">rcu_read_lock</span>();                                 <span class="c">/* not a lock: it marks "a reader is active here" */</span>
+<span class="k">struct</span> <span class="t">config</span> *c = <span class="f">rcu_dereference</span>(current_config);
+timeout = c-&gt;timeout;                            <span class="c">/* c stays valid until rcu_read_unlock() */</span>
+<span class="f">rcu_read_unlock</span>();
+
+<span class="c">/* A writer (writers still exclude each other with an ordinary lock): */</span>
+<span class="k">struct</span> <span class="t">config</span> *new = <span class="f">kmalloc</span>(<span class="k">sizeof</span> *new, GFP_KERNEL);
+*new = *old;                                     <span class="c">/* read-copy ... */</span>
+new-&gt;timeout = <span class="m">60</span>;                               <span class="c">/* ... update the copy ... */</span>
+<span class="f">rcu_assign_pointer</span>(current_config, new);         <span class="c">/* ... publish it atomically */</span>
+<span class="f">synchronize_rcu</span>();                               <span class="c">/* wait until no reader can still hold old */</span>
+<span class="f">kfree</span>(old);</pre>
+
+  <h2>Should you write lock-free code?</h2>
+  <p>Usually not. The stack above is the easiest lock-free structure there is, and it took two subtle fixes to make correct. A queue is much harder, and a hash table harder again. Use the proven implementations: the concurrent collections of your language, a library such as liburcu or Folly, the kernel's primitives. Reach for them when you have measured lock contention you can't design away, or when you need the guarantee itself. And measure afterwards too: under heavy contention a lock-free structure's cache line bounces between cores just as a lock's would (<a href="32-multicore-caches-numa.html">Chapter 32</a>), and the retries are pure waste.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Assuming lock-free means faster.</b> It means no thread can block the others. Uncontended mutexes are often quicker and always simpler.</li>
+      <li><b>Treating "same pointer" as "nothing changed".</b> That assumption is the ABA problem. Compare a version too, or make address reuse impossible.</li>
+      <li><b>Freeing a node as soon as it is unlinked.</b> Another thread may be about to dereference it. You need a reclamation scheme.</li>
+      <li><b>Updating two variables with two CASes.</b> Other threads can see the state between them. Either the invariant must hold at every step or both must be one atomic unit.</li>
+      <li><b>Testing only on x86 and only lightly loaded.</b> These bugs need a preemption at one precise instruction. Use stress tests, ThreadSanitizer and a weakly ordered CPU.</li>
+      <li><b>Writing your own when a library exists.</b> Published lock-free algorithms have had errors found in them years later.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the ABA problem?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is a flaw in using compare-and-swap to detect change. A thread reads a shared value A, computes something from the state it saw, and plans to CAS from A to a new value. Before it does, other threads change the value to B and then back to A. The CAS succeeds because the value matches, but the state the thread reasoned about is gone. The classic case is a lock-free stack: a thread reads top = A and A's next = B, then is preempted; others pop A and B, free B, and push A back. The CAS from A to B succeeds and installs a pointer to freed memory. It arises with pointers because allocators reuse addresses. Fixes are to pair the pointer with a version counter and CAS both, so any intervening update makes the CAS fail, or to prevent reuse while anyone may hold a reference, with hazard pointers, epoch-based reclamation or a garbage collector.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> When would you choose a lock-free structure over a mutex, and what would make you hesitate?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I'd choose it when I need the progress guarantee or when a measured lock is the bottleneck. The guarantee matters where a stalled lock holder is unacceptable: code that runs in signal or interrupt context and can't sleep, real-time paths that can't tolerate priority inversion, or systems where threads can be descheduled for long periods while others must keep going. For performance, read-mostly data is the strong case: RCU-style schemes let readers proceed with no shared writes at all, which scales across cores in a way a reader–writer lock can't. I'd hesitate for three reasons. Correctness is hard: ABA, memory reclamation and memory ordering all have to be right, and bugs appear only under rare interleavings. It is often not faster: with write contention, failed CAS attempts are wasted work and the cache line still bounces between cores. And maintenance: few engineers can review it. So my order is a mutex with short critical sections first, then partitioning or sharding to cut contention, then an existing, well-tested concurrent structure, and only then something written by hand.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Lock-free means some thread always makes progress; wait-free means every thread does. Neither means fast.</li>
+      <li>The basic tool is the CAS retry loop: read, compute privately, swap if unchanged, otherwise retry.</li>
+      <li>A CAS checks that a value is the same, not that it was never changed. A to B to A fools it: the ABA problem.</li>
+      <li>A version tag swapped together with the pointer makes any intervening update visible.</li>
+      <li>The harder problem is reclamation: a node can't be freed while another thread might still dereference it.</li>
+      <li>Hazard pointers, epochs and RCU, or a garbage collector, solve reclamation. Use proven implementations.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does it mean for a data structure to be lock-free?</p>
+      <div class="opts">
+        <button class="opt">It is always faster than one that uses a mutex</button>
+        <button class="opt">Whatever the scheduler does, at least one thread completes its operation in a bounded number of steps</button>
+        <button class="opt">Every thread completes its operation in a bounded number of steps</button>
+        <button class="opt">It never uses atomic instructions</button>
+      </div>
+      <div class="explain">Lock-free guarantees system-wide progress. "Every thread" is the stronger wait-free guarantee, and speed is not part of either definition.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">In a CAS retry loop, a thread's compare-and-swap fails. What does that tell it?</p>
+      <div class="opts">
+        <button class="opt">The program has a bug</button>
+        <button class="opt">The variable is locked</button>
+        <button class="opt">It should sleep before trying again</button>
+        <button class="opt">Another thread changed the variable since it was read, so it must recompute from the new value</button>
+      </div>
+      <div class="explain">A failure means someone else succeeded. The loop reloads the current value and tries again.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Thread 1 reads <code>top = A</code> and <code>A-&gt;next = B</code>. Thread 2 then pops A, pops and frees B, and pushes A back. What does thread 1's <code>CAS(top, A, B)</code> do?</p>
+      <div class="opts">
+        <button class="opt">Succeeds, and sets top to B, which has been freed</button>
+        <button class="opt">Fails, because the stack was modified</button>
+        <button class="opt">Blocks until thread 2 finishes</button>
+        <button class="opt">Succeeds, and correctly sets top to C</button>
+      </div>
+      <div class="explain">The CAS only compares addresses, and top holds A again. This is the ABA problem.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How does a version tag fix the ABA problem?</p>
+      <div class="opts">
+        <button class="opt">It prevents nodes from being freed</button>
+        <button class="opt">It locks the stack during a pop</button>
+        <button class="opt">Every update increments a counter that is compared along with the pointer, so the CAS fails if anything changed in between</button>
+        <button class="opt">It stops the allocator from reusing addresses</button>
+      </div>
+      <div class="explain">The pointer may return to A, but the version can't return to its old value, so the pair no longer matches.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In RCU, when is the old version of an updated structure freed?</p>
+      <div class="opts">
+        <button class="opt">Immediately after the pointer is switched</button>
+        <button class="opt">After a grace period: once every reader that might have seen the old version has finished</button>
+        <button class="opt">When its reference count reaches zero</button>
+        <button class="opt">Never</button>
+      </div>
+      <div class="explain">Readers take no lock and hold no count, so the writer waits until all readers that were in progress have left their read sections.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  let tagged = 'off', s, last;
+  const fresh = () => ({ next: { A: 'B', B: 'C', C: null }, where: { A: 'stack', B: 'stack', C: 'stack' }, top: 'A', ver: 0, held: [], t1: { pc: 0, old: null, seen: null, next: null }, got: null, corrupt: false });
+  function reset() { s = fresh(); last = null; }
+  const P = (x) => x === null ? 'NULL' : x;
+  function t1Step() {
+    const t = s.t1;
+    if (t.pc === 0) {
+      t.old = s.top; t.seen = s.ver; t.next = null; t.pc = 1;
+      if (t.old === null) { t.pc = 3; return { cls: 'lf-ok', text: 'Thread 1 reads <code>top</code>: it is NULL. The stack is empty, so <code>pop</code> returns NULL.' }; }
+      return { cls: '', text: `Thread 1 reads <code>top</code>: it is <b>${t.old}</b>` + (tagged === 'on' ? `, at <b>version ${t.seen}</b>` : '') + '. Nothing protects that node while thread 1 goes on to use it.' };
+    }
+    if (t.pc === 1) {
+      t.next = s.next[t.old]; t.pc = 2;
+      if (s.where[t.old] === 'freed') return { cls: 'lf-bad', text: `Thread 1 reads <code>${t.old}-&gt;next</code>, but <b>${t.old} has been freed</b>. This is a read of freed memory: here it still finds ${P(t.next)}, in a real program it could find anything. Version tags don't help with this; it needs a reclamation scheme.` };
+      return { cls: '', text: `Thread 1 reads <code>${t.old}-&gt;next</code>: it is <b>${P(t.next)}</b>. It now plans to make ${P(t.next)} the new top. Suppose it is preempted here.` };
+    }
+    const same = s.top === t.old, ok = same && (tagged === 'off' || s.ver === t.seen);
+    if (!ok) {
+      const why = same ? `<code>top</code> is ${P(t.old)} again, but its version is ${s.ver}, not the ${t.seen} thread 1 saw` : `<code>top</code> is now ${P(s.top)}, not ${P(t.old)}`;
+      t.pc = 0;
+      return { cls: 'lf-ok', text: `Thread 1's CAS <b>fails</b>: ${why}. Something changed, so its plan is out of date. It throws the plan away and starts again from the current state.` };
+    }
+    const nx = t.next;
+    s.top = nx; s.ver++; s.where[t.old] = 't1'; s.got = t.old; t.pc = 3;
+    if (nx !== null && s.where[nx] !== 'stack') {
+      s.corrupt = true;
+      const lost = ['A', 'B', 'C'].filter((n) => s.where[n] === 'stack' && n !== nx);
+      return { cls: 'lf-bad', text: `Thread 1's CAS <b>succeeds</b>, because <code>top</code> holds the address ${t.old} again. It installs ${nx} as the top. But <b>${nx} ${s.where[nx] === 'freed' ? 'was freed' : 'is not on the stack'}</b>` + (lost.length ? `, and ${lost.join(' and ')}, which really ${lost.length > 1 ? 'are' : 'is'} on the stack, can no longer be reached` : '') + '. The stack is corrupt, and nothing has reported an error.' };
+    }
+    return { cls: 'lf-ok', text: `Thread 1's CAS <b>succeeds</b>: <code>top</code> was still ${t.old}${tagged === 'on' ? ' at version ' + t.seen : ''}, and it becomes ${P(nx)}. Thread 1 has popped ${t.old}, correctly.` };
+  }
+  function t2(op) {
+    if (op === 'pop') {
+      if (s.top === null) return { cls: '', text: 'Thread 2 pops, but the stack is empty.' };
+      const x = s.top; s.top = s.next[x]; s.ver++; s.where[x] = 'held'; s.held.push(x);
+      return { cls: '', text: `Thread 2 pops <b>${x}</b>. <code>top</code> is now ${P(s.top)}.` };
+    }
+    if (op === 'free') {
+      const x = s.held.pop(); s.where[x] = 'freed';
+      return { cls: 'lf-warn', text: `Thread 2 frees <b>${x}</b>. Its memory goes back to the allocator.` + (s.t1.pc > 0 && s.t1.pc < 3 && (s.t1.old === x || s.t1.next === x) ? ` Thread 1 still has ${x} in a local variable.` : '') };
+    }
+    const x = s.held.shift(); s.next[x] = s.top; s.top = x; s.ver++; s.where[x] = 'stack';
+    return { cls: s.t1.pc === 2 && s.t1.old === x ? 'lf-warn' : '', text: `Thread 2 pushes <b>${x}</b> back. <code>top</code> is ${x} and ${x}'s next is now ${P(s.next[x])}.` + (s.t1.pc === 2 && s.t1.old === x ? ` <code>top</code> holds the same address thread 1 read earlier, but the stack underneath is different.` : '') };
+  }
+  function chainHtml() {
+    let h = `<span class="lf-top">top${tagged === 'on' ? ' (v' + s.ver + ')' : ''}</span>`, n = s.top, hops = 0;
+    while (n !== null && hops++ < 5) {
+      const dead = s.where[n] !== 'stack';
+      h += `<span class="lf-arrow">→</span><span class="lf-n ${dead ? 'lf-freed' : ''}">${n}</span>`;
+      if (dead) { h += '<span class="lf-arrow">→ ?</span>'; return h; }
+      n = s.next[n];
+    }
+    return h + '<span class="lf-arrow">→</span><span>NULL</span>';
+  }
+  function render() {
+    const t = s.t1, held = s.held, freed = ['A', 'B', 'C'].filter((n) => s.where[n] === 'freed');
+    $('#lfChain').innerHTML = chainHtml();
+    const lines = tagged === 'on' ? ['old = top;          // pointer and version', 'next = old.ptr->next;', 'CAS(&top, old, {next, old.version + 1});'] : ['old = top;', 'next = old->next;', 'CAS(&top, old, next);'];
+    $('#lfCode').innerHTML = lines.map((l, i) => `<div class="lf-ln ${i < t.pc ? 'lf-ran' : ''} ${i === t.pc ? 'lf-cur' : ''}">${l.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</div>`).join('');
+    $('#lfLoc').innerHTML = t.pc === 3 ? `finished: returned <b>${P(s.got)}</b>` : `locals: old = <b>${t.pc >= 1 ? P(t.old) : '?'}</b>` + (tagged === 'on' ? `, version seen = <b>${t.pc >= 1 ? t.seen : '?'}</b>` : '') + `, next = <b>${t.pc >= 2 ? P(t.next) : '?'}</b>`;
+    $('#lfHeld').innerHTML = 'holds: ' + (held.length ? held.map((n) => `<span class="lf-n lf-held">${n}</span>`).join('') : 'nothing');
+    $('#lfFreed').innerHTML = 'freed: ' + (freed.length ? freed.map((n) => `<span class="lf-n lf-freed">${n}</span>`).join('') : 'nothing');
+    const d = $('#lfDesc');
+    d.className = 'lf-desc ' + (last ? last.cls : '');
+    d.innerHTML = last ? last.text : 'The stack is A, then B, then C. Step thread 1 through its pop, and run thread 2 between the steps.';
+    $('#lfStats').innerHTML = `<div class="stat"><div class="k">Updates to top</div><div class="v">${s.ver}</div></div>
+      <div class="stat"><div class="k">Thread 1</div><div class="v" style="font-size:16px">${t.pc === 3 ? 'returned ' + P(s.got) : t.pc === 0 ? 'not started' : 'paused mid-pop'}</div></div>
+      <div class="stat ${s.corrupt ? 'bad' : t.pc === 3 ? 'good' : ''}"><div class="k">Stack</div><div class="v" style="font-size:16px">${s.corrupt ? 'corrupt' : 'intact'}</div></div>`;
+    $('#lfT1').disabled = t.pc === 3; $('#lfT1').textContent = t.pc === 3 ? 'Thread 1: done' : `Thread 1: ${['read top', 'read next', 'CAS'][t.pc]} →`;
+    $('#lfPop').disabled = s.corrupt || s.top === null;
+    $('#lfFree').disabled = s.corrupt || !held.length; $('#lfFree').textContent = held.length ? `Thread 2: free(${held[held.length - 1]})` : 'Thread 2: free';
+    $('#lfPush').disabled = s.corrupt || !held.length; $('#lfPush').textContent = held.length ? `Thread 2: push ${held[0]} back` : 'Thread 2: push back';
+  }
+  $('#lfT1').onclick = () => { if (s.t1.pc < 3) last = t1Step(); render(); };
+  $('#lfPop').onclick = () => { last = t2('pop'); render(); };
+  $('#lfFree').onclick = () => { if (s.held.length) last = t2('free'); render(); };
+  $('#lfPush').onclick = () => { if (s.held.length) last = t2('push'); render(); };
+  $('#lfReset').onclick = () => { reset(); render(); };
+  $('#lfTag').addEventListener('segchange', (e) => { tagged = e.detail; reset(); render(); });
+  $('#lfPlay').onclick = () => {
+    reset(); t1Step(); t1Step(); t2('pop'); t2('pop'); t2('free'); t2('push');
+    last = { cls: 'lf-warn', text: 'Thread 1 read <code>top = A</code> and <code>next = B</code>, then was preempted. Thread 2 popped A, popped B, freed B and pushed A back. <code>top</code> is A once more, but the stack is now A, then C. Press <b>Thread 1: CAS</b>.' };
+    render();
+  };
+  reset(); render();
+})();
+</script>
+</body>
+</html>

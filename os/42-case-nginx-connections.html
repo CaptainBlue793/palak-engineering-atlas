@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: How nginx Handles 10,000 Connections</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ng-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
+  @media (max-width:760px) { .ng-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .ng-w { border:1.5px solid var(--border); border-radius:12px; padding:9px 11px; background:var(--surface); transition:.2s; }
+  .ng-w h6 { margin:0 0 2px; font-size:13px; }
+  .ng-w small { display:block; font-size:12px; color:var(--muted); min-height:17px; }
+  .ng-w b { display:block; margin-top:4px; font-family:var(--mono); font-size:20px; }
+  .ng-w b span { font-size:12px; font-weight:500; color:var(--muted); }
+  .ng-w .ng-bar { height:8px; margin-top:6px; border-radius:4px; background:var(--surface-3); overflow:hidden; }
+  .ng-w .ng-bar i { display:block; height:100%; background:var(--accent-2); transition:width .25s; }
+  .ng-w.ng-got { border-color:var(--green); background:var(--green-soft); }
+  .ng-w.ng-woke { border-color:var(--amber); background:var(--amber-soft); }
+  .ng-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .ng-desc.ng-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .ng-desc.ng-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
+</head>
+<body data-chapter="42">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 42</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Case Study: <span class="grad">How nginx Handles 10,000 Connections</span></h1>
+    <p class="lead">nginx was written in the early 2000s to answer one question: how does a single machine hold ten thousand client connections at once? Its answer is now the standard shape of a network server. A few processes, one per core. Each runs one thread in one loop, never blocks, and treats every connection as a small record of state instead of a thread with a stack. Static files leave through the kernel without ever being copied into the server. Almost every design decision in it is a chapter of this course applied on purpose: fork, epoll, the event loop, the page cache, privilege dropping. This case study walks through a running nginx and shows which mechanism is doing what.</p>
+    <ul class="objectives">
+      <li>Describe the master and worker processes and what each is for</li>
+      <li>Follow one request through a worker's event loop</li>
+      <li>Explain the thundering herd on accept and the three ways nginx has avoided it</li>
+      <li>Explain what sendfile saves when serving a file</li>
+      <li>Compare the design with a thread or process per connection</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>epoll, readiness and edge-triggering.</b> See <a href="28-io-multiplexing-epoll.html">Chapter 28</a>.</li>
+        <li><b>Event loops, and why they must not block.</b> See <a href="29-event-loops-io-uring.html">Chapter 29</a>.</li>
+        <li><b>fork, and descriptors shared across it.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a> and <a href="10-file-descriptors.html">Chapter 10</a>.</li>
+        <li><b>The page cache.</b> See <a href="31-page-cache-fsync.html">Chapter 31</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Master and workers</h2>
+<pre class="code"><span class="c">$</span> ps -o pid,ppid,user,nlwp,rss,cmd -C nginx
+    PID    PPID USER     NLWP   RSS CMD
+   <span class="m">1201</span>       <span class="m">1</span> root        <span class="m">1</span>  <span class="m">2104</span> nginx: master process /usr/sbin/nginx
+   <span class="m">1202</span>    <span class="m">1201</span> www-data    <span class="m">1</span>  <span class="m">9820</span> nginx: worker process
+   <span class="m">1203</span>    <span class="m">1201</span> www-data    <span class="m">1</span>  <span class="m">9744</span> nginx: worker process
+   <span class="m">1204</span>    <span class="m">1201</span> www-data    <span class="m">1</span>  <span class="m">9912</span> nginx: worker process
+   <span class="m">1205</span>    <span class="m">1201</span> www-data    <span class="m">1</span>  <span class="m">9801</span> nginx: worker process</pre>
+  <p>Five processes on a four-core machine, each with a single thread (<code>NLWP</code> 1), and two different users. That listing is the architecture.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Master process</th><th>Worker processes</th></tr></thead>
+      <tbody>
+        <tr><td><b>How many</b></td><td>One</td><td>One per core (<code>worker_processes auto</code>)</td></tr>
+        <tr><td><b>Runs as</b></td><td>root</td><td>An unprivileged user</td></tr>
+        <tr><td><b>Does</b></td><td>Reads the configuration, opens the listening sockets on ports 80 and 443, forks the workers, and waits for signals</td><td>Everything a client sees: accepting connections, reading requests, sending responses</td></tr>
+        <tr><td><b>Touches client data</b></td><td>Never</td><td>Constantly</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The split is least privilege at work (<a href="36-os-security.html">Chapter 36</a>). Binding a port below 1024 needs privilege, so the master does that, and only that, as root. The workers are created by <code>fork</code>, so they inherit the listening sockets as open descriptors (<a href="10-file-descriptors.html">Chapter 10</a>), and then drop to an ordinary user before reading a byte from the network. A bug in request parsing is a bug in an unprivileged process.</p>
+  <p>The master also makes configuration changes painless. On <code>nginx -s reload</code> it reads the new configuration, forks a new set of workers, and tells the old ones to stop accepting and exit once their current requests finish. No connection is dropped, and the listening sockets never close.</p>
+
+  <h2>One event loop per worker</h2>
+  <p>Each worker is the loop of <a href="29-event-loops-io-uring.html">Chapter 29</a>: wait in <code>epoll_wait</code>, handle whatever is ready, repeat. A connection is not a thread. It is a small structure holding the socket, a buffer and a position in a state machine, and nginx's own figure is about 2.5 MB of memory for ten thousand idle keep-alive connections.</p>
+  <figure class="seq" data-actors="Client|Kernel|Worker">
+    <ol>
+      <li data-m="0>1">TCP handshake on port 443</li>
+      <li data-m="1>2">epoll_wait returns: the listening socket is readable</li>
+      <li data-m="2>1">accept4(): a new non-blocking socket; register it with epoll</li>
+      <li data-m="0>1">the request arrives</li>
+      <li data-m="1>2">epoll_wait returns: that socket is readable</li>
+      <li data-m="2>1">read() until EAGAIN; parse; open the file; sendfile()</li>
+      <li data-m="1>0" data-k="reply">response</li>
+      <li data-m="2>1">back to epoll_wait, with the connection kept for the next request</li>
+    </ol>
+    <figcaption><b>One request in one worker.</b> Between each pair of steps the worker is handling other connections. It only ever waits in one place, <code>epoll_wait</code>, and there it is waiting for all of them at once.</figcaption>
+  </figure>
+<pre class="code"><span class="c"># /etc/nginx/nginx.conf: the lines that set this up</span>
+worker_processes  auto;                 <span class="c"># one worker per core</span>
+events {
+    worker_connections  <span class="m">4096</span>;           <span class="c"># per worker</span>
+}
+http {
+    sendfile        on;                 <span class="c"># files go from the page cache straight to the socket</span>
+    tcp_nopush      on;                 <span class="c"># send the headers and the start of the file in one packet</span>
+    keepalive_timeout  <span class="m">65</span>;
+}</pre>
+  <p>Because a worker has one thread, it has no locks round its own data, and one worker per core means the kernel has no reason to move it: its caches stay warm (<a href="32-multicore-caches-numa.html">Chapter 32</a>). The price is the rule from Chapter 29. A worker must never block. Disk reads are the awkward case, since a file that isn't in the page cache blocks whoever reads it, so nginx can hand those reads to a small thread pool and collect the result as another event.</p>
+
+  <h2>Who accepts? The thundering herd</h2>
+  <p>All four workers inherited the same listening socket, and each has it in its epoll set. When a connection arrives, the socket becomes readable for all of them. The naive result is that <b>every worker wakes</b>, they all call <code>accept</code>, one gets the connection, and the rest get <code>EAGAIN</code> and go back to sleep, having achieved nothing but context switches. This is the <b>thundering herd</b>. nginx has used three remedies over the years:</p>
+  <ul>
+    <li><b>An accept mutex.</b> Workers take turns holding a lock, and only the holder has the listening socket in its epoll set. One worker wakes. It was nginx's default for many years.</li>
+    <li><b><code>EPOLLEXCLUSIVE</code></b> (Linux 4.5, 2016). A flag asking the kernel to wake just one of the waiters on a shared socket. No lock is needed in user space; modern nginx uses it and has the mutex off by default.</li>
+    <li><b><code>SO_REUSEPORT</code></b> (<code>listen 80 reuseport;</code>). Each worker opens its <i>own</i> listening socket on the same port, and the kernel shares incoming connections among the sockets by hashing the client's address. No shared socket, no herd, and no contention on one accept queue.</li>
+  </ul>
+
+  <h2>Deliver some connections</h2>
+  <p>Four workers, one port. Send connections one at a time to see who wakes, then send a thousand and compare how the work is shared out.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Four workers and a listening port</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="ngMode"><button class="active" data-v="herd">shared socket, no protection</button><button data-v="mutex">accept mutex</button><button data-v="excl">EPOLLEXCLUSIVE</button><button data-v="reuse">SO_REUSEPORT</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="ngOne">1 connection arrives</button>
+        <button class="btn sm" id="ngMany">1,000 arrive</button>
+        <button class="btn sm" id="ngReset">↺ Reset</button>
+      </div>
+      <div class="ng-grid" id="ngGrid"></div>
+      <div class="ng-desc" id="ngDesc"></div>
+      <div class="stats" id="ngStats"></div>
+    </div>
+    <div class="panel-foot">A model of a lightly loaded server: each connection keeps a worker busy for a fraction of the gap before the next one. With <code>EPOLLEXCLUSIVE</code> the kernel goes through the workers in a fixed order and wakes the first that is idle. With <code>SO_REUSEPORT</code> it picks a socket by hashing the client's address and port. Amber means a worker was woken for nothing.</div>
+  </div>
+
+  <p>Things to notice. With no protection, a thousand connections cause four thousand wake-ups, three quarters of them wasted. The other three modes wake one worker each time, but they share the work very differently. The mutex passes round, so the split is even. <code>EPOLLEXCLUSIVE</code> wakes the first idle worker in a fixed order, which under light load is nearly always the same one, so one worker ends up doing most of the work while the others idle. <code>SO_REUSEPORT</code> spreads connections evenly by hash, whether or not the chosen worker is free.</p>
+
+  <div class="callout usecase">
+    <div class="ico">⚖️</div>
+    <div class="body"><div class="title">"Why does one NGINX worker take all the load?"</div><p>Engineers at Cloudflare noticed exactly what the panel shows: on their servers one nginx worker was far busier than the rest, and they published an investigation under that title in 2017. The cause was the order in which the kernel wakes waiters on a shared socket. It isn't round-robin. The kernel's choice favours the same worker whenever that worker is free, so a worker that has just finished a request is given the next one too, and the busiest worker stays busiest. Their first instinct was that this must be bad, and they tested <code>SO_REUSEPORT</code>, which gave a beautifully even spread. Then they measured latency, and it was <i>worse</i>, especially in the tail. With one socket per worker, a connection is assigned by hash to a particular worker's queue, and if that worker happens to be busy with a slow request the connection waits, even though three other workers are idle. With a shared socket, any idle worker can take it. The uneven load had been keeping one worker's caches hot and costing nothing. The conclusion, that balanced isn't the same as fast, is the kind you only reach by measuring: the three accept strategies are still all in nginx because each wins on some workload.</p></div>
+  </div>
+
+  <h2>sendfile: the file never visits user space</h2>
+  <p>Serving a static file the obvious way moves every byte across the user–kernel boundary twice:</p>
+<pre class="code"><span class="c">/* The obvious way: two system calls and two copies per chunk */</span>
+<span class="k">while</span> ((n = <span class="f">read</span>(file_fd, buf, <span class="k">sizeof</span> buf)) &gt; <span class="m">0</span>)     <span class="c">/* page cache -&gt; buf  (copy 1) */</span>
+    <span class="f">write</span>(sock_fd, buf, n);                          <span class="c">/* buf -&gt; socket buffer  (copy 2) */</span>
+
+<span class="c">/* sendfile: one system call, and the data stays in the kernel */</span>
+<span class="t">off_t</span> off = <span class="m">0</span>;
+<span class="f">sendfile</span>(sock_fd, file_fd, &amp;off, file_size);         <span class="c">/* page cache -&gt; socket, by reference */</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th><code>read</code> + <code>write</code></th><th><code>sendfile</code></th></tr></thead>
+      <tbody>
+        <tr><td><b>Path of the data</b></td><td>Page cache → user buffer → socket buffer → network card</td><td>Page cache → network card. The socket buffer holds references to the cached pages</td></tr>
+        <tr><td><b>Copies made by the CPU</b></td><td>Two</td><td>None, with a network card that can gather data from several places</td></tr>
+        <tr><td><b>System calls for a 1 MB file</b></td><td>Hundreds, with small buffers</td><td>One, or a few</td></tr>
+        <tr><td><b>User-space memory</b></td><td>A buffer per connection</td><td>None</td></tr>
+        <tr><td><b>Limits</b></td><td>None</td><td>The data can't be changed on the way: no compression on the fly, and encryption only if the kernel does the TLS</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>This is <b>zero-copy</b> I/O, and it rests on <a href="31-page-cache-fsync.html">Chapter 31</a>: the file's pages are already in memory in the page cache, and the kernel's network stack can transmit straight from them. A worker serving a thousand large downloads is doing almost no work per byte. It is telling the kernel which file goes to which socket.</p>
+
+  <h2>Compared with a thread or process per connection</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Process or thread per connection (classic Apache)</th><th>Event loop per core (nginx)</th></tr></thead>
+      <tbody>
+        <tr><td><b>An idle connection costs</b></td><td>A process or thread: a stack, kernel structures, megabytes</td><td>A few kilobytes of state</td></tr>
+        <tr><td><b>10,000 slow clients</b></td><td>10,000 threads, mostly asleep, and a scheduler juggling them. An attacker can hold them open cheaply</td><td>10,000 entries in epoll sets. The workers don't notice</td></tr>
+        <tr><td><b>Context switches</b></td><td>One or more per request</td><td>Almost none: a worker keeps its core</td></tr>
+        <tr><td><b>Application code</b></td><td>Simple: write it as if the connection were the only one, and block freely</td><td>Must never block; logic is a state machine or callbacks</td></tr>
+        <tr><td><b>A slow or CPU-heavy handler</b></td><td>Delays one connection</td><td>Delays every connection on that worker</td></tr>
+        <tr><td><b>Best at</b></td><td>Running application code inside the server</td><td>Holding many connections, proxying and serving files</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>That last row is why the two are so often used together: nginx at the front holding the thousands of slow client connections, passing complete requests to a smaller pool of application processes behind it that are allowed to block.</p>
+<pre class="code"><span class="c">$</span> ss -lntp | grep nginx                       <span class="c"># one listening socket shared by all the workers ...</span>
+LISTEN 0 511 0.0.0.0:80  users:((<span class="s">"nginx"</span>,pid=<span class="m">1205</span>,fd=<span class="m">6</span>),(<span class="s">"nginx"</span>,pid=<span class="m">1204</span>,fd=<span class="m">6</span>),(<span class="s">"nginx"</span>,pid=<span class="m">1203</span>,fd=<span class="m">6</span>),(<span class="s">"nginx"</span>,pid=<span class="m">1202</span>,fd=<span class="m">6</span>),(<span class="s">"nginx"</span>,pid=<span class="m">1201</span>,fd=<span class="m">6</span>))
+<span class="c">$</span> strace -c -p <span class="m">1202</span>                           <span class="c"># ... and what a worker spends its system calls on</span>
+% time     calls  syscall
+ <span class="m">38.1</span>     <span class="m">41200</span>  epoll_wait
+ <span class="m">22.4</span>     <span class="m">20114</span>  sendfile
+ <span class="m">14.9</span>     <span class="m">20130</span>  recvfrom
+  <span class="m">9.8</span>     <span class="m">20114</span>  openat</pre>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Setting far more workers than cores.</b> Workers don't block, so extra ones only add context switches and cold caches.</li>
+      <li><b>Blocking inside a worker.</b> A slow disk, a synchronous lookup or a heavy script in the worker stalls every connection it holds.</li>
+      <li><b>Forgetting the descriptor limit.</b> Each connection is a descriptor, and a proxied one is two. Raise the limit to match <code>worker_connections</code>.</li>
+      <li><b>Assuming even load across workers is the goal.</b> Measure latency. A shared socket with uneven load can beat a perfectly balanced one.</li>
+      <li><b>Expecting sendfile to apply to everything.</b> Compressed or transformed responses must pass through user space.</li>
+      <li><b>Running the workers as root.</b> Only the master needs it, and only to bind the ports.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does nginx handle thousands of concurrent connections with only a few processes?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It uses an event-driven design instead of a thread per connection. A master process, running as root, binds the listening ports and forks one worker per CPU core; the workers inherit the listening sockets and drop privileges. Each worker is single-threaded and runs an event loop on epoll. All its sockets are non-blocking and registered with epoll; the worker sleeps in <code>epoll_wait</code>, wakes when some sockets are ready, does a small amount of work on each, such as reading part of a request or writing part of a response, and goes back to waiting. A connection is just a small state structure, a few kilobytes, so tens of thousands cost little memory and no context switches, and idle or slow clients cost almost nothing. Static files are sent with <code>sendfile</code>, directly from the page cache to the socket. The constraint is that a worker must never block, so blocking work is pushed to thread pools or to upstream application servers.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> What is the thundering herd problem in this design, and how is it avoided?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>All workers share one listening socket, inherited through fork, and each waits on it with epoll. When a connection arrives the socket becomes readable for all of them, so every worker is woken, they all call <code>accept</code>, one succeeds and the rest get <code>EAGAIN</code>: wasted wake-ups and context switches on every connection. There are three fixes. An accept mutex in user space, so that only the worker holding it listens for new connections at any moment. The <code>EPOLLEXCLUSIVE</code> flag, which asks the kernel to wake only one waiter per event; it prefers the same worker whenever that worker is idle, so load concentrates on a few workers under light traffic. Or <code>SO_REUSEPORT</code>, where each worker has its own listening socket on the same port and the kernel distributes connections by hashing the client address; that removes contention and balances evenly, but a connection is bound to one worker's queue and waits if that worker is busy, which can hurt tail latency. Which is best depends on the workload, so I'd measure latency, not just the distribution.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A root master binds ports and forks workers; unprivileged workers, one per core, do all the serving.</li>
+      <li>Each worker is one thread running an epoll event loop over non-blocking sockets. A connection is a few kilobytes of state.</li>
+      <li>Workers share the listening socket through fork, which invites a thundering herd on accept.</li>
+      <li>An accept mutex, <code>EPOLLEXCLUSIVE</code> or <code>SO_REUSEPORT</code> each wake one worker; they differ in how evenly, and how quickly, connections are picked up.</li>
+      <li><code>sendfile</code> sends file data from the page cache to the socket inside the kernel, with no copies through user space.</li>
+      <li>The model excels at many slow connections and fails if a worker blocks, which is why it is paired with separate application servers.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why does the nginx master process run as root while the workers don't?</p>
+      <div class="opts">
+        <button class="opt">Root processes are scheduled first</button>
+        <button class="opt">The workers aren't allowed to use epoll as root</button>
+        <button class="opt">Binding ports below 1024 needs privilege; the code that handles untrusted client data should have none</button>
+        <button class="opt">Only root can call <code>fork</code></button>
+      </div>
+      <div class="explain">The master does the one privileged job and forks; the workers inherit the sockets and drop to an ordinary user. Least privilege.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">How do the worker processes come to share one listening socket?</p>
+      <div class="opts">
+        <button class="opt">The master opens it before forking, and each child inherits the open descriptor</button>
+        <button class="opt">Each worker binds the port separately</button>
+        <button class="opt">The kernel copies connections between workers</button>
+        <button class="opt">They pass it to each other over a pipe</button>
+      </div>
+      <div class="explain"><code>fork</code> copies the descriptor table, so every worker has a descriptor for the same socket.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Four workers wait on a shared listening socket with no protection. One connection arrives. What happens?</p>
+      <div class="opts">
+        <button class="opt">The kernel picks one worker at random to wake</button>
+        <button class="opt">The master accepts it and hands it on</button>
+        <button class="opt">All four accept it</button>
+        <button class="opt">All four wake; one accepts the connection and three find nothing and go back to sleep</button>
+      </div>
+      <div class="explain">The thundering herd: every waiter is told the socket is readable, though there is work for only one.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does <code>sendfile</code> avoid, compared with a loop of <code>read</code> and <code>write</code>?</p>
+      <div class="opts">
+        <button class="opt">Reading the file from disk</button>
+        <button class="opt">Copying the file's data into a user-space buffer and back into the kernel</button>
+        <button class="opt">The TCP handshake</button>
+        <button class="opt">Opening the file</button>
+      </div>
+      <div class="explain">The data goes from the page cache to the socket inside the kernel. The application never sees the bytes.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A module run inside an nginx worker makes a blocking database call that takes 200 ms. What is the effect?</p>
+      <div class="opts">
+        <button class="opt">Only that request is delayed</button>
+        <button class="opt">The master starts another worker to compensate</button>
+        <button class="opt">Every connection handled by that worker is stalled for 200 ms</button>
+        <button class="opt">The kernel preempts the call</button>
+      </div>
+      <div class="explain">A worker has one thread. While it is blocked it isn't in <code>epoll_wait</code>, so none of its other connections make progress.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const N = 4;
+  let mode = 'herd', cnt, st, last, woke, got, turn, busyUntil, now, seed;
+  function rnd() { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; }
+  function reset() { cnt = new Array(N).fill(0); st = { conns: 0, wake: 0, wasted: 0 }; last = null; woke = []; got = null; turn = 0; busyUntil = [-4, -3, -2, -1]; now = 0; seed = 4242; }
+  // Deliver one connection; returns the worker that accepts it.
+  function arrive() {
+    let w;
+    woke = [];
+    if (mode === 'herd') { w = Math.floor(rnd() * N); woke = [0, 1, 2, 3]; st.wake += N; st.wasted += N - 1; }
+    else if (mode === 'mutex') { w = turn; turn = (turn + 1) % N; woke = [w]; st.wake++; }
+    else if (mode === 'reuse') { w = Math.floor(rnd() * N); woke = [w]; st.wake++; }
+    else {
+      now += rnd() < 0.2 ? 0.15 : 1;                                  // mostly spaced out, sometimes a burst
+      const idle = [0, 1, 2, 3].filter((k) => busyUntil[k] <= now);
+      if (idle.length) w = idle[0];                                                         // the kernel's list has a fixed order: first idle worker wins
+      else w = [0, 1, 2, 3].reduce((a, b) => busyUntil[b] < busyUntil[a] ? b : a);          // all busy: whoever is free first
+      busyUntil[w] = Math.max(now, busyUntil[w]) + 0.2 + rnd() * 0.4;
+      woke = [w]; st.wake++;
+    }
+    cnt[w]++; st.conns++; got = w;
+    return w;
+  }
+  const WHY = {
+    herd: (w) => `The listening socket became readable in all four epoll sets, so <b>all four workers woke up</b>. Worker ${w} called <code>accept</code> first and got the connection. The other three got <code>EAGAIN</code> and went back to sleep: three wake-ups, and three context switches, for nothing.`,
+    mutex: (w) => `Only worker ${w} held the accept mutex, so only its epoll set contained the listening socket. <b>One worker woke</b> and accepted. It releases the mutex, and the next worker to take it will watch for the next connection.`,
+    excl: (w) => `The kernel woke <b>one</b> waiter: worker ${w}, the first one in its list that was idle. The list's order doesn't change, so if this worker is free again when the next connection comes, it will be chosen again.`,
+    reuse: (w) => `The kernel hashed the client's address and port and picked worker ${w}'s own listening socket. <b>One worker woke.</b> The choice doesn't depend on whether worker ${w} was busy.`,
+  };
+  function render() {
+    const max = Math.max(1, ...cnt), total = Math.max(1, st.conns);
+    $('#ngGrid').innerHTML = cnt.map((c, k) => `<div class="ng-w ${got === k ? 'ng-got' : woke.includes(k) ? 'ng-woke' : ''}"><h6>Worker ${k}</h6><small>${got === k ? 'accepted it' : woke.includes(k) ? 'woke for nothing' : mode === 'mutex' && turn === k ? 'holds the accept mutex' : ''}</small><b>${c.toLocaleString('en-GB')} <span>${st.conns ? Math.round(c / total * 100) + '%' : ''}</span></b><div class="ng-bar"><i style="width:${(c / max * 100).toFixed(0)}%"></i></div></div>`).join('');
+    const d = $('#ngDesc');
+    d.className = 'ng-desc ' + (last ? last.cls : '');
+    d.innerHTML = last ? last.text : 'Four workers are asleep in <code>epoll_wait</code>. Send a connection.';
+    const top = Math.max(...cnt) / total * 100;
+    $('#ngStats').innerHTML = `<div class="stat"><div class="k">Connections</div><div class="v">${st.conns.toLocaleString('en-GB')}</div></div>
+      <div class="stat"><div class="k">Wake-ups</div><div class="v">${st.wake.toLocaleString('en-GB')}</div></div>
+      <div class="stat ${st.wasted ? 'bad' : st.conns ? 'good' : ''}"><div class="k">Wasted wake-ups</div><div class="v">${st.wasted.toLocaleString('en-GB')}</div></div>
+      <div class="stat ${st.conns > 20 && top > 45 ? 'warn' : ''}"><div class="k">Busiest worker's share</div><div class="v">${st.conns ? top.toFixed(0) + '%' : '–'}</div></div>`;
+  }
+  $('#ngOne').onclick = () => { const w = arrive(); last = { cls: mode === 'herd' ? 'ng-warn' : 'ng-ok', text: WHY[mode](w) }; render(); };
+  $('#ngMany').onclick = () => {
+    for (let i = 0; i < 1000; i++) arrive();
+    woke = []; got = null;
+    const top = Math.max(...cnt) / st.conns * 100;
+    last = mode === 'herd' ? { cls: 'ng-warn', text: `A thousand connections, and each one woke all four workers: <b>${st.wasted.toLocaleString('en-GB')} wasted wake-ups</b> so far. The connections end up evenly spread, by chance, at four times the scheduling cost.` }
+      : mode === 'mutex' ? { cls: 'ng-ok', text: 'One wake-up per connection, and the mutex passes round, so the workers share the load evenly. The cost is a lock that every worker touches on every pass through its loop.' }
+      : mode === 'excl' ? { cls: 'ng-warn', text: `One wake-up per connection and no lock, but look at the split: <b>the busiest worker took ${top.toFixed(0)}%</b>. The kernel always starts from the same end of its list, so the first worker gets everything it has time for. The others only get work when it is busy.` }
+      : { cls: 'ng-ok', text: 'One wake-up per connection, no shared socket, and an even split by hash. What the numbers here can\'t show is the catch: a connection hashed to a worker that is busy waits in that worker\'s queue even if the others are idle.' };
+    render();
+  };
+  $('#ngReset').onclick = () => { reset(); render(); };
+  $('#ngMode').addEventListener('segchange', (e) => { mode = e.detail; reset(); render(); });
+  reset(); render();
+})();
+</script>
+</body>
+</html>

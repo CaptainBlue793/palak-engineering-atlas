@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Threads</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .th-cols { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:14px; }
+  @media (max-width:720px) { .th-cols { grid-template-columns:1fr; } }
+  .th-col { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); overflow:hidden; transition:.25s; }
+  .th-col.th-dead { opacity:.45; border-color:var(--red); }
+  .th-col h5 { margin:0; padding:7px 10px; font-size:12.5px; background:var(--surface-2); border-bottom:1px solid var(--border); display:flex; justify-content:space-between; }
+  .th-row { display:grid; grid-template-columns:96px 1fr; gap:6px; padding:4px 10px; font-family:var(--mono); font-size:12px; border-bottom:1px dashed var(--border); }
+  .th-row:last-child { border-bottom:0; }
+  .th-row b { color:var(--muted); font-weight:600; }
+  .th-row.th-chg span { color:var(--accent); font-weight:800; }
+  .th-row.th-sh b::after { content:" ⇄"; color:var(--accent-2); }
+  .th-acts { display:flex; flex-wrap:wrap; gap:6px; margin-top:12px; }
+  .th-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); }
+  .th-res.th-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
+</head>
+<body data-chapter="5">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 5</span><span class="pill">Beginner</span><span class="pill">⏱ 45 min</span></div>
+    <h1><span class="grad">Threads</span></h1>
+    <p class="lead">A process is a container: an address space, a table of open files, a set of credentials. A <b>thread</b> is a flow of execution inside that container, with its own registers and stack. One process can hold many threads, and they all see the same memory and the same files. That makes threads the cheap, fast way to use several cores at once, and it is also exactly why concurrency is hard: when everything is shared, every shared write is a potential bug. This chapter is about what threads share, how they're created, and when you'd pick them over processes. Chapters 17 to 22 deal with the bugs.</p>
+    <ul class="objectives">
+      <li>List what threads of one process share and what each keeps private</li>
+      <li>Create and join threads with <code>pthread_create</code> and <code>pthread_join</code></li>
+      <li>Explain how Linux implements threads with <code>clone()</code></li>
+      <li>Compare 1:1, N:1 and M:N threading models</li>
+      <li>Choose between threads and processes for a given design</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The stack and the heap.</b> See <a href="p1-c-for-systems.html">P1</a>.</li>
+        <li><b>fork and what a child copies.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a>.</li>
+        <li><b>The PCB and run queues.</b> See <a href="04-process-states-pcb.html">Chapter 4</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>What threads share, and what they don't</h2>
+  <p>Think of a web server process handling 50 requests at once with 50 threads. They all run the same code, use the same in-memory cache, write to the same log file descriptor and listen on the same socket. But each is at a different point in its own request, so each needs its own program counter, its own registers and its own stack of function calls.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Shared by all threads of a process</th><th>Private to each thread</th></tr></thead>
+      <tbody>
+        <tr><td>Code (<code>.text</code>) and read-only data</td><td>Registers, including <code>rip</code> and <code>rsp</code></td></tr>
+        <tr><td>Global and static variables (<code>.data</code>, <code>.bss</code>)</td><td>The stack: local variables, return addresses</td></tr>
+        <tr><td>The heap: everything <code>malloc</code>'d</td><td>Thread-local storage, including <code>errno</code></td></tr>
+        <tr><td>Open file descriptors and their offsets</td><td>Signal mask (which signals it blocks)</td></tr>
+        <tr><td>Current directory, user and group IDs, PID</td><td>Thread ID (TID) and scheduling state</td></tr>
+        <tr><td>Signal handlers; the address space as a whole</td><td>CPU time used; its own <code>task_struct</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>"Private" stacks are private by convention, not by protection: all stacks live in the one shared address space, so a thread that gets a pointer to another thread's local variable can read and write it. The only real isolation boundary is between processes.</p>
+
+  <h2>Creating and joining threads</h2>
+  <p>POSIX threads (<b>pthreads</b>) is the standard C API. <code>pthread_create</code> starts a new thread running a function you give it, with one <code>void *</code> argument; <code>pthread_join</code> waits for a thread to finish and collects its return value, like <code>waitpid</code> for threads. Here four threads sum quarters of an array in parallel:</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;pthread.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdint.h&gt;</span>
+
+<span class="k">#define</span> <span class="f">N</span>        (<span class="m">1u</span> &lt;&lt; <span class="m">24</span>)
+<span class="k">#define</span> <span class="m">NTHREADS</span> <span class="m">4</span>
+
+<span class="k">static</span> <span class="t">uint32_t</span> data[N];                   <span class="c">/* shared: every thread can see it */</span>
+
+<span class="k">struct</span> slice { <span class="t">size_t</span> lo, hi; <span class="t">uint64_t</span> sum; };   <span class="c">/* one per thread: no sharing of results */</span>
+
+<span class="k">static</span> <span class="k">void</span> *<span class="f">sum_slice</span>(<span class="k">void</span> *arg) {
+	<span class="k">struct</span> slice *s = arg;
+	<span class="t">uint64_t</span> total = <span class="m">0</span>;                        <span class="c">/* local: on this thread's own stack */</span>
+	<span class="k">for</span> (<span class="t">size_t</span> i = s-&gt;lo; i &lt; s-&gt;hi; i++) total += data[i];
+	s-&gt;sum = total;                            <span class="c">/* each thread writes only its own slot */</span>
+	<span class="k">return</span> <span class="k">NULL</span>;
+}
+
+<span class="k">int</span> <span class="f">main</span>(<span class="k">void</span>) {
+	<span class="k">for</span> (<span class="t">size_t</span> i = <span class="m">0</span>; i &lt; N; i++) data[i] = (<span class="t">uint32_t</span>)(i % <span class="m">7</span>);
+	<span class="t">pthread_t</span> tid[<span class="m">NTHREADS</span>];
+	<span class="k">struct</span> slice sl[<span class="m">NTHREADS</span>];
+	<span class="k">for</span> (<span class="k">int</span> t = <span class="m">0</span>; t &lt; <span class="m">NTHREADS</span>; t++) {
+		sl[t] = (<span class="k">struct</span> slice){ .lo = (<span class="t">size_t</span>)t * N / <span class="m">NTHREADS</span>, .hi = (<span class="t">size_t</span>)(t + <span class="m">1</span>) * N / <span class="m">NTHREADS</span> };
+		<span class="k">int</span> rc = <span class="f">pthread_create</span>(&amp;tid[t], <span class="k">NULL</span>, sum_slice, &amp;sl[t]);
+		<span class="k">if</span> (rc != <span class="m">0</span>) { <span class="f">fprintf</span>(stderr, <span class="s">"pthread_create: error %d\n"</span>, rc); <span class="k">return</span> <span class="m">1</span>; }   <span class="c">/* returns the error, not -1 */</span>
+	}
+	<span class="t">uint64_t</span> total = <span class="m">0</span>;
+	<span class="k">for</span> (<span class="k">int</span> t = <span class="m">0</span>; t &lt; <span class="m">NTHREADS</span>; t++) {
+		<span class="f">pthread_join</span>(tid[t], <span class="k">NULL</span>);            <span class="c">/* wait, then it's safe to read sl[t].sum */</span>
+		total += sl[t].sum;
+	}
+	<span class="f">printf</span>(<span class="s">"total = %llu\n"</span>, (<span class="k">unsigned</span> <span class="k">long</span> <span class="k">long</span>)total);
+	<span class="k">return</span> <span class="m">0</span>;
+}</pre>
+<pre class="code"><span class="c">$</span> gcc -O2 -pthread sum.c -o sum &amp;&amp; ./sum
+total = <span class="m">50331645</span></pre>
+  <p>Two design choices keep this correct without any locks: the shared array is only <i>read</i>, and each thread <i>writes</i> only its own <code>struct slice</code>. Results are combined after <code>pthread_join</code>, which guarantees the thread's writes are visible. The moment two threads write the same variable, you need the tools from <a href="17-race-conditions.html">Chapter 17</a> onwards. Note also that pthread functions return an error number instead of setting <code>errno</code>.</p>
+
+  <h2>Shared or private? Try it</h2>
+  <p>Run the same actions against three threads of one process, then against three processes created with <code>fork()</code>, and watch who sees each change. Shared items are marked ⇄.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Threads vs processes: who sees the change?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="thMode"><button class="active" data-v="t">3 threads in one process</button><button data-v="p">3 processes after fork()</button></div>
+        <button class="btn sm" id="thReset">↺ Reset</button>
+      </div>
+      <div class="th-cols" id="thCols"></div>
+      <div class="th-acts" id="thActs"></div>
+      <div class="th-res" id="thRes"></div>
+    </div>
+    <div class="panel-foot">Each column is one thread (or process). <code>counter</code> is a global, <code>cache</code> points to a heap object, <code>x</code> is a local variable, fd 4 is the server's log file, and <code>errno</code> is thread-local in both models.</div>
+  </div>
+
+  <h2>How Linux makes a thread</h2>
+  <p>Linux has no separate "thread" object. A thread is a task (a <code>task_struct</code>, <a href="04-process-states-pcb.html">Chapter 4</a>) created by the <code>clone()</code> system call with flags saying what to share with its creator. <code>fork()</code> is <code>clone()</code> sharing nothing; <code>pthread_create</code> is <code>clone()</code> sharing nearly everything:</p>
+  <figure class="seq" data-actors="main thread|glibc pthread_create|kernel|new thread">
+    <ol>
+      <li data-m="0>1">pthread_create(&amp;tid, NULL, sum_slice, &amp;sl[1])</li>
+      <li data-m="1>2">mmap 8 MiB for the new stack (+ a guard page)</li>
+      <li data-m="1>2">clone(CLONE_VM | CLONE_FILES | CLONE_FS | CLONE_SIGHAND | CLONE_THREAD | …, stack)</li>
+      <li data-m="2>2">new task_struct pointing at the SAME mm and files; new TID</li>
+      <li data-m="2>1" data-k="reply">returns the TID</li>
+      <li data-m="2>3" data-k="async">scheduled on some CPU; starts in sum_slice(arg)</li>
+      <li data-m="1>0" data-k="reply">returns 0; tid filled in</li>
+    </ol>
+    <figcaption><b>A thread is a task that shares.</b> <code>CLONE_VM</code> shares the address space, <code>CLONE_FILES</code> the fd table, <code>CLONE_THREAD</code> puts it in the same thread group, so <code>getpid()</code> returns the same PID for all of them. The stack size comes from <code>ulimit -s</code> (8 MiB by default).</figcaption>
+  </figure>
+<pre class="code"><span class="c">$</span> ps -eLo pid,lwp,nlwp,stat,cmd | grep <span class="s">'[j]ava'</span>
+   <span class="m">4120</span>    <span class="m">4120</span>   <span class="m">58</span> Sl   java -jar api.jar     <span class="c"># PID 4120, 58 threads ("lightweight processes")</span>
+   <span class="m">4120</span>    <span class="m">4121</span>   <span class="m">58</span> Sl   java -jar api.jar     <span class="c"># LWP = the thread's own ID (TID)</span>
+<span class="c">$</span> ls /proc/<span class="m">4120</span>/task | wc -l
+<span class="m">58</span></pre>
+  <p>Because every thread is a full kernel task, the kernel schedules threads, not processes: a process with eight runnable threads can use eight cores. Creating a thread costs roughly tens of microseconds (mostly the stack mapping and the kernel task), less than a <code>fork</code> of a big process but far from free, which is why servers use thread pools (<a href="27-thread-pools.html">Chapter 27</a>).</p>
+
+  <h2>Kernel threads, user threads and M:N</h2>
+  <p>"Thread" can mean two things: a kernel-scheduled task, or a lighter flow of control scheduled by a language runtime in user space (a goroutine, a Java virtual thread, a coroutine). How the two map onto each other is a classic design choice:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Model</th><th>Mapping</th><th>Strengths</th><th>Weaknesses</th><th>Examples</th></tr></thead>
+      <tbody>
+        <tr><td>1:1</td><td>Each user thread is one kernel task</td><td>Simple; true parallelism; blocking calls block only that thread</td><td>Each thread costs a kernel task and a large stack; tens of thousands get heavy</td><td>pthreads on Linux, Java platform threads, Rust <code>std::thread</code></td></tr>
+        <tr><td>N:1</td><td>Many user threads on one kernel task</td><td>Very cheap switches, no kernel involvement</td><td>No parallelism; one blocking syscall stalls all of them</td><td>Early "green threads" in Java (1990s), Python's asyncio on one thread</td></tr>
+        <tr><td>M:N</td><td>Many user threads on a pool of kernel threads</td><td>Millions of cheap threads <i>and</i> all cores used</td><td>Complex runtime scheduler; must handle blocking calls specially</td><td>Go goroutines, Java 21 virtual threads, Erlang processes</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><a href="45-case-goroutines-jvm-threads.html">Chapter 45</a> opens up Go's and Java's M:N schedulers. Underneath both, the kernel still sees ordinary 1:1 threads, one per core or so.</p>
+
+  <h2>Threads or processes?</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Threads</th><th>Processes</th></tr></thead>
+      <tbody>
+        <tr><td>Sharing data</td><td>Free: same memory</td><td>Needs IPC: pipes, sockets, shared memory (<a href="09-ipc-pipes-signals-shm.html">Chapter 9</a>)</td></tr>
+        <tr><td>Creation and switching</td><td>Cheaper; no page-table switch between threads of one process</td><td>Costlier; switching changes the address space</td></tr>
+        <tr><td>Memory overhead</td><td>A stack and a task each</td><td>Separate page tables; pages shared until written (copy-on-write)</td></tr>
+        <tr><td>A crash</td><td>Kills the whole process, every thread</td><td>Kills one process; the others carry on</td></tr>
+        <tr><td>Security boundary</td><td>None between threads</td><td>Yes: separate address spaces, can run as different users, sandboxable</td></tr>
+        <tr><td>Bugs to fear</td><td>Data races, deadlocks</td><td>Fewer shared-state bugs; IPC protocol bugs instead</td></tr>
+        <tr><td>Chosen by</td><td>Java and Go servers, MySQL, databases' worker pools</td><td>PostgreSQL, Chrome, nginx workers, Python multiprocessing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🐘</div>
+    <div class="body"><div class="title">PostgreSQL vs MySQL: one connection, one process or one thread?</div><p>PostgreSQL forks a backend <i>process</i> for every client connection; MySQL serves each connection with a <i>thread</i> in one big process. PostgreSQL's choice dates from the 1990s, when threads were less portable, and it gives isolation: a backend that crashes on a bad query can't scribble over another session's memory, and the postmaster restarts cleanly. The cost is memory and setup time per connection, which is why PostgreSQL deployments put a connection pooler like PgBouncer in front and keep connections in the hundreds, not thousands. MySQL's threads make connections cheaper but share one address space. The trade-off is live: in 2023 PostgreSQL developers started discussing a long-term move to a threaded model to cut that per-connection overhead. <a href="43-case-postgres-on-os.html">Chapter 43</a> looks at the process model in depth.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Passing a pointer to a loop variable to <code>pthread_create</code>.</b> By the time the thread reads it, the loop has changed it. Give each thread its own argument, as the listing does.</li>
+      <li><b>Returning a pointer to the thread's stack from the thread function.</b> The stack is freed when the thread ends.</li>
+      <li><b>Forgetting to join or detach.</b> An unjoined, undetached thread is a "zombie thread": its stack and record stay allocated.</li>
+      <li><b>Checking <code>errno</code> after pthread calls.</b> They return the error number directly.</li>
+      <li><b>Assuming more threads means more speed.</b> Beyond the number of cores, CPU-bound threads just take turns and add switching.</li>
+      <li><b>Calling <code>exit()</code> from a worker thread.</b> It ends the whole process; use <code>return</code> or <code>pthread_exit</code>.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What's the difference between a process and a thread?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A process is a unit of resource ownership: its own address space, file-descriptor table, credentials. A thread is a unit of execution inside a process: its own registers, program counter and stack, but sharing the process's memory, open files and identity with the other threads. So threads communicate through shared memory cheaply but can corrupt each other and die together; processes are isolated and survive each other's crashes but need IPC to share data. On Linux both are tasks created by <code>clone()</code>; a thread is a task that shares its creator's address space and fd table.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> If threads are so much cheaper to share data between, why do Chrome and PostgreSQL use processes?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Isolation. A process is the boundary the hardware and kernel enforce: separate page tables, separate privileges. Chrome runs each site's renderer in its own sandboxed process, so a compromised or crashed renderer can't read another site's memory or take the browser down, and it can drop privileges with seccomp. PostgreSQL's process per connection means a backend that crashes can't corrupt other sessions' memory, and the postmaster can recover. Both pay with memory and IPC complexity, and both mitigate it: Chrome shares rendering processes under memory pressure, PostgreSQL deployments pool connections.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Threads share code, globals, the heap, file descriptors and identity; each has its own registers, stack and TLS (<code>errno</code>).</li>
+      <li><code>pthread_create</code> starts a thread; <code>pthread_join</code> waits for it and makes its writes visible.</li>
+      <li>On Linux a thread is a task made with <code>clone(CLONE_VM | CLONE_FILES | CLONE_THREAD …)</code>; the kernel schedules threads.</li>
+      <li>1:1 is simple and parallel; M:N (Go, virtual threads) gives millions of cheap threads on a few kernel threads.</li>
+      <li>Threads: cheap sharing, shared fate. Processes: isolation, at the cost of IPC and memory.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which of these is private to each thread of a process?</p>
+      <div class="opts">
+        <button class="opt">Global variables</button>
+        <button class="opt">The heap</button>
+        <button class="opt">The stack and the registers</button>
+        <button class="opt">Open file descriptors</button>
+      </div>
+      <div class="explain">Each thread needs its own call stack and CPU state; everything in the address space and the fd table is shared.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">One thread of a 40-thread server dereferences a NULL pointer. What happens?</p>
+      <div class="opts">
+        <button class="opt">The whole process, all 40 threads, is killed by SIGSEGV</button>
+        <button class="opt">Only that thread dies</button>
+        <button class="opt">The thread restarts</button>
+        <button class="opt">Nothing; the kernel ignores it</button>
+      </div>
+      <div class="explain">Signals like SIGSEGV act on the process. Threads share fate, which is why crash isolation needs processes.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">How does Linux create a thread?</p>
+      <div class="opts">
+        <button class="opt">With fork() followed by exec()</button>
+        <button class="opt">Entirely in user space, without the kernel</button>
+        <button class="opt">With a special thread_create system call unrelated to processes</button>
+        <button class="opt">With clone(), sharing the address space, file table and signal handlers with the creator</button>
+      </div>
+      <div class="explain">Threads are tasks that share. fork() is clone() that shares nothing; pthread_create uses clone() with CLONE_VM, CLONE_FILES, CLONE_SIGHAND, CLONE_THREAD and more.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In an N:1 threading model, a user thread calls a blocking read() on a slow disk. What happens to the other user threads?</p>
+      <div class="opts">
+        <button class="opt">They keep running on other cores</button>
+        <button class="opt">They all stall, because they share one kernel thread that is now blocked</button>
+        <button class="opt">They are killed</button>
+        <button class="opt">They are migrated to new processes</button>
+      </div>
+      <div class="explain">That's N:1's big weakness, and why M:N runtimes like Go hand off blocked kernel threads and start others.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why do PostgreSQL deployments typically run a connection pooler such as PgBouncer?</p>
+      <div class="opts">
+        <button class="opt">PostgreSQL can't accept TCP connections</button>
+        <button class="opt">To encrypt connections</button>
+        <button class="opt">Each connection is a separate backend process, so thousands of connections cost a lot of memory and setup time</button>
+        <button class="opt">PostgreSQL is single-threaded and can only serve one query at a time</button>
+      </div>
+      <div class="explain">Process-per-connection buys isolation at a per-connection cost; a pooler multiplexes many clients onto a few backends.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const ACTS = [
+    ['g', '#2: counter++ (global)'],
+    ['h', '#1: cache->ttl = 60 (heap)'],
+    ['l', '#3: x = 99 (local)'],
+    ['c', '#1: close(4)'],
+    ['r', '#2: write(4, …)'],
+    ['e', '#2: open() fails → errno'],
+    ['s', '#3: NULL dereference'],
+  ];
+  let mode = 't', S, chg;
+  function reset() {
+    S = [0, 1, 2].map(() => ({ counter: 0, ttl: 30, x: 7, fd4: 'open (log)', errno: 0, alive: true }));
+    chg = [];
+    $('#thRes').className = 'th-res';
+    $('#thRes').innerHTML = mode === 't' ? 'Three threads, one address space. Click an action.' : 'Three processes made by <code>fork()</code>: each has its own copy of everything. Click an action.';
+    render();
+  }
+  function apply(a) {
+    const T = mode === 't', who = { g: 1, h: 0, l: 2, c: 0, r: 1, e: 1, s: 2 }[a];
+    if (!S[who].alive) { OS.toast('That ' + (T ? 'thread' : 'process') + ' is dead.'); return; }
+    chg = [];
+    const touch = (key, fn, shared) => { (shared ? [0, 1, 2] : [who]).forEach((k) => { if (S[k].alive) { fn(S[k]); chg.push(k + key); } }); };
+    let msg = '', bad = false;
+    if (a === 'g') { touch('counter', (s) => s.counter++, T); msg = T ? 'All three threads see <b>counter = ' + S[0].counter + '</b>: one global, one copy. If two threads did this at the same time they could lose an update (<a href="17-race-conditions.html">Chapter 17</a>).' : 'Only process #2 sees the new value. After fork each process has its own copy of every global (shared copy-on-write until this write, then copied).'; }
+    if (a === 'h') { touch('ttl', (s) => (s.ttl = 60), T); msg = T ? 'The heap is shared: every thread following <code>cache</code> sees ttl = 60. That\'s how threads share caches and connection pools for free.' : 'Only process #1 changed. The other processes have separate heaps, so sharing a cache between processes needs shared memory or a separate server like Redis.'; }
+    if (a === 'l') { touch('x', (s) => (s.x = 99), false); msg = 'Only #3 changed: <code>x</code> lives on its own stack in <b>both</b> models. Locals are the one thing threads never share by default.'; }
+    if (a === 'c') { touch('fd4', (s) => (s.fd4 = 'closed'), T); msg = T ? 'Closing fd 4 closed it for <b>every</b> thread: the fd table is shared. Thread #2 is about to have a bad day.' : 'Only process #1 closed its descriptor. After fork each process has its own fd table (both pointed at the same open file, which stays open while any process holds it).'; }
+    if (a === 'r') { if (S[1].fd4 === 'closed') { touch('errno', (s) => (s.errno = 'EBADF'), false); msg = 'write(4) failed with <b>EBADF</b>: another thread closed the descriptor out from under it. Worse, if anything had opened a new file in between, it might reuse number 4, and the log line would go into that file instead.'; bad = true; } else { touch('fd4', (s) => (s.fd4 = 'open (log) +1 line'), false); msg = 'The write succeeded: fd 4 is still open for #2.'; } }
+    if (a === 'e') { touch('errno', (s) => (s.errno = 'ENOENT'), false); msg = '<code>errno</code> changed only for #2, even among threads: it\'s thread-local storage, so one thread\'s failed call can\'t clobber another thread\'s error code.'; }
+    if (a === 's') {
+      if (T) { S.forEach((s) => (s.alive = false)); msg = '<b>SIGSEGV kills the whole process.</b> Thread #3\'s bug took down #1 and #2 with it, along with every request they were serving. Shared memory means shared fate.'; bad = true; }
+      else { S[2].alive = false; msg = 'Only process #3 died. Its parent gets SIGCHLD and can restart it; #1 and #2 never notice. This is why Chrome and PostgreSQL use processes.'; }
+    }
+    $('#thRes').className = 'th-res' + (bad ? ' th-bad' : '');
+    $('#thRes').innerHTML = msg;
+    render();
+  }
+  function render() {
+    const T = mode === 't';
+    const rows = [['counter', 'counter', T], ['cache->ttl', 'ttl', T], ['local x', 'x', false], ['fd 4', 'fd4', T], ['errno', 'errno', false]];
+    $('#thCols').innerHTML = S.map((s, k) => `<div class="th-col ${s.alive ? '' : 'th-dead'}"><h5><span>${T ? 'Thread' : 'Process'} #${k + 1}</span><span class="muted">${T ? 'TID ' + (4120 + k) : 'PID ' + (4120 + k)}${s.alive ? '' : ' · dead'}</span></h5>` +
+      rows.map(([l, key, sh]) => `<div class="th-row ${sh ? 'th-sh' : ''} ${chg.includes(k + key) ? 'th-chg' : ''}"><b>${l}</b><span>${s.alive ? s[key] : '—'}</span></div>`).join('') + '</div>').join('');
+    $('#thActs').innerHTML = ACTS.map(([a, l]) => `<button class="btn sm" data-a="${a}">${l.replace('#', T ? 'T' : 'P')}</button>`).join('');
+  }
+  $('#thActs').addEventListener('click', (e) => { const b = e.target.closest('[data-a]'); if (b) apply(b.dataset.a); });
+  $('#thMode').addEventListener('segchange', (e) => { mode = e.detail; reset(); });
+  $('#thReset').onclick = reset;
+  reset();
+})();
+</script>
+</body>
+</html>

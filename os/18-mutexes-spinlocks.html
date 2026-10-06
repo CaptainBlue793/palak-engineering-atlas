@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mutexes &amp; Spinlocks</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .lk-tl { margin-top:14px; }
+  .lk-row { display:grid; grid-template-columns:58px minmax(0,1fr); gap:8px; align-items:center; margin-top:4px; }
+  .lk-row > span { font-size:11.5px; font-weight:700; color:var(--muted); white-space:nowrap; }
+  .lk-tr { display:flex; height:26px; border-radius:7px; overflow:hidden; border:1px solid var(--border); background:var(--surface-2); }
+  .lk-tr i { display:block; min-width:0; overflow:hidden; font-style:normal; font-family:var(--mono); font-size:10.5px; font-weight:700; line-height:24px; text-align:center; color:var(--text); }
+  .lk-work { background:color-mix(in srgb, var(--accent-2) 30%, var(--surface)); }
+  .lk-cs { background:color-mix(in srgb, var(--green) 55%, var(--surface)); }
+  .lk-spin { background:color-mix(in srgb, var(--red) 60%, var(--surface)); }
+  .lk-wake { background:color-mix(in srgb, var(--amber) 60%, var(--surface)); }
+  .lk-idle { background:transparent; }
+  .lk-held { background:color-mix(in srgb, var(--green) 30%, var(--surface)); }
+  .lk-axis { display:flex; justify-content:space-between; margin:3px 0 0 66px; font-family:var(--mono); font-size:10.5px; color:var(--muted); }
+  .lk-key { margin-top:8px; font-size:12.5px; color:var(--muted); }
+  .lk-key i { display:inline-block; width:11px; height:11px; border-radius:3px; margin:0 4px 0 12px; vertical-align:-1px; border:1px solid var(--border); }
+  .lk-key i:first-child { margin-left:0; }
+  .lk-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .lk-cmp { width:100%; margin-top:14px; border-collapse:collapse; font-size:13px; }
+  .lk-cmp th, .lk-cmp td { padding:6px 8px; border-bottom:1px solid var(--border); text-align:right; font-family:var(--mono); }
+  .lk-cmp th { font-family:var(--font); font-size:11.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .lk-cmp th:first-child, .lk-cmp td:first-child { text-align:left; font-family:var(--font); font-weight:600; }
+  .lk-cmp tr.lk-sel td { background:color-mix(in srgb, var(--accent) 9%, var(--surface)); }
+  .lk-cmp td.lk-best { color:var(--green); font-weight:700; }
+</style>
+</head>
+<body data-chapter="18">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 18</span><span class="pill">Intermediate</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Mutexes &amp; <span class="grad">Spinlocks</span></h1>
+    <p class="lead">Chapter 17 ended on a circle: a lock made from ordinary reads and writes has the same race as the code it protects. The way out is hardware. Every CPU has an instruction that reads a value and writes a new one as a single indivisible step, and a lock is a small amount of code wrapped around it. What that code does when the lock is already taken is the interesting part. It can <b>spin</b>, burning CPU until the lock is free, or <b>sleep</b>, and pay for a trip through the kernel. This chapter builds both, shows how Linux's <code>pthread_mutex</code> gets the best of each, and looks at what locks cost once many threads want them.</p>
+    <ul class="objectives">
+      <li>Explain test-and-set and compare-and-swap, and build a spinlock from one of them</li>
+      <li>Decide when spinning beats sleeping, and why spinning is dangerous in user space</li>
+      <li>Explain how a futex makes an uncontended mutex cost no system call</li>
+      <li>Reason about contention, lock granularity and what they do to scaling</li>
+      <li>Say when a reader–writer lock helps and when it doesn't</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Critical sections and the three requirements for a lock.</b> See <a href="17-race-conditions.html">Chapter 17</a>.</li>
+        <li><b>What a context switch costs, and time slices.</b> See <a href="06-context-switches-interrupts.html">Chapter 6</a>.</li>
+        <li><b>Blocked threads and wait queues.</b> See <a href="04-process-states-pcb.html">Chapter 4</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>The instruction that breaks the circle</h2>
+  <p>The broken lock was <code>while (busy) ; busy = 1;</code>. Two threads could both read 0 before either wrote 1. What is needed is a way to read the old value and write the new one with nothing able to come between. CPUs provide two such operations, and C11 exposes both in <code>&lt;stdatomic.h&gt;</code>.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Operation</th><th>What it does, atomically</th><th>x86 instruction</th><th>C11</th></tr></thead>
+      <tbody>
+        <tr><td><b>Test-and-set</b> (exchange)</td><td>Write a new value; return the old one</td><td><code>xchg</code></td><td><code>atomic_flag_test_and_set</code>, <code>atomic_exchange</code></td></tr>
+        <tr><td><b>Compare-and-swap</b> (CAS)</td><td>If the value equals <i>expected</i>, write <i>new</i>; report whether it did</td><td><code>lock cmpxchg</code></td><td><code>atomic_compare_exchange_strong</code></td></tr>
+        <tr><td><b>Fetch-and-add</b></td><td>Add to the value; return the old one</td><td><code>lock xadd</code></td><td><code>atomic_fetch_add</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The core makes the step indivisible by holding the cache line that contains the variable exclusively for the duration of the instruction, so no other core can read or write it in between (<a href="32-multicore-caches-numa.html">Chapter 32</a>). With test-and-set, the lock is four lines:</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;stdatomic.h&gt;</span>
+
+<span class="k">typedef</span> <span class="k">struct</span> { <span class="t">atomic_flag</span> held; } <span class="t">spinlock_t</span>;      <span class="c">/* initialise with { ATOMIC_FLAG_INIT } */</span>
+
+<span class="t">void</span> <span class="f">spin_lock</span>(<span class="t">spinlock_t</span> *l)
+{
+    <span class="k">while</span> (<span class="f">atomic_flag_test_and_set</span>(&amp;l-&gt;held))    <span class="c">/* set it to 1 and learn what it was, in one step */</span>
+        <span class="f">__builtin_ia32_pause</span>();                   <span class="c">/* it was already 1: someone else has it. Try again. */</span>
+}
+
+<span class="t">void</span> <span class="f">spin_unlock</span>(<span class="t">spinlock_t</span> *l)
+{
+    <span class="f">atomic_flag_clear</span>(&amp;l-&gt;held);
+}</pre>
+  <p>If two threads call <code>spin_lock</code> at the same instant, the hardware orders their two exchanges. One of them gets back 0 and owns the lock; the other gets back 1 and loops. Mutual exclusion holds. The <code>pause</code> instruction changes nothing logically; it tells the core this is a wait loop, which saves power and lets a hyperthread sharing the core get more done.</p>
+  <p>For something as small as the counter of Chapter 17 you don't need a lock at all: <code>atomic_fetch_add(&amp;counter, 1)</code> compiles to one <code>lock add</code> instruction and is correct from any number of threads. Locks are for critical sections longer than one instruction.</p>
+
+  <h2>Spinlocks</h2>
+  <p>A thread waiting for a <b>spinlock</b> stays on its core, running the loop until the lock is free. That is the right thing to do in exactly one situation: the lock will be released <i>very</i> soon by a thread that is <i>running right now</i> on another core. Then the wait is a few dozen nanoseconds, far less than any alternative.</p>
+  <p>It goes wrong in three ways:</p>
+  <ul>
+    <li><b>Long critical sections.</b> Every waiter burns a whole core for the entire wait. Four threads and a 1 ms critical section turn three cores into heaters.</li>
+    <li><b>The holder isn't running.</b> If the thread holding the lock is preempted, the waiters spin for its whole absence, perhaps several time slices, and their spinning is what keeps it off the CPU. This is <b>lock-holder preemption</b>. On a single core it is the normal case: if you are spinning, the holder can't be running.</li>
+    <li><b>No fairness.</b> Whoever executes the exchange at the lucky moment wins. A thread can lose again and again, so bounded waiting isn't met.</li>
+  </ul>
+  <p>The kernel uses spinlocks heavily, because it can rule those problems out: it disables preemption while one is held, keeps the protected sections to a handful of instructions, and uses a queued design that hands the lock over in arrival order. It also has no choice in interrupt handlers, which can't sleep. User programs have none of those guarantees, since the scheduler can preempt them at any instruction, so a pure spinlock in application code is almost always a mistake.</p>
+
+  <h2>Sleeping locks and the futex</h2>
+  <p>A <b>mutex</b> does the other thing: if the lock is taken, the thread asks the kernel to put it to sleep until the lock is released. The waiting costs no CPU, and the core runs something else. The obvious implementation makes every lock and unlock a system call, which would add hundreds of nanoseconds to operations that mostly don't contend at all.</p>
+  <p>Linux's answer is the <b>futex</b>, "fast user-space mutex" (2003). The lock's state is a plain integer in the program's own memory. Taking a free lock and releasing a lock nobody is waiting for are each a single atomic instruction, with no kernel involved. Only when there is contention does a thread call into the kernel:</p>
+  <ul>
+    <li><code>futex(addr, FUTEX_WAIT, val)</code>: "put me to sleep, but only if <code>*addr</code> still equals <code>val</code>".</li>
+    <li><code>futex(addr, FUTEX_WAKE, n)</code>: "wake up to <code>n</code> threads sleeping on <code>addr</code>".</li>
+  </ul>
+<pre class="code"><span class="c">/* A futex mutex, after Ulrich Drepper's "Futexes Are Tricky".
+   *m is 0 = free, 1 = locked, 2 = locked and someone may be sleeping.
+   futex() is a thin wrapper around syscall(SYS_futex, ...). */</span>
+<span class="t">void</span> <span class="f">mutex_lock</span>(<span class="t">atomic_int</span> *m)
+{
+    <span class="t">int</span> c = <span class="m">0</span>;
+    <span class="k">if</span> (<span class="f">atomic_compare_exchange_strong</span>(m, &amp;c, <span class="m">1</span>))    <span class="c">/* fast path: 0 -&gt; 1, no system call */</span>
+        <span class="k">return</span>;
+    <span class="k">if</span> (c != <span class="m">2</span>)
+        c = <span class="f">atomic_exchange</span>(m, <span class="m">2</span>);                   <span class="c">/* announce that someone is waiting */</span>
+    <span class="k">while</span> (c != <span class="m">0</span>) {
+        <span class="f">futex</span>(m, <span class="m">FUTEX_WAIT</span>, <span class="m">2</span>);                     <span class="c">/* sleep, unless *m is no longer 2 */</span>
+        c = <span class="f">atomic_exchange</span>(m, <span class="m">2</span>);                   <span class="c">/* woken: try to take it */</span>
+    }
+}
+
+<span class="t">void</span> <span class="f">mutex_unlock</span>(<span class="t">atomic_int</span> *m)
+{
+    <span class="k">if</span> (<span class="f">atomic_fetch_sub</span>(m, <span class="m">1</span>) != <span class="m">1</span>) {               <span class="c">/* it was 2: there may be sleepers */</span>
+        <span class="f">atomic_store</span>(m, <span class="m">0</span>);
+        <span class="f">futex</span>(m, <span class="m">FUTEX_WAKE</span>, <span class="m">1</span>);                     <span class="c">/* wake one */</span>
+    }
+}</pre>
+  <figure class="seq" data-actors="Thread A|mutex word (user memory)|Kernel futex queue|Thread B">
+    <ol>
+      <li data-m="0>1">CAS 0 → 1: succeeds. A holds the lock, no system call</li>
+      <li data-m="3>1">CAS 0 → 1: fails. Exchange → 2 ("a waiter exists")</li>
+      <li data-m="3>2">futex(WAIT, 2): the word is still 2, so B sleeps</li>
+      <li data-m="0>1">unlock: 2 − 1 ≠ 0, so store 0</li>
+      <li data-m="0>2">futex(WAKE, 1)</li>
+      <li data-m="2>3" data-k="reply">B is runnable again</li>
+      <li data-m="3>1">exchange → 2, old value 0: B holds the lock</li>
+    </ol>
+    <figcaption><b>One contended lock and unlock.</b> If B had never arrived, A's lock and unlock would have been two atomic instructions and nothing else. The kernel is involved only when someone has to wait.</figcaption>
+  </figure>
+  <p>The value passed to <code>FUTEX_WAIT</code> closes a gap. Between B deciding to sleep and B actually sleeping, A might unlock and send its wake-up to nobody. The kernel checks the word and queues the thread as one atomic step: if the word has changed, the call returns at once instead of sleeping. Chapter 19 calls this the lost wake-up problem.</p>
+  <p><code>pthread_mutex_lock</code> in glibc is built this way: about 20 ns when uncontended, a system call only under contention. Most modern mutexes add one refinement and <b>spin briefly before sleeping</b>, on the bet that the holder is about to finish. Go's, Java's and Rust's standard mutexes all do it, and glibc offers it as <code>PTHREAD_MUTEX_ADAPTIVE_NP</code>.</p>
+
+  <h2>Spin, sleep or both?</h2>
+  <p>Each thread repeats: 4 µs of its own work, then a critical section under one shared lock. Change the lock, the number of threads and cores, and the length of the critical section. The table underneath compares all three locks for the current setting.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One lock, 400 µs: where the CPU time goes</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="lkKind"><button class="active" data-v="spin">spinlock</button><button data-v="sleep">sleeping mutex</button><button data-v="adaptive">spin, then sleep</button></div>
+        <div class="seg" id="lkL"><button class="active" data-v="2">critical section 2 µs</button><button data-v="40">40 µs</button></div>
+      </div>
+      <div class="controls">
+        <div class="seg" id="lkN"><button data-v="2">2 threads</button><button class="active" data-v="4">4 threads</button><button data-v="8">8 threads</button></div>
+        <div class="seg" id="lkC"><button data-v="1">1 core</button><button data-v="2">2 cores</button><button class="active" data-v="4">4 cores</button></div>
+      </div>
+      <div class="lk-tl" id="lkTl"></div>
+      <div class="lk-axis"><span>0</span><span>100 µs</span><span>200 µs</span><span>300 µs</span><span>400 µs</span></div>
+      <div class="lk-key"><i class="lk-work"></i>own work<i class="lk-cs"></i>in the critical section<i class="lk-spin"></i>spinning<i class="lk-wake"></i>going to sleep or waking<i class="lk-idle"></i>core idle</div>
+      <div class="lk-desc" id="lkDesc"></div>
+      <div class="stats" id="lkStats"></div>
+      <table class="lk-cmp" id="lkCmp"></table>
+    </div>
+    <div class="panel-foot">A model: one tick is a microsecond; a sleeping thread costs 1 µs to block and 8 µs to wake and get back on a core; the time slice is 50 µs (real ones are milliseconds, so real lock-holder preemption is far worse); "spin, then sleep" spins for at most 4 µs. A released lock is free for any running thread to take, as with a real futex mutex. Letters mark which thread a long stretch belongs to.</div>
+  </div>
+
+  <p>Things to notice. With a 2 µs critical section on 4 cores, the spinlock finishes the most sections (198) and the sleeping mutex the fewest (185): it spends about a quarter of the CPU on going to sleep and waking, for waits that were shorter than the wake-up itself. With a 40 µs critical section all three complete the same work, but the spinlock burns over 70% of four cores doing it, while the mutex leaves them idle for someone else. Now set 1 core: the spinlock collapses to 2 sections against the mutex's 7, because the holder is preempted inside the critical section and each waiter spins away a full time slice. "Spin, then sleep" is never the best lock in this model and never far from it. That is why it is the default almost everywhere: it doesn't have to know in advance which case it is in.</p>
+
+  <h2>Contention and granularity</h2>
+  <p>A lock makes part of the program run one thread at a time, and that part limits everything. If 5% of each request's work is inside one shared lock, then no matter how many cores you add, throughput can't exceed 20 times a single core's (Amdahl's law), and long before that limit, threads are queuing. A lock is <b>contended</b> when threads often find it taken; contended locks are where multithreaded programs lose their scaling.</p>
+  <p>The main design choice is <b>granularity</b>: how much data one lock covers.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Coarse: one big lock</th><th>Fine: many small locks</th></tr></thead>
+      <tbody>
+        <tr><td><b>Example</b></td><td>One mutex around a whole hash table</td><td>One mutex per bucket, or per group of buckets</td></tr>
+        <tr><td><b>Correctness</b></td><td>Easy to reason about</td><td>Harder: operations that touch two parts need two locks, in a consistent order (<a href="22-deadlock.html">Chapter 22</a>)</td></tr>
+        <tr><td><b>Scaling</b></td><td>Poor: all threads queue on it</td><td>Good: threads working on different parts don't meet</td></tr>
+        <tr><td><b>Overhead</b></td><td>One lock, taken once per operation</td><td>More memory and more lock operations per request</td></tr>
+        <tr><td><b>Use when</b></td><td>The lock is held briefly and contention is low. Start here</td><td>Profiling shows that one lock is the bottleneck</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Before splitting a lock, shorten what it protects. Three habits remove most contention: do the expensive work (allocation, formatting, hashing) <i>outside</i> the lock and only publish the result inside; never hold a lock across I/O or anything else that can block; and don't call code you don't control, such as a callback, while holding one. To find out whether a lock is the problem, look at where threads are waiting, not where they are computing:</p>
+<pre class="code"><span class="c">$</span> strace -c -f -e trace=futex -p <span class="m">4120</span>        <span class="c"># futex calls only happen under contention</span>
+% time     seconds  usecs/call     calls    errors syscall
+<span class="m">100.00</span>   <span class="m">41.208133</span>         <span class="m">212</span>    <span class="m">194377</span>     <span class="m">31020</span> futex
+<span class="c">$</span> perf lock contention -b -p <span class="m">4120</span> sleep <span class="m">10</span>     <span class="c"># which locks, and for how long (recent kernels)</span>
+<span class="c">$</span> perf record -g -p <span class="m">4120</span> sleep <span class="m">10</span>; perf report   <span class="c"># look for stacks ending in __lll_lock_wait</span></pre>
+
+  <div class="callout usecase">
+    <div class="ico">🔐</div>
+    <div class="body"><div class="title">The Big Kernel Lock: fifteen years of making one lock smaller</div><p>When Linux first supported multiprocessor machines, in version 2.0 (1996), it did so in the simplest way that could be correct: a single spinlock, the <b>Big Kernel Lock</b>, taken on every entry to the kernel. Only one CPU could execute kernel code at a time. A two-processor machine ran user programs in parallel, but as soon as they made system calls they queued. It was the coarsest granularity possible, and it was the right first step, because nothing in the kernel had been written with concurrency in mind. Then the work of splitting it began: separate locks for the scheduler, for each file system, for each inode, for each network socket, release after release, each change exposing code that had quietly depended on the big lock. The last users were removed and the lock deleted in version 2.6.39, in 2011. Python's Global Interpreter Lock is the same design with the same history: one lock that makes a single-threaded runtime safe, simple and fast on one core, which took decades to make optional (the free-threaded build arrived in Python 3.13). The lesson both teach: a coarse lock is cheap to add and very expensive to remove, because everything written under it comes to rely on it.</p></div>
+  </div>
+
+  <h2>Reader–writer locks</h2>
+  <p>Many threads reading the same data don't conflict; only writing does. A <b>reader–writer lock</b> allows either any number of readers or exactly one writer.</p>
+<pre class="code"><span class="t">pthread_rwlock_t</span> rw = <span class="m">PTHREAD_RWLOCK_INITIALIZER</span>;
+
+<span class="t">int</span> <span class="f">lookup</span>(<span class="k">const</span> <span class="t">char</span> *key) {
+    <span class="f">pthread_rwlock_rdlock</span>(&amp;rw);           <span class="c">/* shared: other readers may hold it too */</span>
+    <span class="t">int</span> v = <span class="f">table_get</span>(key);
+    <span class="f">pthread_rwlock_unlock</span>(&amp;rw);
+    <span class="k">return</span> v;
+}
+
+<span class="t">void</span> <span class="f">update</span>(<span class="k">const</span> <span class="t">char</span> *key, <span class="t">int</span> v) {
+    <span class="f">pthread_rwlock_wrlock</span>(&amp;rw);           <span class="c">/* exclusive: waits for every reader to leave */</span>
+    <span class="f">table_put</span>(key, v);
+    <span class="f">pthread_rwlock_unlock</span>(&amp;rw);
+}</pre>
+  <p>It helps when reads are much more common than writes <i>and</i> the read sections are long enough to overlap. It is not a free upgrade. Taking the lock for reading still writes to shared memory, to count the readers, so every reader drags the lock's cache line between cores; for short sections a plain mutex is often faster. And the policy matters: if readers are always admitted while other readers hold the lock, a steady stream of them can keep a writer waiting for ever (<a href="21-classic-sync-problems.html">Chapter 21</a>). Data that is read constantly and changed rarely is often better served by schemes where readers take no lock at all (<a href="26-lock-free.html">Chapter 26</a>).</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Writing your own spinlock in application code.</b> One preempted holder and every waiter burns a time slice. Use the mutex your platform provides; it already spins when that pays.</li>
+      <li><b>Holding a lock across I/O or a blocking call.</b> A 10 ms disk read under a lock makes it a 10 ms lock for everyone.</li>
+      <li><b>Unlocking on only some paths.</b> An early <code>return</code> or error branch that skips the unlock hangs the next caller for ever.</li>
+      <li><b>Assuming a mutex is slow.</b> Uncontended, it is one atomic instruction each way. Contention is what costs, so measure before redesigning.</li>
+      <li><b>Reaching for a reader–writer lock by default.</b> With short critical sections it usually loses to a plain mutex.</li>
+      <li><b>Protecting data with the wrong lock, or two different ones.</b> Decide which lock guards which data, write it down next to the data, and keep to it.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the difference between a spinlock and a mutex, and when would you use each?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Both give mutual exclusion; they differ in what a thread does when the lock is already held. With a spinlock it loops on an atomic test-and-set until it gets the lock, staying on the CPU. With a mutex it asks the kernel to put it to sleep and is woken when the lock is released. Spinning is cheaper when the wait is shorter than a sleep and wake-up, which cost microseconds, and when the holder is running on another core, so it is used inside the kernel for very short sections and in interrupt context, where sleeping isn't allowed. A mutex is right for anything longer, for anything that might block while holding the lock, and in user space generally, where the holder can be preempted and spinners would waste whole time slices. In practice a modern mutex is a hybrid: an atomic instruction when uncontended, a short spin, then a futex sleep.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How does <code>pthread_mutex_lock</code> avoid a system call in the common case?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is built on futexes. The mutex's state is an integer in user memory. Locking does a compare-and-swap from 0 to 1; if that succeeds the thread owns the lock, and no kernel call was made. Unlocking decrements it, and if no waiter was recorded that is also the end. Only when the CAS fails does the thread mark the lock as contended and call <code>futex</code> with <code>FUTEX_WAIT</code>, passing the value it expects to find. The kernel checks that the word still has that value and puts the thread on a wait queue keyed by the address, atomically, so a wake-up that happens in between isn't lost. The unlocking thread sees the contended state and calls <code>FUTEX_WAKE</code> to wake one sleeper. So the kernel is only involved when a thread really has to wait, and since most acquisitions in a well-designed program are uncontended, the average cost is tens of nanoseconds.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Locks are built on atomic instructions: exchange (test-and-set) and compare-and-swap.</li>
+      <li>A spinlock waits by looping. It suits very short sections whose holder is running on another core, which the kernel can guarantee and applications can't.</li>
+      <li>A mutex waits by sleeping. A futex keeps the lock word in user memory, so only contended operations make a system call.</li>
+      <li>Real mutexes spin briefly and then sleep, getting most of the benefit of both.</li>
+      <li>Contention, not locking itself, is what hurts. Shorten critical sections first; split locks when profiling says so.</li>
+      <li>Reader–writer locks help read-mostly data with long read sections; elsewhere a plain mutex is usually as good or better.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why can a lock be built from test-and-set but not from a plain read followed by a plain write?</p>
+      <div class="opts">
+        <button class="opt">Test-and-set is faster</button>
+        <button class="opt">A plain write can't store the value 1</button>
+        <button class="opt">Test-and-set reads the old value and writes the new one as one indivisible step, so two threads can't both see "free"</button>
+        <button class="opt">Test-and-set disables interrupts</button>
+      </div>
+      <div class="explain">With separate read and write, two threads can both read 0 before either writes. An atomic exchange gives exactly one of them the old value 0.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Two threads share one core. Thread A holds a spinlock and is preempted; thread B then tries to take the lock. What happens?</p>
+      <div class="opts">
+        <button class="opt">B spins for its whole time slice, achieving nothing, because A can't run to release the lock</button>
+        <button class="opt">B gets the lock at once</button>
+        <button class="opt">The kernel notices and switches back to A immediately</button>
+        <button class="opt">The program deadlocks permanently</button>
+      </div>
+      <div class="explain">Lock-holder preemption. B's spinning uses the only core, which is what keeps A from finishing. It resolves only when B's slice ends.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A thread locks and unlocks a futex-based mutex that no other thread is using. How many system calls does that take?</p>
+      <div class="opts">
+        <button class="opt">Two: one to lock and one to unlock</button>
+        <button class="opt">One: only the lock</button>
+        <button class="opt">One: only the unlock, to wake waiters</button>
+        <button class="opt">None: both are atomic instructions in user space</button>
+      </div>
+      <div class="explain">The kernel is called only to sleep (FUTEX_WAIT) or to wake a sleeper (FUTEX_WAKE). Without contention neither is needed.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">When is spinning a better choice than sleeping?</p>
+      <div class="opts">
+        <button class="opt">When the critical section does disk I/O</button>
+        <button class="opt">When the critical section is much shorter than a sleep and wake-up, and the holder is running on another core</button>
+        <button class="opt">When there are more threads than cores</button>
+        <button class="opt">Whenever fairness matters</button>
+      </div>
+      <div class="explain">A sleep and wake-up cost microseconds. If the lock will be free in nanoseconds, waiting on the CPU is cheaper. Otherwise spinning only wastes it.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which combination does a reader–writer lock allow at the same time?</p>
+      <div class="opts">
+        <button class="opt">One reader and one writer</button>
+        <button class="opt">Two writers</button>
+        <button class="opt">Several readers and no writer</button>
+        <button class="opt">Any number of readers and writers</button>
+      </div>
+      <div class="explain">Readers don't conflict with each other, so they share the lock. A writer needs it exclusively: no readers and no other writer.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const T = 400, W = 4, K = 8, Q = 50, SPIN_LIMIT = 4;
+  const NAME = { spin: 'Spinlock', sleep: 'Sleeping mutex', adaptive: 'Spin, then sleep' };
+  let kind = 'spin', N = 4, C = 4, L = 2;
+
+  // One tick is a microsecond. Each thread loops: W ticks of its own work, then L ticks holding the lock.
+  function sim(kind, N, C, L) {
+    const th = [];
+    for (let i = 0; i < N; i++) th.push({ id: i, phase: 'work', left: W + i, spun: 0, slice: 0 });
+    const running = new Array(C).fill(null), ready = th.map((t) => t.id), sleepers = [];
+    const rows = running.map(() => []), lockRow = [];
+    const tally = { work: 0, cs: 0, spin: 0, wake: 0, idle: 0 };
+    const runnable = (t) => t.phase !== 'sleep';
+    let owner = null, done = 0;
+    function release(t) {
+      done++; t.phase = 'work'; t.left = W;
+      owner = null;                                                       // free at once: any running thread may take it
+      if (sleepers.length) { const s = th[sleepers.shift()]; s.phase = 'wake'; s.left = K; }   // and one sleeper is woken
+    }
+    for (let now = 0; now < T; now++) {
+      for (let c = 0; c < C; c++) {                                       // scheduler: drop sleepers, rotate on slice expiry
+        const id = running[c];
+        if (id !== null) {
+          const t = th[id];
+          if (!runnable(t)) running[c] = null;
+          else if (t.slice >= Q && ready.some((r) => runnable(th[r]))) { ready.push(id); running[c] = null; }
+        }
+        if (running[c] === null) {
+          const k = ready.findIndex((r) => runnable(th[r]));
+          if (k >= 0) { running[c] = ready.splice(k, 1)[0]; th[running[c]].slice = 0; }
+        }
+      }
+      const freed = [];
+      for (let c = 0; c < C; c++) {
+        const id = running[c];
+        if (id === null) { rows[c].push(null); tally.idle++; continue; }
+        const t = th[id]; t.slice++;
+        let what;
+        if (t.phase === 'work') { what = 'work'; if (--t.left === 0) { t.phase = 'want'; t.spun = 0; } }
+        else if (t.phase === 'want') {
+          if (owner === null) { owner = id; t.phase = 'cs'; t.left = L; what = 'cs'; if (--t.left === 0) freed.push(t); }
+          else if (kind === 'sleep' || (kind === 'adaptive' && t.spun >= SPIN_LIMIT)) { what = 'wake'; t.phase = 'sleep'; sleepers.push(id); ready.push(id); }
+          else { what = 'spin'; t.spun++; }
+        }
+        else if (t.phase === 'cs') { what = 'cs'; if (--t.left === 0) freed.push(t); }
+        else { what = 'wake'; if (--t.left === 0) { t.phase = 'want'; t.spun = 0; } }
+        rows[c].push({ id, what }); tally[what]++;
+      }
+      lockRow.push(owner);
+      freed.forEach(release);                                             // a release takes effect at the end of the tick
+    }
+    return { rows, lockRow, tally, done, total: T * C };
+  }
+  const letter = (id) => String.fromCharCode(65 + id);
+  function track(cells, cls, lab) {                                        // run-length encode one row of ticks
+    let h = '', i = 0;
+    while (i < cells.length) {
+      let j = i; const k = cls(cells[i]);
+      while (j < cells.length && cls(cells[j]) === k && lab(cells[j]) === lab(cells[i])) j++;
+      h += `<i class="${k}" style="flex:${j - i} 0 0">${j - i >= 14 ? lab(cells[i]) : ''}</i>`;
+      i = j;
+    }
+    return h;
+  }
+  const pct = (x, r) => Math.round(x / r.total * 100);
+  function verdict(r) {
+    const sp = pct(r.tally.spin, r), sw = pct(r.tally.wake, r), id = pct(r.tally.idle, r);
+    if (kind === 'spin') {
+      if (N > C && L >= 40) return `More threads than cores, and a long critical section. The holder gets preempted <i>inside</i> the critical section, and every other thread then spins away its whole time slice waiting for a thread that isn't running. <b>${sp}%</b> of the CPU is spent spinning.`;
+      if (L >= 40) return `The waiting threads spin for the full 40 µs, every time. The work gets done no faster than with a mutex, and <b>${sp}%</b> of the CPU is burnt on waiting that could have run something else.`;
+      if (N > C) return `Short critical sections keep the spinning brief, but with more threads than cores a holder is sometimes preempted and its waiters spin until it runs again. <b>${sp}%</b> of the CPU is spent spinning.`;
+      return `Short critical sections on enough cores: a waiter spins for a microsecond or two and gets the lock. That is cheaper than a sleep and wake-up would be. <b>${sp}%</b> of the CPU is spent spinning.`;
+    }
+    if (kind === 'sleep') {
+      if (L < 40) return `Every thread that finds the lock taken goes to sleep, and waking it costs 8 µs: four times the length of the critical section it was waiting for. <b>${sw}%</b> of the CPU goes on sleeping and waking.`;
+      return `Waiting threads sleep, so they use no CPU. The cores they would have spun on are ${id ? `idle <b>${id}%</b> of the time and free for other work` : 'given to other threads'}; the cost of sleeping (<b>${sw}%</b>) is small next to a 40 µs wait.`;
+    }
+    return `A waiter spins for up to 4 µs, about half the cost of a sleep and wake-up, on the bet that the lock is about to be released. If it isn't, the thread sleeps. Here that means <b>${sp}%</b> spinning and <b>${sw}%</b> sleeping and waking.`;
+  }
+  function render() {
+    const all = { spin: sim('spin', N, C, L), sleep: sim('sleep', N, C, L), adaptive: sim('adaptive', N, C, L) }, r = all[kind];
+    $('#lkTl').innerHTML = r.rows.map((row, c) => `<div class="lk-row"><span>core ${c}</span><div class="lk-tr">${track(row, (x) => x ? 'lk-' + x.what : 'lk-idle', (x) => x ? letter(x.id) : '')}</div></div>`).join('') +
+      `<div class="lk-row"><span>lock</span><div class="lk-tr">${track(r.lockRow, (x) => x === null ? 'lk-idle' : 'lk-held', (x) => x === null ? '' : letter(x))}</div></div>`;
+    $('#lkDesc').innerHTML = verdict(r);
+    const useful = pct(r.tally.work + r.tally.cs, r);
+    $('#lkStats').innerHTML = `<div class="stat acc"><div class="k">Sections done</div><div class="v">${r.done}</div></div>
+      <div class="stat ${useful >= 75 ? 'good' : ''}"><div class="k">Useful work</div><div class="v">${useful}%</div></div>
+      <div class="stat ${pct(r.tally.spin, r) >= 20 ? 'bad' : ''}"><div class="k">Spinning</div><div class="v">${pct(r.tally.spin, r)}%</div></div>
+      <div class="stat ${pct(r.tally.wake, r) >= 15 ? 'warn' : ''}"><div class="k">Sleep / wake</div><div class="v">${pct(r.tally.wake, r)}%</div></div>
+      <div class="stat"><div class="k">Idle</div><div class="v">${pct(r.tally.idle, r)}%</div></div>`;
+    const best = Math.max(...Object.values(all).map((x) => x.done));
+    $('#lkCmp').innerHTML = '<tr><th>Lock</th><th>Sections done</th><th>Useful</th><th>Spinning</th><th>Sleep / wake</th><th>Idle</th></tr>' +
+      Object.keys(all).map((k) => { const x = all[k]; return `<tr class="${k === kind ? 'lk-sel' : ''}"><td>${NAME[k]}</td><td class="${x.done === best ? 'lk-best' : ''}">${x.done}</td><td>${pct(x.tally.work + x.tally.cs, x)}%</td><td>${pct(x.tally.spin, x)}%</td><td>${pct(x.tally.wake, x)}%</td><td>${pct(x.tally.idle, x)}%</td></tr>`; }).join('');
+  }
+  $('#lkKind').addEventListener('segchange', (e) => { kind = e.detail; render(); });
+  $('#lkL').addEventListener('segchange', (e) => { L = +e.detail; render(); });
+  $('#lkN').addEventListener('segchange', (e) => { N = +e.detail; render(); });
+  $('#lkC').addEventListener('segchange', (e) => { C = +e.detail; render(); });
+  render();
+})();
+</script>
+</body>
+</html>

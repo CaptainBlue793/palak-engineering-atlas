@@ -145,7 +145,7 @@
       topics: ['Processes', 'Virtual memory', 'Scheduling', 'Locks & deadlock', 'epoll', '8 case studies'],
       lang: 'C',
       chapters: 56,
-      hours: 42,
+      hours: 41,
       c1: '#dc2626', c2: '#d97706', d1: '#f87171', d2: '#fbbf24',
       store: 'os',
       indexVar: 'OS_INDEX',
@@ -153,7 +153,6 @@
       first: 'p1-c-for-systems.html',
       dist: 'os-course.html',
       release: null,
-      soon: true,
     },
     {
       id: 'networks',

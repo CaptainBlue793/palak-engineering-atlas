@@ -26,6 +26,18 @@ for (const [dir, [l, ls, d, ds]] of Object.entries(EXPECT)) {
   check(dir + ' --accent-2 light/dark/dark', JSON.stringify(a2) === JSON.stringify([l, d, d]), JSON.stringify(a2));
   check(dir + ' --accent-2-soft light/dark/dark', JSON.stringify(soft) === JSON.stringify([ls, ds, ds]), JSON.stringify(soft));
 }
+// Courses created by tools/new-course.cjs take both accents from the registry (light c1/c2, dark d1/d2).
+const rgba = (hex, a) => { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; };
+const LEGACY = ['system-design', 'ml-ai-systems', 'dsa', 'lld'];
+for (const c of require('./registry.cjs').onDisk().filter((c) => !LEGACY.includes(c.id))) {
+  const css = fs.readFileSync(path.join(ROOT, c.dir, 'assets/style.css'), 'utf8');
+  const all = (name) => [...css.matchAll(new RegExp('--' + name + ':\\s*([^;]+);', 'g'))].map((m) => m[1].replace(/\s+/g, ''));
+  check(c.dir + ' --accent light/dark/dark', JSON.stringify(all('accent')) === JSON.stringify([c.c1, c.d1, c.d1]), JSON.stringify(all('accent')));
+  check(c.dir + ' --accent-2 light/dark/dark', JSON.stringify(all('accent-2')) === JSON.stringify([c.c2, c.d2, c.d2]), JSON.stringify(all('accent-2')));
+  check(c.dir + ' --accent-soft', JSON.stringify(all('accent-soft')) === JSON.stringify([rgba(c.c1, '.12'), rgba(c.d1, '.15'), rgba(c.d1, '.15')]), JSON.stringify(all('accent-soft')));
+  check(c.dir + ' --accent-2-soft', JSON.stringify(all('accent-2-soft')) === JSON.stringify([rgba(c.c2, '.12'), rgba(c.d2, '.13'), rgba(c.d2, '.13')]), JSON.stringify(all('accent-2-soft')));
+  HERO[c.dir] = [c.c1, c.c2];
+}
 for (const [dir, [c1, c2]] of Object.entries(HERO)) {
   const html = fs.readFileSync(path.join(ROOT, dir, 'index.html'), 'utf8');
   check(dir + ' hero title gradient', html.includes('linear-gradient(100deg,' + c1 + ',' + c2 + ')'), 'not found');

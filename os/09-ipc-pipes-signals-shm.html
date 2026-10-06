@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IPC: Pipes, Signals &amp; Shared Memory</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pl-wrap { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.4fr) minmax(0,1fr); gap:12px; margin-top:14px; align-items:stretch; }
+  @media (max-width:760px) { .pl-wrap { grid-template-columns:1fr; } }
+  .pl-p { border:1.5px solid var(--border); border-radius:12px; padding:10px 12px; background:var(--surface); }
+  .pl-p h5 { margin:0 0 4px; font-size:13px; }
+  .pl-p .pl-st { font-family:var(--mono); font-size:12px; font-weight:800; padding:2px 8px; border-radius:6px; display:inline-block; margin:4px 0; }
+  .pl-run { background:var(--green-soft); color:var(--green); }
+  .pl-blk { background:var(--amber-soft); color:var(--amber); }
+  .pl-dead { background:var(--red-soft); color:var(--red); }
+  .pl-p .small { margin-top:4px; }
+  .pl-buf { border:1.5px dashed var(--border-strong); border-radius:12px; padding:10px; background:var(--surface-2); }
+  .pl-buf h5 { margin:0 0 6px; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); display:flex; justify-content:space-between; }
+  .pl-cells { display:grid; grid-template-columns:repeat(16,minmax(0,1fr)); gap:3px; }
+  .pl-cells i { height:28px; border-radius:4px; background:var(--surface-3); display:block; transition:background .2s; }
+  .pl-cells i.pl-f { background:color-mix(in srgb, var(--accent-2) 70%, transparent); }
+  .pl-ends { display:flex; justify-content:space-between; font-family:var(--mono); font-size:11.5px; color:var(--muted); margin-top:6px; }
+  .pl-ends .pl-x { color:var(--red); text-decoration:line-through; }
+  .pl-opts { display:flex; flex-wrap:wrap; gap:14px; margin-top:12px; font-size:13.5px; color:var(--text-2); }
+  .pl-opts label { display:flex; gap:6px; align-items:center; cursor:pointer; }
+</style>
+</head>
+<body data-chapter="9">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 9</span><span class="pill">Beginner</span><span class="pill">⏱ 45 min</span></div>
+    <h1>IPC: Pipes, Signals &amp; <span class="grad">Shared Memory</span></h1>
+    <p class="lead">Processes are isolated by design (<a href="01-what-an-os-does.html">Chapter 1</a>), so when they need to cooperate the kernel has to provide the channel. A shell pipeline streams bytes through a pipe. systemd and Kubernetes tell a server to shut down with a signal. PostgreSQL's backends share their buffer cache through shared memory. The Docker CLI talks to its daemon over a Unix domain socket. Each mechanism makes a different trade between simplicity, speed and safety, and each has a way of failing that catches people out: a pipe that blocks forever, a signal handler that deadlocks, shared memory with no lock.</p>
+    <ul class="objectives">
+      <li>Use pipes and FIFOs, and predict when readers and writers block, see end-of-file, or get <code>SIGPIPE</code></li>
+      <li>Install a signal handler safely and explain what may run inside one</li>
+      <li>Share memory between processes with <code>shm_open</code> and <code>mmap</code>, and say what extra it needs</li>
+      <li>Explain what Unix domain sockets add, including passing file descriptors</li>
+      <li>Choose an IPC mechanism for a given job</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Pipes and <code>kill</code> from the shell.</b> See <a href="p7-linux-shell-files.html">P7</a>.</li>
+        <li><b>fork, and which resources a child inherits.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a>.</li>
+        <li><b>Blocking and wait queues.</b> See <a href="04-process-states-pcb.html">Chapter 4</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Pipes and FIFOs</h2>
+  <p>A <b>pipe</b> is a one-way byte stream through a buffer in the kernel. <code>pipe(fds)</code> returns two file descriptors: <code>fds[0]</code> to read from and <code>fds[1]</code> to write to. On its own that's useless (one process talking to itself), but descriptors survive <code>fork()</code>, so a parent creates the pipe, forks, and each side closes the end it doesn't use:</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;string.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/wait.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;unistd.h&gt;</span>
+
+<span class="k">int</span> <span class="f">main</span>(<span class="k">void</span>) {
+	<span class="k">int</span> fds[<span class="m">2</span>];
+	<span class="k">if</span> (<span class="f">pipe</span>(fds) &lt; <span class="m">0</span>) { <span class="f">perror</span>(<span class="s">"pipe"</span>); <span class="k">return</span> <span class="m">1</span>; }
+	<span class="t">pid_t</span> pid = <span class="f">fork</span>();
+	<span class="k">if</span> (pid &lt; <span class="m">0</span>) { <span class="f">perror</span>(<span class="s">"fork"</span>); <span class="k">return</span> <span class="m">1</span>; }
+	<span class="k">if</span> (pid == <span class="m">0</span>) {                         <span class="c">/* child: the reader */</span>
+		<span class="f">close</span>(fds[<span class="m">1</span>]);                      <span class="c">/* MUST close the write end, or it never sees EOF */</span>
+		<span class="k">char</span> buf[<span class="m">256</span>];
+		<span class="t">ssize_t</span> n;
+		<span class="k">while</span> ((n = <span class="f">read</span>(fds[<span class="m">0</span>], buf, <span class="k">sizeof</span> buf)) &gt; <span class="m">0</span>)
+			<span class="f">fwrite</span>(buf, <span class="m">1</span>, (<span class="t">size_t</span>)n, stdout);
+		<span class="f">_exit</span>(n &lt; <span class="m">0</span> ? <span class="m">1</span> : <span class="m">0</span>);                 <span class="c">/* n == 0: every write end is closed: end of file */</span>
+	}
+	<span class="f">close</span>(fds[<span class="m">0</span>]);                          <span class="c">/* parent: the writer */</span>
+	<span class="k">const</span> <span class="k">char</span> *msg = <span class="s">"job 17 done\njob 18 done\n"</span>;
+	<span class="k">if</span> (<span class="f">write</span>(fds[<span class="m">1</span>], msg, <span class="f">strlen</span>(msg)) &lt; <span class="m">0</span>) <span class="f">perror</span>(<span class="s">"write"</span>);
+	<span class="f">close</span>(fds[<span class="m">1</span>]);                          <span class="c">/* signals EOF to the reader */</span>
+	<span class="f">waitpid</span>(pid, <span class="k">NULL</span>, <span class="m">0</span>);
+	<span class="k">return</span> <span class="m">0</span>;
+}</pre>
+  <p>Four rules cover almost every pipe bug. A <code>read</code> on an empty pipe <b>blocks</b> while any write end is open. A <code>read</code> returns <b>0 (end of file)</b> only once every write end, in every process, is closed, which is why forgetting <code>close(fds[1])</code> in the reader hangs it forever. A <code>write</code> to a full pipe (Linux's default capacity is 64 KiB) <b>blocks</b> until the reader makes room. And a <code>write</code> when no read end is open raises <b><code>SIGPIPE</code></b>, killing the writer by default; that's how <code>yes | head -1</code> stops. A <b>FIFO</b> (<code>mkfifo /tmp/jobs</code>) is the same thing with a name in the file system, so unrelated processes can open it.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Pipe lab: blocking, end-of-file and SIGPIPE</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="pl-wrap">
+        <div class="pl-p" id="plW"></div>
+        <div class="pl-buf"><h5><span>Kernel pipe buffer</span><span id="plFill"></span></h5><div class="pl-cells" id="plCells"></div><div class="pl-ends" id="plEnds"></div></div>
+        <div class="pl-p" id="plR"></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" data-a="w">writer: write(16 KiB)</button>
+        <button class="btn sm primary" data-a="r">reader: read(16 KiB)</button>
+        <button class="btn sm" data-a="cw">writer: close(write end)</button>
+        <button class="btn sm" data-a="cr">reader: close(read end)</button>
+        <button class="btn sm" data-a="reset">↺ Reset</button>
+      </div>
+      <div class="pl-opts">
+        <label><input type="checkbox" id="plNb"> writer's fd has <code>O_NONBLOCK</code></label>
+        <label><input type="checkbox" id="plIgn"> writer ignores <code>SIGPIPE</code></label>
+      </div>
+      <div class="log" id="plLog" style="margin-top:12px;height:130px"></div>
+    </div>
+    <div class="panel-foot">Each cell is 4 KiB; the buffer holds 64 KiB, Linux's default (<code>fcntl(fd, F_SETPIPE_SZ, …)</code> can change it, up to <code>/proc/sys/fs/pipe-max-size</code>). A blocked writer finishes its write as soon as there's room.</div>
+  </div>
+
+  <h2>Signals</h2>
+  <p>A <b>signal</b> is a tiny asynchronous message: just a number, delivered to a process by the kernel, another process (<code>kill()</code>) or the terminal. Each signal has a default action (terminate, terminate with a core dump, ignore, stop or continue), which a program can replace with a handler for all but two: <code>SIGKILL</code> and <code>SIGSTOP</code> can never be caught.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Signal</th><th>Number</th><th>Sent when</th><th>Default</th><th>Typical handling</th></tr></thead>
+      <tbody>
+        <tr><td><code>SIGINT</code></td><td>2</td><td>Ctrl+C in the terminal</td><td>Terminate</td><td>Stop gracefully</td></tr>
+        <tr><td><code>SIGTERM</code></td><td>15</td><td><code>kill</code>, systemd, Kubernetes, Docker stop</td><td>Terminate</td><td>Finish in-flight work, then exit</td></tr>
+        <tr><td><code>SIGKILL</code></td><td>9</td><td><code>kill -9</code>, the OOM killer, end of a grace period</td><td>Terminate</td><td>Can't be caught</td></tr>
+        <tr><td><code>SIGHUP</code></td><td>1</td><td>Terminal closed; by convention "reload config"</td><td>Terminate</td><td>nginx and many daemons reload</td></tr>
+        <tr><td><code>SIGCHLD</code></td><td>17</td><td>A child exited or stopped</td><td>Ignore</td><td>Reap with <code>waitpid</code> (<a href="03-processes-fork-exec-wait.html">Chapter 3</a>)</td></tr>
+        <tr><td><code>SIGPIPE</code></td><td>13</td><td>Write to a pipe or socket with no reader</td><td>Terminate</td><td>Servers ignore it and handle <code>EPIPE</code></td></tr>
+        <tr><td><code>SIGSEGV</code></td><td>11</td><td>Invalid memory access</td><td>Core dump</td><td>Fix the bug</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The danger is that a handler can run between any two instructions of your program, even in the middle of <code>malloc</code> while it holds the heap lock. If the handler then calls <code>malloc</code> or <code>printf</code>, it can deadlock or corrupt state. So a handler may only call <b>async-signal-safe</b> functions (a short list in <code>man 7 signal-safety</code>: <code>write</code>, <code>_exit</code> and a few dozen more). The robust pattern is to do nothing in the handler but set a flag, and let the main loop act on it:</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;signal.h&gt;</span>
+
+<span class="k">static</span> <span class="k">volatile</span> <span class="t">sig_atomic_t</span> stopping = <span class="m">0</span>;          <span class="c">/* the only thing the handler touches */</span>
+
+<span class="k">static</span> <span class="k">void</span> <span class="f">on_term</span>(<span class="k">int</span> sig) { (<span class="k">void</span>)sig; stopping = <span class="m">1</span>; }
+
+<span class="k">int</span> <span class="f">main</span>(<span class="k">void</span>) {
+	<span class="k">struct</span> sigaction sa = { .sa_handler = on_term };    <span class="c">/* sigaction, not signal(): portable semantics */</span>
+	<span class="f">sigemptyset</span>(&amp;sa.sa_mask);
+	<span class="k">if</span> (<span class="f">sigaction</span>(<span class="m">SIGTERM</span>, &amp;sa, <span class="k">NULL</span>) &lt; <span class="m">0</span>) { <span class="f">perror</span>(<span class="s">"sigaction"</span>); <span class="k">return</span> <span class="m">1</span>; }
+	<span class="f">signal</span>(<span class="m">SIGPIPE</span>, <span class="m">SIG_IGN</span>);                           <span class="c">/* get EPIPE from write() instead of dying */</span>
+
+	<span class="k">while</span> (!stopping) {
+		<span class="f">serve_one_request</span>();                            <span class="c">/* blocking calls return EINTR when a signal lands */</span>
+	}
+	<span class="f">drain_and_close</span>();                                  <span class="c">/* graceful: finish in-flight work */</span>
+	<span class="k">return</span> <span class="m">0</span>;
+}</pre>
+  <figure class="seq" data-actors="kubelet|container runtime|your server (PID 1)|kernel">
+    <ol>
+      <li data-m="0>1">delete pod: stop container</li>
+      <li data-m="1>3">kill(pid, SIGTERM)</li>
+      <li data-m="3>2" data-k="async">deliver: on_term() sets stopping = 1</li>
+      <li data-m="2>2">stop accepting, finish in-flight requests, close DB pool</li>
+      <li data-m="2>3">exit(0) within the grace period</li>
+      <li data-m="0-3" data-k="note">if still running after 30 s: SIGKILL, no clean-up</li>
+    </ol>
+    <figcaption><b>Graceful shutdown.</b> <code>SIGTERM</code> asks; <code>SIGKILL</code> follows after the grace period. A server that ignores TERM drops every in-flight request when KILL arrives.</figcaption>
+  </figure>
+
+  <h2>Shared memory</h2>
+  <p>Pipes and sockets copy every byte twice: from the writer's buffer into the kernel, then out to the reader's. <b>Shared memory</b> avoids that: the same physical pages are mapped into both processes' address spaces, so a write by one is immediately visible to the other, with no system call per message. It's the fastest IPC there is, and the least safe, because the kernel no longer orders anything for you.</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;fcntl.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/mman.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;unistd.h&gt;</span>
+
+<span class="k">struct</span> ring { <span class="k">_Atomic</span> <span class="k">unsigned</span> head, tail; <span class="k">char</span> slots[<span class="m">1024</span>][<span class="m">256</span>]; };   <span class="c">/* a shared queue layout */</span>
+
+<span class="k">int</span> fd = <span class="f">shm_open</span>(<span class="s">"/metrics-ring"</span>, <span class="m">O_CREAT</span> | <span class="m">O_RDWR</span>, <span class="m">0600</span>);   <span class="c">/* a named object in /dev/shm */</span>
+<span class="k">if</span> (fd &lt; <span class="m">0</span>) { <span class="f">perror</span>(<span class="s">"shm_open"</span>); <span class="k">return</span> <span class="m">1</span>; }
+<span class="k">if</span> (<span class="f">ftruncate</span>(fd, <span class="k">sizeof</span>(<span class="k">struct</span> ring)) &lt; <span class="m">0</span>) { <span class="f">perror</span>(<span class="s">"ftruncate"</span>); <span class="k">return</span> <span class="m">1</span>; }
+<span class="k">struct</span> ring *r = <span class="f">mmap</span>(<span class="k">NULL</span>, <span class="k">sizeof</span> *r, <span class="m">PROT_READ</span> | <span class="m">PROT_WRITE</span>, <span class="m">MAP_SHARED</span>, fd, <span class="m">0</span>);
+<span class="k">if</span> (r == <span class="m">MAP_FAILED</span>) { <span class="f">perror</span>(<span class="s">"mmap"</span>); <span class="k">return</span> <span class="m">1</span>; }
+<span class="f">close</span>(fd);                     <span class="c">/* the mapping stays valid */</span>
+<span class="c">/* Another process does the same shm_open + mmap and sees the same bytes.
+   Coordination (atomics, a futex or a process-shared mutex) is entirely up to you. */</span></pre>
+  <p>Chapter 30 explains <code>mmap</code> and <code>MAP_SHARED</code> properly; Chapters 17 to 26 cover the synchronisation shared memory needs. PostgreSQL is the classic user: all backend processes map one shared buffer pool (<a href="43-case-postgres-on-os.html">Chapter 43</a>).</p>
+
+  <h2>Unix domain sockets</h2>
+  <p>A <b>Unix domain socket</b> is a socket whose address is a path in the file system (or an abstract name) instead of an IP and port. It uses the familiar socket API, <code>socket(AF_UNIX, SOCK_STREAM, 0)</code>, <code>bind</code>, <code>listen</code>, <code>connect</code>, but never touches the network stack, so it's faster than TCP on localhost. It is two-way, connection-oriented, and has two features no other IPC has: the server can ask the kernel who the client really is (<code>SO_PEERCRED</code> gives its PID, UID and GID), and processes can <b>send open file descriptors</b> to each other (<code>SCM_RIGHTS</code>). <code>/var/run/docker.sock</code>, PostgreSQL's local connections and systemd's socket activation all use them.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Mechanism</th><th>Shape</th><th>Copies per message</th><th>Related processes only?</th><th>Use it for</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td>Pipe</td><td>One-way byte stream</td><td>2</td><td>Yes (inherited fds)</td><td>Pipelines, parent ↔ child output</td><td>Missing <code>close</code>, SIGPIPE, 64 KiB full buffer</td></tr>
+        <tr><td>FIFO</td><td>One-way byte stream, named</td><td>2</td><td>No</td><td>Simple producer/consumer between unrelated programs</td><td><code>open</code> blocks until both ends open</td></tr>
+        <tr><td>Signal</td><td>A number, no data</td><td>–</td><td>No (same user or root)</td><td>Notifications: stop, reload, child exited</td><td>Async-signal safety; signals of the same kind merge</td></tr>
+        <tr><td>Unix socket</td><td>Two-way stream or datagrams</td><td>2</td><td>No</td><td>Local client/server: Docker, databases</td><td>Stale socket files; permissions on the path</td></tr>
+        <tr><td>Shared memory</td><td>Raw shared bytes</td><td>0</td><td>No</td><td>High-volume data: buffer pools, ring buffers, video frames</td><td>You must build all synchronisation</td></tr>
+        <tr><td>TCP on localhost</td><td>Two-way stream</td><td>2 + network stack</td><td>No</td><td>When the peer may move to another machine later</td><td>Slower than a Unix socket</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">☸️</div>
+    <div class="body"><div class="title">Kubernetes shutdown is a signal and a timer</div><p>When Kubernetes stops a pod, during a deploy or a node drain, the container runtime sends <code>SIGTERM</code> to the container's PID 1 and starts a clock: <code>terminationGracePeriodSeconds</code>, 30 seconds by default. If the process is still alive when it runs out, it gets <code>SIGKILL</code>. Services that handle <code>SIGTERM</code> properly stop accepting new work, finish in-flight requests and close their connection pools, so deploys cause no errors. Services that don't (or that run under a shell script as PID 1 that never forwards the signal, <a href="03-processes-fork-exec-wait.html">Chapter 3</a>'s PID 1 problem) are killed mid-request every single deploy, and users see a burst of 502s. The entire graceful-shutdown story of cloud platforms rests on the 1970s signal mechanism in this chapter.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Not closing unused pipe ends.</b> A reader that still holds the write end never sees EOF; a writer holding the read end never gets SIGPIPE.</li>
+      <li><b>Calling <code>printf</code>, <code>malloc</code> or locks in a signal handler.</b> Set a <code>volatile sig_atomic_t</code> flag instead.</li>
+      <li><b>Assuming every signal is delivered once.</b> Two <code>SIGCHLD</code>s arriving together can merge into one; reap in a loop.</li>
+      <li><b>Dying on <code>SIGPIPE</code> in a server.</b> A client that disconnects shouldn't kill the process: ignore the signal and handle <code>EPIPE</code>.</li>
+      <li><b>Shared memory without synchronisation.</b> Two processes writing the same region need atomics or a process-shared lock, exactly like threads.</li>
+      <li><b>Forgetting <code>EINTR</code>.</b> A handled signal interrupts blocking calls; retry them, or use <code>SA_RESTART</code>.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> A parent writes to a pipe and its child reads until end-of-file, but the child hangs forever after the last message. Why?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The child never closed its own copy of the write end. After <code>fork()</code> both processes hold both ends, and <code>read</code> returns 0 only when every write end in every process is closed. The parent closed its write end, but the child's inherited one keeps the pipe "open for writing", so the child's <code>read</code> blocks waiting for data that it would have to write itself. The fix is for each process to close the end it doesn't use immediately after the fork.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> When would you choose shared memory over a Unix domain socket, and what does it cost you?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>When the data volume or message rate is high enough that copying through the kernel and a system call per message dominate: a buffer pool shared by database backends, a ring buffer of telemetry, video frames between processes. Shared memory gives zero copies and no syscalls on the fast path. The cost is that the kernel no longer provides ordering, boundaries or wake-ups: I have to design the data layout, use atomics or a process-shared mutex, handle a crashed peer leaving a lock held, and usually still use a socket, eventfd or futex to wake the other side instead of spinning. For control messages or moderate rates, a Unix socket is simpler and safer, and it can also check peer credentials and pass file descriptors.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A pipe is a one-way kernel buffer (64 KiB by default): readers block when empty, writers when full.</li>
+      <li>EOF needs every write end closed; writing with no reader raises <code>SIGPIPE</code> (or <code>EPIPE</code> if ignored).</li>
+      <li>Signals are asynchronous numbers; handlers may only use async-signal-safe calls, so set a flag and act in the main loop.</li>
+      <li><code>SIGTERM</code> asks politely, <code>SIGKILL</code> can't be caught; graceful shutdown depends on handling TERM.</li>
+      <li>Shared memory is zero-copy but needs your own synchronisation; Unix sockets add two-way streams, peer credentials and fd passing.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A process writes 100 KiB into a pipe that nobody is reading yet. What happens on Linux with default settings?</p>
+      <div class="opts">
+        <button class="opt">The write fails with ENOSPC</button>
+        <button class="opt">The data is written to disk</button>
+        <button class="opt">The write blocks once the 64 KiB buffer is full, until a reader makes room</button>
+        <button class="opt">The extra data is silently dropped</button>
+      </div>
+      <div class="explain">Pipes provide backpressure: a full buffer blocks the writer (or returns EAGAIN with O_NONBLOCK).</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">When does <code>read()</code> on a pipe return 0?</p>
+      <div class="opts">
+        <button class="opt">When the pipe is empty and every write end, in every process, has been closed</button>
+        <button class="opt">Whenever the pipe is empty</button>
+        <button class="opt">When the writer sends a zero byte</button>
+        <button class="opt">After a timeout</button>
+      </div>
+      <div class="explain">An empty pipe with a writer still open blocks; only when no writer remains does read report end of file.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What is the safe thing to do inside a SIGTERM handler?</p>
+      <div class="opts">
+        <button class="opt">Log a message with printf and free all memory</button>
+        <button class="opt">Close the database connection pool</button>
+        <button class="opt">Call exit() so atexit handlers run</button>
+        <button class="opt">Set a volatile sig_atomic_t flag that the main loop checks</button>
+      </div>
+      <div class="explain">Handlers can interrupt non-reentrant code like malloc or printf. Do the real work in the main loop.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which IPC mechanism avoids copying data through the kernel for every message?</p>
+      <div class="opts">
+        <button class="opt">A pipe</button>
+        <button class="opt">Shared memory mapped into both processes</button>
+        <button class="opt">A Unix domain socket</button>
+        <button class="opt">A FIFO</button>
+      </div>
+      <div class="explain">With shared memory both processes access the same physical pages. Pipes and sockets copy in and out of a kernel buffer.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What can a Unix domain socket do that a pipe can't?</p>
+      <div class="opts">
+        <button class="opt">Carry bytes faster than any other mechanism</button>
+        <button class="opt">Work across machines</button>
+        <button class="opt">Pass open file descriptors between processes and report the peer's PID and UID</button>
+        <button class="opt">Survive a reboot</button>
+      </div>
+      <div class="explain">SCM_RIGHTS passes fds; SO_PEERCRED gives credentials. It's also two-way, unlike a pipe.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const CAP = 64, CHUNK = 16;  // KiB
+  let S;
+  function reset() {
+    S = { buf: 0, wOpen: true, rOpen: true, wState: 'run', rState: 'run', wPending: 0, rWaiting: false, wDead: false, rDone: false, written: 0, read: 0 };
+    $('#plLog').innerHTML = '';
+    OS.log($('#plLog'), 'pipe(fds) → fds[0] = 3 (read end), fds[1] = 4 (write end); fork(); each side closed the end it doesn\'t use.', 'acc');
+    render();
+  }
+  const log = (m, c) => OS.log($('#plLog'), m, c);
+  function wakeReader() {
+    if (S.rWaiting && (S.buf > 0 || !S.wOpen)) {
+      S.rWaiting = false; S.rState = 'run';
+      if (S.buf > 0) { const n = Math.min(S.buf, CHUNK); S.buf -= n; S.read += n; log(`reader wakes: read() returns ${n} KiB`, 'ok'); }
+      else { S.rDone = true; log('reader wakes: read() returns 0 → end of file. The reader finishes.', 'ok'); }
+    }
+  }
+  function wakeWriter() {
+    if (S.wPending > 0 && S.buf < CAP && S.rOpen) {
+      const n = Math.min(S.wPending, CAP - S.buf); S.buf += n; S.wPending -= n; S.written += n;
+      if (!S.wPending) { S.wState = 'run'; log(`writer wakes: room again, the blocked write() completes (${n} KiB more)`, 'ok'); }
+      else log(`writer copies ${n} KiB more, still blocked for ${S.wPending} KiB`, 'warn');
+    }
+  }
+  function act(a) {
+    const nb = $('#plNb').checked, ign = $('#plIgn').checked;
+    if (a === 'reset') return reset();
+    if (a === 'w') {
+      if (S.wDead) return OS.toast('The writer is dead.');
+      if (!S.wOpen) return OS.toast('The writer already closed its end.');
+      if (S.wState === 'blk') return OS.toast('The writer is blocked inside its last write().');
+      if (!S.rOpen) {
+        if (ign) { log('write() = -1, errno = EPIPE: no reader. (SIGPIPE ignored, so the program can handle it.)', 'warn'); }
+        else { S.wDead = true; S.wState = 'dead'; S.wOpen = false; log('write() with no read end open → kernel sends SIGPIPE → writer terminated (exit status 141 = 128 + 13)', 'bad'); }
+        return render();
+      }
+      const room = CAP - S.buf;
+      if (room >= CHUNK) { S.buf += CHUNK; S.written += CHUNK; log(`write(4, buf, 16 KiB) = 16 KiB → buffer ${S.buf}/64 KiB`); }
+      else if (nb) { if (room > 0) { S.buf += room; S.written += room; log(`O_NONBLOCK: partial write, ${room} KiB accepted (returns ${room * 1024})`, 'warn'); } else log('O_NONBLOCK: write() = -1, errno = EAGAIN (buffer full). An event loop would wait for EPOLLOUT (Chapter 28).', 'warn'); }
+      else { S.buf += room; S.written += room; S.wPending = CHUNK - room; S.wState = 'blk'; log(`buffer full after ${room} KiB → writer BLOCKS in write() with ${S.wPending} KiB to go (state S, on the pipe's wait queue)`, 'warn'); }
+      wakeReader();
+    } else if (a === 'r') {
+      if (!S.rOpen) return OS.toast('The reader closed its end.');
+      if (S.rDone) return OS.toast('The reader already saw end of file and finished.');
+      if (S.rWaiting) return OS.toast('The reader is blocked inside read().');
+      if (S.buf > 0) { const n = Math.min(S.buf, CHUNK); S.buf -= n; S.read += n; log(`read(3, buf, 16 KiB) = ${n} KiB → buffer ${S.buf}/64 KiB`); wakeWriter(); }
+      else if (S.wOpen) { S.rWaiting = true; S.rState = 'blk'; log('buffer empty, a write end is still open → reader BLOCKS in read()', 'warn'); }
+      else { S.rDone = true; log('read() = 0: empty AND no write end open → end of file', 'ok'); }
+    } else if (a === 'cw') {
+      if (!S.wOpen) return OS.toast('Already closed.');
+      if (S.wState === 'blk') return OS.toast('The writer is blocked; it can\'t call close() until its write returns.');
+      S.wOpen = false; S.wState = 'done'; log('close(4): last write end closed. Buffered data can still be read; after that, readers get EOF.', 'acc'); wakeReader();
+    } else if (a === 'cr') {
+      if (!S.rOpen) return OS.toast('Already closed.');
+      S.rOpen = false; S.rState = 'done'; S.rWaiting = false; log('close(3): no read end left. Unread data is discarded; the next write gets SIGPIPE.', 'acc');
+      if (S.wState === 'blk') { if (ign) { S.wState = 'run'; S.wPending = 0; log('the blocked writer wakes: write() fails with EPIPE', 'warn'); } else { S.wDead = true; S.wState = 'dead'; S.wOpen = false; log('the blocked writer wakes into SIGPIPE and is terminated', 'bad'); } }
+      S.buf = 0;
+    }
+    render();
+  }
+  function card(name, st, extra) {
+    const lab = { run: ['pl-run', 'running'], blk: ['pl-blk', 'BLOCKED'], dead: ['pl-dead', 'killed by SIGPIPE'], done: ['pl-run', 'done'] }[st];
+    return `<h5>${name}</h5><span class="pl-st ${lab[0]}">${lab[1]}</span><div class="small muted">${extra}</div>`;
+  }
+  function render() {
+    $('#plW').innerHTML = card('Writer (parent)', S.wState, `fd 4 = write end ${S.wOpen ? 'open' : 'closed'}<br>written: ${S.written} KiB${S.wPending ? `<br>waiting to write ${S.wPending} KiB` : ''}`);
+    $('#plR').innerHTML = card('Reader (child)', S.rDone ? 'done' : S.rState, `fd 3 = read end ${S.rOpen ? 'open' : 'closed'}<br>read: ${S.read} KiB${S.rDone ? '<br>saw end of file' : ''}`);
+    $('#plCells').innerHTML = Array.from({ length: 16 }, (_, k) => `<i class="${k < S.buf / 4 ? 'pl-f' : ''}"></i>`).join('');
+    $('#plFill').textContent = `${S.buf} / ${CAP} KiB`;
+    $('#plEnds').innerHTML = `<span class="${S.wOpen ? '' : 'pl-x'}">write end (fd 4) →</span><span class="${S.rOpen ? '' : 'pl-x'}">→ read end (fd 3)</span>`;
+  }
+  $('.panel').addEventListener('click', (e) => { const b = e.target.closest('[data-a]'); if (b) act(b.dataset.a); });
+  reset();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mmap &amp; Copy-on-Write</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .cw-h { margin:14px 0 6px; font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .cw-row { display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); gap:6px; }
+  @media (max-width:760px) { .cw-row { grid-template-columns:repeat(4,minmax(0,1fr)); } }
+  .cw-p { display:block; width:100%; text-align:center; border:1.5px solid var(--border); border-radius:10px; padding:6px 3px; background:var(--surface); color:var(--text); font-family:var(--mono); font-size:11px; line-height:1.45; min-height:66px; cursor:pointer; transition:.15s; }
+  .cw-p:hover { border-color:var(--border-strong); }
+  .cw-p b { display:block; font-size:14px; }
+  .cw-p span { display:block; color:var(--muted); }
+  .cw-p.cw-sh { background:color-mix(in srgb, var(--accent-2) 14%, var(--surface)); border-color:var(--accent-2); }
+  .cw-p.cw-own { background:var(--green-soft); border-color:var(--green); }
+  .cw-p.cw-new { outline:2px solid var(--text); outline-offset:1px; }
+  .cw-none { padding:14px; border:1.5px dashed var(--border-strong); border-radius:10px; font-size:13px; color:var(--muted); }
+  .cw-frames { display:flex; flex-wrap:wrap; gap:5px; }
+  .cw-f { font-family:var(--mono); font-size:11px; padding:4px 7px; border-radius:7px; border:1px solid var(--border); background:var(--surface-2); }
+  .cw-f.cw-two { border-color:var(--accent-2); background:color-mix(in srgb, var(--accent-2) 14%, var(--surface)); }
+  .cw-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .cw-desc.cw-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .cw-desc.cw-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
+</head>
+<body data-chapter="30">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 30</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
+    <h1>mmap &amp; <span class="grad">Copy-on-Write</span></h1>
+    <p class="lead">Two of the most useful tricks in the kernel are the same trick: point page-table entries at memory that is shared, and sort out the details only if someone writes. <code>mmap</code> uses it to make a file appear as an array in your address space, with no reads and no copies. <code>fork</code> uses it to "duplicate" a ten-gigabyte process in milliseconds by duplicating nothing. Both rest on the page fault from Chapter 14, used as a hook: mark a page read-only, wait for a write to trap, and do the expensive part then, for that one page only. This is <b>copy-on-write</b>, and it is behind program loading, shared libraries, Redis snapshots and container images.</p>
+    <ul class="objectives">
+      <li>Map a file into memory and explain what the kernel does, and doesn't do, at that moment</li>
+      <li>Choose between shared and private mappings, and file-backed and anonymous ones</li>
+      <li>Explain how fork avoids copying memory, and what a write does afterwards</li>
+      <li>Predict the memory cost of forking a large process that keeps writing</li>
+      <li>Say when mmap is a better choice than read and write, and when it isn't</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Page faults, VMAs and demand paging.</b> See <a href="14-page-faults-demand-paging.html">Chapter 14</a>.</li>
+        <li><b>The Writable bit in a page-table entry.</b> See <a href="12-paging-page-tables.html">Chapter 12</a>.</li>
+        <li><b>fork and exec.</b> See <a href="03-processes-fork-exec-wait.html">Chapter 3</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>mmap: a file as memory</h2>
+  <p><code>mmap</code> asks the kernel to make a range of your address space <i>stand for</i> a range of a file. After the call you read the file by reading memory.</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;sys/mman.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/stat.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;fcntl.h&gt;</span>
+
+<span class="t">int</span> fd = <span class="f">open</span>(<span class="s">"access.log"</span>, <span class="m">O_RDONLY</span>);
+<span class="k">struct</span> <span class="t">stat</span> st;
+<span class="f">fstat</span>(fd, &amp;st);
+
+<span class="t">char</span> *p = <span class="f">mmap</span>(<span class="m">NULL</span>, st.st_size, <span class="m">PROT_READ</span>, <span class="m">MAP_PRIVATE</span>, fd, <span class="m">0</span>);
+<span class="f">close</span>(fd);                                  <span class="c">/* the mapping keeps the file open by itself */</span>
+
+<span class="t">long</span> lines = <span class="m">0</span>;
+<span class="k">for</span> (<span class="t">off_t</span> i = <span class="m">0</span>; i &lt; st.st_size; i++)       <span class="c">/* no read() calls: just memory accesses */</span>
+    lines += (p[i] == <span class="s">'\n'</span>);
+
+<span class="f">munmap</span>(p, st.st_size);</pre>
+  <p>The <code>mmap</code> call itself does almost nothing: it creates a VMA saying "these addresses are that file" and returns. No data is read. The first touch of each page faults, and the kernel maps in the page that holds that part of the file from its <b>page cache</b> (<a href="31-page-cache-fsync.html">Chapter 31</a>), reading it from disk first if necessary. Your process and the kernel's cache then share <i>the same physical frame</i>: nothing is copied into a buffer of yours, because there is no buffer.</p>
+
+  <h2>Shared or private, file or anonymous</h2>
+  <p>Two choices define a mapping. Is it backed by a file, or by nothing (<b>anonymous</b>, starting as zeros)? And what happens to writes: are they <b>shared</b> with everyone else who maps the same thing, or <b>private</b> to this process?</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th><code>MAP_SHARED</code></th><th><code>MAP_PRIVATE</code></th></tr></thead>
+      <tbody>
+        <tr><td><b>File-backed</b></td><td>Writes go into the page cache: other processes mapping the file see them at once, and the kernel writes them back to the file. <i>Used for:</i> memory-mapped databases, shared data files</td><td>Reads come from the file; a write gets a private copy of that page, and <b>the file is never changed</b>. <i>Used for:</i> loading programs and libraries</td></tr>
+        <tr><td><b>Anonymous</b></td><td>Memory shared between a process and the children it forks. <i>Used for:</i> shared memory between related processes (<a href="09-ipc-pipes-signals-shm.html">Chapter 9</a>)</td><td>Ordinary private memory, zero-filled on first touch. <i>Used for:</i> the heap, stacks, large <code>malloc</code> blocks (<a href="16-heap-malloc.html">Chapter 16</a>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The top-right cell is how every program on the machine is loaded. The dynamic loader maps the C library's file privately into each process. The code pages are never written, so all three hundred processes that use the library share one copy of them in RAM. The library's data pages start out shared too, and a process gets its own copy of one only when it first writes to it. This is why the "shared" column in <code>top</code> is so large, and why starting the hundredth copy of a program costs so little memory.</p>
+
+  <h2>Copy-on-write after fork</h2>
+  <p><code>fork</code> must give the child a copy of the parent's entire address space. Early Unix really copied it. That is wasteful in the usual case, where the child calls <code>exec</code> a moment later and throws the copy away (<a href="03-processes-fork-exec-wait.html">Chapter 3</a>), and intolerable for a large process. Modern kernels copy only the <i>page tables</i>:</p>
+  <ul>
+    <li>the child's page tables point at the same physical frames as the parent's;</li>
+    <li>every writable private page is marked <b>read-only</b> in <i>both</i> processes;</li>
+    <li>each frame's reference count goes up by one.</li>
+  </ul>
+  <p>Reads work as before, for both. The first write to a page, by either process, hits the read-only bit and faults:</p>
+  <figure class="seq" data-actors="Child|MMU|Kernel|Parent">
+    <ol>
+      <li data-m="0>1">write to page 5</li>
+      <li data-m="1>2">protection fault: the entry is read-only</li>
+      <li data-m="2>1">the VMA allows writes and the frame has 2 users: copy it, and point the child's entry at the new frame, writable</li>
+      <li data-m="2>0" data-k="reply">return: the write is retried and succeeds</li>
+      <li data-m="2>3">parent's page 5 still uses the old frame, now with 1 user</li>
+    </ol>
+    <figcaption><b>A copy-on-write fault.</b> One 4 KiB page is copied, at the moment it is needed, and the other process never knows. Pages nobody writes are never copied.</figcaption>
+  </figure>
+  <p>The kernel tells this fault apart from an illegal write by looking at the VMA (<a href="14-page-faults-demand-paging.html">Chapter 14</a>): the mapping is writable, only the page-table entry says otherwise. If the reference count has already dropped to one, because the other process exited or copied its own, there is nothing to copy: the kernel just makes the page writable again.</p>
+  <p>Fork is therefore cheap but not free. The page tables themselves are copied, about 2 MiB of them per gigabyte of memory, so forking a process with tens of gigabytes takes tens of milliseconds, during which the parent is paused. Programs that only want to start another program can skip even that with <code>posix_spawn</code> or <code>vfork</code>.</p>
+
+  <h2>Fork a process</h2>
+  <p>A parent with eight pages of data. Fork it, then click pages in either row to write to them and watch which frames are shared and which are copied. Try letting the child exit, or exec, before anyone writes. Then repeat with a shared mapping.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">fork() and copy-on-write, page by page</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="cwKind"><button class="active" data-v="private">private memory (heap)</button><button data-v="shared">MAP_SHARED memory</button></div>
+        <button class="btn sm primary" id="cwFork">fork()</button>
+        <button class="btn sm" id="cwAll">Parent rewrites every page</button>
+        <button class="btn sm" id="cwExec">Child: exec()</button>
+        <button class="btn sm" id="cwExit">Child: exit()</button>
+        <button class="btn sm" id="cwReset">↺ Reset</button>
+      </div>
+      <div class="cw-h">Parent's pages (click to write)</div>
+      <div class="cw-row" id="cwPar"></div>
+      <div class="cw-h">Child's pages (click to write)</div>
+      <div id="cwChildWrap"></div>
+      <div class="cw-h">Physical frames</div>
+      <div class="cw-frames" id="cwFrames"></div>
+      <div class="cw-desc" id="cwDesc"></div>
+      <div class="stats" id="cwStats"></div>
+    </div>
+    <div class="panel-foot">The letter and number in each page are its contents: the number goes up each time that page is written, so you can see when parent and child have different data. "ro" means the page-table entry is read-only although the memory is writable: a write will fault. Blue pages share their frame with the other process.</div>
+  </div>
+
+  <p>Things to notice. Straight after <code>fork</code> there are sixteen pages and still eight frames. Each first write to a shared page costs one copy, whichever side writes. If the child calls <code>exec</code> or exits before any write, nothing was ever copied, which is the common case fork was optimised for. The parent's pages are left read-only, and its next write to each one faults once more but copies nothing, because it is the only user. Now press <b>Parent rewrites every page</b> while a child exists: memory use doubles. That is exactly what happens to a database that snapshots itself with fork while under heavy write load. With <code>MAP_SHARED</code> memory there are no copies at all, and each side sees the other's writes.</p>
+
+  <h2>mmap or read()?</h2>
+  <p>Reading a file with <code>read()</code> copies data from the page cache into your buffer, one system call at a time. A mapping gives you the page cache's own pages. Which is better depends on the access pattern more than on any general rule.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th><code>read()</code> / <code>write()</code></th><th><code>mmap</code></th></tr></thead>
+      <tbody>
+        <tr><td><b>Copies</b></td><td>Page cache to your buffer, every time</td><td>None</td></tr>
+        <tr><td><b>System calls</b></td><td>One per read</td><td>None after set-up, but a page fault per page on first touch</td></tr>
+        <tr><td><b>Random access to a huge file</b></td><td>A seek and a read each time</td><td>Pointer arithmetic</td></tr>
+        <tr><td><b>Several processes on the same data</b></td><td>Each has its own copy in its own buffers</td><td>All share the same frames</td></tr>
+        <tr><td><b>Sequential scan, once</b></td><td>Fast: large reads, kernel read-ahead</td><td>Similar or slower: fault and TLB costs</td></tr>
+        <tr><td><b>I/O errors</b></td><td>A return value you can check</td><td>A <code>SIGBUS</code> signal in the middle of a memory access</td></tr>
+        <tr><td><b>Control over when data is written back</b></td><td>You decide: write, then <code>fsync</code></td><td>The kernel decides, unless you call <code>msync</code></td></tr>
+        <tr><td><b>Tearing it down</b></td><td>Nothing to do</td><td><code>munmap</code> needs a TLB shootdown on every core (<a href="13-tlb.html">Chapter 13</a>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Mappings suit read-mostly data that several processes share, lookups scattered across a large file, and loading code. Plain reads and writes suit streaming through a file, anything that needs precise control of durability, and code that must handle disk errors gracefully. You can tell the kernel what to expect with <code>madvise</code>: <code>MADV_SEQUENTIAL</code>, <code>MADV_RANDOM</code>, <code>MADV_WILLNEED</code>, or <code>MADV_DONTNEED</code> to hand pages back.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🍃</div>
+    <div class="body"><div class="title">Why databases keep giving up on mmap</div><p>Memory-mapping the data files looks like the perfect way to build a database: the operating system already has a cache, already decides what to keep in RAM and already writes dirty pages back, so the database need not have a buffer pool of its own. MongoDB's original storage engine did exactly this, and was named MMAPv1 after it. In practice the engine could never control what mattered. It couldn't decide which pages stayed in memory, couldn't know whether touching a record would take a nanosecond or block the thread on a disk read, and couldn't guarantee the order in which changes reached the disk, which a database needs in order to recover correctly after a crash. MongoDB made the WiredTiger engine, with its own cache, the default in 2015 and later removed MMAPv1 altogether. In 2022 a paper by Andrew Crotty, Viktor Leis and Andy Pavlo, "Are You Sure You Want to Use MMAP in Your Database Management System?", collected the same story from several systems and measured the rest: with fast disks and many cores, the kernel's page eviction and the TLB shootdowns that go with it stop scaling long before a purpose-built buffer pool does. Some stores, LMDB among them, use mmap deliberately and well, for read-heavy workloads that fit in memory. The general lesson is about control: mmap is at its best when the kernel's own choices are good enough for you.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Thinking mmap reads the file.</b> It sets up a mapping. Pages arrive by page fault as you touch them, possibly blocking on disk each time.</li>
+      <li><b>Expecting writes to a <code>MAP_PRIVATE</code> mapping to reach the file.</b> They go to private copies and vanish when the process exits.</li>
+      <li><b>Assuming fork is free for large processes.</b> The page tables are copied, and every page written afterwards is copied too.</li>
+      <li><b>Forking a multithreaded program and carrying on.</b> Only the calling thread exists in the child, while locks held by the others stay locked. Call <code>exec</code> promptly, or don't fork.</li>
+      <li><b>Ignoring <code>SIGBUS</code>.</b> If a mapped file is truncated by someone else, or the disk fails, the access kills the process unless you handle the signal.</li>
+      <li><b>Mapping and unmapping in a hot loop.</b> Each <code>munmap</code> interrupts every core running the process. Map once and keep it.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is copy-on-write, and how does fork use it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Copy-on-write means sharing a resource until someone modifies it, and copying only then. When a process forks, the kernel doesn't duplicate its memory. It copies the page tables so the child's entries point at the same physical frames, marks the writable private pages read-only in both processes, and increments each frame's reference count. Both can read freely. When either writes to such a page, the CPU raises a protection fault; the kernel sees that the mapping is meant to be writable and the frame is shared, so it allocates a new frame, copies that one page, points the writer's page-table entry at the copy with write permission, and restarts the instruction. Pages that are never written are never copied. That makes fork fast even for large processes, and nearly free in the common fork-then-exec case, where the child replaces its address space before writing much at all.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A 20 GB in-memory database forks to write a snapshot to disk. What does that cost in time and memory?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The fork itself copies page tables, not data: about 2 MB of page tables per gigabyte, so tens of megabytes, which takes tens of milliseconds during which the parent can't serve requests. That is a latency spike proportional to the process's size. After the fork the child reads a frozen view of memory and writes it out, while the parent keeps serving. Every page the parent modifies during the snapshot triggers a copy-on-write fault and a 4 KB copy, so extra memory use equals the amount of data written while the child is alive. A read-mostly workload costs almost nothing; a write-heavy one can approach double the memory, 40 GB, and if that isn't available the machine swaps or the OOM killer steps in. Transparent huge pages make it worse, because one write then copies 2 MB instead of 4 KB. So I'd plan for headroom, disable huge pages for that process, set overcommit so the fork isn't refused, and schedule snapshots when the write rate is low.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li><code>mmap</code> makes a file, or fresh zeroed memory, appear at an address; pages arrive on demand by page fault.</li>
+      <li>A file mapping shares the page cache's frames with your process: no copy into a buffer.</li>
+      <li>Shared mappings write through to the file and to other mappers; private mappings copy on write and never change the file.</li>
+      <li><code>fork</code> copies page tables only, marks pages read-only, and copies a page on the first write to it.</li>
+      <li>A forked process costs memory in proportion to what is written while both copies exist.</li>
+      <li>mmap trades copies and system calls for page faults, SIGBUS on errors and less control over writeback.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A process using 4 GB of memory calls <code>fork()</code>. Immediately afterwards, before either process writes anything, how much extra physical memory is in use?</p>
+      <div class="opts">
+        <button class="opt">4 GB: the child has its own copy</button>
+        <button class="opt">2 GB: half is copied eagerly</button>
+        <button class="opt">A few megabytes: only the page tables were copied</button>
+        <button class="opt">None at all</button>
+      </div>
+      <div class="explain">Parent and child share every frame, marked read-only. Only the page tables, about 2 MB per gigabyte, are duplicated.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">After a fork, the child writes one byte to a page it shares with the parent. What does the kernel do?</p>
+      <div class="opts">
+        <button class="opt">Copies that one page to a new frame, maps it writable for the child, and restarts the write</button>
+        <button class="opt">Copies the child's whole address space</button>
+        <button class="opt">Sends the child SIGSEGV</button>
+        <button class="opt">Lets the write through; the parent sees the change</button>
+      </div>
+      <div class="explain">The write faults on the read-only entry. The kernel recognises a copy-on-write page and copies just that 4 KiB.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A program maps a file with <code>MAP_PRIVATE</code> and <code>PROT_READ | PROT_WRITE</code>, then modifies the mapped memory. What happens to the file on disk?</p>
+      <div class="opts">
+        <button class="opt">It is updated immediately</button>
+        <button class="opt">It is updated when the program calls <code>munmap</code></button>
+        <button class="opt">It is updated when the program exits</button>
+        <button class="opt">Nothing: the changes go to private copies of the pages</button>
+      </div>
+      <div class="explain">Private mappings are copy-on-write. To change the file through a mapping you need <code>MAP_SHARED</code>.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Three hundred processes use the same shared library. Why is its code in physical memory only once?</p>
+      <div class="opts">
+        <button class="opt">The kernel compresses duplicate pages</button>
+        <button class="opt">Each process maps the library file, and the unmodified pages all refer to the same page-cache frames</button>
+        <button class="opt">The processes are threads of one process</button>
+        <button class="opt">The library is copied into each process on demand and then deduplicated</button>
+      </div>
+      <div class="explain">A file-backed mapping shares the page cache's frames. Code is never written, so no process ever gets a private copy.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A program reads a memory-mapped file while the disk develops a bad sector under one of its pages. How does the program find out?</p>
+      <div class="opts">
+        <button class="opt"><code>mmap</code> returns an error</button>
+        <button class="opt">The memory read returns zeros</button>
+        <button class="opt">It receives a <code>SIGBUS</code> signal at the instruction that touched the page</button>
+        <button class="opt">The next <code>read()</code> call returns -1</button>
+      </div>
+      <div class="explain">A memory access has no return value to carry an error, so the kernel can only signal. This is one of mmap's real drawbacks.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const N = 8, L = 'ABCDEFGH';
+  let kind = 'private', frames, par, child, copies, nextFrame, last, hot;
+  // A page is { f: frame id, ro: page-table entry is read-only }. A frame is { id, v: version, refs, l: letter }.
+  function reset() {
+    frames = {}; par = []; child = null; copies = 0; nextFrame = 0; last = null; hot = null;
+    for (let i = 0; i < N; i++) { frames[nextFrame] = { id: nextFrame, v: 0, refs: 1, l: L[i] }; par.push({ f: nextFrame++, ro: false }); }
+  }
+  const pages = (who) => who === 'P' ? par : child;
+  const name = (who) => who === 'P' ? 'parent' : 'child';
+  function drop() { child.forEach((p) => { frames[p.f].refs--; if (frames[p.f].refs === 0) delete frames[p.f]; }); child = null; }
+  function doFork() {
+    if (child) return;
+    child = par.map((p) => { frames[p.f].refs++; return { f: p.f, ro: kind === 'private' }; });
+    if (kind === 'private') par.forEach((p) => { p.ro = true; });
+    hot = null;
+    last = kind === 'private'
+      ? { cls: 'cw-ok', text: '<b>fork()</b> copied the page tables and nothing else. The child\'s eight pages point at the same eight frames, every entry is now <b>read-only in both processes</b>, and each frame has two users. No data was copied.' }
+      : { cls: 'cw-ok', text: '<b>fork()</b> copied the page tables. Because the memory is <code>MAP_SHARED</code>, the entries stay writable in both processes: they are meant to share it, and no copy will ever be made.' };
+  }
+  function write(who, i) {
+    const p = pages(who)[i], fr = frames[p.f], other = who === 'P' ? 'child' : 'parent';
+    hot = who + i;
+    if (!p.ro) {
+      fr.v++;
+      return { cls: '', text: `The ${name(who)} writes to page ${i}. The entry is writable, so there is no fault` + (fr.refs > 1 ? `. The frame is shared, so <b>the ${other} sees the new contents too</b>.` : '.') };
+    }
+    if (fr.refs > 1) {
+      fr.refs--;
+      const nf = { id: nextFrame, v: fr.v + 1, refs: 1, l: fr.l }; frames[nextFrame] = nf; p.f = nextFrame++; p.ro = false; copies++;
+      return { cls: 'cw-warn', text: `The ${name(who)} writes to page ${i}. The entry is read-only: <b>protection fault</b>. The kernel sees a copy-on-write page whose frame has two users, so it <b>copies the 4 KiB to a new frame ${nf.id}</b>, maps it writable for the ${name(who)}, and restarts the write. The ${other} keeps the old frame and the old contents.` };
+    }
+    p.ro = false; fr.v++;
+    return { cls: 'cw-ok', text: `The ${name(who)} writes to page ${i}. The entry is read-only, so it faults, but the frame has only one user now. <b>Nothing is copied</b>: the kernel just makes the entry writable again.` };
+  }
+  function rowHtml(who) {
+    return pages(who).map((p, i) => { const fr = frames[p.f]; return `<button class="cw-p ${fr.refs > 1 ? 'cw-sh' : 'cw-own'} ${hot === who + i ? 'cw-new' : ''}" data-w="${who}" data-i="${i}"><b>${fr.l}${fr.v}</b><span>frame ${p.f}</span><span>${p.ro ? 'ro' : 'rw'}</span></button>`; }).join('');
+  }
+  function render() {
+    $('#cwPar').innerHTML = rowHtml('P');
+    $('#cwChildWrap').innerHTML = child ? `<div class="cw-row" id="cwCh">${rowHtml('C')}</div>` : '<div class="cw-none">No child process. Press <b>fork()</b>.</div>';
+    const ids = Object.keys(frames).map(Number).sort((a, b) => a - b);
+    $('#cwFrames').innerHTML = ids.map((id) => `<span class="cw-f ${frames[id].refs > 1 ? 'cw-two' : ''}">frame ${id}: ${frames[id].l}${frames[id].v}${frames[id].refs > 1 ? ' ×2' : ''}</span>`).join('');
+    const d = $('#cwDesc');
+    d.className = 'cw-desc ' + (last ? last.cls : '');
+    d.innerHTML = last ? last.text : 'One process, eight pages, eight frames. Press <b>fork()</b>.';
+    const shared = ids.filter((id) => frames[id].refs > 1).length, total = N + (child ? N : 0);
+    $('#cwStats').innerHTML = `<div class="stat"><div class="k">Pages mapped</div><div class="v">${total}</div></div>
+      <div class="stat acc"><div class="k">Frames in use</div><div class="v">${ids.length}</div></div>
+      <div class="stat"><div class="k">Frames shared</div><div class="v">${shared}</div></div>
+      <div class="stat ${copies ? 'warn' : ''}"><div class="k">Pages copied</div><div class="v">${copies}</div></div>
+      <div class="stat good"><div class="k">Saved by sharing</div><div class="v">${(total - ids.length) * 4}<small> KiB</small></div></div>`;
+    $('#cwFork').disabled = !!child; $('#cwExec').disabled = !child; $('#cwExit').disabled = !child;
+  }
+  $('#cwPar').addEventListener('click', (e) => { const b = e.target.closest('.cw-p'); if (!b) return; last = write('P', +b.dataset.i); render(); });
+  $('#cwChildWrap').addEventListener('click', (e) => { const b = e.target.closest('.cw-p'); if (!b) return; last = write('C', +b.dataset.i); render(); });
+  $('#cwFork').onclick = () => { doFork(); render(); };
+  $('#cwAll').onclick = () => {
+    const before = copies; for (let i = 0; i < N; i++) write('P', i);
+    const made = copies - before; hot = null;
+    last = { cls: made ? 'cw-warn' : '', text: `The parent wrote to all eight of its pages. ` + (made ? `<b>${made} of them had to be copied</b> because the child still shares the old versions. While the child lives, the two processes together now need ${Object.keys(frames).length} frames instead of 8.` : child && kind === 'shared' ? 'The memory is shared, so the child sees all the new contents and nothing was copied.' : 'No other process shares these frames, so nothing was copied.') };
+    render();
+  };
+  const gone = (how) => () => {
+    if (!child) return;
+    const sh = Object.values(frames).filter((f) => f.refs > 1).length; drop(); hot = null;
+    last = { cls: 'cw-ok', text: `The child ${how}. Its page tables are thrown away and each frame it used loses a user` + (copies ? '.' : `. <b>Not one page was ever copied</b>: the ${sh} frames it shared simply go back to having one owner.`) + (par.some((p) => p.ro) ? ' Some of the parent\'s entries are still marked read-only; its next write to each will fault once and copy nothing.' : '') };
+    render();
+  };
+  $('#cwExec').onclick = gone('calls exec() and becomes a different program');
+  $('#cwExit').onclick = gone('exits');
+  $('#cwReset').onclick = () => { reset(); render(); };
+  $('#cwKind').addEventListener('segchange', (e) => { kind = e.detail; reset(); render(); });
+  reset(); render();
+})();
+</script>
+</body>
+</html>

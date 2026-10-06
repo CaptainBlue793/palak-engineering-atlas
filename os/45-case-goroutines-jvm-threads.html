@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Goroutines vs JVM Threads (M:N Scheduling)</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .mn-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .mn-row > span { font-size:12.5px; color:var(--muted); min-width:150px; }
+  .mn-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:14px; }
+  @media (max-width:760px) { .mn-grid { grid-template-columns:1fr; } }
+  .mn-card { border:1.5px solid var(--border); border-left-width:4px; border-radius:12px; padding:10px 12px; background:var(--surface); }
+  .mn-card.mn-good { border-left-color:var(--green); }
+  .mn-card.mn-warn { border-left-color:var(--amber); }
+  .mn-card.mn-bad { border-left-color:var(--red); }
+  .mn-card h6 { margin:0; font-size:13.5px; }
+  .mn-card h6 small { font-weight:500; color:var(--muted); font-size:12px; margin-left:6px; }
+  .mn-time { font-family:var(--mono); font-size:21px; font-weight:700; margin-top:6px; }
+  .mn-good .mn-time { color:var(--green); } .mn-warn .mn-time { color:var(--amber); } .mn-bad .mn-time { color:var(--red); }
+  .mn-bar { height:7px; border-radius:4px; background:var(--surface-3); overflow:hidden; margin:5px 0 7px; }
+  .mn-bar i { display:block; height:100%; background:currentColor; opacity:.8; transition:width .25s; }
+  .mn-good .mn-bar { color:var(--green); } .mn-warn .mn-bar { color:var(--amber); } .mn-bad .mn-bar { color:var(--red); }
+  .mn-kv { display:flex; flex-wrap:wrap; gap:2px 14px; font-size:12px; color:var(--muted); }
+  .mn-kv b { font-family:var(--mono); color:var(--text); font-weight:600; }
+  .mn-card p { margin:7px 0 0; font-size:13px; }
+</style>
+</head>
+<body data-chapter="45">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 45</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Case Study: <span class="grad">Goroutines vs JVM Threads (M:N Scheduling)</span></h1>
+    <p class="lead">The last three case studies each chose between two ways of handling many connections: a thread per connection, which is simple to write and expensive to run, or an event loop, which is cheap to run and awkward to write. Go's goroutines and Java's virtual threads are an attempt to have both. You write ordinary blocking code, one task per connection, and a scheduler <i>inside the language runtime</i> runs millions of those tasks on a handful of kernel threads, with an event loop hidden underneath. This case study looks at how the two runtimes do it, and at the places where the kernel thread underneath shows through.</p>
+    <ul class="objectives">
+      <li>Compare one kernel thread per task with many tasks on a few kernel threads</li>
+      <li>Describe the Go scheduler's G, M and P and how work stealing balances them</li>
+      <li>Explain what happens to the kernel thread when a goroutine waits for the network or blocks in a system call</li>
+      <li>Explain Java virtual threads, carrier threads and pinning</li>
+      <li>Choose between platform threads, virtual threads and goroutines for a workload</li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Kernel threads and what a context switch costs.</b> See <a href="05-threads.html">Chapter 5</a> and <a href="06-context-switches-interrupts.html">Chapter 6</a>.</li>
+        <li><b>Thread pools and work stealing.</b> See <a href="27-thread-pools.html">Chapter 27</a>.</li>
+        <li><b>epoll and event loops.</b> See <a href="28-io-multiplexing-epoll.html">Chapter 28</a> and <a href="29-event-loops-io-uring.html">Chapter 29</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>1:1 and M:N threading</h2>
+  <p>A <code>pthread</code>, and a classic Java thread, is a <b>kernel thread</b>: the kernel creates it, gives it a stack, and schedules it. One thread in the language is one thread in the kernel, which is called <b>1:1</b> threading. It's simple and it uses every core, but each thread costs enough that a server can afford thousands, not millions.</p>
+  <p><b>M:N</b> threading puts a second scheduler in user space. The program creates M lightweight tasks, and the runtime runs them on N kernel threads, with N about the number of cores. Switching between two tasks on the same kernel thread is a function call that saves a few registers and changes the stack pointer. The kernel isn't involved and doesn't know the tasks exist.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Kernel thread (pthread, Java platform thread)</th><th>Goroutine</th><th>Java virtual thread</th></tr></thead>
+      <tbody>
+        <tr><td><b>Scheduled by</b></td><td>The kernel</td><td>The Go runtime</td><td>The JDK (a fork-join pool)</td></tr>
+        <tr><td><b>Stack</b></td><td>A fixed reservation: 1 MB by default in Java, 8 MB for a Linux pthread</td><td>Starts at 2 KB and grows by being copied to a larger one</td><td>Frames are kept on the heap while the thread is parked</td></tr>
+        <tr><td><b>Creating one</b></td><td>A system call: tens of microseconds</td><td>Well under a microsecond</td><td>About a microsecond</td></tr>
+        <tr><td><b>Switching</b></td><td>Through the kernel: a few microseconds, plus cold caches</td><td>In user space: a few hundred nanoseconds</td><td>In user space, copying some stack frames</td></tr>
+        <tr><td><b>How many is practical</b></td><td>Thousands</td><td>Millions</td><td>Millions</td></tr>
+        <tr><td><b>Taken off the CPU by force</b></td><td>Yes, by the timer interrupt</td><td>Yes, since Go 1.14, after about 10 ms</td><td>No: only when it blocks</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The hard part of M:N has always been blocking. If a task makes a system call that blocks, the kernel puts the <i>kernel thread</i> to sleep, and every other task that was due to run on it waits too. Both runtimes are best understood as a set of answers to that one problem.</p>
+
+  <h2>Go: G, M and P</h2>
+<pre class="code"><span class="c">// A server written as if threads were free</span>
+<span class="k">func</span> <span class="f">handle</span>(conn net.Conn) {
+    <span class="k">defer</span> conn.<span class="f">Close</span>()
+    buf := <span class="f">make</span>([]<span class="t">byte</span>, <span class="m">4096</span>)
+    n, _ := conn.<span class="f">Read</span>(buf)          <span class="c">// looks blocking. Parks the goroutine, not the thread</span>
+    conn.<span class="f">Write</span>(<span class="f">reply</span>(buf[:n]))
+}
+
+<span class="k">for</span> {
+    conn, _ := ln.<span class="f">Accept</span>()
+    <span class="k">go</span> <span class="f">handle</span>(conn)                 <span class="c">// one goroutine per connection, 100,000 of them if need be</span>
+}</pre>
+  <p>The Go scheduler has three kinds of object, and their one-letter names are used everywhere, including in its own trace output:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>What it is</th><th>How many</th></tr></thead>
+      <tbody>
+        <tr><td><b>G</b>: goroutine</td><td>A task: a small stack, saved registers and a state (running, runnable, waiting)</td><td>As many as the program starts</td></tr>
+        <tr><td><b>M</b>: machine</td><td>A kernel thread</td><td>As many as needed. Most are asleep</td></tr>
+        <tr><td><b>P</b>: processor</td><td>Permission to run Go code, together with a local queue of up to 256 runnable goroutines</td><td>Exactly <code>GOMAXPROCS</code>, by default the number of cores</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>An M must hold a P to run a goroutine. That one rule is the design. It caps the number of threads running Go code at the number of cores, however many threads exist, and it gives each running thread a private queue that it can use without taking a lock. The P was added in Go 1.1, in 2013. Before it there was one global queue behind one lock, and that lock was where busy programs spent their time, which is the lesson of <a href="27-thread-pools.html">Chapter 27</a> over again.</p>
+<pre class="code"><span class="c">$</span> GODEBUG=schedtrace=<span class="m">1000</span> ./server            <span class="c"># one line from the scheduler every second</span>
+SCHED 3004ms: gomaxprocs=<span class="m">4</span> idleprocs=<span class="m">0</span> threads=<span class="m">9</span> idlethreads=<span class="m">3</span> runqueue=<span class="m">212</span> [<span class="m">38</span> <span class="m">41</span> <span class="m">29</span> <span class="m">44</span>]
+<span class="c">#             4 Ps, none idle     9 kernel threads     global queue   each P's local queue</span></pre>
+
+  <h2>Work stealing, the network and system calls</h2>
+  <p>When the goroutine an M is running blocks or finishes, the M looks for another, in a fixed order:</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start">An M holding a P needs a goroutine to run</li>
+      <li data-k="decision">Is one waiting in this P's local queue? Run it. No lock needed</li>
+      <li data-k="decision">Is one in the global queue? Take a batch (checked first now and then, so it can't starve)</li>
+      <li data-k="decision">Has the network poller got sockets that became ready? Run the goroutines that were waiting for them</li>
+      <li data-k="decision">Has another P got work? Steal half of its local queue</li>
+      <li data-k="end">Nothing anywhere: give up the P and put the thread to sleep</li>
+    </ol>
+    <figcaption><b>Finding work.</b> The common case is the first step, which touches only memory this thread owns. Stealing happens only when a P has run dry, and it moves work towards idle cores.</figcaption>
+  </figure>
+  <p>The fourth step is the hidden event loop. Every socket Go opens is non-blocking. When <code>conn.Read</code> finds no data, the runtime registers the socket with <b>epoll</b>, marks the goroutine as waiting, and switches to another goroutine on the same thread. No kernel thread is waiting for that socket. When the data arrives, the poller hands the goroutine back to a run queue. It is the nginx architecture of <a href="42-case-nginx-connections.html">Chapter 42</a>, with the state machine replaced by a parked stack.</p>
+  <p>That only works for calls the runtime can turn into "try, and wait for readiness". A read from a regular file, a call into C code, or any other system call that really blocks leaves the kernel thread stuck. For those, Go does something different:</p>
+  <ul>
+    <li>Before the system call, the M marks its P as "in a system call".</li>
+    <li>A monitoring thread called <b>sysmon</b> runs without a P and checks every few tens of microseconds. If a P has been stuck that long and other goroutines are waiting, sysmon takes the P away and gives it to another M, waking an idle one or <b>creating a new kernel thread</b>.</li>
+    <li>When the call returns, the first M has no P. It puts its goroutine on a run queue and goes to sleep.</li>
+  </ul>
+  <p>So other goroutines keep running, at the price of an extra kernel thread for every call that is blocked at once. For the duration of a blocking call, M:N quietly becomes 1:1. sysmon has a second job: it marks any goroutine that has run for 10 ms without yielding, and since Go 1.14 it sends that thread a signal to force the switch. Before that, a loop with no function calls in it could hold a P for ever.</p>
+
+  <h2>Java virtual threads and pinning</h2>
+  <p>Java went the other way round. Its threads have been kernel threads since the 1990s, now called <b>platform threads</b>, and a large server is built from pools of a few hundred of them. <b>Virtual threads</b>, final in JDK 21 (2023), add M:N scheduling without changing the API: a virtual thread is a <code>java.lang.Thread</code>, and existing blocking code runs on one unchanged.</p>
+<pre class="code"><span class="c">// One virtual thread per task. No pool: they are cheap enough to create and throw away</span>
+<span class="k">try</span> (<span class="k">var</span> executor = Executors.<span class="f">newVirtualThreadPerTaskExecutor</span>()) {
+    <span class="k">for</span> (<span class="k">var</span> request : requests)
+        executor.<span class="f">submit</span>(() -&gt; <span class="f">handle</span>(request));     <span class="c">// handle() may block on sockets freely</span>
+}</pre>
+  <p>A virtual thread runs by being <b>mounted</b> on a <b>carrier</b>, a platform thread from a small pool with one carrier per core. When it blocks on a socket or a <code>java.util.concurrent</code> lock, the JDK <b>unmounts</b> it: its stack frames are copied to the heap, and the carrier takes another virtual thread.</p>
+  <figure class="seq" data-actors="Virtual thread|JDK runtime|Carrier thread|Kernel">
+    <ol>
+      <li data-m="0>1">socket read: no data yet</li>
+      <li data-m="1>3">register the socket with epoll</li>
+      <li data-m="1>2">unmount: copy this thread's frames to the heap</li>
+      <li data-m="2>1">mount the next runnable virtual thread</li>
+      <li data-m="3>1">the socket is readable</li>
+      <li data-m="1>2">mount it again: copy the frames back</li>
+      <li data-m="2>0" data-k="reply">the read returns, as if it had simply blocked</li>
+    </ol>
+    <figcaption><b>A virtual thread waiting for the network.</b> The carrier is busy with other virtual threads the whole time. The same steps as Go's network poller, with the stack moved to the heap in between.</figcaption>
+  </figure>
+  <p>Sometimes the unmount isn't possible, and the virtual thread is <b>pinned</b>: it stays on its carrier, and if it blocks, the carrier blocks with it. In JDK 21 that happened in two cases.</p>
+<pre class="code"><span class="c">// 1. Blocking inside synchronized (JDK 21 to 23). The monitor was tied to the carrier thread</span>
+<span class="k">synchronized</span> (connection) {
+    connection.<span class="f">send</span>(request);        <span class="c">// blocks: the carrier is stuck with it</span>
+}
+
+<span class="c">// The workaround at the time: a java.util.concurrent lock, which can unmount</span>
+lock.<span class="f">lock</span>();
+<span class="k">try</span> { connection.<span class="f">send</span>(request); } <span class="k">finally</span> { lock.<span class="f">unlock</span>(); }
+
+<span class="c">// 2. Blocking with a native frame on the stack (still true): the JDK can't copy a C stack frame</span></pre>
+  <p>With four carriers, four pinned virtual threads are enough to stop every other virtual thread in the process, however many thousands are ready to run. JDK 24 (2025) removed the first case: a virtual thread can now unmount while holding a monitor. The second remains. One more difference from Go matters in practice: virtual threads are <b>never preempted</b>. One that computes without blocking keeps its carrier until it finishes.</p>
+
+  <h2>Ten thousand requests, four ways</h2>
+  <p>A 4-core machine receives a burst of requests. Each one waits 100 ms for something, and what it waits for is the choice below. The four cards show what each runtime does with it.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">What happens to the kernel threads?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="mn-row"><span>For 100 ms each request</span><div class="seg" id="mnWork"><button class="active" data-v="net">waits for the network</button><button data-v="sync">waits, holding a monitor</button><button data-v="native">blocks in native code</button><button data-v="cpu">computes</button></div></div>
+      <div class="mn-row"><span>Requests arriving at once</span><div class="seg" id="mnN"><button data-v="100">100</button><button class="active" data-v="10000">10,000</button><button data-v="1000000">1,000,000</button></div></div>
+      <div class="mn-grid" id="mnGrid"></div>
+    </div>
+    <div class="panel-foot">A model with round numbers: 1 MB of stack reserved per platform thread, about 4 KB per parked goroutine and 2 KB per parked virtual thread, and a default thread limit of 10,000 in the Go runtime. "Holding a monitor" means inside a <code>synchronized</code> block on the request's own object, so the requests don't contend with each other.</div>
+  </div>
+
+  <p>Things to notice. Waiting for the network is the case M:N was built for: the pool of 200 platform threads takes 5 seconds because only 200 requests can wait at once, while goroutines and virtual threads finish in about a tenth of a second on four kernel threads. Now hold a monitor while waiting. On JDK 21 each waiting request pins a carrier, only four can wait at a time, and the burst takes over four minutes; the identical code on JDK 24 is back to a tenth of a second. Native code is the case where the old model wins. Virtual threads are pinned, Go tries to start a kernel thread per call and hits its limit of 10,000, and the plain pool of 200 finishes in 5 seconds. For pure computation the four cards agree, because no scheduler can add cores. Last, drop to 100 requests. Nothing crashes and the worst figure is 2.5 seconds, which is why these problems are found in production and not in testing.</p>
+
+  <div class="callout usecase">
+    <div class="ico">⚖️</div>
+    <div class="body"><div class="title">Netflix: "Dude, where's my lock?"</div><p>In 2024 Netflix engineers described a failure that appeared after services moved to Java 21 with virtual threads handling requests. Instances would stop answering. They weren't using CPU, and they weren't out of memory. The number of sockets waiting to be closed climbed steadily, and the health checks failed. The usual thread dump was no help, because it listed platform threads and the work was on virtual ones. A fuller dump showed thousands of virtual threads that had been created and had never run. The instances had four vCPUs, so four carriers. Each of the four was occupied by a virtual thread that was <b>pinned</b>: inside a <code>synchronized</code> block in a tracing library, it had gone on to wait for a lock. The lock was actually free. Its previous holder had released it, and the next thread in line to take it was another virtual thread, which had been made runnable and needed a carrier to run on. There were none. Nothing was deadlocked in the textbook sense of <a href="22-deadlock.html">Chapter 22</a>, since no cycle of locks existed, yet nothing could ever move. The resource that had run out was kernel threads, hidden one layer below the code anyone was reading. The fix at the time was to replace <code>synchronized</code> with a lock that can unmount, and the JDK 24 change removed the cause.</p></div>
+  </div>
+
+  <h2>Choosing</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>The workload</th><th>What fits</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><b>Many connections, mostly waiting on the network</b></td><td>Goroutines, or virtual threads</td><td>A waiting task costs kilobytes and no kernel thread</td></tr>
+        <tr><td><b>CPU-bound work</b></td><td>A fixed pool of platform threads, one per core, or goroutines</td><td>Cores are the limit. Lightweight tasks add nothing, and virtual threads aren't time-sliced</td></tr>
+        <tr><td><b>Calls into blocking native libraries</b></td><td>A bounded pool of platform threads, or goroutines behind a semaphore</td><td>Each blocked call needs a real kernel thread whatever the runtime, so bound the number yourself</td></tr>
+        <tr><td><b>A mix of short requests and long computations</b></td><td>Goroutines, or separate pools for the two</td><td>Go preempts every 10 ms. A computing virtual thread holds its carrier</td></tr>
+        <tr><td><b>Limiting load on a database or downstream service</b></td><td>A semaphore</td><td>With cheap tasks, the pool size no longer limits concurrency for you</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The last row is the change of habit that M:N asks for. A pool of 200 threads was also, without anyone designing it, a limit of 200 concurrent calls on whatever sat behind it. A million goroutines have no such limit, and the first thing they exhaust is someone else's connection pool.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Pooling virtual threads or goroutines.</b> They are cheap to create. A pool only brings back the limit you were avoiding.</li>
+      <li><b>Expecting M:N to speed up computation.</b> It makes waiting cheap. Running still needs a core.</li>
+      <li><b>Starting unbounded numbers of tasks.</b> Without back-pressure, memory and downstream services absorb the load. Goroutines blocked for ever on a channel are a leak.</li>
+      <li><b>Thousands of concurrent blocking native calls.</b> In Go that is thousands of kernel threads; in Java it is pinned carriers.</li>
+      <li><b>Ignoring the CPU limit of a container.</b> A runtime that sizes itself to the host's 64 cores inside a 2-CPU cgroup gets throttled (<a href="34-containers-namespaces-cgroups.html">Chapter 34</a>). Go respects the limit by default only since 1.25.</li>
+      <li><b>Reading a normal thread dump and seeing nothing.</b> Parked virtual threads and goroutines aren't kernel threads. Use the runtime's own dump.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the difference between a goroutine and an operating-system thread?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>An OS thread is created and scheduled by the kernel, has a fixed stack reservation of a megabyte or more, and costs a system call to create and a trip through the kernel to switch. A goroutine is a task managed by the Go runtime in user space. It starts with a stack of about 2 KB that grows on demand, creating one is a small allocation, and switching between two of them is a few hundred nanoseconds with no kernel involvement. The runtime multiplexes many goroutines onto a small number of OS threads, roughly one running per core, which is M:N scheduling. When a goroutine waits for a channel, a mutex or the network, the runtime parks it and runs another on the same thread; network waits are handled by an epoll-based poller underneath. So a program can have hundreds of thousands of goroutines where it could afford only thousands of threads, while the code still reads as straightforward blocking code.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> What happens when one of those lightweight tasks makes a blocking system call, in Go and in Java?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It depends on whether the runtime can avoid the block. For sockets, both runtimes use non-blocking I/O with a poller: the task is parked and the kernel thread carries on with other tasks. For a call that truly blocks the kernel thread, such as file I/O or a call into C, the thread is stuck. In Go, the thread, an M, was holding a P, the token needed to run Go code. A monitor thread notices the P has been in a system call too long and hands it to another M, starting a new OS thread if none is idle, so the other goroutines keep running. When the call returns, the original goroutine queues to get a P again. The cost is one OS thread per concurrently blocked call. In Java, a virtual thread that blocks in native code, or inside <code>synchronized</code> before JDK 24, is pinned to its carrier thread: it can't be unmounted, so the carrier blocks. The JDK adds temporary carriers for some operations such as file I/O, but in general pinned threads reduce the carrier pool, and with one carrier per core a few pinned threads can stall the whole application. In both, the practical advice is to bound the number of concurrent truly blocking calls.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>1:1 threading maps each task to a kernel thread. M:N runs many cheap tasks on a few kernel threads with a scheduler in user space.</li>
+      <li>In Go, a kernel thread (M) needs a P to run a goroutine (G). There are as many Ps as cores, each with a local run queue, and idle Ps steal work.</li>
+      <li>Network waits park the task and use epoll underneath, so no kernel thread waits. This is an event loop presented as blocking code.</li>
+      <li>A truly blocking call still blocks a kernel thread. Go hands the P to another thread; Java pins the carrier.</li>
+      <li>Pinning inside <code>synchronized</code> could stall a JDK 21 application on a few carriers. JDK 24 removed it; native frames still pin.</li>
+      <li>M:N makes waiting cheap, not computing. With cheap tasks, limit concurrency with a semaphore, not a pool.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In the Go scheduler, what is a P?</p>
+      <div class="opts">
+        <button class="opt">A kernel thread</button>
+        <button class="opt">A token that a kernel thread must hold to run Go code, with a local queue of runnable goroutines</button>
+        <button class="opt">A goroutine that is waiting for I/O</button>
+        <button class="opt">A process</button>
+      </div>
+      <div class="explain">There are <code>GOMAXPROCS</code> of them, so at most that many threads run Go code at once.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A goroutine calls <code>conn.Read</code> on a socket with no data waiting. What happens to the kernel thread it was running on?</p>
+      <div class="opts">
+        <button class="opt">It blocks in <code>read</code> until data arrives</button>
+        <button class="opt">It spins, retrying the read</button>
+        <button class="opt">It is destroyed</button>
+        <button class="opt">It runs another goroutine; the socket is registered with the network poller</button>
+      </div>
+      <div class="explain">The socket is non-blocking. The goroutine is parked and made runnable again when epoll reports data.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A goroutine makes a call into a C library that blocks for a second. How do the other goroutines on its P keep running?</p>
+      <div class="opts">
+        <button class="opt">The runtime gives the P to another kernel thread, creating one if necessary</button>
+        <button class="opt">They don't: they wait a second</button>
+        <button class="opt">The C call is interrupted by a signal</button>
+        <button class="opt">The goroutine's stack is copied to the heap</button>
+      </div>
+      <div class="explain">The blocked thread keeps the goroutine but loses the P. The cost is an extra kernel thread per blocked call.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">On JDK 21, a virtual thread blocks on I/O inside a <code>synchronized</code> block. What is the effect?</p>
+      <div class="opts">
+        <button class="opt">It unmounts as usual</button>
+        <button class="opt">The JVM throws an exception</button>
+        <button class="opt">It is pinned: its carrier thread blocks too and can't run other virtual threads</button>
+        <button class="opt">The monitor is released while it waits</button>
+      </div>
+      <div class="explain">With one carrier per core, a handful of pinned threads can stall everything. JDK 24 lifted this restriction.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A service does 100 ms of pure computation per request on 4 cores. It is moved from a pool of 200 platform threads to virtual threads. What changes?</p>
+      <div class="opts">
+        <button class="opt">Throughput rises about fiftyfold</button>
+        <button class="opt">Throughput stays about 40 requests a second, and requests are no longer time-sliced fairly</button>
+        <button class="opt">Each request finishes in under a millisecond</button>
+        <button class="opt">The service uses 200 cores</button>
+      </div>
+      <div class="explain">Lightweight threads make waiting cheap. Computation is limited by cores under any scheduler.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const CORES = 4, WAIT = 0.1, POOL = 200, GO_MAX = 10000;
+  let work = 'net', N = 10000;
+  const num = (x) => x.toLocaleString('en-GB');
+  const dur = (t) => t < 0.95 ? Math.round(t * 1000) + ' ms' : t < 120 ? (t < 10 ? t.toFixed(1) : Math.round(t)) + ' s' : t < 7200 ? (t / 60).toFixed(1) + ' min' : (t / 3600).toFixed(1) + ' hours';
+  const mem = (kb) => kb < 1024 ? Math.round(kb) + ' KB' : kb < 1048576 ? Math.round(kb / 1024) + ' MB' : (kb / 1048576).toFixed(1) + ' GB';
+  const serial = () => Math.max(WAIT, N * WAIT / CORES);           // four at a time
+  const parked = () => WAIT + N * 0.5e-6;                          // everyone waits at once; a little scheduling work
+  function plat() {
+    const th = Math.min(N, POOL), m = mem(th * 1024) + ' of stacks';
+    if (work === 'cpu') return { th, m, t: serial(), note: `${num(th)} runnable threads share four cores. The kernel time-slices them, so all make progress, at the speed of four cores.` };
+    return { th, m, t: Math.ceil(N / POOL) * WAIT, note: N <= POOL ? 'A kernel thread per request, each asleep in the kernel. At this size that costs nothing worth measuring.'
+      : `Each waiting request holds a whole kernel thread, so only ${POOL} can wait at once. The other ${num(N - POOL)} queue behind them.` };
+  }
+  function go() {
+    if (work === 'cpu') return { th: CORES, m: mem(N * 4) + ' of stacks', t: serial(), note: 'Four Ps, so four goroutines run. The others sit in run queues and are swapped in every 10 ms, so all make progress, at the speed of four cores.' };
+    if (work === 'native') {
+      const th = N + CORES;
+      return th > GO_MAX ? { th, m: 'one kernel stack per call', t: null, note: `A thread stuck in native code can't be parked, so the runtime hands its P to another thread, starting a new one for each blocked call. That needs ${num(th)} kernel threads, and the Go runtime stops at 10,000: <code>fatal error: thread exhaustion</code>.` }
+        : { th, m: 'one kernel stack per call', t: WAIT + N * 5e-6, note: 'A thread stuck in native code can\'t be parked, so the runtime hands its P to another thread and starts a new one for each blocked call. M:N has become 1:1 for the duration.' };
+    }
+    return { th: CORES, m: mem(N * 4) + ' of stacks', t: parked(), note: work === 'net' ? `The read parks the goroutine and registers its socket with the network poller. No kernel thread waits, so all ${num(N)} wait at once.`
+      : 'Go has no monitors. A goroutine holding a <code>sync.Mutex</code> parks like any other, so this is the same as the plain network case.' };
+  }
+  function vt(jdk24) {
+    const m = mem(N * 2) + ' on the heap';
+    if (work === 'cpu') return { th: CORES, m, t: serial(), note: 'Virtual threads aren\'t time-sliced. The first four run to completion while the rest wait their turn. The total is the same; the last request waits for all the others.' };
+    if (work === 'native') return { th: CORES, m, t: serial(), note: 'A native frame on the stack pins the virtual thread to its carrier, so the carrier blocks with it. Four carriers, four requests at a time: 40 a second.' };
+    if (work === 'sync' && !jdk24) return { th: CORES, m, t: serial(), note: '<b>Pinned.</b> A virtual thread that blocks inside <code>synchronized</code> can\'t unmount, so it holds its carrier for the whole 100 ms. Four carriers, four requests at a time: 40 a second.' };
+    return { th: CORES, m, t: parked(), note: work === 'sync' ? 'Since JDK 24 a virtual thread can unmount while holding a monitor. Code that stalled on JDK 21 now behaves like the plain network case.'
+      : `The read unmounts the virtual thread: its frames go to the heap and the carrier takes another. Four carriers serve all ${num(N)}.` };
+  }
+  function render() {
+    const cards = [['Java platform threads', '1:1, a pool of 200', plat()], ['Go goroutines', 'M:N on 4 Ps', go()], ['Java virtual threads', 'JDK 21', vt(false)], ['Java virtual threads', 'JDK 24 and later', vt(true)]];
+    $('#mnGrid').innerHTML = cards.map(([name, sub, r]) => {
+      const cls = r.t == null ? 'mn-bad' : work === 'cpu' ? 'mn-warn' : r.t < 1 ? 'mn-good' : r.t < 30 ? 'mn-warn' : 'mn-bad';
+      const w = r.t == null ? 100 : Math.max(3, Math.min(100, Math.log(r.t / 0.08) / Math.log(25000 / 0.08) * 100));
+      return `<div class="mn-card ${cls}"><h6>${name}<small>${sub}</small></h6>
+        <div class="mn-time">${r.t == null ? 'crashes' : dur(r.t)}</div><div class="mn-bar"><i style="width:${w.toFixed(0)}%"></i></div>
+        <div class="mn-kv"><span>Kernel threads <b>${r.t == null ? 'over ' + num(GO_MAX) : num(r.th)}</b></span><span>Memory <b>${r.m}</b></span></div><p>${r.note}</p></div>`;
+    }).join('');
+  }
+  $('#mnWork').addEventListener('segchange', (e) => { work = e.detail; render(); });
+  $('#mnN').addEventListener('segchange', (e) => { N = +e.detail; render(); });
+  render();
+})();
+</script>
+</body>
+</html>
