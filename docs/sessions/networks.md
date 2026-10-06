@@ -31,3 +31,4 @@
 - Decisions: each chapter's panel is driven headlessly (script errors, the numbers quoted in the text, 390 px overflow) before its commit;
   the branch is pushed after every chapter. The glossary already covers Ch 8–48, so terms are added only when a chapter needs a new one.
 - Ch 8 TCP: The Handshake & the Byte Stream: conversation builder (handshake one segment at a time, data both ways, lose-the-next-segment, real or relative sequence numbers, states at both ends)
+- Ch 9 NAT, Ports & Sockets: be-the-NAT-router panel (three devices behind one address and six ports; outbound TCP and UDP, replies, a stranger's packet, idle expiry after 1 and 6 minutes, port exhaustion)
