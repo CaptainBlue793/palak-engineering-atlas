@@ -58,8 +58,6 @@
   - Ch 20 Semaphores (30 KB): one-semaphore simulator (start at 0, 1 or 3; threads wait, post, return early without posting, or post without waiting) showing the value, who is inside and who sleeps
   - Ch 21 Classic Problems (36 KB): dining-philosophers table (left-then-right, lower fork first, four seats, try-and-back-off; step one philosopher, all at once, or 300 random steps) showing deadlock and livelock; links to LLD Ch 23 for the Java producer-consumer
   - Ch 22 Deadlock (33 KB): banker's algorithm on the textbook 5-process, 3-resource state (step-by-step safety check, three preset requests that are granted / must wait / refused as unsafe, and free-form requests)
-- Status after Ch 22: 30 of 56 lessons written (P1-P8, Ch 1-22); the Intermediate level needs only Ch 23-24.
-- Next: Ch 23 File Systems: Inodes, Directories & Blocks.
   - Ch 23 File Systems (42 KB): hands-on file system with 8 inodes and 12 blocks and a small command line (touch, write, ln, ln -s, mv, rm, cat, ls) showing directory entries, link counts, dangling links, and running out of inodes before blocks
   - Ch 24 Journaling & Crash Consistency (37 KB): pull-the-plug simulator for a one-block append (no journal with the three writes in any order and fsck; ordered metadata journal; full data journal) with reboot-and-recover
   - Ch 25 Atomics & Memory Models (34 KB): store-buffer litmus test (x=1; r1=y against y=1; r2=x) under three models (no store buffers, x86 store buffers, seq_cst stores) with manual buffer drains and a count of every schedule (6 / 74 / 20)
@@ -74,3 +72,5 @@
   - Ch 34 Containers (36 KB): build-a-container panel (switch on PID, mount, network, UTS and user namespaces and memory and CPU limits one at a time; run ps, hostname, ip addr, ls /, id; allocate memory until the cgroup OOM kill; spin threads into throttling)
   - Ch 35 Booting, Kernel Modules & Drivers (36 KB): boot stepper through seven stages with a console log and five injectable faults (boot loader config lost, disk driver missing, wrong root=, bad fstab line, failed service), each stopping at the right stage with the real message and the fix
   - Ch 36 OS Security (33 KB): exploit-versus-defences panel (four attacker inputs against a stack overflow; stack canary, NX, ASLR and a seccomp sandbox as switches) showing the overwritten stack frame, which defence stops which attack, and what the attacker ends up controlling
+- Status after Ch 36: 44 of 56 lessons written (P1-P8, Ch 1-36). Prerequisites, Beginner, Intermediate and Advanced are complete.
+- Next: Ch 37 Performance Tools, then the rest of Expert (38-40) and the case studies (41-48).
