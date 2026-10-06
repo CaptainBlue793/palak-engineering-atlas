@@ -34,3 +34,4 @@
 - Decisions: objectives are written `<li><span>…</span></li>` from Ch 11 on, so that an objective containing `<code>` doesn't split
   into columns (`.objectives li` is a flex row). Each chapter's panel is driven headlessly and its text checked against the panel's
   numbers before the commit; wide tables go in `.table-wrap`.
+- DB 11: Pages, Tuples & Heap Files: slotted-page simulator (insert, update, delete, VACUUM; fillfactor 100 vs 70; HOT updates and redirects)
