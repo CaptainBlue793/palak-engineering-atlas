@@ -72,3 +72,23 @@
 - DB 46: Case Study: Instagram's Sharded IDs: real 64-bit IDs built from a time, a user's logical shard and a sequence, shown as bits, decoded back, and unchanged when the number of servers changes
 - DB 47: Case Study: Building a Mini LSM Key-Value Store: the store running (put, delete, get with its search path, crash and restart, compaction) with the memtable, the log and every table's contents shown; the 125 lines of Python were tested against a dictionary over 40,000 random operations and 178 restarts
 - DB 48: Case Study: An Analytics Warehouse: bytes read, time and monthly cost of four queries over two years of events, with partitioning by day, clustering by event type or customer, and daily rollups switched on or off
+- Status after DB 48 (2026-10-07): all 56 lessons are written (P1–P8 + Ch 1–48). A full sweep loaded every lesson headlessly at 1100 px
+  and at 390 px: five quizzes, one panel, at least one figure, no script errors, no horizontal overflow, no placeholder left.
+  Audit: 0 errors. Bundle rebuilt (60 pages, 2.33 MB). Bundle, palette and hub checks pass.
+- The phone-width sweep found 12 of the session-1 lessons (P1, P3, P6–P8, Ch 1–5, 8, 10) overflowing: their comparison tables were not
+  inside `.table-wrap`. All 23 bare `table.t` elements in P1–P8 and Ch 1–10 are now wrapped. The stylesheet expects the wrapper,
+  which supplies the frame and the scrolling. No wording changed.
+- Checked beyond the panels: Ch 39's queries were run in SQLite and agree with the panel's results. Ch 46's decoding example was
+  recomputed independently. Ch 47's 125 lines of Python were run against a dictionary (40,000 random operations, 178 restarts, a
+  torn log line, a half-finished compaction), and a script confirms that every tested line appears in the lesson unchanged.
+- Not checked against sources: the figures and dates in the real-system write-ups (GitLab 2017, Spanner and F1, OpenAI, Stack
+  Overflow, Shopify, Uber, GitHub 2018, Discord, Instagram and Snowflake, LevelDB, LinkedIn and Kafka, and those in the earlier
+  chapters) were written from memory. They are worth a read by the owner before release.
+- Needs a shared change (release, Step 4 of the playbook; not done, waiting for the owner's go-ahead): in `assets/atlas.js` remove
+  `soon: true` from the databases entry. `chapters` is already 56. `hours` is 42 and the lessons total 2,475 minutes (41.25
+  hours), so 41 or 42 is the owner's call. In `README.md` add the Database Internals & SQL row to the course table, drop it from
+  "On the way", change the totals to 396 chapters (340 main + 56 prerequisites) and about 290 hours, and add `databases/` to the
+  folder tree. Still open from before: the `.objectives li` flex fix in `style.css`, the README table's order, the home page's
+  meta description, and release `networks-v1.0.0`.
+- Next: the owner's go-ahead, then Step 4 (shared edits, checks, pull request into main, and release `databases-v1.0.0` if wanted).
+  After that, the next course (Distributed Systems).
