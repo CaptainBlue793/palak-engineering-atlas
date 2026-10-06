@@ -53,3 +53,4 @@
   - Ch 16 The Heap: How malloc Works (38 KB): free-list allocator (first/best/worst fit, splitting, coalescing on/off,
     brk growth, a one-click fragmented heap)
   - Ch 17 Race Conditions & Critical Sections (33 KB): be-the-scheduler stepper for two threads doing counter++ (load/add/store), exhaustive search of all 20 schedules, mutex on/off
+  - Ch 18 Mutexes & Spinlocks (37 KB): spin-vs-sleep lock simulation (spinlock / futex-style mutex / spin-then-sleep, 2-8 threads, 1-4 cores, 2 or 40 us critical section) with a per-core timeline and a three-way comparison table
