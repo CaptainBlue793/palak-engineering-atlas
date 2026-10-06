@@ -40,3 +40,4 @@
 - Ch 15 HTTP/1.1: page-load waterfall (13 files; a new connection per request, one kept alive, one pipelined, or six in parallel; 20 / 100 / 300 ms round trips; an optional slow second file) showing handshakes, queueing and head-of-line blocking
 - Ch 16 HTTP/2: twelve files over six HTTP/1.1 connections or one HTTP/2 connection (interleaved packets on the wire, urgent streams first, completion time per file), with one lost packet to show TCP head-of-line blocking stalling every stream
 - Ch 17 TLS 1.3 & Certificates: certificate-chain validator (correct, expired, wrong name, intermediate not sent, self-signed, private CA; browser or curl) showing the chain, the four checks and the exact error each client reports
+- Ch 18 HTTP/3 & QUIC: round-trip comparison of TCP + TLS 1.3 against QUIC (50 / 150 / 300 ms; first visit or returning with 0-RTT) for time to first byte, and for a Wi-Fi to mobile network change (reconnect against connection migration)
