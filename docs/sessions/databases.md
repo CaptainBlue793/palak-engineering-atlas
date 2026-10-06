@@ -52,3 +52,4 @@
 - DB 26: Partitioning & Sharding: three shard keys over four shards (data and write spread, shards visited by four operations, a very large customer)
 - DB 27: Connection Pooling: throughput and time-in-database for five pool sizes at three loads on an 8-core server
 - DB 28: Column Stores & OLAP: row store vs column store (plain and compressed) for four operations, with the cells of the table each one reads
+- DB 29: Time-Series Storage: Gorilla encoder on real bits (delta-of-delta timestamps, XOR values) for steady, slow-moving and noisy series
