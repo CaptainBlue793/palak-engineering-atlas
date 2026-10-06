@@ -38,3 +38,4 @@
 - Ch 13 Congestion Control: cwnd simulator over 30 seconds (Reno, CUBIC or BBR; a shallow, 1-BDP or deep bottleneck queue; 0 / 0.1% / 1% random loss) charting packets in flight against link capacity and the drop line, with link use, queueing delay and loss counts
 - Ch 14 Closing Connections & TIME_WAIT: closing stepper with four scenarios (orderly close, half-close, the last ACK lost, close with unread data) showing each segment and both ends' states, TIME-WAIT and the reset
 - Ch 15 HTTP/1.1: page-load waterfall (13 files; a new connection per request, one kept alive, one pipelined, or six in parallel; 20 / 100 / 300 ms round trips; an optional slow second file) showing handshakes, queueing and head-of-line blocking
+- Ch 16 HTTP/2: twelve files over six HTTP/1.1 connections or one HTTP/2 connection (interleaved packets on the wire, urgent streams first, completion time per file), with one lost packet to show TCP head-of-line blocking stalling every stream
