@@ -70,3 +70,4 @@
 - Ch 45 Case Study: The 2016 Dyn DNS Attack: share of users still resolving a name through a 130-minute outage (TTL, second provider, serve-stale)
 - Ch 46 Case Study: Load-Balancer Failover: 36 seconds after a backend dies (crash or freeze, check interval, passive ejection, retries)
 - Ch 47 Case Study: Networking for Multiplayer Games: how late you see an opponent (pings, tick rate, prediction), with peeker's advantage and rewind
+- Ch 48 Case Study: Debugging a Slow API from a Capture: latency budget with three fixes (one write/TCP_NODELAY, receive-buffer autotuning, connection reuse)
