@@ -60,3 +60,4 @@
   - Ch 22 Deadlock (33 KB): banker's algorithm on the textbook 5-process, 3-resource state (step-by-step safety check, three preset requests that are granted / must wait / refused as unsafe, and free-form requests)
 - Status after Ch 22: 30 of 56 lessons written (P1-P8, Ch 1-22); the Intermediate level needs only Ch 23-24.
 - Next: Ch 23 File Systems: Inodes, Directories & Blocks.
+  - Ch 23 File Systems (42 KB): hands-on file system with 8 inodes and 12 blocks and a small command line (touch, write, ln, ln -s, mv, rm, cat, ls) showing directory entries, link counts, dangling links, and running out of inodes before blocks
