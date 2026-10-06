@@ -33,3 +33,4 @@
 - Ch 8 TCP: The Handshake & the Byte Stream: conversation builder (handshake one segment at a time, data both ways, lose-the-next-segment, real or relative sequence numbers, states at both ends)
 - Ch 9 NAT, Ports & Sockets: be-the-NAT-router panel (three devices behind one address and six ports; outbound TCP and UDP, replies, a stranger's packet, idle expiry after 1 and 6 minutes, port exhaustion)
 - Ch 10 DNS Resolution: recursive-resolver simulator (four names incl. a CNAME across TLDs and a typo; step-by-step trace with latencies; the cache with TTLs counting down; 1 minute / 10 minutes / 3 days pass; negative caching)
+- Ch 11 TCP Reliability: lose-some-segments panel (ten segments, click to lose any; timer only, fast retransmit, or fast retransmit + SACK) showing the receiver's ACK stream with duplicates and SACK ranges, the sender's timeline, and time to deliver against no loss
