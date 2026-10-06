@@ -6,34 +6,321 @@
 <title>Thread Pools &amp; Work Stealing</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .tp-ctl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:12px; }
+  @media (max-width:760px) { .tp-ctl { grid-template-columns:1fr; } }
+  .tp-ctl label { display:block; font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .tp-ctl input { width:100%; accent-color:var(--accent); margin-top:6px; }
+  .tp-ctl .v { float:right; font-family:var(--mono); font-size:13px; color:var(--text); text-transform:none; letter-spacing:0; }
+  .tp-h { margin:14px 0 6px; font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .tp-th { display:flex; flex-wrap:wrap; gap:3px; }
+  .tp-th i { display:block; width:14px; height:14px; border-radius:4px; border:1px solid var(--border); background:var(--surface-2); }
+  .tp-th .tp-run { background:var(--green); border-color:var(--green); }
+  .tp-th .tp-io { background:var(--accent-2); border-color:var(--accent-2); }
+  .tp-th .tp-rq { background:var(--red); border-color:var(--red); }
+  .tp-key { margin-top:6px; font-size:12.5px; color:var(--muted); }
+  .tp-key i { display:inline-block; width:11px; height:11px; border-radius:3px; margin:0 4px 0 12px; vertical-align:-1px; border:1px solid var(--border); }
+  .tp-key i:first-child { margin-left:0; }
+  .tp-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .tp-desc.tp-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .tp-desc.tp-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .tp-desc.tp-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="27">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 27</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>Thread Pools &amp; Work <span class="grad">Stealing</span></h1>
-    <p class="lead">Reusing threads, sizing pools for CPU vs I/O work, and work-stealing deques.</p>
+    <p class="lead">A server that starts a new thread for every request works well in a demo and falls over in production: ten thousand requests become ten thousand threads, each with its own stack, all fighting for eight cores. A <b>thread pool</b> turns that round. A fixed crew of worker threads takes tasks from a queue, so threads are reused, the amount of work in progress has a limit, and there is one obvious place to say "too busy". Almost every server, runtime and database you use is built on one. The design questions are few and they matter: how many workers, what kind of queue, and how to share work among cores without the queue itself becoming the bottleneck.</p>
+    <ul class="objectives">
+      <li>Explain what a thread pool saves and what it limits</li>
+      <li>Size a pool for CPU-bound and for I/O-bound work</li>
+      <li>Choose a queue and a policy for when it is full</li>
+      <li>Explain how work stealing balances load without a shared queue</li>
+      <li>Recognise the pools inside Java, Go, Rust, Node.js and nginx</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>What a thread costs and what a context switch costs.</b> See <a href="05-threads.html">Chapter 5</a> and <a href="06-context-switches-interrupts.html">Chapter 6</a>.</li>
+        <li><b>The bounded buffer and backpressure.</b> See <a href="21-classic-sync-problems.html">Chapter 21</a>.</li>
+        <li><b>Lock contention.</b> See <a href="18-mutexes-spinlocks.html">Chapter 18</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why pools</li>
-    <li>Sizing: cores and wait/compute</li>
-    <li>Work queues and backpressure</li>
-    <li>Work-stealing deques</li>
-    <li>Pools in Go, Java and Rust runtimes</li>
-  </ol>
+  <h2>Why pool threads?</h2>
+  <p>Creating a thread per task has three costs. Creation and teardown take tens of microseconds each, which is more than many tasks need to run. Each thread reserves a stack, 8 MiB of address space by default on Linux, and occupies kernel memory. And nothing limits the number: a burst of load creates a burst of threads, which makes every one of them slower (<a href="06-context-switches-interrupts.html">Chapter 6</a>), which makes the backlog grow, which creates more threads.</p>
+  <p>A pool is a bounded buffer with the consumers built in. This is all of it:</p>
+<pre class="code"><span class="k">typedef</span> <span class="k">struct</span> { <span class="t">void</span> (*fn)(<span class="t">void</span> *); <span class="t">void</span> *arg; } <span class="t">task_t</span>;
+<span class="k">static</span> <span class="t">queue_t</span> q;                          <span class="c">/* the bounded queue of Chapter 21 */</span>
+
+<span class="k">static</span> <span class="t">void</span> *<span class="f">worker</span>(<span class="t">void</span> *unused)
+{
+    <span class="k">for</span> (;;) {
+        <span class="t">task_t</span> t = <span class="f">queue_get</span>(&amp;q);           <span class="c">/* sleeps while there is nothing to do */</span>
+        <span class="k">if</span> (!t.fn) <span class="k">break</span>;                  <span class="c">/* an empty task means "shut down" */</span>
+        t.<span class="f">fn</span>(t.arg);
+    }
+    <span class="k">return</span> <span class="m">NULL</span>;
+}
+
+<span class="t">void</span> <span class="f">pool_start</span>(<span class="t">int</span> n) {
+    <span class="k">for</span> (<span class="t">int</span> i = <span class="m">0</span>; i &lt; n; i++) { <span class="t">pthread_t</span> t; <span class="f">pthread_create</span>(&amp;t, <span class="m">NULL</span>, worker, <span class="m">NULL</span>); }
+}
+
+<span class="t">bool</span> <span class="f">pool_submit</span>(<span class="t">void</span> (*fn)(<span class="t">void</span> *), <span class="t">void</span> *arg) {
+    <span class="k">return</span> <span class="f">queue_try_put</span>(&amp;q, (<span class="t">task_t</span>){ fn, arg });   <span class="c">/* false when full: the caller must cope */</span>
+}</pre>
+  <p>Two numbers define its behaviour: the number of workers and the capacity of the queue.</p>
+
+  <h2>How many threads?</h2>
+  <p>It depends on what a task spends its time doing.</p>
+  <ul>
+    <li><b>CPU-bound tasks</b> (compressing, encoding, parsing, computing) run until they finish. A core can run one at a time, so the right number of threads is <b>the number of cores</b>. More than that adds context switches and cold caches and no throughput.</li>
+    <li><b>I/O-bound tasks</b> (a database query, an HTTP call, a disk read) spend most of their time blocked, using no CPU. While one waits, its core is free, so you need more threads than cores to keep the cores busy.</li>
+  </ul>
+<pre class="code">threads ≈ cores × (1 + wait time / compute time)
+
+8 cores, tasks that compute for 10 ms and never wait        8 × (1 + 0/10)   =   8 threads
+8 cores, tasks that compute for 2 ms and wait for 18 ms     8 × (1 + 18/2)   =  80 threads</pre>
+  <p>The formula gives the size at which the CPUs are just saturated. Below it, cores sit idle while tasks queue. Above it, threads queue for cores instead, which is the same waiting with extra overhead. Two cautions. First, measure the ratio; don't guess it. Second, the pool's size is also the number of simultaneous calls it can make to whatever the tasks wait on, and that system may have a much lower limit than your CPUs do.</p>
+  <p>When a program has both kinds of work, give each its own pool. If slow I/O tasks share a pool with quick CPU tasks, a few stuck calls occupy every worker and the quick tasks wait behind them. Separate pools, sometimes called <b>bulkheads</b>, keep one kind of trouble from sinking everything.</p>
+
+  <h2>Size a pool</h2>
+  <p>A 4-core machine. Choose the kind of task, then move the two sliders. Find the smallest pool that handles 1,500 I/O-bound tasks a second. Then see what an oversized pool does to CPU-bound work, and what an unbounded queue does under overload.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One pool on 4 cores</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="tpTask"><button data-v="cpu">CPU-bound: 10 ms compute</button><button class="active" data-v="io">I/O-bound: 2 ms compute + 18 ms wait</button></div>
+        <div class="seg" id="tpQ"><button class="active" data-v="100">queue of 100</button><button data-v="inf">unbounded queue</button></div>
+      </div>
+      <div class="tp-ctl">
+        <label>Threads in the pool <span class="v" id="tpNV"></span><input type="range" id="tpN" min="1" max="128" value="8"></label>
+        <label>Tasks arriving <span class="v" id="tpLV"></span><input type="range" id="tpL" min="50" max="3000" step="50" value="300"></label>
+      </div>
+      <div class="tp-h">The pool's threads right now</div>
+      <div class="tp-th" id="tpTh"></div>
+      <div class="tp-key"><i class="tp-run" style="background:var(--green)"></i>computing on a core<i style="background:var(--accent-2)"></i>blocked on I/O<i style="background:var(--red)"></i>ready, waiting for a core<i></i>idle</div>
+      <div class="tp-desc" id="tpDesc"></div>
+      <div class="stats" id="tpStats"></div>
+    </div>
+    <div class="panel-foot">A steady-state model, not a measurement: tasks are identical, queueing delay uses a standard approximation, and each ready thread beyond the four cores costs a little throughput in switching. "Latency" is the average time from submitting a task to its completion.</div>
+  </div>
+
+  <p>Things to notice. For the I/O-bound task, each thread handles 50 tasks a second, so 8 threads manage 400 while the CPUs sit at 20%; you need about 30 threads for 1,500 a second, and throughput stops rising at 40, where all four cores are busy. For CPU-bound work the limit is 400 a second at 4 threads, and more threads make it slightly worse, never better. Push the arrival rate past capacity: with a queue of 100 the latency settles at a high but fixed value and the excess is rejected; with an unbounded queue nothing is rejected and the wait grows every second without limit.</p>
+
+  <h2>The queue, and what to do when it is full</h2>
+  <p>The queue absorbs short bursts. It can't absorb a sustained overload: if tasks arrive faster than the pool finishes them, any queue only delays the moment of truth, and an unbounded one hides it until memory runs out. Chapter 21's rule applies: bound the queue, and decide in advance what happens at the limit.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>When the queue is full</th><th>Effect</th><th>Suits</th></tr></thead>
+      <tbody>
+        <tr><td><b>Block the submitter</b></td><td>Backpressure: the producer slows to the pool's pace</td><td>Pipelines, batch jobs</td></tr>
+        <tr><td><b>Reject</b> with an error</td><td>The caller can retry later, try elsewhere, or tell the user "busy" (HTTP 503)</td><td>Request-serving systems. Fast failure beats a slow timeout</td></tr>
+        <tr><td><b>Run it in the caller's thread</b></td><td>The submitter is kept busy doing the task, so it submits less</td><td>A simple self-regulating fallback</td></tr>
+        <tr><td><b>Drop</b> the new task, or the oldest queued one</td><td>Work is lost on purpose</td><td>Metrics, sampling, anything where fresh matters more than complete</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>These four are the built-in rejection policies of Java's <code>ThreadPoolExecutor</code>, and every pool has some equivalent. Watch the queue's length in production. A queue that is usually empty means the pool has headroom; one that is usually full means every task is paying the maximum wait, and the pool or what it calls is the bottleneck.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🐘</div>
+    <div class="body"><div class="title">A smaller database connection pool can be fifty times faster</div><p>A database connection pool is a thread pool seen from the other side: its size is the number of queries the database is asked to run at once. The instinct under load is to raise it. The documentation for HikariCP, a widely used Java connection pool, describes a demonstration by Oracle's performance group that shows why that is wrong. An application was driven by thousands of concurrent users against a pool of 2,048 connections. The database was swamped: far more active sessions than cores, all contending for CPU, locks and disk, with response times around 100 ms. Reducing the pool to 96 connections, with nothing else changed, cut response times to about 2 ms. Requests now waited briefly in the application's queue for a connection, and then ran on a database that wasn't thrashing. It is this chapter's formula applied to someone else's CPUs: the useful number of concurrent queries is set by the database's cores and disks, and HikariCP's guide suggests starting near twice the core count plus the number of disks. Beyond that, threads don't add capacity. They only move the queue to a place where waiting is more expensive.</p></div>
+  </div>
+
+  <h2>Work stealing</h2>
+  <p>One shared queue has two problems on a many-core machine. Every worker locks it for every task, so the queue becomes the contended lock of Chapter 18. And tasks land on whichever core is free, far from the data they need.</p>
+  <p><b>Work stealing</b> gives each worker its own double-ended queue (a deque). A worker pushes the tasks it creates onto the <i>bottom</i> of its own deque and takes its next task from the bottom as well: last in, first out, so it works on what it touched most recently, with the data still in its cache. Only when its deque is empty does it become a thief, and takes a task from the <i>top</i> of another worker's deque, the oldest task there.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>A worker needs a task</b></li>
+      <li data-k="decision"><b>Own deque non-empty?</b> Pop from the bottom: the newest task, cache-warm, and no other thread is involved.</li>
+      <li data-k="decision"><b>Anything in the shared queue?</b> Take a task submitted from outside the pool.</li>
+      <li><b>Steal</b> Pick another worker at random and take the oldest task from the top of its deque, with one compare-and-swap.</li>
+      <li data-k="end"><b>Nothing anywhere?</b> Sleep until work is submitted.</li>
+    </ol>
+    <figcaption><b>A work-stealing worker's loop.</b> Owner and thief work at opposite ends of the deque, so they touch the same memory only when one task is left.</figcaption>
+  </figure>
+  <p>The design suits tasks that split into subtasks, which is how parallel sorts, searches and build systems are written. Old tasks near the top tend to be large pieces of the problem, so one steal moves a lot of work and steals are rare. Idle workers do the balancing; busy ones pay almost nothing. The idea comes from the Cilk language of the 1990s and now runs underneath Java's <code>ForkJoinPool</code> and parallel streams, the Go scheduler, Rust's Tokio and Rayon, and .NET's task library.</p>
+
+  <h2>Pools you are already using</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>System</th><th>Its pool</th><th>Worth knowing</th></tr></thead>
+      <tbody>
+        <tr><td><b>Java</b></td><td><code>ThreadPoolExecutor</code> (one queue); <code>ForkJoinPool</code> (work stealing)</td><td><code>Executors.newFixedThreadPool</code> has an unbounded queue. Since Java 21, virtual threads let blocking code run without one OS thread each</td></tr>
+        <tr><td><b>Go</b></td><td>Goroutines scheduled onto <code>GOMAXPROCS</code> worker threads, with work stealing</td><td>A goroutine blocked in a system call gives its slot to another thread (<a href="45-case-goroutines-jvm-threads.html">Chapter 45</a>)</td></tr>
+        <tr><td><b>Rust (Tokio)</b></td><td>One work-stealing worker per core for async tasks; a separate pool for blocking calls</td><td>Calling blocking code on an async worker stalls everything queued behind it</td></tr>
+        <tr><td><b>Node.js</b></td><td>One event-loop thread, plus a libuv pool of 4 threads for file I/O, DNS lookups and some crypto</td><td>Four slow DNS lookups can stall every file read. The size is set with <code>UV_THREADPOOL_SIZE</code></td></tr>
+        <tr><td><b>nginx</b></td><td>Event loops, plus an optional thread pool for blocking disk reads</td><td>Keeps one slow disk from freezing a worker's whole event loop (<a href="42-case-nginx-connections.html">Chapter 42</a>)</td></tr>
+        <tr><td><b>PostgreSQL</b></td><td>A process per connection, and no pool of its own</td><td>Which is why a pooler such as PgBouncer is usually put in front of it (<a href="43-case-postgres-on-os.html">Chapter 43</a>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>An unbounded queue.</b> Overload becomes rising latency and then an out-of-memory kill, instead of a clear "busy" signal.</li>
+      <li><b>Sizing by guesswork.</b> "200 threads to be safe" for CPU-bound work is 200 threads sharing 8 cores. Measure wait and compute time.</li>
+      <li><b>Blocking inside a pool sized for CPU work.</b> A few blocked workers and the pool has no threads left. Give blocking work its own pool.</li>
+      <li><b>A task that waits for another task in the same pool.</b> If all workers are waiting for subtasks that are stuck in the queue behind them, the pool has deadlocked itself.</li>
+      <li><b>Ignoring what the pool calls.</b> A pool of 500 makes 500 simultaneous calls to a database that copes with 50.</li>
+      <li><b>Losing errors.</b> An exception or failure in a pooled task has no caller waiting for it. Make sure results and errors go somewhere.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you decide the size of a thread pool?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>By what the tasks do. For CPU-bound tasks the right size is about the number of cores, because a core runs one thread at a time and extra threads only add context switches and cache misses. For tasks that block on I/O, each thread is idle most of the time, so I need more threads than cores to keep the CPUs busy: roughly cores times one plus the ratio of wait time to compute time. A task that computes for 2 ms and waits 18 ms on a database gives a factor of ten, so 80 threads on 8 cores. I'd get that ratio from measurement, not a guess. Then I'd check the other limits: memory for the stacks, and above all the capacity of what the tasks call, since the pool size is also the number of concurrent requests sent downstream. Finally I'd bound the queue and choose a rejection policy, then tune under realistic load while watching throughput, latency and queue depth.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> What is work stealing, and why does the owner take from one end of its deque and thieves from the other?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Work stealing is a scheduling scheme in which each worker thread has its own deque of tasks instead of all workers sharing one queue. A worker pushes new tasks to the bottom of its own deque and pops from the bottom, so it runs the most recently created task, whose data is likely still in its cache, and it does so with no contention, since no other thread normally touches that end. When its deque is empty it steals from the top of a randomly chosen victim's deque. Taking from the opposite end means the owner and a thief interfere only when the deque is down to its last item, so the common path needs no lock, and implementations such as the Chase–Lev deque use a single CAS for steals. Stealing the oldest task also tends to take the largest piece of work in a divide-and-conquer computation, so one steal keeps the thief busy for a while and the number of steals stays small. The result is good locality, low contention and automatic load balancing driven by idle threads.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A thread pool reuses a fixed set of workers fed by a queue; it limits concurrency and gives a place to apply backpressure.</li>
+      <li>CPU-bound work: threads ≈ cores. I/O-bound work: threads ≈ cores × (1 + wait/compute).</li>
+      <li>More threads than that add switching, memory and downstream load, not throughput.</li>
+      <li>Bound the queue and choose what happens when it is full: block, reject, run in the caller, or drop.</li>
+      <li>Work stealing gives each worker its own deque: owners work LIFO at one end, idle workers steal the oldest task from the other.</li>
+      <li>Keep blocking work and CPU work in separate pools.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A service on an 8-core machine runs CPU-bound image resizing in a pool of 200 threads. What is the likely effect compared with a pool of 8?</p>
+      <div class="opts">
+        <button class="opt">No more throughput, and extra overhead from context switches and cold caches</button>
+        <button class="opt">25 times the throughput</button>
+        <button class="opt">Lower memory use</button>
+        <button class="opt">Each image is resized faster</button>
+      </div>
+      <div class="explain">Eight cores run eight CPU-bound threads at a time. The other 192 only wait for a core and make every switch more expensive.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">On 4 cores, each task computes for 5 ms and waits on the network for 45 ms. Roughly what pool size keeps the CPUs busy?</p>
+      <div class="opts">
+        <button class="opt">4</button>
+        <button class="opt">9</button>
+        <button class="opt">40</button>
+        <button class="opt">450</button>
+      </div>
+      <div class="explain">cores × (1 + wait/compute) = 4 × (1 + 45/5) = 40. Each thread uses a core only a tenth of the time.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Tasks arrive at a pool faster than it can complete them, and the queue is unbounded. What happens?</p>
+      <div class="opts">
+        <button class="opt">The pool creates more threads until it keeps up</button>
+        <button class="opt">New tasks are rejected</button>
+        <button class="opt">Latency stays constant</button>
+        <button class="opt">The queue, the waiting time and memory use all grow without limit</button>
+      </div>
+      <div class="explain">An unbounded queue can't fix sustained overload. It hides it until latency is unusable or memory runs out.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In a work-stealing pool, where does a worker get its next task when its own deque is not empty?</p>
+      <div class="opts">
+        <button class="opt">From the top of its own deque, the oldest task</button>
+        <button class="opt">From the bottom of its own deque, the task it pushed most recently</button>
+        <button class="opt">From the shared global queue</button>
+        <button class="opt">From a random other worker</button>
+      </div>
+      <div class="explain">Owners work last-in, first-out at the bottom, which keeps data cache-warm. Thieves take the oldest task from the top.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why can raising a database connection pool from 100 to 2,000 make an overloaded application slower?</p>
+      <div class="opts">
+        <button class="opt">Connections use too much network bandwidth</button>
+        <button class="opt">The application can't create that many threads</button>
+        <button class="opt">It lets far more queries run at once than the database has cores and disks for, so they contend and all slow down</button>
+        <button class="opt">Databases refuse more than 100 connections</button>
+      </div>
+      <div class="explain">Useful concurrency is set by the database's hardware. Past that point, extra connections only add contention inside the database.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const CORES = 4, TASK = { cpu: { c: 10, w: 0 }, io: { c: 2, w: 18 } };
+  let task = 'io', qcap = 100;
+  // Steady-state model. Times in milliseconds, rates in tasks per second.
+  function model(N, lambda) {
+    const { c, w } = TASK[task], svc = c + w;
+    const ideal = Math.round(CORES * (1 + w / c));
+    let cap, readyExtra = 0, coreLimited = false;
+    if (N * c / svc <= CORES) cap = N / svc * 1000;                       // threads are the limit: cores to spare
+    else {                                                                // cores are the limit
+      const raw = CORES / c * 1000, inIo = raw / 1000 * w;
+      coreLimited = true;
+      readyExtra = Math.max(0, N - inIo - CORES);
+      cap = raw / (1 + 0.008 * readyExtra / CORES);                       // switching between too many ready threads
+    }
+    const rho = lambda / cap, over = rho >= 1, done = Math.min(lambda, cap);
+    const run = over && coreLimited ? CORES : Math.min(CORES, done / 1000 * c), io = done / 1000 * w;
+    let rq = 0, busy = run + io;
+    if (over) { rq = Math.max(0, N - busy); busy = N; }
+    let lat = null, queued = 0;
+    if (!over) {
+      const m = Math.max(1, cap / 1000 * svc);
+      const wq = Math.pow(rho, Math.sqrt(2 * (m + 1))) / (m * (1 - rho)) * svc;
+      lat = svc + wq; queued = lambda / 1000 * wq;
+    } else if (qcap !== Infinity) { lat = qcap / cap * 1000 + N / cap * 1000; queued = qcap; }
+    return { c, w, svc, ideal, cap, rho, over, done, run, io, rq, lat, queued, cpu: run / CORES * 100, rejected: over && qcap !== Infinity ? lambda - cap : 0, growth: over && qcap === Infinity ? lambda - cap : 0 };
+  }
+  const f0 = (x) => Math.round(x).toLocaleString('en-GB');
+  function render() {
+    const N = +$('#tpN').value, lambda = +$('#tpL').value, r = model(N, lambda);
+    $('#tpNV').textContent = N; $('#tpLV').textContent = f0(lambda) + ' per second';
+    const nRun = Math.round(r.run), nIo = Math.min(N - nRun, Math.round(r.io)), nRq = Math.min(N - nRun - nIo, Math.round(r.rq));
+    let h = '';
+    for (let i = 0; i < N; i++) h += `<i class="${i < nRun ? 'tp-run' : i < nRun + nIo ? 'tp-io' : i < nRun + nIo + nRq ? 'tp-rq' : ''}"></i>`;
+    $('#tpTh').innerHTML = h;
+    let cls, text;
+    const sized = N < r.ideal ? `The pool is the limit: with ${N} thread${N > 1 ? 's' : ''} it can finish ${f0(r.cap)} tasks a second while the CPUs are only ${f0(Math.min(100, N * r.c / r.svc / CORES * 100))}% used at full stretch. The formula suggests ${r.ideal}.` : N === r.ideal ? `The pool is exactly the formula's size, ${r.ideal}: at full load every core is busy and no thread waits for one.` : `The cores are the limit. Beyond ${r.ideal} threads there is no more throughput to be had, and the ${N - r.ideal} extra thread${N - r.ideal > 1 ? 's' : ''} cost a little in switching` + (task === 'cpu' ? '' : ' at full load') + '.';
+    if (!r.over) {
+      cls = r.rho > 0.85 ? 'tp-warn' : 'tp-ok';
+      text = `<b>Keeping up.</b> ${f0(lambda)} tasks a second arrive and the pool can do ${f0(r.cap)}, so it is ${f0(r.rho * 100)}% loaded` + (r.rho > 0.85 ? ', close enough to the limit that tasks are starting to queue' : '') + `. ${sized}`;
+    } else if (qcap !== Infinity) {
+      cls = 'tp-bad';
+      text = `<b>Overloaded.</b> ${f0(lambda)} tasks a second arrive and the pool can do ${f0(r.cap)}. The queue of 100 is permanently full, so every accepted task waits behind 100 others, and <b>${f0(r.rejected)} tasks a second are rejected</b>. Latency is high but fixed, and the callers know at once. ${sized}`;
+    } else {
+      cls = 'tp-bad';
+      text = `<b>Overloaded, and hiding it.</b> ${f0(lambda)} tasks a second arrive and the pool can do ${f0(r.cap)}. Nothing is rejected, so the queue <b>grows by ${f0(r.growth)} tasks every second</b>. After one minute it holds ${f0(r.growth * 60)} tasks and a new arrival waits ${f0(r.growth * 60 / r.cap)} seconds; after ten minutes, ${f0(r.growth * 600 / r.cap)} seconds. It ends when memory does. ${sized}`;
+    }
+    const d = $('#tpDesc'); d.className = 'tp-desc ' + cls; d.innerHTML = text;
+    const lat = r.lat === null ? '∞' : r.lat >= 1000 ? (r.lat / 1000).toFixed(1) + '<small> s</small>' : f0(r.lat) + '<small> ms</small>';
+    $('#tpStats').innerHTML = `<div class="stat acc"><div class="k">Pool capacity</div><div class="v">${f0(r.cap)}<small> /s</small></div></div>
+      <div class="stat ${r.over ? 'bad' : 'good'}"><div class="k">Completed</div><div class="v">${f0(r.done)}<small> /s</small></div></div>
+      <div class="stat"><div class="k">CPU used</div><div class="v">${f0(r.cpu)}%</div></div>
+      <div class="stat ${r.over ? 'bad' : r.rho > 0.85 ? 'warn' : ''}"><div class="k">Latency</div><div class="v">${lat}</div></div>
+      <div class="stat ${r.rejected ? 'bad' : ''}"><div class="k">Rejected</div><div class="v">${f0(r.rejected)}<small> /s</small></div></div>
+      <div class="stat"><div class="k">Stacks reserved</div><div class="v">${N * 8}<small> MiB</small></div></div>`;
+  }
+  $('#tpN').addEventListener('input', render); $('#tpL').addEventListener('input', render);
+  $('#tpTask').addEventListener('segchange', (e) => { task = e.detail; render(); });
+  $('#tpQ').addEventListener('segchange', (e) => { qcap = e.detail === 'inf' ? Infinity : +e.detail; render(); });
+  render();
+})();
+</script>
 </body>
 </html>

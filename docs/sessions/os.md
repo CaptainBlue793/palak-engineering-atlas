@@ -64,3 +64,4 @@
   - Ch 24 Journaling & Crash Consistency (37 KB): pull-the-plug simulator for a one-block append (no journal with the three writes in any order and fsck; ordered metadata journal; full data journal) with reboot-and-recover
   - Ch 25 Atomics & Memory Models (34 KB): store-buffer litmus test (x=1; r1=y against y=1; r2=x) under three models (no store buffers, x86 store buffers, seq_cst stores) with manual buffer drains and a count of every schedule (6 / 74 / 20)
   - Ch 26 Lock-Free Data Structures (35 KB): Treiber-stack stepper (thread 1 pops in three steps while thread 2 pops, frees and pushes back) reproducing ABA and the read of a freed node, with plain CAS or pointer + version
+  - Ch 27 Thread Pools & Work Stealing (30 KB): pool-sizing explorer on 4 cores (CPU-bound or I/O-bound tasks, 1-128 threads, arrival rate, bounded or unbounded queue) showing capacity, CPU use, latency, rejections and what each thread is doing
