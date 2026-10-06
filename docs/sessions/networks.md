@@ -49,3 +49,5 @@
 - Ch 24 Load Balancers: algorithm simulator (3,000 requests to four servers; round robin, least connections, two random choices, hash of the client; all alike, one slow server, or one dominant client) showing each server's share and queue, median and 99th-percentile latency
 - Ch 25 BGP: eight-network route simulator (customer > peer > provider preference, valley-free export; an intruder announcing the same /24 or two /25s; RPKI origin validation by nobody, the two carriers, or everyone) showing each network's chosen route and where its traffic goes
 - Ch 26 Anycast & CDNs: one anycast address announced from up to five cities (toggle each site) with seven user cities, showing where each user lands, round trip and new-connection time, and automatic failover when a site stops announcing
+- Status after Ch 26 (2026-10-06): 34 of 56 lessons written (P1–P8, Ch 1–26); audit 0 errors. Stopped here because the session's usage limit was reached.
+- Next: Ch 27 DNS in Depth, then Ch 28–48 (22 lessons left), then the release step with the owner's go-ahead.
