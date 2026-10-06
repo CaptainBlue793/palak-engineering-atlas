@@ -40,3 +40,4 @@
 - DB 14: LSM Trees: small LSM store (memtable, flushes, level 0 to 2 compaction, tombstones, real Bloom filters, write stall, amplification figures)
 - DB 15: Hash, GIN, GiST & Bitmap Indexes: BRIN block-range panel against a B-tree (ordered, late arrivals, shuffled; day, week, month)
 - DB 16: How a Query Runs: iterator-model stepper (LIMIT over a scan, over a Sort, and over an index scan; rows read before the first result)
+- DB 17: Reading EXPLAIN: four EXPLAIN ANALYZE plans with per-node decoding (missing index, 1-row misestimate under a nested loop, sort spill, heap fetches)
