@@ -46,3 +46,4 @@
 - DB 20: WAL & Crash Recovery: log, buffer pool and data files with update, commit, page write, checkpoint, crash and redo (LSN test, redo point)
 - DB 21: Isolation Levels & Anomalies: two-session stepper for five anomalies at four isolation levels (results, errors and retries per level)
 - DB 22: Locking & Two-Phase Locking: three-session lock-conflict panel on PostgreSQL's table and row locks (with the lock-queue pile-up behind ALTER TABLE)
+- DB 23: MVCC: one row's versions with xmin/xmax, a writer, held reader snapshots and VACUUM limited by the oldest snapshot
