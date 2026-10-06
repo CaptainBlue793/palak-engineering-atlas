@@ -94,3 +94,7 @@
 - Release prepared (2026-10-06, with the owner's go-ahead): the shared edits above are made on this branch (`assets/atlas.js`: `soon` removed,
   `hours: 41`; `README.md`: OS row, totals, folder tree). Checks: content audit 0 errors across all courses, bundle check, palette check,
   hub check in light, dark and at 390 px all pass. A pull request into `main` is opened for the merge; the release tag is still to do.
+
+## 2026-10-06 — released
+- Pull request #2 merged into `main` (merge commit b5087e7) with the owner's go-ahead; the course is live on the Atlas hub and on
+  GitHub Pages. Release `os-v1.0.0` published with `os-course.html` attached. Nothing further is planned for this course.

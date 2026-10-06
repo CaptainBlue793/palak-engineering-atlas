@@ -24,3 +24,9 @@
 - Ch 5 Routing Tables & Forwarding: three-router hop-by-hop tracer (LPM, return path, loop, null route)
 - Ch 6 ICMP, ping & traceroute: traceroute/mtr simulator (probe types, silent and rate-limited hops, real loss)
 - Ch 7 UDP: voice call over UDP vs TCP on a lossy path (late = lost)
+
+## 2026-10-06 — session 2 (standalone clone)
+- Setup: work continues in a standalone clone of `feature/networks-course` at `C:\Users\palak\atlas-courses\networks`, outside OneDrive.
+  `main` (with the released OS course) was merged into the branch first. The owner's plan is one course at a time; this is the second.
+- Decisions: each chapter's panel is driven headlessly (script errors, the numbers quoted in the text, 390 px overflow) before its commit;
+  the branch is pushed after every chapter. The glossary already covers Ch 8–48, so terms are added only when a chapter needs a new one.
