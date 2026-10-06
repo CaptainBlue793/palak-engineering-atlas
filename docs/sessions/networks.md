@@ -60,3 +60,4 @@
 - Ch 35 Firewalls, iptables & Security Groups: first-match rule list judged against six packets (state rule, drop-all at top, policy)
 - Ch 36 DDoS & Network Attacks: reflection/amplification calculator (protocol, attacker uplink, victim link, BCP 38 or scrubbing)
 - Ch 37 Packet-Level Debugging: six tcpdump captures to diagnose (dropped SYN, closed port, loss, zero window, slow server, idle reset)
+- Ch 38 Internet Latency Budgets: time-to-first-byte budget (distance, protocol, connection state, server time) against the cold TLS 1.2 case
