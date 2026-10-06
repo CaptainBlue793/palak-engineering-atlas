@@ -62,3 +62,4 @@
 - DB 36: Distributed SQL: a five-node cluster with three replicas of every range (inserts split ranges, replicas rebalance, machines fail and are repaired, ranges without a majority stop)
 - DB 37: Performance Tuning Playbook: a day of pg_stat_statements for nine queries, ranked by mean time, calls or total time, with fixes applied from the top and the load removed
 - DB 38: ORMs & the N+1 Problem: one page of posts loaded lazily, joined, select-in or mixed, with the statements sent, rows returned and time for 10, 50 or 200 posts
+- DB 39: SQL Interview Drills: five classic questions built in three stages each, with results computed from small tables that contain the awkward case (ties, a same-day pair, an empty cell)
