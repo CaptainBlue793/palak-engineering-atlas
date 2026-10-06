@@ -39,3 +39,4 @@
 - DB 13: B-Trees: growable B+ tree with four keys a page (ordered or random keys, middle or right-edge splits, search and range scan)
 - DB 14: LSM Trees: small LSM store (memtable, flushes, level 0 to 2 compaction, tombstones, real Bloom filters, write stall, amplification figures)
 - DB 15: Hash, GIN, GiST & Bitmap Indexes: BRIN block-range panel against a B-tree (ordered, late arrivals, shuffled; day, week, month)
+- DB 16: How a Query Runs: iterator-model stepper (LIMIT over a scan, over a Sort, and over an index scan; rows read before the first result)
