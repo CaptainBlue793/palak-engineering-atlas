@@ -59,3 +59,4 @@
 - DB 33: Caching & Materialised Views: cache and database stepped through four invalidation schemes, in order and with the unlucky interleaving
 - DB 34: Schema Migrations at Scale: a column rename stepped through as a direct rename or as expand and contract, with four servers on mixed code versions
 - DB 35: Backups & Point-in-Time Recovery: four backup plans against three incidents on a five-day timeline, giving what is recovered, what is lost and how long the restore takes
+- DB 36: Distributed SQL: a five-node cluster with three replicas of every range (inserts split ranges, replicas rebalance, machines fail and are repaired, ranges without a majority stop)
