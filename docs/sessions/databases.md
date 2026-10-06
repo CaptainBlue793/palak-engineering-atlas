@@ -38,3 +38,4 @@
 - DB 12: The Buffer Pool: buffer-pool simulator (FIFO, LRU, clock sweep; 8 or 16 frames; hot pages with a scan, or random)
 - DB 13: B-Trees: growable B+ tree with four keys a page (ordered or random keys, middle or right-edge splits, search and range scan)
 - DB 14: LSM Trees: small LSM store (memtable, flushes, level 0 to 2 compaction, tombstones, real Bloom filters, write stall, amplification figures)
+- DB 15: Hash, GIN, GiST & Bitmap Indexes: BRIN block-range panel against a B-tree (ordered, late arrivals, shuffled; day, week, month)
