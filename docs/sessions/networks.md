@@ -66,3 +66,4 @@
 - Ch 41 Case Study: Typing google.com: packet-by-packet trace stepper with per-layer addresses (first visit vs a minute later)
 - Ch 42 Case Study: A WebRTC Video Call: ICE path finder (candidates and checks for each pairing of NAT kinds; direct or TURN)
 - Ch 43 Case Study: A CDN Serves a Viral Video: cache-stampede model for a new live segment (viewers, coalescing, origin shield)
+- Ch 44 Case Study: Facebook's 2021 BGP Outage: dependency model (backbone, DNS self-withdrawal, out-of-band repair path) over eight components
