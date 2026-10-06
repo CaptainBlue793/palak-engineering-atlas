@@ -56,3 +56,4 @@
   - Ch 18 Mutexes & Spinlocks (37 KB): spin-vs-sleep lock simulation (spinlock / futex-style mutex / spin-then-sleep, 2-8 threads, 1-4 cores, 2 or 40 us critical section) with a per-core timeline and a three-way comparison table
   - Ch 19 Condition Variables (34 KB): three-thread stepper (two workers, one producer) with three waiting styles (no mutex / if / while), reproduces the lost wake-up and the stale-condition bug, and counts every schedule (1,750 / 24 / 24)
   - Ch 20 Semaphores (30 KB): one-semaphore simulator (start at 0, 1 or 3; threads wait, post, return early without posting, or post without waiting) showing the value, who is inside and who sleeps
+  - Ch 21 Classic Problems (36 KB): dining-philosophers table (left-then-right, lower fork first, four seats, try-and-back-off; step one philosopher, all at once, or 300 random steps) showing deadlock and livelock; links to LLD Ch 23 for the Java producer-consumer
