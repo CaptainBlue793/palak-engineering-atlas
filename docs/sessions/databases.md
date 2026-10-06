@@ -64,3 +64,4 @@
 - DB 38: ORMs & the N+1 Problem: one page of posts loaded lazily, joined, select-in or mixed, with the statements sent, rows returned and time for 10, 50 or 200 posts
 - DB 39: SQL Interview Drills: five classic questions built in three stages each, with results computed from small tables that contain the awkward case (ties, a same-day pair, an empty cell)
 - DB 40: Database Interview Playbook: assemble a two-minute answer to three questions from ten points each (four essential, three depth, three wrong), with a time bar and the interviewer's reaction
+- DB 41: Case Study: Designing an E-Commerce Schema: one order's invoice under two designs (joins to live rows, or facts copied at purchase) as the price, name and address change and the product is deleted
