@@ -6,33 +6,311 @@
 <title>Time-Series Storage</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ts-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .ts-row > span { font-size:12.5px; color:var(--muted); min-width:90px; }
+  .ts-tbl { margin-top:14px; border:1.5px solid var(--border); border-radius:12px; background:var(--surface); overflow-x:auto; }
+  .ts-tbl table { border-collapse:collapse; width:100%; min-width:640px; font-family:var(--mono); font-size:11.5px; }
+  .ts-tbl th { font-family:var(--font); font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); background:var(--surface-2); padding:6px 8px; text-align:right; border-bottom:1px solid var(--border); white-space:nowrap; }
+  .ts-tbl th.ts-g { text-align:center; border-left:1px solid var(--border); }
+  .ts-tbl td { padding:4px 8px; text-align:right; border-bottom:1px solid var(--border); white-space:nowrap; }
+  .ts-tbl tr:last-child td { border-bottom:0; }
+  .ts-tbl td.ts-b { font-weight:700; }
+  .ts-tbl td.ts-b1 { color:var(--green); } .ts-tbl td.ts-b2 { color:var(--amber); } .ts-tbl td.ts-b3 { color:var(--red); }
+  .ts-tbl td.ts-sep { border-left:1px solid var(--border); }
+  .ts-tbl td.ts-more { text-align:center; color:var(--muted); font-family:var(--font); }
+  .ts-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .ts-msg.ts-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
 </head>
 <body data-chapter="29">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 29</span><span class="pill">Advanced</span><span class="pill">⏱ 40 min</span></div>
     <h1>Time-Series <span class="grad">Storage</span></h1>
-    <p class="lead">Append-heavy data, time partitioning, downsampling and retention.</p>
+    <p class="lead">A server reports its processor load every ten seconds. So do the other nine thousand servers, each for two hundred different measurements. That is 180,000 new values a second, every second, and nobody will ever update one of them. This is time-series data: measurements stamped with the time they were taken, arriving in order, in very large quantity, of which the last hour is looked at constantly and last year almost never. It comes from monitoring, from sensors, from financial markets and from application analytics. Its regularity is so strong that a store built for it can hold a sixteen-byte measurement in under two bytes. This chapter covers the shape of the workload and the three techniques that exploit it: chunking by time, specialised compression, and downsampling.</p>
+    <ul class="objectives">
+      <li><span>Recognise a time-series workload by how it writes, reads and deletes</span></li>
+      <li><span>Explain why time-series tables are divided into chunks by time</span></li>
+      <li><span>Encode timestamps as deltas of deltas, and values by XOR with the previous value</span></li>
+      <li><span>Plan downsampling and retention, and work out the storage each tier needs</span></li>
+      <li><span>Explain why the number of distinct series matters more than the number of points</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Partitioning by time, and dropping partitions:</b> <a href="26-partitioning-sharding.html">Chapter 26</a>.</li>
+        <li><b>Column stores and encodings:</b> <a href="28-column-stores-olap.html">Chapter 28</a>.</li>
+        <li><b>How numbers are stored in binary, and floating point:</b> <a href="../os/p5-bits-hex-binary.html">OS, P5</a>.</li>
+        <li><b>BRIN indexes:</b> <a href="15-other-indexes.html">Chapter 15</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Time-series workloads</li>
-    <li>Chunking by time</li>
-    <li>Compression (delta, Gorilla)</li>
-    <li>Downsampling and retention</li>
-  </ol>
+  <h2>Time-series workloads</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>An ordinary transactional table</th><th>A time series</th></tr></thead>
+      <tbody>
+        <tr><td><b>Writes</b></td><td>Inserts, updates and deletes, anywhere in the table</td><td>Inserts only, always at the newest end</td></tr>
+        <tr><td><b>Rate</b></td><td>Follows what users do</td><td>Steady and high: every source reports on a timer</td></tr>
+        <tr><td><b>Reads</b></td><td>Single rows by key</td><td>Ranges of time, aggregated: "the average for each minute over the last six hours"</td></tr>
+        <tr><td><b>What is read</b></td><td>Anything</td><td>Mostly the last few hours</td></tr>
+        <tr><td><b>Deletes</b></td><td>Individual rows</td><td>Everything older than a cut-off, all at once</td></tr>
+        <tr><td><b>Value of the data</b></td><td>Constant</td><td>Falls with age: last week in full detail, last year as a daily summary</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The data has a simple model. A <b>series</b> is one thing being measured, identified by a name and a set of labels, such as <code>cpu_usage{host="web-17", region="eu"}</code>. A <b>point</b> is a timestamp and a value. A monitoring system has millions of series, and each one grows by a point every few seconds.</p>
+
+  <h2>Chunking by time</h2>
+  <p>Every time-series store divides its data into <b>chunks</b>, each covering a period: two hours, a day, a week. This is partitioning by range of time (<a href="26-partitioning-sharding.html">Chapter 26</a>), and each property of the workload gains from it.</p>
+<pre class="code"><span class="c">-- TimescaleDB, an extension that does this inside PostgreSQL</span>
+<span class="k">CREATE TABLE</span> metrics (
+  time       timestamptz <span class="k">NOT NULL</span>,
+  series_id  integer     <span class="k">NOT NULL</span>,
+  value      double precision
+);
+<span class="k">SELECT</span> <span class="f">create_hypertable</span>(<span class="s">'metrics'</span>, <span class="s">'time'</span>, chunk_time_interval =&gt; <span class="k">INTERVAL</span> <span class="s">'1 day'</span>);
+
+<span class="k">SELECT</span> <span class="f">add_retention_policy</span>(<span class="s">'metrics'</span>, <span class="k">INTERVAL</span> <span class="s">'30 days'</span>);      <span class="c">-- drop whole chunks as they age out</span>
+<span class="k">SELECT</span> <span class="f">add_compression_policy</span>(<span class="s">'metrics'</span>, <span class="k">INTERVAL</span> <span class="s">'2 days'</span>);    <span class="c">-- rewrite older chunks in compressed, columnar form</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Property of the workload</th><th>What chunks do for it</th></tr></thead>
+      <tbody>
+        <tr><td><b>Writes go to the newest data</b></td><td>Only the current chunk is being written, and it and its indexes are small enough to stay in memory</td></tr>
+        <tr><td><b>Reads are ranges of time</b></td><td>A query opens only the chunks its range overlaps</td></tr>
+        <tr><td><b>Old data never changes</b></td><td>A finished chunk can be compressed hard, since nothing will be inserted into it again</td></tr>
+        <tr><td><b>Deletion is by age</b></td><td>Retention is dropping a chunk's files: instant, and with no dead rows to clean up</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>A point arrives</b> appended to a log, and added to the current chunk in memory</li>
+      <li data-k="step"><b>The chunk's period ends</b> a new chunk takes the writes</li>
+      <li data-k="store"><b>The finished chunk is compressed</b> and written to disk as an immutable block, sorted by series and then time</li>
+      <li data-k="step"><b>Blocks are merged</b> several small ones into one larger one, as an LSM tree does (<a href="14-lsm-trees.html">Chapter 14</a>)</li>
+      <li data-k="step"><b>Old data is downsampled</b> to one point for each minute or hour, and the detail is discarded</li>
+      <li data-k="end"><b>At the retention limit</b> the block's files are deleted</li>
+    </ol>
+    <figcaption><b>The life of a point.</b> Written once, compressed, summarised, and removed, without ever having been updated.</figcaption>
+  </figure>
+
+  <h2>Compression (delta, Gorilla)</h2>
+  <p>A point is a 64-bit timestamp and a 64-bit floating-point value: 16 bytes. Two observations about real series shrink that dramatically, and both come from a system at Facebook called Gorilla, whose encoding nearly every time-series database has since adopted.</p>
+  <p><b>Timestamps arrive at a fixed interval.</b> A source that reports every ten seconds produces timestamps ten seconds apart. So store the first timestamp in full. For the next, store the <i>delta</i>, the difference from the one before. For all later ones, store the <i>delta of the delta</i>: how much this interval differs from the last interval. For a regular series that is zero nearly every time, and a zero is written as a single bit.</p>
+  <p><b>Values change little from one point to the next.</b> Temperatures, queue lengths and request rates move slowly. Two similar floating-point numbers have nearly the same bit pattern, so the XOR of a value with the previous one is mostly zeros. If the value hasn't changed, the XOR is zero and one bit says so. Otherwise only the few bits in the middle that differ are stored.</p>
+<pre class="code"><span class="c">timestamp      delta    delta of delta    written as</span>
+1759827600                                <span class="m">64</span> bits, in full
+1759827610      10                        <span class="m">14</span> bits
+1759827620      10           0            <span class="k">1 bit</span>
+1759827630      10           0            <span class="k">1 bit</span>
+1759827641      11          +1            <span class="m">9</span> bits      <span class="c"># a report arrived a second late</span>
+1759827650       9          −2            <span class="m">9</span> bits
+1759827660      10          +1            <span class="m">9</span> bits</pre>
+
+  <h2>Try it: encode a series</h2>
+  <p>A series of 120 points, encoded as Gorilla does. Choose what kind of series it is, and see how many bits each point takes.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Delta of delta, and XOR</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="ts-row"><span>The series is</span><div class="seg" id="tsKind"><button data-v="steady">on time, value constant</button><button class="active" data-v="slow">on time, value moving slowly</button><button data-v="noisy">irregular, value noisy</button></div></div>
+      <div class="ts-tbl"><table id="tsTable"></table></div>
+      <div class="ts-msg" id="tsMsg"></div>
+      <div class="stats" id="tsStats"></div>
+    </div>
+    <div class="panel-foot">The encoding here is the real one, computed on the actual bits of each number. Timestamps: 1 bit if the delta of delta is zero, 9 bits if it is within ±64, 12 within ±256, 16 within ±2,048, and 36 otherwise. Values: 1 bit if unchanged, otherwise 2 control bits and the meaningful bits of the XOR, with 11 more bits when the position of those bits has moved.</div>
+  </div>
+
+  <p>Things to notice. A steady series costs two bits for each point after the first, one for "the interval hasn't changed" and one for "the value hasn't changed", against 128 bits raw. A value that moves slowly through whole numbers still averages under a byte a point. An irregular series with noisy decimal values costs over seven bytes a point, which is barely half the raw size. Its timestamps need nine bits where one would do, and its values share few bits with their predecessors, since a number like 41.37 has no short binary form. The same encoder gives very different results on different data, and the compression comes from the regularity of the series. Reporting on a fixed schedule, and rounding values to the precision that means something, makes a series several times smaller to store.</p>
+
+  <h2>Downsampling and retention</h2>
+  <p>Nobody examines last March at ten-second resolution. A <b>downsampled</b> series keeps one point for each longer interval, usually with the minimum, maximum, sum and count for that interval, so that averages and peaks can still be computed. The full-resolution data is then deleted when its retention period ends.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Tier</th><th>Resolution</th><th>Kept for</th><th>Points for each series</th><th>Used for</th></tr></thead>
+      <tbody>
+        <tr><td><b>Raw</b></td><td>10 seconds</td><td>15 days</td><td>129,600</td><td>Debugging what happened this week</td></tr>
+        <tr><td><b>First rollup</b></td><td>1 minute</td><td>90 days</td><td>129,600</td><td>Dashboards, and comparing with last month</td></tr>
+        <tr><td><b>Second rollup</b></td><td>1 hour</td><td>2 years</td><td>17,520</td><td>Capacity planning and yearly trends</td></tr>
+        <tr><td><b>All three</b></td><td></td><td></td><td>276,720</td><td></td></tr>
+        <tr><td><b>Raw data kept for 2 years</b></td><td>10 seconds</td><td>2 years</td><td>6,307,200</td><td>Nothing that the tiers don't serve</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The three tiers together hold one twenty-third of the points that two years of raw data would, and a query for a year's trend reads 8,760 points for each series where it would have read three million.</p>
+<pre class="code"><span class="c">-- A continuous aggregate: a rollup that the database keeps up to date as new data arrives (Chapter 33)</span>
+<span class="k">CREATE MATERIALIZED VIEW</span> metrics_1m <span class="k">WITH</span> (timescaledb.continuous) <span class="k">AS</span>
+<span class="k">SELECT</span> <span class="f">time_bucket</span>(<span class="s">'1 minute'</span>, time) <span class="k">AS</span> bucket, series_id,
+       <span class="f">min</span>(value), <span class="f">max</span>(value), <span class="f">sum</span>(value), <span class="f">count</span>(*)
+<span class="k">FROM</span> metrics <span class="k">GROUP BY</span> bucket, series_id;</pre>
+  <p>One limit is set by the number of distinct series, called the <b>cardinality</b>, and the volume of points matters less. Every unique combination of labels is its own series, with its own entry in the index and its own chunk being built in memory. A label with a few values, such as region, multiplies the series by a few. A label such as user id or request id multiplies them by millions, and a store that could take a billion points an hour for ten thousand series is brought down by a million series with one point each.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🦍</div>
+    <div class="body"><div class="title">Gorilla: Facebook's monitoring data in 1.37 bytes a point</div><p>By 2013 Facebook's monitoring system was collecting about two billion distinct time series and adding to them at around twelve million points a second. The data was kept in a store built on HBase, and it had become too slow for what it was used for most: an engineer investigating an incident, or an automated system deciding whether something was wrong, both of which query the last few hours and need answers at once. Looking at their own usage, the engineers found that at least 85% of all queries were for data from the past 26 hours. They built Gorilla, described in a paper in 2015, to hold exactly that window entirely in memory in front of the existing store. Whether 26 hours of two billion series could fit in memory depended on the size of a point, and the two encodings above were designed for that purpose. On Facebook's real data, 96% of timestamps compressed to a single bit, because the collectors ran on a fixed schedule, and about half of all values compressed to a single bit too, because they hadn't changed since the last report. The average came to 1.37 bytes for a point, a twelfth of the raw sixteen. With the recent data in memory in that form, queries ran over seventy times faster than they had against the disk-based store. The format was simple and was fully described in the paper, and within a few years Prometheus, InfluxDB, TimescaleDB and most others had adopted it or a close variant. The compression worked because the engineers had measured how regular their own data was before designing for it.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>High-cardinality labels:</b> a user id, a session id or a full URL as a label. Each distinct value creates a series.</li>
+      <li><b>One unpartitioned table with an index on time.</b> It works for a while, and then the index outgrows memory and deletion by age becomes a daily crisis.</li>
+      <li><b>Deleting old data with <code>DELETE</code>.</b> Drop chunks. A delete of billions of rows is slow and leaves bloat behind (<a href="23-mvcc.html">Chapter 23</a>).</li>
+      <li><b>Keeping raw data for ever "just in case".</b> Decide the resolution each age of data needs, and downsample.</li>
+      <li><b>Rollups that store only an average.</b> Averages of averages are wrong, and peaks vanish. Keep the sum, count, minimum and maximum.</li>
+      <li><b>Using a time-series store as a general database.</b> It has no cheap updates and little support for joins or transactions.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What makes time-series data different, and how do databases take advantage of it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Time-series data is append-only, arrives in time order at a high and steady rate, is queried mostly by time range and aggregate rather than by individual row, is most valuable when recent, and is deleted in bulk by age. Stores exploit each of those. They partition by time into chunks, so writes only touch the newest, small chunk; range queries open only the relevant chunks; and retention is dropping whole chunks instead of deleting rows. Because old chunks are immutable, they can be compressed aggressively in columnar form, with encodings designed for the data: timestamps as delta-of-delta, since intervals are regular, and values XORed with their predecessor, since they change slowly; that takes a 16-byte point to a byte or two. And because old data needs less detail, they downsample: keep raw data for days, minute rollups for months, hourly for years. The data model is series identified by a metric name and labels, and the thing that usually limits these systems is cardinality, the number of distinct series, not the number of points.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Design the storage for metrics from 10,000 servers, each reporting 200 metrics every 10 seconds, with a year of history.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First the arithmetic: 10,000 times 200 is two million series; at one point per ten seconds that is 200,000 points a second, about 17 billion a day. Raw at 16 bytes that would be 276 GB a day; with Gorilla-style compression at around 1.5 bytes a point it is about 26 GB a day. A year of raw data would be nearly 10 TB compressed, which is wasteful, since nobody needs ten-second resolution from months ago. So I'd use tiers: raw for two weeks, about 360 GB; one-minute rollups, holding min, max, sum and count, for three months; hourly rollups for the full year. The rollups are six and 360 times fewer points, so the total is well under a terabyte. Physically, I'd chunk by time, a few hours per chunk for the newest data, keep the current chunk in memory with a write-ahead log for durability, flush completed chunks as compressed immutable blocks sorted by series then time, and drop blocks past their retention. An index maps label values to series IDs so that queries like "all hosts in this region" find their series. Rollups are computed incrementally as each chunk closes. The main risks are cardinality, so I'd police labels and reject ones with unbounded values, and write availability, so I'd replicate, or accept that a monitoring store may lose a few seconds on failover. For the system itself I'd use something existing, Prometheus with long-term storage behind it, or TimescaleDB or ClickHouse if SQL matters, rather than build one.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Time-series data is appended in time order, read by range, valued by recency and deleted by age.</li>
+      <li>Chunking by time keeps writes in a small recent chunk, lets queries skip most of the data, and makes retention a matter of dropping files.</li>
+      <li>Timestamps are stored as the delta of the delta, which is zero for a regular series and costs one bit.</li>
+      <li>Values are stored as the XOR with the previous value, which is zero when nothing changed and short when little did.</li>
+      <li>Downsampling keeps old data at coarse resolution, with sum, count, minimum and maximum, for a small fraction of the space.</li>
+      <li>The number of distinct series is what limits a time-series store, so labels must have a bounded set of values.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why is deleting month-old data cheap in a time-series store, and expensive in an ordinary table?</p>
+      <div class="opts">
+        <button class="opt">Time-series stores don't log deletions</button>
+        <button class="opt">Old data is kept in memory</button>
+        <button class="opt">The data is in chunks by time, so a whole chunk's files are dropped, where a table needs every row deleted and cleaned up</button>
+        <button class="opt">Time-series stores never delete anything</button>
+      </div>
+      <div class="explain">Dropping a file is instant and leaves no dead rows.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A sensor reports exactly every 10 seconds. How many bits does each timestamp take after the first two, under delta-of-delta encoding?</p>
+      <div class="opts">
+        <button class="opt">1</button>
+        <button class="opt">8</button>
+        <button class="opt">32</button>
+        <button class="opt">64</button>
+      </div>
+      <div class="explain">The delta is always 10, so the delta of the delta is always 0, which is written as a single bit.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why does XOR with the previous value compress a slowly changing series well?</p>
+      <div class="opts">
+        <button class="opt">XOR makes numbers smaller</button>
+        <button class="opt">It rounds the values</button>
+        <button class="opt">It sorts the values</button>
+        <button class="opt">Similar numbers have similar bit patterns, so the XOR is mostly zeros, and only the few differing bits are stored</button>
+      </div>
+      <div class="explain">An unchanged value gives an XOR of zero, stored as one bit.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A rollup stores only the average for each minute. What goes wrong when an hourly figure is computed from it?</p>
+      <div class="opts">
+        <button class="opt">Nothing: averages can always be averaged</button>
+        <button class="opt">Peaks are lost, and an average of averages is wrong when minutes hold different numbers of points</button>
+        <button class="opt">The hourly figure takes too much space</button>
+        <button class="opt">The timestamps no longer line up</button>
+      </div>
+      <div class="explain">Keep the sum and the count, from which a correct average follows, and the minimum and maximum for the extremes.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A developer adds <code>user_id</code> as a label on a request-latency metric, in a service with 5 million users. What happens?</p>
+      <div class="opts">
+        <button class="opt">Queries become more precise at no cost</button>
+        <button class="opt">Each point becomes slightly larger</button>
+        <button class="opt">The number of series is multiplied by up to 5 million, which overwhelms the index and memory</button>
+        <button class="opt">The label is ignored</button>
+      </div>
+      <div class="explain">Every distinct combination of label values is a separate series. Per-user detail belongs in logs or an analytics store.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const N = 120, T0 = 1759827600, SHOW = 9;
+  // Deterministic pseudo-random numbers, so the series is the same every time.
+  function rng(seed) { let s = seed; return () => (s = (s * 1103515245 + 12345) % 2147483648) / 2147483648; }
+  function series(kind) {
+    const r = rng(kind === 'noisy' ? 9001 : 77), pts = []; let t = T0, v = 42;
+    for (let i = 0; i < N; i++) {
+      if (i) t += kind === 'noisy' ? 10 + Math.round((r() - 0.5) * 4) : 10;
+      if (kind === 'slow' && i) { const x = r(); v += x < 0.25 ? 1 : x < 0.5 ? -1 : 0; }
+      if (kind === 'noisy') v = Math.round((42 + (r() - 0.5) * 6) * 100) / 100;
+      pts.push({ t, v });
+    }
+    return pts;
+  }
+  const bitsOf = (x) => { const d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, x); return d.getBigUint64(0); };
+  const lead = (x) => { let n = 0; for (let b = 63n; b >= 0n && !((x >> b) & 1n); b--) n++; return n; };
+  const trail = (x) => { let n = 0; for (let b = 0n; b < 64n && !((x >> b) & 1n); b++) n++; return n; };
+  // Encode as Gorilla does, returning the bits used for each point's timestamp and value.
+  function encode(pts) {
+    const out = []; let prevDelta = 0, prevBits = 0n, pl = -1, pt = -1;
+    pts.forEach((p, i) => {
+      const row = { t: p.t, v: p.v };
+      if (i === 0) { row.tb = 64; row.vb = 64; }
+      else {
+        const delta = p.t - pts[i - 1].t; row.delta = delta;
+        if (i === 1) row.tb = 14;
+        else { const dod = delta - prevDelta; row.dod = dod; row.tb = dod === 0 ? 1 : dod >= -63 && dod <= 64 ? 9 : dod >= -255 && dod <= 256 ? 12 : dod >= -2047 && dod <= 2048 ? 16 : 36; }
+        prevDelta = delta;
+        const x = bitsOf(p.v) ^ prevBits; row.xor = x;
+        if (x === 0n) row.vb = 1;
+        else { const l = Math.min(31, lead(x)), tr = trail(x);
+          if (pl >= 0 && l >= pl && tr >= pt) row.vb = 2 + (64 - pl - pt);        // fits the previous window
+          else { row.vb = 2 + 5 + 6 + (64 - l - tr); pl = l; pt = tr; } }
+      }
+      prevBits = bitsOf(p.v); out.push(row);
+    });
+    return out;
+  }
+  const cls = (b) => (b <= 2 ? 'ts-b1' : b <= 16 ? 'ts-b2' : 'ts-b3');
+  function render() {
+    const kind = $('#tsKind').dataset.value, rows = encode(series(kind));
+    const body = rows.slice(0, SHOW).map((r, i) => `<tr><td>${r.t}</td><td>${r.delta === undefined ? '' : r.delta}</td><td>${r.dod === undefined ? '' : (r.dod > 0 ? '+' : '') + r.dod}</td><td class="ts-b ${cls(r.tb)}">${r.tb}</td>
+      <td class="ts-sep">${r.v}</td><td>${r.xor === undefined ? '' : r.xor === 0n ? '0' : '0x' + r.xor.toString(16).padStart(16, '0').replace(/^0+/, '0…').replace(/0+$/, '…0')}</td><td class="ts-b ${cls(r.vb)}">${r.vb}</td><td class="ts-sep ts-b">${r.tb + r.vb}</td></tr>`).join('');
+    $('#tsTable').innerHTML = `<thead><tr><th>timestamp</th><th>delta</th><th>delta of delta</th><th>bits</th><th class="ts-g">value</th><th>XOR with previous</th><th>bits</th><th class="ts-g">point</th></tr></thead><tbody>${body}<tr><td class="ts-more" colspan="8">… and ${N - SHOW} more points</td></tr></tbody>`;
+    const tb = rows.reduce((s, r) => s + r.tb, 0), vb = rows.reduce((s, r) => s + r.vb, 0), total = tb + vb;
+    const per = total / N, bytes = per / 8, ratio = 128 / per, day = 8640 * bytes;
+    const oneBitT = rows.filter((r) => r.tb === 1).length, oneBitV = rows.filter((r) => r.vb === 1).length;
+    const m = $('#tsMsg');
+    m.className = 'ts-msg ' + (kind === 'noisy' ? 'ts-warn' : '');
+    m.innerHTML = kind === 'steady' ? `<b>${per.toFixed(1)} bits a point, against 128 raw.</b> After the first two points, every timestamp is "same interval as before" and every value is "unchanged", one bit each. The 120 points take ${Math.ceil(total / 8)} bytes, and nearly all of that is the first point, stored in full.`
+      : kind === 'slow' ? `<b>${per.toFixed(1)} bits a point: ${bytes.toFixed(1)} bytes.</b> The timestamps still cost one bit each. ${oneBitV} of the 120 values were unchanged and cost one bit. The rest changed by one, which alters a few bits of the number, and cost about ${Math.round((vb - oneBitV - 64) / (N - oneBitV - 1))} bits.`
+      : `<b>${per.toFixed(1)} bits a point: ${bytes.toFixed(1)} bytes, ${ratio.toFixed(1)} times smaller than raw and no better.</b> Only ${oneBitT} of the timestamps hit the one-bit case, because the interval keeps changing by a second or two. And a value such as 41.37 has no short binary form, so its XOR with a neighbour differs in about fifty bits, nearly all of which must be stored.`;
+    $('#tsStats').innerHTML = `<div class="stat ${per < 8 ? 'good' : per < 32 ? 'acc' : 'warn'}"><div class="k">Bits for each point</div><div class="v">${per.toFixed(1)}</div></div>
+      <div class="stat"><div class="k">Of which timestamp, value</div><div class="v">${(tb / N).toFixed(1)}, ${(vb / N).toFixed(1)}</div></div>
+      <div class="stat ${ratio > 10 ? 'good' : ''}"><div class="k">Smaller than raw by</div><div class="v">${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)}×</div></div>
+      <div class="stat"><div class="k">One day of this series</div><div class="v">${day >= 1024 ? (day / 1024).toFixed(1) + ' kB' : Math.round(day) + ' B'}</div></div>`;
+  }
+  $('#tsKind').addEventListener('segchange', render);
+  render();
+})();
+</script>
 </body>
 </html>

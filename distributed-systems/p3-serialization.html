@@ -6,33 +6,327 @@
 <title>Serialization: JSON &amp; Protobuf</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pb-in { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:12px; }
+  @media (max-width:760px) { .pb-in { grid-template-columns:1fr 1fr; } }
+  .pb-in label { font-size:12px; font-weight:700; color:var(--muted); display:flex; flex-direction:column; gap:4px; }
+  .pb-in input.inp { font-family:var(--mono); }
+  .pb-bytes { display:flex; flex-wrap:wrap; gap:4px; margin-top:12px; padding:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); }
+  .pb-f { display:inline-flex; gap:2px; padding:3px; border-radius:7px; border:1px solid var(--border); background:var(--surface); }
+  .pb-b { font-family:var(--mono); font-size:12.5px; padding:2px 4px; border-radius:4px; }
+  .pb-b.pb-tag { background:var(--accent-soft); color:var(--accent); font-weight:700; }
+  .pb-b.pb-len { background:var(--amber-soft); color:var(--amber); font-weight:700; }
+  .pb-b.pb-val { color:var(--text); }
+  .pb-f small { display:block; }
+  .pb-cap { font-family:var(--mono); font-size:10.5px; color:var(--muted); text-align:center; margin-top:2px; }
+  .pb-fw { display:flex; flex-direction:column; }
+  .pb-read { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }
+  @media (max-width:760px) { .pb-read { grid-template-columns:1fr; } }
+  .pb-out { font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; padding:12px; border-radius:12px; border:1px solid var(--border); background:var(--surface); min-height:120px; }
+  .pb-res { padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); }
+  .pb-res.pb-ok { background:var(--green-soft); } .pb-res.pb-bad { background:var(--red-soft); } .pb-res.pb-warn { background:var(--amber-soft); }
+</style>
 </head>
 <body data-chapter="0.3">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 3</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 35 min</span></div>
-    <h1>Serialization: <span class="grad">JSON &amp; Protobuf</span></h1>
-    <p class="lead">Turning objects into bytes, schema evolution, and why field numbers matter.</p>
+    <h1>Serialization: JSON &amp; <span class="grad">Protobuf</span></h1>
+    <p class="lead">Objects can't cross a network; bytes can. Every message between nodes, every entry in a replicated log and every record in Kafka is a Java object turned into bytes on one machine and back into an object on another, often by a <b>different version of the code</b>. This chapter covers how JSON and Protocol Buffers do that, what the bytes actually look like, and the rules that let a cluster run old and new versions side by side during a rolling upgrade without corrupting data.</p>
+    <ul class="objectives">
+      <li>Compare JSON, Protobuf, Avro and Java serialization on size, schema and safety</li>
+      <li>Read a Protobuf message byte by byte: tags, varints and length prefixes</li>
+      <li>Define backward and forward compatibility and say which one a rolling upgrade needs</li>
+      <li>Apply the schema evolution rules, including never reusing a field number</li>
+      <li>Explain why an old reader must keep fields it doesn't understand</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>RPCs</b> from <a href="p2-rpc-timeouts.html">P2</a>: serialization is the first and last step of every call.</li>
+        <li><b>Bits and bytes:</b> hexadecimal, and that a byte holds 8 bits (values 0–255).</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>JSON trade-offs</li>
-    <li>Protobuf encoding</li>
-    <li>Backward and forward compatibility</li>
-    <li>Schema evolution rules</li>
-  </ol>
+  <h2>Why not just send the object?</h2>
+  <p>A Java object is a set of fields in one JVM's heap, full of references to other objects at addresses that mean nothing anywhere else. To send it, you <b>serialize</b> it into a self-contained sequence of bytes, and the receiver <b>deserializes</b> those bytes into its own objects. Four things decide whether a format is a good choice between services:</p>
+  <ul>
+    <li><b>Size and speed:</b> bytes on the wire and CPU spent encoding. It matters for a replication log that writes every entry several times.</li>
+    <li><b>Schema:</b> whether the structure is written down and checked, or implied by whatever the sender happened to send.</li>
+    <li><b>Evolution:</b> whether version 2 of a service can talk to version 1, in both directions.</li>
+    <li><b>Safety:</b> whether decoding untrusted bytes can do anything except produce data.</li>
+  </ul>
+  <p>The last point rules out Java's built-in <code>Serializable</code> between services. Deserializing a Java object stream can instantiate arbitrary classes on the classpath, and chains of ordinary library classes ("gadgets") have been used for remote code execution; the 2015 Apache Commons Collections exploits hit WebLogic, JBoss and Jenkins this way. It is also tied to Java and fragile across class changes. Use a data format, not an object-graph format.</p>
+
+  <h2>JSON: readable, schemaless, verbose</h2>
+  <p>JSON is the default for public APIs because anyone can read it and every language can parse it. Between your own services it has costs: field names are repeated in every message, numbers have no fixed type, and nothing checks the structure.</p>
+<pre class="code"><span class="k">public record</span> <span class="t">OrderJson</span>(<span class="k">long</span> id, <span class="t">String</span> sku, <span class="k">int</span> qty) {}
+
+<span class="t">ObjectMapper</span> json = <span class="k">new</span> <span class="t">ObjectMapper</span>()
+	.<span class="f">configure</span>(<span class="t">DeserializationFeature</span>.FAIL_ON_UNKNOWN_PROPERTIES, <span class="k">false</span>);   <span class="c">// see below</span>
+
+<span class="t">String</span> text = json.<span class="f">writeValueAsString</span>(<span class="k">new</span> <span class="t">OrderJson</span>(<span class="m">150</span>, <span class="s">"A-17"</span>, <span class="m">2</span>));
+<span class="c">// {"id":150,"sku":"A-17","qty":2}   → 31 bytes</span>
+<span class="t">OrderJson</span> back = json.<span class="f">readValue</span>(text, <span class="t">OrderJson</span>.<span class="k">class</span>);</pre>
+  <p>Two JSON traps show up in distributed systems. First, Jackson's default is to <b>fail on unknown properties</b>, so the moment a new version of a service adds a field, every old reader starts throwing. Turning that off (as above) is what makes JSON forward compatible. Second, JSON numbers become IEEE doubles in JavaScript, which represent integers exactly only up to 2<sup>53</sup>. 64-bit IDs from Snowflake-style generators exceed that, which is why Twitter's API returned every ID twice, as <code>id</code> and as the string <code>id_str</code>. Send large IDs as strings.</p>
+
+  <h2>Protocol Buffers: a schema and compact bytes</h2>
+  <p>Protobuf starts from a schema file. Each field has a type and, crucially, a <b>field number</b>; the number, not the name, is what goes on the wire.</p>
+<pre class="code"><span class="k">syntax</span> = <span class="s">"proto3"</span>;
+<span class="k">package</span> shop.v1;
+<span class="k">option</span> java_package = <span class="s">"com.example.shop.v1"</span>;
+<span class="k">option</span> java_multiple_files = <span class="k">true</span>;
+
+<span class="k">message</span> <span class="t">Order</span> {
+  <span class="t">int64</span>  id     = <span class="m">1</span>;
+  <span class="t">string</span> sku    = <span class="m">2</span>;
+  <span class="t">int32</span>  qty    = <span class="m">3</span>;
+  <span class="t">string</span> coupon = <span class="m">4</span>;      <span class="c">// added in v2</span>
+  <span class="k">reserved</span> <span class="m">5</span>;              <span class="c">// was bool gift; never reuse the number</span>
+  <span class="k">reserved</span> <span class="s">"gift"</span>;
+}</pre>
+<pre class="code"><span class="t">Order</span> order = <span class="t">Order</span>.<span class="f">newBuilder</span>().<span class="f">setId</span>(<span class="m">150</span>).<span class="f">setSku</span>(<span class="s">"A-17"</span>).<span class="f">setQty</span>(<span class="m">2</span>).<span class="f">build</span>();   <span class="c">// immutable</span>
+<span class="k">byte</span>[] bytes = order.<span class="f">toByteArray</span>();                                       <span class="c">// 11 bytes</span>
+<span class="t">Order</span> back = <span class="t">Order</span>.<span class="f">parseFrom</span>(bytes);</pre>
+  <p>The encoding is a sequence of fields, each starting with a <b>tag</b>: the field number shifted left three bits, combined with a three-bit <b>wire type</b> that tells the parser how to find the end of the value. Wire type 0 is a <b>varint</b>: an integer in 7-bit groups, least significant first, with the top bit of each byte meaning "more bytes follow". Wire type 2 is <b>length-delimited</b>: a varint length, then that many bytes (strings, bytes, nested messages). So <code>id = 150</code> becomes <code>08 96 01</code>: tag <code>08</code> is field 1, wire type 0; then 150 is <code>0010110</code> + <code>0000001</code> in 7-bit groups, written as <code>96 01</code>. Fields left at their default (0, empty string) are not written at all in proto3. Try it:</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Protobuf on the wire: encode, then read with three schemas</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="pb-in">
+        <label>id (int64, field 1)<input class="inp" id="pbId" value="150"></label>
+        <label>sku (string, field 2)<input class="inp" id="pbSku" value="A-17"></label>
+        <label>qty (int32, field 3)<input class="inp" id="pbQty" value="2"></label>
+        <label>coupon (string, field 4)<input class="inp" id="pbCoupon" value="" placeholder="v2 writers only"></label>
+      </div>
+      <div class="pb-bytes" id="pbBytes"></div>
+      <div class="stats" id="pbStats"></div>
+      <div class="controls" style="margin-top:14px"><span class="small muted">Read these bytes with:</span>
+        <div class="seg" id="pbReader"><button class="active" data-v="v2">v2 reader</button><button data-v="v1">v1 reader (no coupon)</button><button data-v="v3">v3: qty deleted, 3 reused</button></div>
+      </div>
+      <div class="pb-read">
+        <div class="pb-out" id="pbSchema"></div>
+        <div class="pb-out" id="pbOut"></div>
+      </div>
+      <div class="pb-res" id="pbRes" style="margin-top:12px"></div>
+    </div>
+    <div class="panel-foot">Purple bytes are tags (field number and wire type), amber bytes are lengths, the rest are values. Type a coupon to play a v2 writer, then read the bytes with an old v1 reader, and with a v3 schema where someone deleted <code>qty</code> and gave field 3 to a new field.</div>
+  </div>
+
+  <h2>Compatibility: two directions, both needed</h2>
+  <p>In a cluster, you never upgrade every machine at once. During a rolling upgrade, v1 and v2 nodes run side by side for minutes or hours, and data written by either can sit in a log or a database for years. That needs both directions of compatibility:</p>
+  <ul>
+    <li><b>Backward compatibility:</b> new code can read data written by old code. Needed as soon as v2 reads anything v1 wrote, including old log entries.</li>
+    <li><b>Forward compatibility:</b> old code can read data written by new code. Needed because a v1 node will receive messages from an already-upgraded v2 node, and because you may have to roll back.</li>
+  </ul>
+  <p>Protobuf gives you both, if you follow its rules. An old reader skips a field number it doesn't know, using the wire type to find where it ends. And it <b>keeps</b> those bytes: since protobuf 3.5, unknown fields are preserved, so a v1 node that reads a v2 record, changes the quantity and writes it back doesn't silently delete the coupon.</p>
+  <figure class="seq" data-actors="v2 checkout|Order store (v1)|v2 billing">
+    <ol>
+      <li data-m="0>1">write Order{id, sku, qty, coupon:"SPRING"}</li>
+      <li data-m="1>1">parse: field 4 unknown, kept as unknown bytes</li>
+      <li data-m="1>1">update qty 2 → 3, re-serialize</li>
+      <li data-m="2>1">read order 150</li>
+      <li data-m="1>2" data-k="reply">Order{qty:3, coupon:"SPRING"}<small>The coupon survived a round trip through code that has never heard of it. Before 3.5, proto3 dropped unknown fields here.</small></li>
+    </ol>
+    <figcaption><b>Forward compatibility in a rolling upgrade.</b> The v1 store neither understands nor loses the v2 field.</figcaption>
+  </figure>
+  <p>The rules that keep this working are short, and every one of them comes from a real outage:</p>
+  <ul>
+    <li><b>Never change a field's number.</b> The number is the field's identity on the wire.</li>
+    <li><b>Never reuse a number or a name</b> after deleting a field. Mark it <code>reserved</code> so the compiler refuses. Old data and old writers still use it.</li>
+    <li><b>Add fields with new numbers</b>, and make sure code works when they are missing (the default value).</li>
+    <li><b>Don't change a field's type</b> except between compatible types (for example <code>int32</code> ↔ <code>int64</code>, which can truncate), and never between a number and a string.</li>
+    <li><b>Renaming is safe on the wire</b> but breaks the JSON mapping and anything that reflects on names.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Format</th><th>Size</th><th>Schema</th><th>Evolution</th><th>Human-readable</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td>Java <code>Serializable</code></td><td>Large</td><td>The Java classes</td><td>Fragile; breaks on class changes</td><td>No</td><td>Nothing that crosses a trust boundary</td></tr>
+        <tr><td>JSON</td><td>Large: names in every message</td><td>Optional (JSON Schema, OpenAPI)</td><td>Good if readers ignore unknown fields</td><td>Yes</td><td>Public APIs, config, debugging</td></tr>
+        <tr><td>Protobuf</td><td>Small: numbers, varints</td><td>Required <code>.proto</code></td><td>Strong: field numbers, unknown fields kept</td><td>No (text format exists)</td><td>gRPC, etcd, internal RPC, storage</td></tr>
+        <tr><td>Avro</td><td>Smallest: no tags at all</td><td>Required; writer's schema travels or sits in a registry</td><td>Strong: resolved by field name against the writer's schema</td><td>No</td><td>Kafka with a schema registry, Hadoop files</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Avro takes the opposite approach to Protobuf: no field numbers on the wire at all, just values in schema order. A reader can decode the bytes only with the <b>writer's</b> schema, which is why Kafka deployments pair Avro with a schema registry and put a schema ID in front of every message.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🔢</div>
+    <div class="body"><div class="title">Use case: the reused field number</div><p>A team removes <code>int32 qty = 3</code> from <code>Order</code> because quantities moved to line items. Months later someone adds <code>int32 discount_pct = 3</code>; the number looked free. Nothing fails. But order records written before the change are still in the database and in a Kafka topic retained for 30 days, and a billing job replaying the topic now reads every old quantity as a discount: an order for 20 items gets 20% off. There is no error to alert on, because the bytes are perfectly valid. The one-line fix would have been <code>reserved 3;</code> when <code>qty</code> was deleted, which makes the compiler reject the reuse. The v3 reader in the panel shows exactly this.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Java serialization between services</b>: unsafe on untrusted input and brittle across versions.</li>
+      <li><b>Reusing a deleted field number.</b> Old data is reinterpreted silently. Always <code>reserve</code> deleted numbers and names.</li>
+      <li><b>JSON readers that fail on unknown fields</b> (Jackson's default), so every additive change breaks old nodes.</li>
+      <li><b>64-bit IDs as JSON numbers</b>, silently rounded by JavaScript clients past 2<sup>53</sup>.</li>
+      <li><b>Assuming a missing field means "not set"</b> in proto3. A zero, an empty string and an absent field look the same unless you use <code>optional</code> or a wrapper.</li>
+      <li><b>Upgrading readers and writers in the wrong order.</b> Deploy code that can read a new field before any code writes it.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What do backward and forward compatibility mean, and why does a rolling upgrade need both?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Backward compatibility means new code can read old data; forward compatibility means old code can read new data. During a rolling upgrade, some nodes run v1 and some v2 at the same time, so v2 nodes read messages and stored records from v1 (backward), and v1 nodes receive messages from v2 nodes (forward). If you need to roll back, v1 code also has to read anything v2 already wrote. Protobuf gets both by identifying fields by number, skipping unknown numbers, and preserving them when re-serializing.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why is reusing a Protobuf field number dangerous, when the build passes and no errors appear?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because the field number is the field's identity on the wire. Old bytes, in databases, logs, caches or from not-yet-upgraded writers, still carry the old meaning under that number. If the new field has a compatible wire type, the parser accepts those bytes and assigns them to the new field, so data is silently misread: no exception, no failed request, just wrong values. If the wire type differs, the value lands in unknown fields and the new field reads as its default, which is also silent. The prevention is <code>reserved</code> for every deleted number and name, plus a schema-compatibility check in CI, such as <code>buf breaking</code>.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Serialization turns objects into self-contained bytes; never use Java's object serialization between services.</li>
+      <li>JSON is readable and flexible but verbose; make readers ignore unknown fields and send big IDs as strings.</li>
+      <li>Protobuf writes a tag (field number and wire type) and then the value: varints for integers, a length prefix for strings and messages.</li>
+      <li>Rolling upgrades need backward and forward compatibility at the same time.</li>
+      <li>Never change or reuse field numbers; reserve deleted ones; add new fields with new numbers.</li>
+      <li>Old readers skip and preserve unknown fields, so data passes safely through code that doesn't understand it.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In Protobuf, what identifies a field in the encoded bytes?</p>
+      <div class="opts">
+        <button class="opt">Its name, written before each value</button>
+        <button class="opt">Its field number, combined with the wire type in a tag</button>
+        <button class="opt">Its position in the message</button>
+        <button class="opt">A hash of the field name</button>
+      </div>
+      <div class="explain">The tag is (field number &lt;&lt; 3) | wire type. Names never appear on the wire, which is why renaming is safe and renumbering is not.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">During a rolling upgrade, a v1 node receives a message from a v2 node that contains a new field. Which property makes this work?</p>
+      <div class="opts">
+        <button class="opt">Backward compatibility</button>
+        <button class="opt">Strong typing</button>
+        <button class="opt">Idempotency</button>
+        <button class="opt">Forward compatibility: old code can read data written by new code</button>
+      </div>
+      <div class="explain">Old reading new is forward compatibility. New reading old (v2 reading v1 data) is backward compatibility. A rolling upgrade needs both.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A team deletes <code>int32 qty = 3</code>, then later adds <code>int32 discount_pct = 3</code>. What happens when the new code reads old records?</p>
+      <div class="opts">
+        <button class="opt">Old quantities are silently read as discounts, with no error</button>
+        <button class="opt">The parser throws an exception on every old record</button>
+        <button class="opt">The new field reads as 0 for old records</button>
+        <button class="opt">Protobuf detects the reuse at runtime and skips the field</button>
+      </div>
+      <div class="explain">Same number, same wire type: the bytes are valid, so they are assigned to the new field. Marking 3 as reserved would have prevented the reuse at compile time.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How is the integer 150 encoded as a Protobuf varint?</p>
+      <div class="opts">
+        <button class="opt">00 96</button>
+        <button class="opt">96</button>
+        <button class="opt">96 01: low 7 bits first with the continuation bit set, then the remaining bits</button>
+        <button class="opt">01 50</button>
+      </div>
+      <div class="explain">150 = 1·128 + 22. The first byte carries the low 7 bits (22 = 0x16) with the top bit set: 0x96. The second byte carries 1 without the top bit: 0x01.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why do Kafka setups that use Avro usually run a schema registry?</p>
+      <div class="opts">
+        <button class="opt">Avro messages are encrypted with the schema</button>
+        <button class="opt">Avro writes no field tags, so a reader needs the writer's exact schema to decode the bytes</button>
+        <button class="opt">Kafka cannot store binary data without it</button>
+        <button class="opt">It converts Avro to JSON for consumers</button>
+      </div>
+      <div class="explain">Avro values are written in schema order with no tags. The message carries a schema ID; the reader fetches that writer schema and resolves it against its own by field name.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  const hex = (b) => b.toString(16).padStart(2, '0');
+  function varint(n) {                       // n: BigInt >= 0
+    const out = [];
+    do { let b = Number(n & 0x7Fn); n >>= 7n; if (n > 0n) b |= 0x80; out.push(b); } while (n > 0n);
+    return out;
+  }
+  const utf8 = (s) => [...new TextEncoder().encode(s)];
+  const READERS = {
+    v1: { name: 'Order (v1)', fields: { 1: ['id', 'int64'], 2: ['sku', 'string'], 3: ['qty', 'int32'] } },
+    v2: { name: 'Order (v2)', fields: { 1: ['id', 'int64'], 2: ['sku', 'string'], 3: ['qty', 'int32'], 4: ['coupon', 'string'] } },
+    v3: { name: 'Order (v3)', fields: { 1: ['id', 'int64'], 2: ['sku', 'string'], 3: ['discount_pct', 'int32'], 4: ['coupon', 'string'] } },
+  };
+  let reader = 'v2';
+
+  function encode() {
+    const parts = [], bad = [];
+    const num = (sel, name) => { const v = $(sel).value.trim(); if (!/^\d+$/.test(v)) { if (v) bad.push(name); return 0n; } return BigInt(v); };
+    const id = num('#pbId', 'id'), qty = num('#pbQty', 'qty');
+    if (qty > 2147483647n) bad.push('qty (int32 max is 2147483647)');
+    if (id > 9223372036854775807n) bad.push('id (int64 max)');
+    const sku = $('#pbSku').value, coupon = $('#pbCoupon').value;
+    if (id) parts.push({ f: 1, name: 'id', tag: [0x08], val: varint(id), text: id.toString() });
+    if (sku) { const b = utf8(sku); parts.push({ f: 2, name: 'sku', tag: [0x12], len: varint(BigInt(b.length)), val: b, text: JSON.stringify(sku) }); }
+    if (qty) parts.push({ f: 3, name: 'qty', tag: [0x18], val: varint(qty), text: qty.toString() });
+    if (coupon) { const b = utf8(coupon); parts.push({ f: 4, name: 'coupon', tag: [0x22], len: varint(BigInt(b.length)), val: b, text: JSON.stringify(coupon) }); }
+    return { parts, bad, json: JSON.stringify(Object.assign({ id: Number(id), sku, qty: Number(qty) }, coupon ? { coupon } : {})) };
+  }
+
+  // A generic Protobuf parser: walk tags, then interpret each field with the reader's schema.
+  function decode(bytes, schema) {
+    let i = 0; const msg = {}, unknown = [];
+    const rv = () => { let r = 0n, s = 0n, b; do { b = bytes[i++]; r |= BigInt(b & 0x7F) << s; s += 7n; } while (b & 0x80); return r; };
+    while (i < bytes.length) {
+      const tag = Number(rv()), f = tag >> 3, wt = tag & 7;
+      let raw;
+      if (wt === 0) raw = rv(); else { const n = Number(rv()); raw = bytes.slice(i, i + n); i += n; }
+      const def = schema.fields[f];
+      const want = def && (def[1] === 'string' ? 2 : 0);
+      if (!def || want !== wt) unknown.push({ f, wt, raw });
+      else msg[def[0]] = def[1] === 'string' ? new TextDecoder().decode(new Uint8Array(raw)) : raw.toString();
+    }
+    return { msg, unknown };
+  }
+
+  function render() {
+    const { parts, bad, json } = encode();
+    const bytes = parts.flatMap((p) => [...p.tag, ...(p.len || []), ...p.val]);
+    $('#pbBytes').innerHTML = parts.length ? parts.map((p) => `<span class="pb-fw"><span class="pb-f">${p.tag.map((b) => `<span class="pb-b pb-tag">${hex(b)}</span>`).join('')}${(p.len || []).map((b) => `<span class="pb-b pb-len">${hex(b)}</span>`).join('')}${p.val.map((b) => `<span class="pb-b pb-val">${hex(b)}</span>`).join('')}</span><span class="pb-cap">${p.name}=${p.text.length > 14 ? p.text.slice(0, 12) + '…' : p.text}</span></span>`).join('')
+      : '<span class="small muted">All fields are at their defaults, so proto3 writes zero bytes.</span>';
+    const jsonLen = new TextEncoder().encode(json).length;
+    $('#pbStats').innerHTML = `
+      <div class="stat acc"><div class="k">Protobuf</div><div class="v">${bytes.length}<small> bytes</small></div></div>
+      <div class="stat"><div class="k">JSON</div><div class="v">${jsonLen}<small> bytes</small></div></div>
+      <div class="stat good"><div class="k">Saved</div><div class="v">${jsonLen ? Math.round((1 - bytes.length / jsonLen) * 100) : 0}<small>%</small></div></div>
+      <div class="stat ${bad.length ? 'bad' : ''}"><div class="k">Input</div><div class="v" style="font-size:14px">${bad.length ? 'bad: ' + bad.join(', ') : 'valid'}</div></div>`;
+
+    const schema = READERS[reader];
+    $('#pbSchema').textContent = `message ${schema.name.split(' ')[0]} {   // ${reader} reader\n` + Object.entries(schema.fields).map(([n, [name, type]]) => `  ${type.padEnd(6)} ${name.padEnd(12)} = ${n};`).join('\n') + (reader === 'v3' ? '\n  // qty was deleted; 3 was "free"' : '') + '\n}';
+    const { msg, unknown } = decode(bytes, schema);
+    $('#pbOut').textContent = `decoded ${schema.name}:\n` + Object.entries(schema.fields).map(([, [name, type]]) => `  ${name} = ${msg[name] != null ? (type === 'string' ? JSON.stringify(msg[name]) : msg[name]) : (type === 'string' ? '""' : '0') + '   (default)'}`).join('\n')
+      + (unknown.length ? `\n\nunknown fields kept: ${unknown.map((u) => `#${u.f} (${u.wt === 2 ? u.raw.length + ' bytes' : 'varint ' + u.raw})`).join(', ')}` : '');
+    const res = $('#pbRes'), coupon = $('#pbCoupon').value, qty = $('#pbQty').value.trim();
+    if (reader === 'v1' && coupon) { res.className = 'pb-res pb-ok'; res.innerHTML = `<b>Forward compatible.</b> The v1 reader has never heard of field 4. The wire type (2: length-delimited) told it how many bytes to skip, and it kept them as an unknown field, so writing this order back won't drop the coupon.`; }
+    else if (reader === 'v3' && qty && qty !== '0') { res.className = 'pb-res pb-bad'; res.innerHTML = `<b>Silent corruption.</b> The bytes still say "field 3 = ${qty}", written when field 3 meant quantity. The v3 schema reads them as <code>discount_pct = ${qty}</code>. Nothing failed; this order now gets ${qty}% off. <code>reserved 3;</code> would have stopped this at compile time.`; }
+    else if (reader === 'v3') { res.className = 'pb-res pb-warn'; res.innerHTML = `With qty at its default, nothing is written for field 3, so there's nothing to misread. Set a quantity to see the reuse bite.`; }
+    else { res.className = 'pb-res'; res.innerHTML = reader === 'v1' ? 'The v1 reader decodes everything it knows. Type a coupon (a v2-only field) to see what it does with a field it has never heard of.' : `Every field decodes as written. Try the <b>v1 reader</b> with a coupon, or the <b>v3</b> schema that reused field 3.`; }
+  }
+  ['#pbId', '#pbSku', '#pbQty', '#pbCoupon'].forEach((s) => $(s).addEventListener('input', render));
+  $('#pbReader').addEventListener('segchange', (e) => { reader = e.detail; render(); });
+  render();
+})();
+</script>
 </body>
 </html>

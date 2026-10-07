@@ -6,34 +6,430 @@
 <title>Page Faults &amp; Demand Paging</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pf-h { margin:14px 0 6px; font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .pf-vm { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:6px; }
+  .pf-ram { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:6px; }
+  @media (max-width:760px) { .pf-vm { grid-template-columns:repeat(3,minmax(0,1fr)); } .pf-ram { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+  .pf-p { display:block; width:100%; text-align:left; border:1.5px solid var(--border); border-radius:10px; padding:6px 8px; background:var(--surface); color:var(--text); font-family:var(--mono); font-size:11px; line-height:1.45; min-height:56px; cursor:pointer; transition:.15s; }
+  .pf-p:hover { border-color:var(--border-strong); }
+  .pf-p b { display:block; font-family:var(--font); font-size:12px; }
+  .pf-p span { color:var(--muted); }
+  .pf-p.pf-in { background:color-mix(in srgb, var(--green) 12%, var(--surface)); }
+  .pf-p.pf-zero { background:color-mix(in srgb, var(--accent-2) 12%, var(--surface)); }
+  .pf-p.pf-swap { background:color-mix(in srgb, var(--amber) 16%, var(--surface)); }
+  .pf-p.pf-hole { border-style:dashed; }
+  .pf-p.pf-cur { outline:2px solid var(--text); outline-offset:1px; }
+  .pf-f { border:1px solid var(--border); border-radius:8px; padding:5px 8px; font-family:var(--mono); font-size:11px; background:var(--surface-2); color:var(--muted); }
+  .pf-f.pf-used { background:color-mix(in srgb, var(--green) 12%, var(--surface)); color:var(--text); }
+  .pf-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .pf-desc.pf-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .pf-desc.pf-minor { background:var(--amber-soft); border-left-color:var(--amber); }
+  .pf-desc.pf-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="14">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 14</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Page Faults &amp; Demand <span class="grad">Paging</span></h1>
-    <p class="lead">Minor and major faults, lazy allocation, swap, and what the kernel does between the fault and the retry.</p>
+    <p class="lead">A <b>page fault</b> sounds like an error. Almost always it is the kernel doing its job as late as possible. <code>malloc</code> hands out address space without memory behind it; <code>exec</code> starts a program without reading it from disk; a 200 MB binary runs on a machine with 100 MB free. Each works because the kernel waits for the first access to a page, catches the fault, and only then finds a frame for it. This chapter follows what happens between the fault and the retry, when it is cheap, when it costs a disk read, and what goes wrong when there isn't enough RAM to go round.</p>
+    <ul class="objectives">
+      <li>Trace a page fault from the failed access to the restarted instruction</li>
+      <li>Tell minor, major and invalid faults apart, and measure them</li>
+      <li>Explain lazy allocation and why a process's virtual size and resident size differ</li>
+      <li>Explain what swap is for, and what happens to pages that have no file behind them</li>
+      <li>Explain overcommit and recognise thrashing</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Page-table entries and the Present, Writable and Dirty bits.</b> See <a href="12-paging-page-tables.html">Chapter 12</a>.</li>
+        <li><b>The regions of an address space, VSZ and RSS.</b> See <a href="11-address-spaces.html">Chapter 11</a>.</li>
+        <li><b>Traps into the kernel, and blocked versus ready processes.</b> See <a href="02-kernel-user-mode-syscalls.html">Chapter 2</a> and <a href="04-process-states-pcb.html">Chapter 4</a>.</li>
+        <li><b>How slow a disk is compared with RAM.</b> See <a href="p4-memory-hierarchy.html">P4</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Minor vs major faults</li>
-    <li>Demand paging and lazy allocation</li>
-    <li>Swap and the swap cache</li>
-    <li>Overcommit</li>
-    <li>Thrashing</li>
-  </ol>
+  <h2>A fault is a question for the kernel</h2>
+  <p>When the MMU can't complete a translation, because the Present bit is clear or the access breaks a permission bit, it stops the instruction before it has any effect. On x86-64 it stores the address in the <b>CR2</b> register, pushes an error code saying what was attempted (read or write, user or kernel mode, data access or instruction fetch, page missing or permission denied), and traps into the kernel's page-fault handler.</p>
+  <p>The kernel then has to answer one question: <i>should this access have worked?</i> The page tables can't tell it, since they only say what is mapped right now. So the kernel keeps its own record of what each process is <i>entitled</i> to: a list of <b>virtual memory areas</b> (VMAs). Each line of <code>/proc/&lt;pid&gt;/maps</code> from Chapter 11 is one VMA: an address range, its permissions, and what backs it (a file, or nothing, for anonymous memory such as the heap and stack).</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Fault</b> The CPU saves the address in CR2 and the reason in an error code, and enters the kernel.</li>
+      <li data-k="decision"><b>Is the address inside a VMA?</b> No: send SIGSEGV. One exception: just below the stack, the kernel grows the stack instead.</li>
+      <li data-k="decision"><b>Does the VMA allow this kind of access?</b> No: send SIGSEGV. A write to a copy-on-write page is allowed and handled in <a href="30-mmap-copy-on-write.html">Chapter 30</a>.</li>
+      <li><b>Find the page's contents</b> Fresh anonymous memory: zeros. A file mapping: the page cache or the file. Swapped out: the swap area.</li>
+      <li data-k="decision"><b>Is the data already in RAM?</b> Yes: a minor fault. No: a major fault, and the process sleeps while the disk is read.</li>
+      <li data-k="end"><b>Map and retry</b> The kernel writes the page-table entry and returns. The CPU runs the same instruction again, and this time it succeeds.</li>
+    </ol>
+    <figcaption><b>What the fault handler decides.</b> The program can't tell a handled fault from a slow instruction. The last step is the important one: the instruction is restarted, not skipped.</figcaption>
+  </figure>
+
+  <h2>Demand paging and lazy allocation</h2>
+  <p><b>Demand paging</b> means a page gets a frame only when it is first used. The kernel applies it everywhere:</p>
+  <ul>
+    <li><b>Heap and stack.</b> <code>malloc</code> of a large block, or <code>mmap</code> of anonymous memory, creates a VMA and returns. No frames are allocated. The first <i>write</i> to each page faults, and the kernel supplies a frame filled with zeros (zeroed so one process can never see another's old data). A first <i>read</i> is cheaper still: the kernel maps one shared, read-only <b>zero page</b> and uses no memory at all.</li>
+    <li><b>Program code.</b> <code>exec</code> maps the executable and its libraries but reads none of them. Pages are loaded as the program runs into them. Code that never runs, such as error paths and unused features, never costs RAM.</li>
+    <li><b>The stack.</b> It starts small and grows a page at a time as faults arrive below it, up to the limit in <code>ulimit -s</code> (usually 8 MiB).</li>
+  </ul>
+  <p>That is why VSZ and RSS differ. This program asks for 1 GiB and watches both:</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdlib.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/resource.h&gt;</span>
+
+<span class="k">static</span> <span class="t">void</span> <span class="f">show</span>(<span class="k">const</span> <span class="t">char</span> *when)
+{
+    <span class="k">struct</span> <span class="t">rusage</span> ru;
+    <span class="t">long</span> size, resident;                              <span class="c">/* both in 4 KiB pages */</span>
+    <span class="t">FILE</span> *f = <span class="f">fopen</span>(<span class="s">"/proc/self/statm"</span>, <span class="s">"r"</span>);
+    <span class="f">fscanf</span>(f, <span class="s">"%ld %ld"</span>, &amp;size, &amp;resident);
+    <span class="f">fclose</span>(f);
+    <span class="f">getrusage</span>(<span class="m">RUSAGE_SELF</span>, &amp;ru);
+    <span class="f">printf</span>(<span class="s">"%-14s VSZ %5ld MiB  RSS %5ld MiB  minor %7ld  major %ld\n"</span>,
+           when, size / <span class="m">256</span>, resident / <span class="m">256</span>, ru.ru_minflt, ru.ru_majflt);
+}
+
+<span class="t">int</span> <span class="f">main</span>(<span class="t">void</span>)
+{
+    <span class="t">size_t</span> len = <span class="m">1UL</span> &lt;&lt; <span class="m">30</span>;                          <span class="c">/* 1 GiB */</span>
+    <span class="t">long</span> sum = <span class="m">0</span>;
+
+    <span class="f">show</span>(<span class="s">"start"</span>);
+    <span class="t">char</span> *p = <span class="f">malloc</span>(len);                           <span class="c">/* address space only */</span>
+    <span class="f">show</span>(<span class="s">"after malloc"</span>);
+    <span class="k">for</span> (<span class="t">size_t</span> i = <span class="m">0</span>; i &lt; len; i += <span class="m">4096</span>) sum += p[i];   <span class="c">/* read one byte per page */</span>
+    <span class="f">show</span>(<span class="s">"after reads"</span>);
+    <span class="k">for</span> (<span class="t">size_t</span> i = <span class="m">0</span>; i &lt; len; i += <span class="m">4096</span>) p[i] = <span class="m">1</span>;      <span class="c">/* write one byte per page */</span>
+    <span class="f">show</span>(<span class="s">"after writes"</span>);
+    <span class="k">return</span> (<span class="t">int</span>)sum;
+}</pre>
+<pre class="code"><span class="c">$</span> gcc -O1 lazy.c -o lazy &amp;&amp; ./lazy
+start          VSZ     2 MiB  RSS     1 MiB  minor      71  major 0
+after malloc   VSZ  1026 MiB  RSS     1 MiB  minor      72  major 0
+after reads    VSZ  1026 MiB  RSS     1 MiB  minor  262216  major 0
+after writes   VSZ  1026 MiB  RSS  1025 MiB  minor  524360  major 0</pre>
+  <p>The numbers are typical for 4 KiB pages; yours will differ slightly. <code>malloc</code> changed VSZ and nothing else. Reading every page took 262,144 faults (1 GiB ÷ 4 KiB) and still used no memory, because every page was mapped to the zero page. Only the writes made the kernel hand over a gigabyte of frames, with one more fault per page. If transparent huge pages are on for this region (<a href="12-paging-page-tables.html">Chapter 12</a>), one fault maps 2 MiB and you will see about 512 faults per pass instead.</p>
+  <p>Each of those faults costs around a microsecond, so touching a fresh gigabyte takes a noticeable fraction of a second. Programs that can't afford faults later ask for the memory up front: <code>mmap</code> with <code>MAP_POPULATE</code> fills the mapping at once, and <code>mlock</code> both loads pages and forbids the kernel from taking them away.</p>
+
+  <h2>Minor, major and invalid faults</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Kind</th><th>What the kernel does</th><th>Disk I/O</th><th>Typical cost</th><th>Examples</th></tr></thead>
+      <tbody>
+        <tr><td><b>Minor</b> (soft)</td><td>Fixes the page table using memory it already has</td><td>None</td><td>About 0.5 to a few µs</td><td>First touch of heap or stack; a file page already in the page cache; a shared library another process has loaded; copy-on-write</td></tr>
+        <tr><td><b>Major</b> (hard)</td><td>Reads the page from storage, with the process blocked</td><td>At least one read</td><td>About 100 µs on an SSD, 5–10 ms on a hard disk</td><td>First run of code from a cold executable; a page that was swapped out; reading a mapped file not in the cache</td></tr>
+        <tr><td><b>Invalid</b></td><td>Sends a signal; by default the process dies</td><td>None</td><td>The process</td><td>NULL dereference; write to read-only code (<code>SIGSEGV</code>); access past the end of a mapped file (<code>SIGBUS</code>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>A major fault is tens of thousands of times slower than an ordinary memory access, and the time is spent asleep, not computing:</p>
+  <figure class="seq" data-actors="Process|MMU|Kernel|Disk">
+    <ol>
+      <li data-m="0>1">load from 0x7f3a00004010</li>
+      <li data-m="1>2">page fault: not present (address in CR2)</li>
+      <li data-m="2>3">find the VMA, take a free frame, read the block into it</li>
+      <li data-m="2>0">you are blocked; another task gets the CPU</li>
+      <li data-m="3>2" data-k="reply">interrupt: the data is in the frame</li>
+      <li data-m="2>1">write the page-table entry: present, frame 0x1a2f4</li>
+      <li data-m="2>0" data-k="reply">runnable again; return to the same instruction</li>
+      <li data-m="0>1">load from 0x7f3a00004010: succeeds</li>
+    </ol>
+    <figcaption><b>A major fault.</b> Between steps 4 and 7 the process is in the blocked state of <a href="04-process-states-pcb.html">Chapter 4</a>, exactly as if it had called <code>read()</code>. It never asked for I/O; touching memory was enough.</figcaption>
+  </figure>
+<pre class="code"><span class="c">$</span> ps -o pid,min_flt,maj_flt,vsz,rss,comm -p <span class="m">4120</span>     <span class="c"># lifetime fault counts for one process</span>
+    PID  MINFLT  MAJFLT     VSZ    RSS COMMAND
+   <span class="m">4120</span>  <span class="m">918244</span>     <span class="m">137</span> <span class="m">9731204</span> <span class="m">2411660</span> java
+<span class="c">$</span> /usr/bin/time -v ./lazy <span class="m">2</span>&gt;&amp;<span class="m">1</span> | grep -i faults
+        Major (requiring I/O) page faults: <span class="m">0</span>
+        Minor (reclaiming a frame) page faults: <span class="m">524417</span>
+<span class="c">$</span> perf stat -e minor-faults,major-faults -p <span class="m">4120</span> sleep <span class="m">10</span>    <span class="c"># fault rate right now</span></pre>
+  <p>Minor faults in the hundreds of thousands are normal for a process that has just started or just allocated memory. A steady stream of <i>major</i> faults in a running service means it keeps waiting for the disk to get its own memory back, and its latency will show it.</p>
+
+  <h2>Fault a process in</h2>
+  <p>This process has eight pages of heap, four pages of code mapped from <code>libc.so</code>, and one address with nothing mapped. Click a page to access it. Start with 12 frames of RAM and press <b>Sweep</b> twice. Then try 6 frames, and then 4 with a hard disk.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Demand paging: 12 pages of virtual memory, a few frames of RAM</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="pfRam"><button data-v="4">4 frames</button><button data-v="6">6 frames</button><button class="active" data-v="12">12 frames</button></div>
+        <div class="seg" id="pfDisk"><button class="active" data-v="ssd">SSD</button><button data-v="hdd">hard disk</button></div>
+        <div class="seg" id="pfMode"><button class="active" data-v="w">click = write</button><button data-v="r">click = read</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="pfSweep">Sweep: touch every page →</button>
+        <button class="btn sm" id="pfReset">↺ Reset</button>
+        <span class="small muted" style="font-family:var(--mono)">VSZ is 48 KiB throughout</span>
+      </div>
+      <div class="pf-h">Virtual pages (click one)</div>
+      <div class="pf-vm" id="pfVm"></div>
+      <div class="pf-h">Physical frames</div>
+      <div class="pf-ram" id="pfFrames"></div>
+      <div class="pf-desc" id="pfDesc"></div>
+      <div class="stats" id="pfStats"></div>
+    </div>
+    <div class="panel-foot">A model: each access stands for 10 µs of work on that page, and "useful work" is the share of time the last 12 accesses spent working and not waiting; a minor fault costs 1 µs and a major fault one disk read (100 µs on the SSD, 8 ms on the hard disk). The victim is the least recently used page; Chapter 15 covers what real kernels do. Swap-out writes happen in the background and aren't counted in the wait. A sweep writes the heap pages and reads the code pages. Real kernels also read neighbouring file pages ahead, which this model leaves out.</div>
+  </div>
+
+  <p>Things to notice. With 12 frames the second sweep causes no faults at all: once the working set is in RAM, demand paging costs nothing. With 6 frames every access in the second sweep is a major fault, and the share of time spent on useful work collapses even though the program is doing exactly the same thing. Read a heap page before writing it and it costs no frame. Evict a heap page that came back from swap and was only read: nothing is written, because its copy in swap is still good.</p>
+
+  <h2>Swap and the swap cache</h2>
+  <p>When RAM runs short the kernel must take frames back. For a <b>file-backed</b> page that is easy: if it is clean, drop it and read it from the file again later; if it is dirty, write it to the file first. An <b>anonymous</b> page (heap, stack) has no file. It can only be evicted if there is somewhere to put it, and that place is <b>swap</b>: a partition or file the kernel uses as a holding area for anonymous pages.</p>
+  <ul>
+    <li><b>Swap out.</b> The kernel writes the page to a free slot in swap and clears the Present bit. With Present clear the MMU ignores the rest of the entry, so the kernel uses those bits to record <i>which swap slot</i> holds the page.</li>
+    <li><b>Swap in.</b> The next access faults, the kernel finds a swap location in the entry, reads the page into a new frame and maps it. That is a major fault.</li>
+    <li><b>The swap cache.</b> After a swap-in, the page is in RAM <i>and</i> still in its swap slot. The kernel remembers the pairing. If the page is evicted again without having been written to, there is nothing to write: the copy in swap is still correct.</li>
+  </ul>
+<pre class="code"><span class="c">$</span> swapon --show
+NAME      TYPE      SIZE  USED PRIO
+/dev/dm-<span class="m">1</span> partition   <span class="m">8G</span>  <span class="m">1.2G</span>   -<span class="m">2</span>
+<span class="c">$</span> grep -E <span class="s">'VmRSS|VmSwap'</span> /proc/<span class="m">4120</span>/status       <span class="c"># how much of one process is in swap</span>
+VmRSS:   <span class="m">2411660</span> kB
+VmSwap:   <span class="m">318204</span> kB
+<span class="c">$</span> sysctl vm.swappiness                              <span class="c"># 0–200; higher = more willing to swap anonymous pages</span>
+vm.swappiness = <span class="m">60</span></pre>
+  <p>Without swap, anonymous pages can never be evicted, so all the pressure falls on file-backed pages: the page cache and program code. That is a trade, not a cure, as the last section shows. Many systems now put swap in RAM itself, compressed (<b>zram</b> on Android, ChromeOS and Fedora; <b>zswap</b> as a compressed cache in front of a disk): swapping in then costs a decompression instead of a disk read.</p>
+
+  <h2>Overcommit</h2>
+  <p>Lazy allocation has a consequence. Since <code>malloc</code> gives out address space and not memory, the kernel can promise more than it has, and it does. This is <b>overcommit</b>, and it is on by default in Linux, because most programs never touch everything they allocate and <code>fork</code> would otherwise need room for a full copy of the parent.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th><code>vm.overcommit_memory</code></th><th>Policy</th><th>When an allocation fails</th><th>Who uses it</th></tr></thead>
+      <tbody>
+        <tr><td><code>0</code> (default)</td><td>Heuristic: refuse only requests that are obviously too large</td><td>Rarely; trouble arrives later, at fault time</td><td>Almost everyone</td></tr>
+        <tr><td><code>1</code></td><td>Always say yes</td><td>Never</td><td>Redis recommends it so that <code>fork</code> for snapshots can't be refused (<a href="44-case-redis-fork.html">Chapter 44</a>)</td></tr>
+        <tr><td><code>2</code></td><td>Strict: total commitments may not exceed swap + 50% of RAM (the ratio is tunable)</td><td><code>malloc</code> returns NULL, <code>fork</code> fails with ENOMEM</td><td>Systems that prefer a failed allocation to a killed process, such as some PostgreSQL servers</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c">$</span> grep -i commit /proc/meminfo
+CommitLimit:    <span class="m">24512368</span> kB      <span class="c"># the ceiling, enforced only in mode 2</span>
+Committed_AS:   <span class="m">31877120</span> kB      <span class="c"># what has been promised: already more than the limit</span></pre>
+  <p>The price is where failure shows up. On Linux, checking <code>malloc</code> for NULL catches very little. If memory really runs out, it happens during a page fault, when the kernel needs a frame and can't free one. No function is there to return an error, so the kernel's <b>OOM killer</b> picks a process and kills it. <a href="48-case-oom-killer.html">Chapter 48</a> works through a real incident.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🔎</div>
+    <div class="body"><div class="title">Elasticsearch: touch every page at start-up, and never swap</div><p>Elasticsearch runs on the JVM, usually with a heap of many gigabytes, and its default configuration makes two choices that come straight from this chapter. First, it starts the JVM with <code>-XX:+AlwaysPreTouch</code>, which writes to every page of the heap during start-up. Start-up gets slower, but all those minor faults are paid before the node takes traffic instead of during the first searches, and a machine without enough RAM fails at once and not at 3 a.m. Second, its documentation tells operators to disable swap or set <code>bootstrap.memory_lock: true</code>, which calls <code>mlockall</code> to pin the process in RAM. The reason is garbage collection: a collector walks the whole heap, so if part of the heap is in swap, a pause that should take milliseconds turns into thousands of major faults and can last minutes. The node stops answering, the cluster decides it has died, and starts moving its data elsewhere. A slow node is often worse than a dead one. Cassandra, Kafka and most databases give the same advice.</p></div>
+  </div>
+
+  <h2>Thrashing</h2>
+  <p>Demand paging works when each process's <b>working set</b>, the pages it is actively using, fits in RAM. When the working sets together are bigger than RAM, every fault has to evict a page that some process will need again almost at once. That page faults back in and evicts another. The machine spends its time moving pages and almost none running programs. This is <b>thrashing</b>.</p>
+  <p>You can recognise it from the outside. CPU utilisation is <i>low</i>, because every process is blocked on a major fault, while the disk is saturated and the load average climbs. Early time-sharing systems made it worse: they saw an idle CPU, admitted more jobs, and deepened the shortage.</p>
+<pre class="code"><span class="c">$</span> vmstat <span class="m">1</span>
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ <span class="m">1</span> <span class="m">14</span> <span class="m">7340032</span>  <span class="m">61240</span>    <span class="m">212</span>  <span class="m">48112</span> <span class="m">9820</span> <span class="m">11304</span> <span class="m">39412</span> <span class="m">45260</span> <span class="m">3120</span> <span class="m">5210</span>  <span class="m">2</span>  <span class="m">6</span>  <span class="m">1</span> <span class="m">91</span>  <span class="m">0</span>
+<span class="c">#  ^ 14 tasks blocked            ^ pages swapped in and out every second          ^ 91% waiting for I/O</span>
+<span class="c">$</span> cat /proc/pressure/memory        <span class="c"># share of time tasks were stalled waiting for memory</span>
+some avg10=<span class="m">78.21</span> avg60=<span class="m">64.90</span> avg300=<span class="m">31.07</span> total=<span class="m">184220931</span>
+full avg10=<span class="m">61.45</span> avg60=<span class="m">49.12</span> avg300=<span class="m">22.80</span> total=<span class="m">139881204</span></pre>
+  <p>Turning swap off does not prevent thrashing. With no swap the kernel can't evict anonymous pages, so it evicts the only thing left: file-backed pages, including the code of running programs. Every function call into an evicted page becomes a major fault that reads the executable from disk again, and the machine freezes just as thoroughly. The real remedies are less demand or more supply: more RAM, fewer or smaller processes, a memory limit on each service so one can't starve the rest (<a href="34-containers-namespaces-cgroups.html">Chapter 34</a>), or a daemon such as <code>systemd-oomd</code> that watches the pressure numbers above and kills something before the whole machine stalls. Which page the kernel chooses to evict is the subject of <a href="15-page-replacement.html">Chapter 15</a>.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Treating every page fault as a bug.</b> Most are minor faults doing lazy allocation. Only invalid faults are errors.</li>
+      <li><b>Reading VSZ as memory use.</b> It counts promises. RSS counts frames, and even RSS double-counts pages shared between processes.</li>
+      <li><b>Trusting <code>malloc</code>'s return value to tell you memory exists.</b> With overcommit, success means address space. The frames are found, or not, when you touch the pages.</li>
+      <li><b>Benchmarking the first pass over fresh memory.</b> It measures page faults, not your code. Touch the memory first, then time it.</li>
+      <li><b>Thinking no swap means no paging.</b> Code and file data are still evicted and re-read from their files.</li>
+      <li><b>Forgetting a memory access can block.</b> A thread that takes a major fault while holding a lock makes every waiter pay for the disk read.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What happens on a page fault?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The MMU can't translate an address, either because the page isn't present or the access isn't permitted, so the CPU saves the faulting address and traps into the kernel. The kernel looks the address up in the process's list of memory areas. If nothing is mapped there, or the access breaks the area's permissions, the process gets SIGSEGV. Otherwise the fault is legitimate and the kernel supplies the page: a zero-filled frame for fresh heap or stack, a page from the page cache for a file mapping, or a read from disk or swap if the data isn't in memory. It updates the page-table entry and returns, and the CPU re-executes the same instruction. If no I/O was needed it is a minor fault costing about a microsecond; if the kernel had to read from storage it is a major fault, and the process sleeps for the duration.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A process calls <code>malloc(8 GiB)</code> on a machine with 4 GiB of RAM and no swap, and it succeeds. How, and what happens next?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It succeeds because Linux overcommits by default. <code>malloc</code> gets address space from <code>mmap</code>: the kernel records a new memory area and allocates no frames. Nothing physical happens until the pages are touched. Reads map the shared zero page and still use no memory. Each first write takes a minor fault and a real frame. As the process writes its way towards 4 GiB the kernel reclaims what it can, which without swap means dropping page-cache and code pages, so the machine gets slow. When it can't free a frame for the next fault, the OOM killer chooses a process, most likely this one since it is the largest, and kills it with SIGKILL. The program never sees a NULL from <code>malloc</code>. To get an error instead you would run in strict overcommit mode, or put the process under a memory limit and handle the failure there.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A page fault traps to the kernel, which checks the address against the process's VMAs, fixes the page table and restarts the instruction.</li>
+      <li>Demand paging gives a page a frame on first use: zeros for anonymous memory, file contents for mappings.</li>
+      <li>Minor faults need no I/O (about a microsecond); major faults read from disk and block the process (100 µs to milliseconds).</li>
+      <li>Swap gives anonymous pages somewhere to go; file-backed pages are dropped or written back to their files.</li>
+      <li>Overcommit lets allocations succeed without memory behind them; running out shows up later as the OOM killer, not a NULL.</li>
+      <li>When working sets exceed RAM the system thrashes: low CPU use, a saturated disk, almost no progress.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A process calls <code>malloc(1 GiB)</code> and never touches the memory. Roughly how much physical RAM does that use?</p>
+      <div class="opts">
+        <button class="opt">1 GiB</button>
+        <button class="opt">Almost none: only address space was reserved</button>
+        <button class="opt">512 MiB, because of overcommit</button>
+        <button class="opt">1 GiB of swap</button>
+      </div>
+      <div class="explain">The kernel records the mapping and allocates frames only when pages are first written. VSZ grows by 1 GiB; RSS does not.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A program writes for the first time to a page of freshly allocated heap. What kind of fault is this?</p>
+      <div class="opts">
+        <button class="opt">A major fault, because a frame must be found</button>
+        <button class="opt">An invalid fault that raises SIGSEGV</button>
+        <button class="opt">No fault: heap pages are mapped by <code>malloc</code></button>
+        <button class="opt">A minor fault: the kernel maps a zero-filled frame with no disk I/O</button>
+      </div>
+      <div class="explain">Nothing has to be read from storage, so it is minor. Major means the kernel had to do I/O to get the page's contents.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">After the kernel has handled a valid page fault, what does the CPU do?</p>
+      <div class="opts">
+        <button class="opt">Re-executes the instruction that faulted</button>
+        <button class="opt">Skips to the next instruction</button>
+        <button class="opt">Restarts the process from <code>main</code></button>
+        <button class="opt">Delivers a signal so the program can retry</button>
+      </div>
+      <div class="explain">The faulting instruction had no effect, so it is run again with the page now mapped. The program never notices.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A server is very slow. <code>vmstat</code> shows 2% user CPU, 91% I/O wait, and thousands of pages swapped in and out per second. What is happening?</p>
+      <div class="opts">
+        <button class="opt">The CPU is too slow for the workload</button>
+        <button class="opt">The processes are waiting for network traffic</button>
+        <button class="opt">It is thrashing: the working sets don't fit in RAM, so processes spend their time blocked on major faults</button>
+        <button class="opt">The TLB is too small</button>
+      </div>
+      <div class="explain">Low CPU use with heavy paging is the signature of thrashing. Adding more work makes it worse; it needs more RAM or less demand.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">With Linux's default overcommit setting, what usually happens when the system truly runs out of memory?</p>
+      <div class="opts">
+        <button class="opt"><code>malloc</code> returns NULL to whichever program asks next</button>
+        <button class="opt">A page fault can't be satisfied, and the OOM killer kills a process to free memory</button>
+        <button class="opt">The kernel pauses every process until memory is freed</button>
+        <button class="opt">The machine reboots</button>
+      </div>
+      <div class="explain">Allocations were already granted. The shortage is discovered when pages are touched, where no error can be returned, so a process is killed instead.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const PAGES = [];
+  for (let i = 0; i < 8; i++) PAGES.push({ kind: 'heap', label: 'heap ' + i });
+  for (let i = 0; i < 4; i++) PAGES.push({ kind: 'code', label: 'libc ' + i });
+  PAGES.push({ kind: 'hole', label: 'unmapped' });
+  const DISK = { ssd: 100, hdd: 8000 }, WORK = 10, MINOR = 1;   // microseconds
+  let ram = 12, disk = 'ssd', mode = 'w';
+  let pg, frames, tick, st, last, hist;
+  const fmt = (us) => us >= 1000 ? (us / 1000).toFixed(us % 1000 ? 1 : 0) + ' ms' : us + ' µs';
+  function reset() {
+    pg = PAGES.map(() => ({ s: 'none', dirty: false, slot: false, used: 0, frame: null }));
+    frames = new Array(ram).fill(null); tick = 0; last = null; hist = [];
+    st = { minor: 0, major: 0, segv: 0, out: 0, work: 0, wait: 0 };
+  }
+  // Give page i a frame, evicting the least recently used page if RAM is full. Returns a note about the eviction.
+  function grab(i) {
+    let f = frames.indexOf(null), note = '';
+    if (f < 0) {
+      let v = -1;
+      pg.forEach((p, j) => { if (p.s === 'ram' && (v < 0 || p.used < pg[v].used)) v = j; });
+      const p = pg[v]; f = p.frame;
+      if (PAGES[v].kind === 'heap') {
+        if (p.dirty || !p.slot) { st.out++; p.slot = true; note = `RAM is full, so the kernel evicts <b>${PAGES[v].label}</b> (least recently used) and writes it to swap. `; }
+        else note = `RAM is full, so the kernel evicts <b>${PAGES[v].label}</b>. Its copy in swap is still current (the swap cache), so nothing is written. `;
+        p.s = 'swap';
+      } else { p.s = 'none'; note = `RAM is full, so the kernel drops <b>${PAGES[v].label}</b>: it is clean and can be read from the file again. `; }
+      p.dirty = false; p.frame = null;
+    }
+    frames[f] = i; pg[i].frame = f; pg[i].s = 'ram';
+    return note;
+  }
+  function touch(i, m) {
+    const P = PAGES[i], p = pg[i], w = m === 'w';
+    let kind, text;
+    const wait0 = st.wait;
+    tick++;
+    if (P.kind === 'hole') {
+      st.segv++; kind = 'segv';
+      text = 'Not present. The kernel looks for a VMA covering the address and finds none: <b>SIGSEGV</b>, a segmentation fault. A real process would die here.';
+    } else if (P.kind === 'code' && w) {
+      st.segv++; kind = 'segv';
+      text = `The VMA for libc's code is <code>r-x</code>. A write is never allowed there, whether or not the page is in RAM: <b>SIGSEGV</b>.`;
+    } else if (p.s === 'ram') {
+      kind = 'ok'; if (w) p.dirty = true;
+      text = `Present in frame ${p.frame}: <b>no fault</b>. The MMU translates the address and the access completes${w ? ', setting the Dirty bit' : ''}.`;
+    } else if (P.kind === 'code') {
+      const note = grab(i); st.major++; st.wait += DISK[disk]; kind = 'major';
+      text = `Not present. The VMA maps <code>libc.so</code> and the page isn't in memory: <b>major fault</b>. ${note}The kernel reads 4 KiB from the file into frame ${p.frame} (${fmt(DISK[disk])}) while the process sleeps, maps it and restarts the instruction.`;
+    } else if (p.s === 'swap') {
+      const note = grab(i); st.major++; st.wait += DISK[disk]; kind = 'major'; p.dirty = w;
+      text = `Not present, and the page-table entry holds a swap location: <b>major fault</b>. ${note}The kernel reads the page back from swap into frame ${p.frame} (${fmt(DISK[disk])}) while the process sleeps, then restarts the instruction.`;
+    } else if (!w && p.s === 'zero') {
+      kind = 'ok';
+      text = 'Mapped to the shared zero page: <b>no fault</b>. The read returns zeros and still uses no frame.';
+    } else if (!w) {
+      p.s = 'zero'; st.minor++; st.wait += MINOR; kind = 'minor';
+      text = 'Not present. The VMA is anonymous memory that has never been touched, and this is a read: <b>minor fault</b>. The kernel maps the shared, read-only <b>zero page</b>. No frame is used.';
+    } else {
+      const wasZero = p.s === 'zero', note = grab(i);
+      p.dirty = true; st.minor++; st.wait += MINOR; kind = 'minor';
+      text = (wasZero ? 'Mapped read-only to the zero page, and this is a write: <b>minor fault</b>. ' : 'Not present. Anonymous memory, first touch: <b>minor fault</b>. ') + `${note}The kernel takes frame ${p.frame}, fills it with zeros, maps it writable and restarts the instruction. No disk is involved.`;
+    }
+    if (kind !== 'segv') { p.used = tick; st.work += WORK; }
+    hist.push([kind === 'segv' ? 0 : WORK, st.wait - wait0]);
+    return { i, kind, text };
+  }
+  function render() {
+    $('#pfVm').innerHTML = PAGES.map((P, i) => {
+      const p = pg[i];
+      const state = P.kind === 'hole' ? 'no mapping' : p.s === 'ram' ? 'frame ' + p.frame + (p.dirty ? ' · dirty' : '') : p.s === 'zero' ? 'zero page' : p.s === 'swap' ? 'in swap' : P.kind === 'code' ? 'in the file' : 'not present';
+      const cls = P.kind === 'hole' ? 'pf-hole' : p.s === 'ram' ? 'pf-in' : p.s === 'zero' ? 'pf-zero' : p.s === 'swap' ? 'pf-swap' : '';
+      return `<button class="pf-p ${cls} ${last && last.i === i ? 'pf-cur' : ''}" data-i="${i}"><b>${P.label}</b><span>${P.kind === 'heap' ? 'rw-' : P.kind === 'code' ? 'r-x' : '---'}</span><br>${state}</button>`;
+    }).join('');
+    $('#pfFrames').innerHTML = frames.map((o, f) => `<div class="pf-f ${o === null ? '' : 'pf-used'}">frame ${f}: ${o === null ? 'free' : PAGES[o].label}</div>`).join('');
+    const d = $('#pfDesc');
+    d.className = 'pf-desc' + (!last ? '' : last.kind === 'ok' ? ' pf-ok' : last.kind === 'minor' ? ' pf-minor' : ' pf-bad');
+    d.innerHTML = last ? last.text : 'Nothing has been touched yet: the process has 48 KiB of address space and no memory. Click a page, or press <b>Sweep</b>.';
+    const used = frames.filter((x) => x !== null).length, sw = pg.filter((p) => p.s === 'swap').length;
+    const recent = hist.slice(-12), rw = recent.reduce((a, h) => a + h[0], 0), rt = recent.reduce((a, h) => a + h[1], 0);
+    const util = rw + rt ? rw / (rw + rt) * 100 : null;
+    $('#pfStats').innerHTML = `<div class="stat acc"><div class="k">RSS</div><div class="v">${used * 4}<small> KiB of ${ram * 4}</small></div></div>
+      <div class="stat"><div class="k">Minor faults</div><div class="v">${st.minor}</div></div>
+      <div class="stat ${st.major ? 'bad' : ''}"><div class="k">Major faults</div><div class="v">${st.major}</div></div>
+      <div class="stat"><div class="k">In swap</div><div class="v">${sw * 4}<small> KiB</small></div></div>
+      <div class="stat"><div class="k">Swap writes</div><div class="v">${st.out}</div></div>
+      <div class="stat"><div class="k">Fault wait</div><div class="v" style="font-size:18px">${fmt(st.wait)}</div></div>
+      <div class="stat ${util === null ? '' : util >= 90 ? 'good' : util >= 50 ? 'warn' : 'bad'}"><div class="k">Useful work</div><div class="v">${util === null ? '–' : util >= 1 ? util.toFixed(0) + '%' : util.toFixed(1) + '%'}</div></div>`;
+  }
+  $('#pfVm').addEventListener('click', (e) => {
+    const b = e.target.closest('.pf-p'); if (!b) return;
+    last = touch(+b.dataset.i, mode); render();
+  });
+  $('#pfSweep').onclick = () => {
+    const before = { minor: st.minor, major: st.major };
+    let r;
+    PAGES.forEach((P, i) => { if (P.kind !== 'hole') r = touch(i, P.kind === 'heap' ? 'w' : 'r'); });
+    const mi = st.minor - before.minor, ma = st.major - before.major;
+    last = { i: r.i, kind: ma ? 'major' : mi ? 'minor' : 'ok', text: `Sweep finished: 8 heap pages written, 4 code pages read. This pass took <b>${mi} minor</b> and <b>${ma} major</b> fault${ma === 1 ? '' : 's'}${!mi && !ma ? ': everything the process needs is in RAM' : ''}. Press it again to see the steady state.` };
+    render();
+  };
+  $('#pfRam').addEventListener('segchange', (e) => { ram = +e.detail; reset(); render(); });
+  $('#pfDisk').addEventListener('segchange', (e) => { disk = e.detail; reset(); render(); });
+  $('#pfMode').addEventListener('segchange', (e) => { mode = e.detail; });
+  $('#pfReset').onclick = () => { reset(); render(); };
+  reset(); render();
+})();
+</script>
 </body>
 </html>

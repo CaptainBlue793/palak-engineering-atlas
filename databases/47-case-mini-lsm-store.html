@@ -6,34 +6,462 @@
 <title>Case Study: Building a Mini LSM Key-Value Store</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ml-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .ml-row > span { font-size:12.5px; color:var(--muted); min-width:40px; }
+  .ml-cols { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:12px; }
+  @media (max-width:820px) { .ml-cols { grid-template-columns:1fr; } }
+  .ml-box { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; min-width:0; }
+  .ml-box h6 { margin:0 0 2px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .ml-box .ml-sub { font-size:11.5px; color:var(--muted); margin-bottom:6px; }
+  .ml-box.ml-ram { border-style:dashed; }
+  .ml-file { font-family:var(--mono); font-size:12px; }
+  .ml-file b { display:block; font-size:12px; margin:6px 0 2px; }
+  .ml-file b:first-child { margin-top:0; }
+  .ml-file i { display:block; font-style:normal; padding:1px 6px; border-radius:5px; overflow-wrap:anywhere; }
+  .ml-file i.ml-tomb { color:var(--red); }
+  .ml-file i.ml-hit { background:var(--accent-soft); outline:1.5px solid var(--accent); }
+  .ml-file em { font-style:normal; color:var(--muted); font-family:inherit; }
+  .ml-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .ml-msg.ml-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .ml-msg.ml-warn { background:var(--amber-soft, var(--surface-2)); border-left-color:var(--amber, var(--accent)); }
+</style>
 </head>
 <body data-chapter="47">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
-    <div class="eyebrow"><span class="pill accent">Chapter 47</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 55 min</span></div>
-    <h1>Case Study: <span class="grad">Building a Mini LSM Key-Value Store</span></h1>
-    <p class="lead">A memtable, a WAL, SSTables and compaction in a few hundred lines of Python.</p>
+    <div class="eyebrow"><span class="pill accent">Chapter 47</span><span class="pill">Case Study</span><span class="pill">⏱ 55 min</span></div>
+    <h1>Case Study: Building a <span class="grad">Mini LSM Key-Value Store</span></h1>
+    <p class="lead"><a href="14-lsm-trees.html">Chapter 14</a> described the log-structured merge tree from the outside: a memtable, a write-ahead log, sorted files and compaction, and the trade it makes between cheap writes and dearer reads. This chapter builds one. The whole store is 125 lines of Python with no dependencies, and it is a real one in the sense that matters: it keeps its promises across a crash, including a crash halfway through writing a record, and it has been checked against a plain dictionary through tens of thousands of random operations and restarts. RocksDB, LevelDB and the storage engines inside Cassandra and CockroachDB are far larger, and nearly all of the extra is performance. The skeleton is the same five parts, and writing them out removes most of the mystery from the big ones.</p>
+    <ul class="objectives">
+      <li><span>Implement <code>put</code>, <code>get</code> and <code>delete</code> on a memtable backed by a write-ahead log</span></li>
+      <li><span>Flush the memtable to an immutable sorted file, atomically</span></li>
+      <li><span>Read across several files, newest first, with a sparse index and tombstones</span></li>
+      <li><span>Compact files with a streaming merge, and say when a tombstone may be dropped</span></li>
+      <li><span>Say what survives a crash at each step, and why</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>LSM trees:</b> <a href="14-lsm-trees.html">Chapter 14</a>. This chapter assumes its vocabulary and doesn't repeat its reasoning.</li>
+        <li><b>The write-ahead log and <code>fsync</code>:</b> <a href="20-wal-recovery.html">Chapter 20</a>.</li>
+        <li><b>Files and disks:</b> <a href="p3-disks-and-files.html">the prerequisite lesson</a>.</li>
+        <li><b>Merging sorted lists, and heaps:</b> the <a href="../dsa/index.html">DSA course</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The API</li>
-    <li>Memtable and WAL</li>
-    <li>Flushing SSTables</li>
-    <li>Reads across levels</li>
-    <li>Compaction</li>
-  </ol>
+  <h2>The API</h2>
+  <p>The store maps string keys to values. It has three operations and one promise: once <code>put</code> or <code>delete</code> returns, the change survives a crash.</p>
+<pre class="code">db = <span class="f">MiniLSM</span>(<span class="s">"data"</span>, memtable_limit=<span class="m">3</span>)          <span class="c"># a directory. Flush after every 3 keys, to keep the example small</span>
+db.<span class="f">put</span>(<span class="s">"user:1"</span>, <span class="s">"Asha"</span>)
+db.<span class="f">put</span>(<span class="s">"user:2"</span>, <span class="s">"Ben"</span>)
+db.<span class="f">put</span>(<span class="s">"user:3"</span>, <span class="s">"Chloe"</span>)                    <span class="c"># the third key: the memtable is flushed to 000001.sst</span>
+db.<span class="f">put</span>(<span class="s">"user:2"</span>, <span class="s">"Benedict"</span>)                 <span class="c"># an overwrite</span>
+db.<span class="f">delete</span>(<span class="s">"user:3"</span>)
+
+db.<span class="f">get</span>(<span class="s">"user:1"</span>)     <span class="c"># 'Asha'       from the file</span>
+db.<span class="f">get</span>(<span class="s">"user:2"</span>)     <span class="c"># 'Benedict'   from the memtable, which hides the older 'Ben' in the file</span>
+db.<span class="f">get</span>(<span class="s">"user:3"</span>)     <span class="c"># None         deleted, though 'Chloe' is still in the file</span></pre>
+  <p>After those calls the directory holds two files, and their contents are the whole state of the store.</p>
+<pre class="code"><span class="c"># data/000001.sst: sorted by key, never modified again</span>
+["user:1", "Asha"]
+["user:2", "Ben"]
+["user:3", "Chloe"]
+
+<span class="c"># data/wal.log: what has happened since that flush, in order of arrival</span>
+["user:2", "Benedict"]
+["user:3", null]</pre>
+  <p>Nothing on disk was changed to perform the overwrite or the delete. Both were appended to the log, and <code>null</code> is the tombstone. The old values will stay in <code>000001.sst</code> until compaction.</p>
+
+  <h2>Memtable and WAL</h2>
+  <p>A write has to be both fast and durable. Writing it into its sorted place in a file would be slow, and keeping it only in memory would lose it on a crash. So it goes to two places: appended to a log file, which is the cheapest write a disk can do, and put into an in-memory table that is quick to search.</p>
+<pre class="code"><span class="k">class</span> <span class="t">MiniLSM</span>:
+    <span class="k">def</span> <span class="f">__init__</span>(self, directory, memtable_limit=<span class="m">1000</span>, max_tables=<span class="m">4</span>):
+        self.dir, self.memtable_limit, self.max_tables = directory, memtable_limit, max_tables
+        os.<span class="f">makedirs</span>(directory, exist_ok=<span class="k">True</span>)
+        names = <span class="f">sorted</span>(n <span class="k">for</span> n <span class="k">in</span> os.<span class="f">listdir</span>(directory) <span class="k">if</span> n.<span class="f">endswith</span>(<span class="s">".sst"</span>))
+        self.tables = [<span class="f">SSTable</span>(os.path.<span class="f">join</span>(directory, n)) <span class="k">for</span> n <span class="k">in</span> names]      <span class="c"># oldest first</span>
+        self.next_id = <span class="f">int</span>(names[-<span class="m">1</span>][:-<span class="m">4</span>]) + <span class="m">1</span> <span class="k">if</span> names <span class="k">else</span> <span class="m">1</span>
+        self.memtable = {}
+        self.wal_path = os.path.<span class="f">join</span>(directory, <span class="s">"wal.log"</span>)
+        self.<span class="f">_recover</span>()
+        self.wal = <span class="f">open</span>(self.wal_path, <span class="s">"a"</span>)
+
+    <span class="k">def</span> <span class="f">put</span>(self, key, value):
+        self.wal.<span class="f">write</span>(json.<span class="f">dumps</span>([key, value]) + <span class="s">"\n"</span>)
+        self.wal.<span class="f">flush</span>()
+        os.<span class="f">fsync</span>(self.wal.<span class="f">fileno</span>())                       <span class="c"># on disk before we say yes</span>
+        self.memtable[key] = value
+        <span class="k">if</span> <span class="f">len</span>(self.memtable) &gt;= self.memtable_limit:
+            self.<span class="f">flush</span>()
+
+    <span class="k">def</span> <span class="f">delete</span>(self, key):
+        self.<span class="f">put</span>(key, <span class="k">None</span>)                               <span class="c"># a tombstone</span></pre>
+  <p>The order inside <code>put</code> is the write-ahead rule of <a href="20-wal-recovery.html">Chapter 20</a>: log first, force the log to disk, and only then change the memtable and return. The <code>fsync</code> is what makes the promise true, and it is also the slowest line in the store. A production engine gathers the writes of many concurrent callers into one <code>fsync</code>, which this one doesn't attempt.</p>
+  <p>Starting up is the other half. The memtable is gone after a crash, and the log still holds every write that hadn't been flushed, so replaying it rebuilds the memtable exactly.</p>
+<pre class="code">    <span class="k">def</span> <span class="f">_recover</span>(self):
+        <span class="s">"""Rebuild the memtable from the log, after a restart."""</span>
+        <span class="k">if not</span> os.path.<span class="f">exists</span>(self.wal_path):
+            <span class="k">return</span>
+        good = <span class="m">0</span>                                          <span class="c"># the byte where the last whole record ends</span>
+        <span class="k">with</span> <span class="f">open</span>(self.wal_path, <span class="s">"rb"</span>) <span class="k">as</span> f:
+            <span class="k">for</span> line <span class="k">in</span> f:
+                <span class="k">if not</span> line.<span class="f">endswith</span>(<span class="s">b"\n"</span>):
+                    <span class="k">break</span>                                 <span class="c"># a torn last line: the crash came mid-write</span>
+                key, value = json.<span class="f">loads</span>(line)
+                self.memtable[key] = value
+                good += <span class="f">len</span>(line)
+        os.<span class="f">truncate</span>(self.wal_path, good)                  <span class="c"># cut the torn tail off, so new records start cleanly</span></pre>
+  <p>The torn line deserves its three lines of code. If power fails while a record is being written, the log ends in half a record. That write was never acknowledged, so ignoring it is correct. Leaving it in the file is a bug, and it was in the first version of this code: the next record would be appended directly after the half one, the two would run together into one unreadable line, and the following recovery would stop there and lose an acknowledged write. Real engines guard each log record with a length and a checksum for the same reason.</p>
+
+  <h2>Flushing SSTables</h2>
+  <p>The memtable can't grow without limit, and the log with it. When it reaches its limit it is written out, in key order, as a <b>sorted string table</b>: a file that will never be modified.</p>
+<pre class="code"><span class="k">class</span> <span class="t">SSTable</span>:
+    <span class="s">"""An immutable file of records sorted by key, one JSON line each."""</span>
+    EVERY = <span class="m">16</span>                                            <span class="c"># the sparse index holds one key in sixteen</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(self, path):
+        self.path, self.keys, self.offsets, self.max_key = path, [], [], <span class="k">None</span>
+        <span class="k">with</span> <span class="f">open</span>(path, <span class="s">"rb"</span>) <span class="k">as</span> f:
+            n = <span class="m">0</span>
+            <span class="k">while</span> <span class="k">True</span>:
+                pos, line = f.<span class="f">tell</span>(), f.<span class="f">readline</span>()
+                <span class="k">if not</span> line:
+                    <span class="k">break</span>
+                key = json.<span class="f">loads</span>(line)[<span class="m">0</span>]
+                <span class="k">if</span> n % self.EVERY == <span class="m">0</span>:
+                    self.keys.<span class="f">append</span>(key)
+                    self.offsets.<span class="f">append</span>(pos)
+                self.max_key, n = key, n + <span class="m">1</span>
+
+    <span class="k">@staticmethod</span>
+    <span class="k">def</span> <span class="f">write</span>(path, items):
+        <span class="s">"""Write (key, value) pairs, already in key order, and return the table."""</span>
+        tmp = path + <span class="s">".tmp"</span>
+        <span class="k">with</span> <span class="f">open</span>(tmp, <span class="s">"w"</span>) <span class="k">as</span> f:
+            <span class="k">for</span> key, value <span class="k">in</span> items:
+                f.<span class="f">write</span>(json.<span class="f">dumps</span>([key, value]) + <span class="s">"\n"</span>)
+            f.<span class="f">flush</span>()
+            os.<span class="f">fsync</span>(f.<span class="f">fileno</span>())
+        os.<span class="f">replace</span>(tmp, path)                             <span class="c"># atomic: the table appears whole, or not at all</span>
+        <span class="k">return</span> <span class="f">SSTable</span>(path)</pre>
+<pre class="code">    <span class="c"># in MiniLSM</span>
+    <span class="k">def</span> <span class="f">flush</span>(self):
+        <span class="k">if not</span> self.memtable:
+            <span class="k">return</span>
+        self.tables.<span class="f">append</span>(SSTable.<span class="f">write</span>(self.<span class="f">_new_path</span>(), <span class="f">sorted</span>(self.memtable.<span class="f">items</span>())))
+        self.memtable = {}
+        self.wal.<span class="f">close</span>()
+        self.wal = <span class="f">open</span>(self.wal_path, <span class="s">"w"</span>)               <span class="c"># the flushed records no longer need the log</span>
+        <span class="k">if</span> <span class="f">len</span>(self.tables) &gt; self.max_tables:
+            self.<span class="f">compact</span>()</pre>
+  <p>Two things here carry the crash-safety. The table is written under a temporary name and renamed into place only after it is complete and synced, and a rename is atomic, so a crash can never leave half a table under a real name. And the log is emptied only <i>after</i> the table exists. A crash between those two steps leaves the same records in both the new table and the log. On restart the log is replayed into the memtable, the same values are found twice, and nothing is wrong: applying a write a second time gives the same result as applying it once.</p>
+  <p>The constructor reads the file once and remembers every sixteenth key with its byte offset. That is the <b>sparse index</b>: small enough to keep in memory for a very large file, and enough to bring any lookup to within sixteen records of its target.</p>
+
+  <h2>Reads across levels</h2>
+  <p>A key may now be in the memtable and in any number of tables, with a different value in each. The rule that makes this correct is to look in order of age, newest first, and stop at the first place that knows the key.</p>
+<pre class="code">    <span class="c"># in MiniLSM</span>
+    <span class="k">def</span> <span class="f">get</span>(self, key):
+        <span class="k">if</span> key <span class="k">in</span> self.memtable:
+            <span class="k">return</span> self.memtable[key]                     <span class="c"># None here means deleted</span>
+        <span class="k">for</span> table <span class="k">in</span> <span class="f">reversed</span>(self.tables):               <span class="c"># newest first</span>
+            found, value = table.<span class="f">get</span>(key)
+            <span class="k">if</span> found:
+                <span class="k">return</span> value
+        <span class="k">return</span> <span class="k">None</span>
+
+    <span class="c"># in SSTable</span>
+    <span class="k">def</span> <span class="f">get</span>(self, key):
+        <span class="s">"""Return (found, value). A found value of None is a tombstone."""</span>
+        <span class="k">if not</span> self.keys <span class="k">or</span> key &lt; self.keys[<span class="m">0</span>] <span class="k">or</span> key &gt; self.max_key:
+            <span class="k">return</span> <span class="k">False</span>, <span class="k">None</span>                            <span class="c"># outside this table's range: no disk read</span>
+        i = bisect.<span class="f">bisect_right</span>(self.keys, key) - <span class="m">1</span>       <span class="c"># the last indexed key at or before ours</span>
+        <span class="k">with</span> <span class="f">open</span>(self.path, <span class="s">"rb"</span>) <span class="k">as</span> f:
+            f.<span class="f">seek</span>(self.offsets[i])
+            <span class="k">for</span> _ <span class="k">in</span> <span class="f">range</span>(self.EVERY):
+                line = f.<span class="f">readline</span>()
+                <span class="k">if not</span> line:
+                    <span class="k">break</span>
+                k, value = json.<span class="f">loads</span>(line)
+                <span class="k">if</span> k == key:
+                    <span class="k">return</span> <span class="k">True</span>, value
+                <span class="k">if</span> k &gt; key:
+                    <span class="k">break</span>
+        <span class="k">return</span> <span class="k">False</span>, <span class="k">None</span></pre>
+  <p>The distinction between "found, and the value is <code>None</code>" and "not found" is the whole reason tombstones exist. A table that holds a tombstone for the key ends the search: the key is deleted, and the older tables, which may well hold a value for it, must not be consulted. Without the tombstone a deleted key would come back to life from an older file.</p>
+  <p>The cost of a read is now visible in the code. A key in the memtable costs a dictionary lookup. A key in the newest table costs one seek and a few lines. A key that doesn't exist costs a look at every table whose key range covers it, and that is the worst case. It is why real engines put a Bloom filter in front of every table (<a href="14-lsm-trees.html">Chapter 14</a>), and why they can't let the number of tables grow.</p>
+
+  <h2>Try it: the store, running</h2>
+  <p>The same logic as the Python above, with a memtable of four keys and compaction when a fourth table appears. Everything in the two right-hand boxes is on disk and survives a crash. The memtable doesn't.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">The memtable, the log and the tables</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="ml-row"><span>Key</span><div class="seg" id="mlK"><button class="active" data-v="apple">apple</button><button data-v="banana">banana</button><button data-v="cherry">cherry</button><button data-v="date">date</button><button data-v="elder">elder</button><button data-v="fig">fig</button></div></div>
+      <div class="controls">
+        <button class="btn sm primary" id="mlPut">put</button>
+        <button class="btn sm" id="mlDel">delete</button>
+        <button class="btn sm" id="mlGet">get</button>
+        <button class="btn sm" id="mlCrash">⚡ Crash and restart</button>
+        <button class="btn sm" id="mlCompact">Compact now</button>
+        <button class="btn sm ghost" id="mlReset">↺ Reset</button>
+      </div>
+      <div class="ml-cols">
+        <div class="ml-box ml-ram"><h6>Memtable</h6><div class="ml-sub" id="mlMemSub"></div><div class="ml-file" id="mlMem"></div></div>
+        <div class="ml-box"><h6>wal.log</h6><div class="ml-sub">on disk, in order of arrival</div><div class="ml-file" id="mlWal"></div></div>
+        <div class="ml-box"><h6>SSTables</h6><div class="ml-sub">on disk, newest first, each sorted</div><div class="ml-file" id="mlTabs"></div></div>
+      </div>
+      <div class="ml-msg" id="mlMsg"></div>
+      <div class="stats" id="mlStats"></div>
+    </div>
+    <div class="panel-foot">Each put writes a new value, v1, v2 and so on, so that versions can be told apart. A record shown as ✗ is a tombstone. After a get, the record that answered it is outlined. The memtable has a dashed border as a reminder that it is in memory only.</div>
+  </div>
+
+  <p>Things to notice. Put the same key several times: the log grows by a line each time and the memtable doesn't grow, since it keeps only the newest value. The fourth distinct key triggers a flush: a table appears and the log empties. Delete a key that is in a table, then get it: the search stops at the tombstone in the memtable and never opens the table. Now crash. The memtable is rebuilt from the log exactly as it was, and no get returns a different answer from before. Keep writing until there are four tables: they are merged into one, each key keeps only its newest value, and the tombstones vanish along with the values they were hiding. Count the records on disk before and after that merge to see how much of the data was already dead.</p>
+
+  <h2>Compaction</h2>
+  <p>Every flush adds a table, and every table is one more place a read may have to look and one more copy of keys that have since been overwritten. Compaction merges tables into one, keeping the newest value for each key. Since every input is already sorted, it is the merge step of merge sort, and it never needs more than one record from each table in memory at a time.</p>
+<pre class="code">    <span class="k">def</span> <span class="f">compact</span>(self):
+        <span class="s">"""Merge every table into one, keeping the newest value of each key."""</span>
+        <span class="k">def</span> <span class="f">tagged</span>(table, age):                           <span class="c"># age 0 is the newest table</span>
+            <span class="k">for</span> key, value <span class="k">in</span> table:
+                <span class="k">yield</span> key, age, value
+
+        streams = [<span class="f">tagged</span>(t, age) <span class="k">for</span> age, t <span class="k">in</span> <span class="f">enumerate</span>(<span class="f">reversed</span>(self.tables))]
+
+        <span class="k">def</span> <span class="f">newest_live</span>():
+            previous = <span class="f">object</span>()
+            <span class="k">for</span> key, _, value <span class="k">in</span> heapq.<span class="f">merge</span>(*streams):   <span class="c"># by key, and for equal keys newest first</span>
+                <span class="k">if</span> key != previous:
+                    previous = key
+                    <span class="k">if</span> value <span class="k">is not</span> <span class="k">None</span>:                 <span class="c"># every older copy is in this merge: drop the tombstone</span>
+                        <span class="k">yield</span> key, value
+
+        merged = SSTable.<span class="f">write</span>(self.<span class="f">_new_path</span>(), <span class="f">newest_live</span>())
+        old, self.tables = self.tables, [merged]
+        <span class="k">for</span> table <span class="k">in</span> old:
+            os.<span class="f">remove</span>(table.path)</pre>
+  <p><code>heapq.merge</code> takes any number of sorted streams and yields their records in order, holding one from each in a heap. Tagging each record with its table's age makes equal keys come out newest first, so the first record seen for a key is the one to keep and the rest are skipped. The tombstone rule is in one line and is easy to get wrong: a tombstone may be dropped only when every table that could hold an older value for that key is part of the same merge. Here that is always true, since the merge takes all the tables. An engine that merges a few tables at a time has to carry tombstones forward until they reach the oldest level.</p>
+  <p>Four small pieces complete the file: the imports, the iterator that compaction reads a table with, the helper that names the next table, and <code>close</code>.</p>
+<pre class="code"><span class="k">import</span> bisect
+<span class="k">import</span> heapq
+<span class="k">import</span> json
+<span class="k">import</span> os
+
+    <span class="c"># in SSTable</span>
+    <span class="k">def</span> <span class="f">__iter__</span>(self):
+        <span class="k">with</span> <span class="f">open</span>(self.path) <span class="k">as</span> f:
+            <span class="k">for</span> line <span class="k">in</span> f:
+                <span class="k">yield</span> <span class="f">tuple</span>(json.<span class="f">loads</span>(line))
+
+    <span class="c"># in MiniLSM</span>
+    <span class="k">def</span> <span class="f">_new_path</span>(self):
+        path = os.path.<span class="f">join</span>(self.dir, <span class="s">f"{self.next_id:06d}.sst"</span>)
+        self.next_id += <span class="m">1</span>
+        <span class="k">return</span> path
+
+    <span class="k">def</span> <span class="f">close</span>(self):
+        self.wal.<span class="f">close</span>()</pre>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>put: append to the log and sync</b> a crash before the sync: the write was never acknowledged, and the torn record is cut off</li>
+      <li data-k="step"><b>Update the memtable</b> a crash here: the log replays it</li>
+      <li data-k="step"><b>flush: write the table under a temporary name, sync, rename</b> a crash before the rename: a stray .tmp file, and the log still has everything</li>
+      <li data-k="step"><b>Empty the log</b> a crash just before this: the records are in the table and the log both, and replaying them is harmless</li>
+      <li data-k="step"><b>compact: write the merged table</b> a crash before the old tables are removed: old and new both exist, the new one is the newest, and reads agree</li>
+      <li data-k="end"><b>Remove the old tables</b> space is reclaimed</li>
+    </ol>
+    <figcaption><b>What a crash leaves at each step.</b> Each step is ordered so that the files on disk always describe a correct state.</figcaption>
+  </figure>
+
+  <h2>What a real engine adds</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Part</th><th>This store</th><th>A production engine</th></tr></thead>
+      <tbody>
+        <tr><td><b>Memtable</b></td><td>A dictionary, sorted once at flush</td><td>A skip list, always sorted, so range scans work and several threads can insert</td></tr>
+        <tr><td><b>Log</b></td><td>A JSON line and an <code>fsync</code> for every write</td><td>Binary records with checksums, and many callers' writes grouped into one <code>fsync</code></td></tr>
+        <tr><td><b>Table format</b></td><td>JSON lines, with the index rebuilt by reading the file at start-up</td><td>Compressed blocks of a few kilobytes, with the index and a Bloom filter stored in the file</td></tr>
+        <tr><td><b>Missing keys</b></td><td>Checked against every table in range</td><td>A Bloom filter for each table answers "certainly not here" from memory</td></tr>
+        <tr><td><b>Compaction</b></td><td>All tables into one, while writes wait</td><td>Levels or tiers, a few tables at a time, on background threads</td></tr>
+        <tr><td><b>The set of live tables</b></td><td>Whatever <code>.sst</code> files are in the directory</td><td>A manifest file recording each change to the set, so that it switches atomically</td></tr>
+        <tr><td><b>Concurrency and snapshots</b></td><td>One caller at a time</td><td>Sequence numbers on every record, giving consistent snapshots to readers</td></tr>
+        <tr><td><b>Range scans</b></td><td>None</td><td>A merging iterator over the memtable and every table, the same merge as compaction</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Each row is a good exercise, and the first three to try are a <code>scan(start, end)</code> built on the same <code>heapq.merge</code>, a Bloom filter for each table, and a length and checksum on each log record.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧱</div>
+    <div class="body"><div class="title">LevelDB: the same five parts, as a library</div><p>The engine that made this design ordinary was LevelDB, released by Google in 2011 and written by Jeff Dean and Sanjay Ghemawat, who had built the same structure years earlier as the storage layer of Bigtable. Its source is a few tens of thousands of lines of C++, and the correspondence with this chapter is close. Writes go to a log file and into a memtable, which is a skip list. When the memtable reaches its size limit, 4 MB by default, it becomes immutable and a background thread writes it out as a table file. A table is a series of blocks of about 4 kB, each compressed, followed by an index block giving the last key of each data block, which is this chapter's sparse index stored in the file where ours is rebuilt in memory. An optional Bloom filter of about ten bits for each key lets a read skip tables that can't contain it. Tables are arranged in levels. Level 0 holds freshly flushed tables, whose key ranges overlap, and four of them trigger a compaction into level 1. From level 1 down, the tables in a level have disjoint key ranges, and each level may hold ten times the data of the one above, so a read needs to look at one table in each of those levels at most. A manifest file records which tables make up each level, and is how the engine knows after a crash which files are live. Every record carries a sequence number, so that a reader can hold a snapshot while writes continue. Facebook forked LevelDB in 2012 as RocksDB, adding multi-threaded compaction and a great many tuning options for servers with fast flash storage, and RocksDB went on to become the storage engine underneath MyRocks, the first versions of CockroachDB, TiKV, Kafka's stream-processing state and a long list of others. LevelDB itself is in every copy of Chrome, where it stores IndexedDB data. The 125 lines above differ from it in almost every detail and in none of the ideas.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Updating the memtable before the log is synced.</b> A crash then loses a write that was acknowledged.</li>
+      <li><b>Emptying the log before the table is safely on disk.</b> A crash between the two loses the whole memtable.</li>
+      <li><b>Writing a table in place.</b> Write to a temporary name and rename, or a crash leaves half a file that looks like a table.</li>
+      <li><b>Searching oldest first,</b> or not stopping at the first hit. A stale value wins.</li>
+      <li><b>Treating a tombstone as "not found".</b> The search carries on to an older table, and the deleted key returns.</li>
+      <li><b>Dropping tombstones in a partial compaction,</b> while an older table still holds the value.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Walk me through what happens on a write and on a read in an LSM-tree storage engine.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>On a write, the engine appends the key and value to a write-ahead log and syncs it, which makes the write durable, and then inserts it into the memtable, a sorted in-memory structure. That is all: no existing file is modified, which is why writes are fast, one sequential append. When the memtable reaches a size limit it is written out in key order as an immutable file, an SSTable, and the log for it is discarded. Deletes are writes too: a tombstone marker. On a read, the engine looks in the memtable first, then in the SSTables from newest to oldest, and returns the first entry it finds for the key; if that entry is a tombstone, the key is deleted. Within an SSTable it uses a small index to find the right block, and a Bloom filter for each table lets it skip tables that definitely don't contain the key. Since tables accumulate, a background process, compaction, merges them: it combines sorted files into new ones, keeps only the newest version of each key, and drops tombstones once nothing older remains. So the trade is cheap writes in exchange for reads that may check several files and background work to keep that number small.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your LSM store crashes at an arbitrary moment. Convince me that no acknowledged write is lost and no half-written state is visible.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I'd go through each step and say what is on disk if the crash comes right after it. A put appends to the log and fsyncs before touching the memtable or returning. If the crash is before the fsync completes, the write was never acknowledged, and on restart the log either lacks it or ends in a partial record, which recovery detects, by a missing terminator here or by a checksum in a real engine, and truncates. If the crash is after the fsync, the record is in the log and replay restores it to the memtable. A flush writes the memtable to a temporary file, fsyncs it, and renames it to its final name; rename is atomic, so on restart the table either exists complete or doesn't exist, and a leftover temporary file is ignored. Only after the rename is the log truncated. A crash between the rename and the truncation leaves the same records in the table and the log; replay puts them in the memtable again with identical values, which is harmless since the operations are idempotent and the memtable is consulted first anyway. Compaction writes the merged table the same way, then removes the inputs. A crash before removal leaves inputs and output together; the output has the highest number so it is treated as newest, and any key resolves to the same value either way: live keys are found in the output, and deleted keys either have their tombstone still in an input or are absent everywhere. The invariant throughout is that every acknowledged write is in the log or in a complete table, and files only become visible when whole. Two caveats for a real system: the directory itself needs an fsync after a rename for the rename to be durable, and a manifest is the proper way to make the switch of table sets atomic.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>An LSM store is five parts: a log, a memtable, immutable sorted tables, a newest-first read path, and compaction.</li>
+      <li>Log, sync, then memtable. Recovery replays the log and cuts off a torn last record.</li>
+      <li>Tables are written whole under a temporary name and renamed. Files are never modified in place.</li>
+      <li>Reads go newest first and stop at the first hit. A tombstone is a hit.</li>
+      <li>Compaction is a streaming merge of sorted files. A tombstone can go only when every older copy is in the merge.</li>
+      <li>Each step is ordered so that a crash at any point leaves a correct state on disk.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In <code>put</code>, why is the log synced to disk before the memtable is updated?</p>
+      <div class="opts">
+        <button class="opt">The memtable reads from the log</button>
+        <button class="opt">So that a write is never acknowledged, or visible, unless it would survive a crash</button>
+        <button class="opt">To keep the log sorted</button>
+        <button class="opt">It makes writes faster</button>
+      </div>
+      <div class="explain">The memtable is lost in a crash. The log is what restores it.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A crash happens after a flush has renamed the new table into place and before the log is emptied. What happens on restart?</p>
+      <div class="opts">
+        <button class="opt">The table is corrupt</button>
+        <button class="opt">The flushed writes are lost</button>
+        <button class="opt">The store refuses to start</button>
+        <button class="opt">The log is replayed, the same records end up in the memtable and the table, and reads are correct</button>
+      </div>
+      <div class="explain">Replaying a write that has already been applied gives the same value. Duplicates are harmless.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Key <code>k</code> has a value in an old table and a tombstone in a newer one. What does <code>get(k)</code> return, and why?</p>
+      <div class="opts">
+        <button class="opt">None: the search goes newest first and stops at the tombstone</button>
+        <button class="opt">The old value: tombstones are skipped</button>
+        <button class="opt">An error</button>
+        <button class="opt">It depends on which table is larger</button>
+      </div>
+      <div class="explain">A tombstone is "found, and deleted". Skipping it would bring the old value back.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which read is the most expensive in this store?</p>
+      <div class="opts">
+        <button class="opt">A key that is in the memtable</button>
+        <button class="opt">A key that was written a moment ago</button>
+        <button class="opt">A key that doesn't exist, and falls within every table's key range</button>
+        <button class="opt">A key that has been deleted recently</button>
+      </div>
+      <div class="explain">Every table has to be consulted before the store can say no. Bloom filters exist for this case.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A compaction merges only the two newest of five tables. May it drop the tombstones it meets?</p>
+      <div class="opts">
+        <button class="opt">Yes: tombstones are always dropped at compaction</button>
+        <button class="opt">No: an older table outside the merge may still hold a value for the key, which the tombstone must go on hiding</button>
+        <button class="opt">Yes, if the tombstone is the newest record for the key</button>
+        <button class="opt">Only if the log is empty</button>
+      </div>
+      <div class="explain">A tombstone can go only when everything it might be hiding is in the same merge.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const LIMIT = 4, MAX = 3;
+  let st;
+  const sortRows = (rows) => rows.slice().sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  const name = () => String(st.next++).padStart(6, '0') + '.sst';
+  function compact() {
+    const merged = new Map(); let before = 0;
+    st.tables.forEach((t) => t.rows.forEach(([k, v]) => { merged.set(k, v); before++; }));            // oldest first: newer overwrite older
+    const live = sortRows([...merged].filter(([, v]) => v !== null));
+    const n = st.tables.length; st.tables = [{ name: name(), rows: live }];
+    return { n, before, after: live.length };
+  }
+  function flush() {
+    if (!st.mem.size) return null;
+    const t = { name: name(), rows: sortRows([...st.mem]) }; st.tables.push(t); st.mem = new Map(); st.wal = [];
+    return { table: t.name, compacted: st.tables.length > MAX ? compact() : null };
+  }
+  function put(k, v) { st.wal.push([k, v]); st.mem.set(k, v); return st.mem.size >= LIMIT ? flush() : null; }
+  function get(k) {
+    const trace = [];
+    if (st.mem.has(k)) return { trace: ['memtable: found'], where: 'mem', value: st.mem.get(k) };
+    trace.push('memtable: not there');
+    for (let i = st.tables.length - 1; i >= 0; i--) {
+      const t = st.tables[i];
+      if (!t.rows.length || k < t.rows[0][0] || k > t.rows[t.rows.length - 1][0]) { trace.push(`${t.name}: outside its key range, not read`); continue; }
+      const row = t.rows.find((r) => r[0] === k);
+      if (row) { trace.push(`${t.name}: found`); return { trace, where: t.name, value: row[1] }; }
+      trace.push(`${t.name}: read, not there`);
+    }
+    return { trace, where: null, value: undefined };
+  }
+  function reset() {
+    st = { mem: new Map(), wal: [], tables: [], next: 1, n: 0, hit: null };
+    ['apple', 'banana', 'cherry'].forEach((k) => put(k, 'v' + (++st.n)));
+    say('', '<b>Three keys written.</b> Each is in the log, on disk, and in the memtable, in memory. No table exists yet. The memtable holds four keys, so one more new key will flush it.');
+  }
+  function say(kind, html) { st.kind = kind; st.msg = html; draw(); }
+  const rec = (k, v, hit) => `<i class="${v === null ? 'ml-tomb' : ''} ${hit ? 'ml-hit' : ''}">${k} ${v === null ? '✗' : '= ' + v}</i>`;
+  function draw() {
+    const h = st.hit || {};
+    $('#mlMemSub').textContent = `in memory, ${st.mem.size} of ${LIMIT} keys`;
+    $('#mlMem').innerHTML = sortRows([...st.mem]).map(([k, v]) => rec(k, v, h.where === 'mem' && h.key === k)).join('') || '<em>empty</em>';
+    $('#mlWal').innerHTML = st.wal.map(([k, v]) => rec(k, v, false)).join('') || '<em>empty</em>';
+    $('#mlTabs').innerHTML = st.tables.slice().reverse().map((t) => `<b>${t.name}</b>` + (t.rows.map(([k, v]) => rec(k, v, h.where === t.name && h.key === k)).join('') || '<em>empty</em>')).join('') || '<em>none yet</em>';
+    const m = $('#mlMsg'); m.className = 'ml-msg ' + (st.kind === 'bad' ? 'ml-bad' : st.kind === 'warn' ? 'ml-warn' : ''); m.innerHTML = st.msg;
+    const onDisk = st.tables.reduce((a, t) => a + t.rows.length, 0), tomb = st.tables.reduce((a, t) => a + t.rows.filter((r) => r[1] === null).length, 0);
+    const keys = ['apple', 'banana', 'cherry', 'date', 'elder', 'fig'].filter((k) => { const g = get(k); return g.value !== undefined && g.value !== null; });
+    $('#mlStats').innerHTML = `<div class="stat acc"><div class="k">Tables on disk</div><div class="v">${st.tables.length}</div></div>
+      <div class="stat"><div class="k">Records in tables</div><div class="v">${onDisk} <small>${tomb ? `${tomb} ${tomb === 1 ? 'tombstone' : 'tombstones'}` : ''}</small></div></div>
+      <div class="stat"><div class="k">Lines in the log</div><div class="v">${st.wal.length}</div></div>
+      <div class="stat good"><div class="k">Live keys</div><div class="v">${keys.length}</div></div>`;
+  }
+  const after = (f) => f ? ` <b>The memtable reached ${LIMIT} keys and was flushed to ${f.table}</b>, sorted, and the log was emptied.` + (f.compacted ? ` That made ${f.compacted.n} tables, more than the limit of ${MAX}, so they were <b>compacted into one</b>: ${f.compacted.before} records went in and ${f.compacted.after} came out.` : '') : '';
+  const K = () => $('#mlK').dataset.value;
+  $('#mlPut').onclick = () => { const k = K(), v = 'v' + (++st.n), had = st.mem.has(k), f = put(k, v); st.hit = null;
+    say('', `<b>put ${k} = ${v}.</b> One line appended to the log and synced, then the memtable updated.${had && !f ? ' The key was already in the memtable, so its value was replaced there. The log keeps both lines.' : ''}${after(f)}`); };
+  $('#mlDel').onclick = () => { const k = K(), f = put(k, null); st.hit = null;
+    say('warn', `<b>delete ${k}.</b> A delete is a write: a tombstone goes to the log and the memtable. Nothing is removed from any table, and any older value of ${k} stays on disk until compaction.${after(f)}`); };
+  $('#mlGet').onclick = () => { const k = K(), g = get(k); st.hit = { where: g.where, key: k };
+    say(g.value === undefined || g.value === null ? 'warn' : '', `<b>get ${k} → ${g.value === undefined ? 'None (no such key)' : g.value === null ? 'None (deleted)' : g.value}.</b> ${g.trace.join(' → ')}.${g.value === null ? ' The tombstone ends the search. Older tables aren\'t consulted, whatever they hold.' : g.value === undefined ? ' Every place that could have held it was checked before the answer could be no.' : ''}`); };
+  $('#mlCrash').onclick = () => { const lost = st.mem.size; st.mem = new Map(); st.wal.forEach(([k, v]) => st.mem.set(k, v)); st.hit = null;
+    say(lost ? '' : 'warn', lost ? `<b>Crashed and restarted.</b> The memtable's ${lost} ${lost === 1 ? 'key was' : 'keys were'} lost with the process. On start-up the ${st.wal.length} ${st.wal.length === 1 ? 'line of the log was' : 'lines of the log were'} replayed in order, and the memtable is exactly as it was. The tables were never in doubt: they are complete files.` : '<b>Crashed and restarted.</b> The memtable was empty and so is the log. Everything is in the tables.'); };
+  $('#mlCompact').onclick = () => { st.hit = null; if (st.tables.length < 2) return say('warn', `<b>Nothing to merge.</b> There ${st.tables.length === 1 ? 'is one table' : 'are no tables'}. Compaction needs at least two.`);
+    const c = compact(); say('', `<b>${c.n} tables merged into one.</b> ${c.before} records were read and ${c.after} written: for each key the newest value was kept, and tombstones were dropped together with everything they were hiding. The memtable and the log weren't involved.`); };
+  $('#mlReset').onclick = reset;
+  reset();
+})();
+</script>
 </body>
 </html>

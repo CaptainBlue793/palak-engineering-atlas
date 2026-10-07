@@ -6,34 +6,330 @@
 <title>Multicore: Cache Coherence, False Sharing &amp; NUMA</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ms-mem { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+  .ms-line { flex:1 1 220px; display:flex; border:1.5px solid var(--border-strong); border-radius:10px; overflow:hidden; font-family:var(--mono); font-size:12px; }
+  .ms-line span { padding:7px 9px; border-right:1px dashed var(--border-strong); }
+  .ms-line span:last-child { border-right:0; flex:1; color:var(--muted); }
+  .ms-line b { color:var(--muted); font-weight:600; font-family:var(--font); font-size:11px; padding:7px 9px; background:var(--surface-2); border-right:1.5px solid var(--border-strong); }
+  .ms-var { background:color-mix(in srgb, var(--accent) 14%, var(--surface)); font-weight:700; }
+  .ms-cores { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:10px; }
+  @media (max-width:760px) { .ms-cores { grid-template-columns:1fr; } }
+  .ms-core { border:1.5px solid var(--border); border-radius:12px; padding:9px 11px; background:var(--surface); }
+  .ms-core h6 { margin:0 0 2px; font-size:13px; }
+  .ms-core small { display:block; margin-bottom:8px; font-size:12px; color:var(--muted); }
+  .ms-st { display:flex; align-items:center; gap:8px; margin-top:5px; font-size:12.5px; color:var(--muted); }
+  .ms-badge { display:inline-block; min-width:92px; text-align:center; font-family:var(--mono); font-size:12px; font-weight:700; padding:4px 8px; border-radius:8px; border:1.5px solid var(--border-strong); background:var(--surface-2); color:var(--text); }
+  .ms-M { border-color:var(--red); background:var(--red-soft); }
+  .ms-E { border-color:var(--green); background:var(--green-soft); }
+  .ms-S { border-color:var(--accent-2); background:var(--accent-2-soft); }
+  .ms-I { opacity:.55; border-style:dashed; }
+  .ms-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .ms-desc.ms-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .ms-desc.ms-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .ms-desc.ms-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="32">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 32</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
     <h1>Multicore: <span class="grad">Cache Coherence, False Sharing &amp; NUMA</span></h1>
-    <p class="lead">MESI, cache-line ping-pong, false sharing, CPU affinity and NUMA-aware memory.</p>
+    <p class="lead">Two threads on two cores each increment their own counter. They share no data, take no lock and never wait for each other, and together they run <i>slower</i> than one thread doing both jobs. Nothing in the source code explains it. The explanation is in the hardware underneath: each core has a private cache, the caches must agree about memory, and the unit they agree in is not a variable but a 64-byte line. This chapter is about what it costs to keep many caches consistent, how that cost shows up in programs as contention you can't see, and what changes again when the memory itself is split between processor sockets.</p>
+    <ul class="objectives">
+      <li>Explain why caches need a coherence protocol and what MESI's four states mean</li>
+      <li>Explain why writes to shared data are expensive even without locks</li>
+      <li>Recognise false sharing, measure it and remove it</li>
+      <li>Say when pinning threads to cores helps</li>
+      <li>Explain NUMA, first-touch allocation and the classic ways they go wrong</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Cache levels, cache lines and latency numbers.</b> See <a href="p4-memory-hierarchy.html">P4</a>.</li>
+        <li><b>Atomic instructions and why contended locks hurt.</b> See <a href="18-mutexes-spinlocks.html">Chapter 18</a>.</li>
+        <li><b>Store buffers.</b> See <a href="25-atomics-memory-models.html">Chapter 25</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Private caches, shared memory</li>
-    <li>The MESI protocol</li>
-    <li>False sharing and padding</li>
-    <li>CPU affinity</li>
-    <li>NUMA nodes and local memory</li>
-  </ol>
+  <h2>Private caches, one memory</h2>
+  <p>Every core has its own L1 and L2 caches; the L3 is usually shared by the cores of one chip. Caches hold memory in <b>lines</b> of 64 bytes. So one line of memory can be present in several cores' private caches at once, and that is fine as long as everybody only reads it. When one core writes, the other copies are out of date, and no core may ever be allowed to read a stale copy.</p>
+  <p>The hardware prevents it with a <b>cache-coherence protocol</b>. Cores exchange messages about lines ("I want to read this", "I am about to write this, drop your copies"), invisibly to software. Programs are always correct as a result. What the protocol can't hide is the time the messages take.</p>
+
+  <h2>The MESI protocol</h2>
+  <p>The classic protocol gives every line in every cache one of four states, and is named after them.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>State</th><th>Meaning</th><th>Other caches have it?</th><th>Read</th><th>Write</th></tr></thead>
+      <tbody>
+        <tr><td><b>M</b>odified</td><td>This cache has the only copy, and it is newer than memory</td><td>No</td><td>Free</td><td>Free</td></tr>
+        <tr><td><b>E</b>xclusive</td><td>This cache has the only copy, identical to memory</td><td>No</td><td>Free</td><td>Free: becomes M silently</td></tr>
+        <tr><td><b>S</b>hared</td><td>A valid copy; others may have one too</td><td>Maybe</td><td>Free</td><td><b>Must first tell every other cache to invalidate its copy</b></td></tr>
+        <tr><td><b>I</b>nvalid</td><td>No usable copy</td><td>—</td><td><b>Must fetch the line</b>, from another cache or from memory</td><td><b>Must fetch it and invalidate all others</b></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The rule that matters for performance is in the Write column: <b>to write a line, a core must own it exclusively</b>. Any number of cores can read a line together in the S state at no cost. The moment one writes, all the others lose their copies, and the next one to touch the line has to fetch it back.</p>
+  <figure class="seq" data-actors="Core 0|Interconnect|Core 1">
+    <ol>
+      <li data-m="0>1">I want to write line 0x7f3a40 (I hold it Shared)</li>
+      <li data-m="1>2">invalidate your copy of line 0x7f3a40</li>
+      <li data-m="2>1" data-k="reply">done: mine is Invalid</li>
+      <li data-m="1>0" data-k="reply">you own it: Modified</li>
+      <li data-m="2>1">later, Core 1 reads the line: "I need line 0x7f3a40"</li>
+      <li data-m="0>1">here is my modified copy (both now Shared)</li>
+    </ol>
+    <figcaption><b>One write and one read of a shared line.</b> Each exchange costs tens of nanoseconds, against about one nanosecond for an access a core can satisfy from its own cache.</figcaption>
+  </figure>
+  <p>This is the hidden cost behind much of the last few chapters. An atomic increment of a shared counter (<a href="18-mutexes-spinlocks.html">Chapter 18</a>) needs the line in M state, so when eight cores increment the same counter the line travels round all eight caches, and each increment costs a transfer, not a nanosecond. A contended spinlock is the same thing. So is a reader–writer lock's count of readers. The lock-free structures of <a href="26-lock-free.html">Chapter 26</a> avoid blocking; they don't avoid this.</p>
+
+  <h2>False sharing</h2>
+  <p>When threads write the <i>same</i> variable, the line has to move: that is <b>true sharing</b>, and the cure is to share less, for instance a counter per thread that is summed when somebody asks for the total. <b>False sharing</b> is when threads write <i>different</i> variables that happen to sit in the same 64-byte line. Logically they share nothing. Physically the line bounces between their cores exactly as if they did.</p>
+<pre class="code"><span class="k">#include</span> <span class="s">&lt;stdalign.h&gt;</span>
+
+<span class="k">struct</span> <span class="t">counters</span> {                  <span class="c">/* 16 bytes: both fields in one cache line */</span>
+    <span class="t">long</span> a;                        <span class="c">/* incremented only by thread 1 */</span>
+    <span class="t">long</span> b;                        <span class="c">/* incremented only by thread 2 */</span>
+};
+
+<span class="k">struct</span> <span class="t">counters_padded</span> {           <span class="c">/* 128 bytes: a line each */</span>
+    <span class="k">alignas</span>(<span class="m">64</span>) <span class="t">long</span> a;
+    <span class="k">alignas</span>(<span class="m">64</span>) <span class="t">long</span> b;
+};</pre>
+<pre class="code"><span class="c">$</span> ./counters        <span class="c"># two threads, 500 million increments each</span>
+same line:      <span class="m">3.10</span> s
+padded:         <span class="m">0.62</span> s
+<span class="c">$</span> perf c2c record ./counters &amp;&amp; perf c2c report      <span class="c"># finds lines written by one core and wanted by another</span></pre>
+  <p>The times are illustrative; a slowdown of three to ten times is typical. False sharing turns up wherever small per-thread items are packed together: an array of per-thread counters or statistics, adjacent fields of one struct used by different threads, small heap objects allocated one after another. The fixes are to align or pad the hot items to 64 bytes, to keep per-thread data in memory each thread allocated for itself, and to keep fields that are only read away from fields that are written often.</p>
+
+  <h2>Bounce a cache line</h2>
+  <p>Two cores. Thread A on core 0 uses <code>x</code>; thread B on core 1 uses <code>y</code>. Step through some reads and writes and watch the states. Then press the 1,000-writes button with the two variables in one line, and again with padding.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">MESI on two cores</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="msLay"><button class="active" data-v="same">x and y in the same cache line</button><button data-v="pad">padded: a line each</button></div>
+        <button class="btn sm" id="msReset">↺ Reset</button>
+      </div>
+      <div class="controls">
+        <button class="btn sm" data-op="0,x,r">Core 0: read x</button>
+        <button class="btn sm primary" data-op="0,x,w">Core 0: write x</button>
+        <button class="btn sm" data-op="1,y,r">Core 1: read y</button>
+        <button class="btn sm primary" data-op="1,y,w">Core 1: write y</button>
+        <button class="btn sm" data-op="1,x,r">Core 1: read x</button>
+        <button class="btn sm" id="msBulk">Alternate 1,000 writes</button>
+      </div>
+      <div class="ms-mem" id="msMem"></div>
+      <div class="ms-cores" id="msCores"></div>
+      <div class="ms-desc" id="msDesc"></div>
+      <div class="stats" id="msStats"></div>
+    </div>
+    <div class="panel-foot">A model with round numbers: 1 ns for an access a core's own cache can satisfy, 30 ns to invalidate another core's copy, 60 ns to fetch a line from another core, 100 ns to fetch it from memory. "Alternate 1,000 writes" has core 0 write x and core 1 write y in turn, 500 each.</div>
+  </div>
+
+  <p>Things to notice. A core reading a line nobody else has gets it Exclusive, and can then write it for nothing. Two cores can both hold a line Shared and read it for ever. But in the same-line layout, every write by one core invalidates the other's copy, although the other core only cares about a different variable; the thousand alternating writes cost a thousand line transfers, about 60 ns each. With padding, each core takes its own line once and every later write is a 1 ns hit: about fifty times faster, from a change that altered no logic at all.</p>
+
+  <h2>CPU affinity</h2>
+  <p>A thread's recently used data is in the caches of the core it last ran on. If the scheduler moves it to another core, it starts cold, pulling its lines across one miss at a time. The scheduler knows this and tries to keep threads where they are, but it also has to balance load, and it will move them. <b>Affinity</b> lets you overrule it by restricting a thread or process to chosen cores.</p>
+<pre class="code"><span class="c">$</span> taskset -c <span class="m">0</span>-<span class="m">3</span> ./server                 <span class="c"># start it restricted to cores 0 to 3</span>
+<span class="c">$</span> taskset -cp <span class="m">4120</span>                         <span class="c"># which cores may process 4120 use?</span>
+pid 4120's current affinity list: 0-15</pre>
+<pre class="code"><span class="t">cpu_set_t</span> set;
+<span class="f">CPU_ZERO</span>(&amp;set);
+<span class="f">CPU_SET</span>(<span class="m">2</span>, &amp;set);
+<span class="f">pthread_setaffinity_np</span>(<span class="f">pthread_self</span>(), <span class="k">sizeof</span> set, &amp;set);    <span class="c">/* this thread now runs only on core 2 */</span></pre>
+  <p>Pinning suits designs that already have one long-lived thread per core, such as an event loop per core in nginx or a packet-processing thread per network queue: each keeps its caches warm and nothing migrates. It hurts when it prevents the scheduler from doing its job. Pin eight busy threads to four cores and four cores sit idle beside them. Measure before and after.</p>
+
+  <h2>NUMA: when memory has a location</h2>
+  <p>A server with two or more processor sockets doesn't have one pool of memory. Each socket has its own memory banks attached directly to it. A core can use any memory in the machine, but memory attached to <i>another</i> socket is reached through an interconnect and is noticeably slower, often 1.5 to 2 times. This is <b>non-uniform memory access</b>. Each socket with its local memory is a <b>NUMA node</b>.</p>
+<pre class="code"><span class="c">$</span> numactl --hardware
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23
+node 0 size: 128742 MB
+node 1 cpus: 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31
+node 1 size: 129011 MB
+node distances:
+node   0   1
+  0:  10  21              <span class="c"># reaching the other node's memory costs about twice as much</span>
+  1:  21  10</pre>
+  <p>Which node a page of memory comes from is decided by <b>first touch</b>. Chapter 14 showed that a page gets a frame when it is first written; Linux takes that frame from the node of the core that does the writing. Usually that is what you want: a thread's data ends up next to the thread. It goes wrong in two well-known ways:</p>
+  <ul>
+    <li><b>One thread initialises everything.</b> The main thread allocates and zeroes a large array, then sixteen workers spread over both sockets process it. All of the array is on the main thread's node. Half the workers do every access across the interconnect, and that node's memory fills while the other's sits empty. The fix is to have each worker initialise the part it will use.</li>
+    <li><b>One process bigger than a node.</b> A database with a cache larger than one node's memory fills its home node first. The kernel may then start reclaiming or swapping on that node while the other has gigabytes free.</li>
+  </ul>
+<pre class="code"><span class="c">$</span> numastat -p <span class="m">4120</span>                          <span class="c"># where one process's memory lives</span>
+                 Node 0     Node 1      Total
+Private        <span class="m">61204.11</span>    <span class="m">2811.40</span>   <span class="m">64015.51</span>     <span class="c"># MB: badly lopsided</span>
+<span class="c">$</span> numactl --cpunodebind=<span class="m">0</span> --membind=<span class="m">0</span> ./worker        <span class="c"># keep a process and its memory on one node</span>
+<span class="c">$</span> numactl --interleave=all ./database                  <span class="c"># or spread its pages evenly over all nodes</span></pre>
+
+  <div class="callout usecase">
+    <div class="ico">🐬</div>
+    <div class="body"><div class="title">MySQL's "swap insanity"</div><p>Around 2010, administrators moving MySQL to new two-socket servers met a baffling fault. A machine with 64 GB of RAM, running one MySQL instance with a 48 GB buffer pool, would start swapping heavily, stall for seconds at a time, and show many gigabytes of memory free the whole time. Jeremy Cole, then at Twitter, traced it and named it the swap insanity problem. The buffer pool was allocated by MySQL's start-up thread, so first touch placed as much as fitted, about 32 GB, on that thread's node, and the remainder on the other. Node 0 was now full. When anything running on node 0 later needed a page, the kernel preferred to free memory <i>on that node</i>, and the nearest candidates were pages of the buffer pool, which it pushed to swap, even though node 1 had space to spare. The database then faulted them back in from disk. The cure was one line: start MySQL under <code>numactl --interleave=all</code>, so its pages alternate between nodes and neither fills first. MySQL later gained an option to do this itself, and MongoDB and other large in-memory stores give the same advice. For one process that uses most of the machine, even placement beats local placement.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Assuming "no lock" means "no contention".</b> Two cores writing the same cache line contend in hardware, with or without a lock.</li>
+      <li><b>Packing per-thread counters into one array.</b> Eight <code>long</code>s fit in one line, and eight threads then fight over it. Pad each to 64 bytes.</li>
+      <li><b>One global atomic counter on a hot path.</b> Every increment moves the line. Count per thread and add up on demand.</li>
+      <li><b>Padding everything.</b> Padding costs memory and cache space. Apply it to data that profiling shows is written by several cores.</li>
+      <li><b>Initialising all memory from one thread on a NUMA machine.</b> First touch puts it all on one node.</li>
+      <li><b>Pinning threads without measuring.</b> Affinity can leave cores idle while pinned threads queue.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is false sharing and how do you fix it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>False sharing is when threads on different cores write to different variables that lie in the same cache line. Caches work in units of 64-byte lines, and the coherence protocol requires a core to own a line exclusively before writing to it. So when thread A writes its variable, the line is invalidated in thread B's cache, and when B writes its own variable it has to take the line back, invalidating A's. The line ping-pongs between the cores on every write, each transfer costing tens of nanoseconds instead of about one for a cache hit, although the threads share no data logically. A typical case is an array of per-thread counters. The fix is to put each thread's hot data on its own line, by aligning or padding to 64 bytes, for example <code>alignas(64)</code> in C, or by giving each thread separately allocated data. I'd confirm it first with <code>perf c2c</code>, which reports lines being modified on one core and accessed from another.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A service moved from an 8-core machine to a 2-socket, 64-core machine and got slower. What would you look at?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Three things, all about the hardware no longer being flat. First, shared writes: anything that every thread updates, a global counter, a lock, a reference count, an allocator's shared state, costs a cache-line transfer per update, and with 64 cores and two sockets those transfers are both more frequent and more expensive. I'd look for contended lines with <code>perf c2c</code> and for time in lock and atomic operations, and move to per-thread or per-core state. Second, NUMA placement: check <code>numastat</code> for the process. If memory was initialised by one thread it is all on one node, so half the threads access remote memory at roughly twice the latency, and that node may be reclaiming while the other is empty. Fixes are per-thread initialisation, binding worker groups and their memory to nodes, or interleaving for a single large shared structure. Third, scheduling: threads migrating between sockets lose their caches and their local memory, so I'd consider affinity per node. And I'd check the plainer causes too, such as a pool sized for 8 cores or a lock that was fine at 8 threads and collapses at 64.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Cores have private caches; a coherence protocol keeps them consistent, 64 bytes at a time.</li>
+      <li>MESI: Modified, Exclusive, Shared, Invalid. Reading a shared line is free; writing needs exclusive ownership and invalidates every other copy.</li>
+      <li>Any data written by several cores, a counter, a lock, a queue head, costs a line transfer per write.</li>
+      <li>False sharing is the same cost for unrelated variables in one line. Pad hot per-thread data to its own line.</li>
+      <li>Affinity keeps a thread's caches warm; it helps fixed thread-per-core designs and can hurt elsewhere.</li>
+      <li>On NUMA machines memory belongs to a socket and is placed by first touch. Initialise where you will use, or interleave.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Two cores both hold a cache line in the Shared state. Core 0 writes to it. What must happen first?</p>
+      <div class="opts">
+        <button class="opt">Nothing: Shared lines can be written freely</button>
+        <button class="opt">Core 0 must reload the line from memory</button>
+        <button class="opt">Core 1's copy must be invalidated, leaving core 0 with the only copy</button>
+        <button class="opt">Both cores must flush the line to disk</button>
+      </div>
+      <div class="explain">A write needs exclusive ownership. Core 0's line becomes Modified and core 1's Invalid.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Thread A increments <code>stats[0]</code> and thread B increments <code>stats[1]</code>, where <code>stats</code> is an array of <code>long</code>. They run on different cores and are much slower than expected. Why?</p>
+      <div class="opts">
+        <button class="opt">Both elements are in the same 64-byte cache line, which bounces between the cores on every write</button>
+        <button class="opt">The increments are not atomic</button>
+        <button class="opt">The array is being swapped out</button>
+        <button class="opt">The two threads are deadlocked</button>
+      </div>
+      <div class="explain">False sharing. The variables are separate, but the hardware's unit of ownership is the line that holds both.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why doesn't a single shared atomic counter scale across many cores?</p>
+      <div class="opts">
+        <button class="opt">Atomic operations take a kernel lock</button>
+        <button class="opt">Each core has its own copy, so the count is wrong</button>
+        <button class="opt">Atomic instructions are only allowed on one core at a time by the scheduler</button>
+        <button class="opt">Each increment needs the line exclusively, so the line has to travel to whichever core increments next</button>
+      </div>
+      <div class="explain">The counter is correct, but every update costs a cross-core line transfer. Per-thread counters avoid it.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">On a NUMA machine running Linux, which node does a newly allocated page of memory normally come from?</p>
+      <div class="opts">
+        <button class="opt">The node with the most free memory</button>
+        <button class="opt">The node of the core running the thread that first writes to the page</button>
+        <button class="opt">Always node 0</button>
+        <button class="opt">The node where <code>malloc</code> was called, at the time of the call</button>
+      </div>
+      <div class="explain">First touch: physical memory is assigned at the first write, from the node where that thread is running at that moment.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">The main thread allocates and zero-fills a 100 GB array, then 32 worker threads on two sockets process it. What NUMA problem results?</p>
+      <div class="opts">
+        <button class="opt">The array is split evenly, so there is no problem</button>
+        <button class="opt">All the pages are on the main thread's node, so the workers on the other socket access remote memory for everything</button>
+        <button class="opt">The workers can't see memory allocated by another thread</button>
+        <button class="opt">The kernel refuses allocations larger than one node</button>
+      </div>
+      <div class="explain">The zero-fill was the first touch. Letting each worker initialise its own portion places the pages next to the cores that use them.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const FULL = { M: 'Modified', E: 'Exclusive', S: 'Shared', I: 'Invalid' };
+  const HIT = 1, INVAL = 30, XFER = 60, MEM = 100;
+  let lay = 'same', st, cnt, last;
+  const lineOf = (v) => lay === 'same' ? 0 : v === 'x' ? 0 : 1;
+  const nLines = () => lay === 'same' ? 1 : 2;
+  function reset() { st = [['I', 'I'], ['I', 'I']]; cnt = { ops: 0, xfer: 0, inval: 0, mem: 0, ns: 0 }; last = null; }
+  // One access. Returns a description; updates states and counters.
+  function access(c, v, kind) {
+    const L = lineOf(v), o = 1 - c, mine = st[c][L], theirs = st[o][L];
+    cnt.ops++;
+    const head = `Core ${c} ${kind === 'r' ? 'reads' : 'writes'} <code>${v}</code>. `;
+    if (kind === 'r') {
+      if (mine !== 'I') { cnt.ns += HIT; return { cls: 'ms-ok', text: head + `Its copy of the line is ${FULL[mine]}: a hit in its own cache, about 1 ns.` }; }
+      if (theirs !== 'I') {
+        st[c][L] = 'S'; st[o][L] = 'S'; cnt.xfer++; cnt.ns += XFER;
+        return { cls: 'ms-warn', text: head + `Its copy is Invalid, so it asks for the line. Core ${o} has it (${FULL[theirs]}) and sends it over: about 60 ns. <b>Both copies are now Shared.</b>` };
+      }
+      st[c][L] = 'E'; cnt.mem++; cnt.ns += MEM;
+      return { cls: '', text: head + 'No cache has the line, so it is fetched from memory: about 100 ns. Nobody else holds it, so it arrives <b>Exclusive</b>.' };
+    }
+    if (mine === 'M') { cnt.ns += HIT; return { cls: 'ms-ok', text: head + 'It already owns the line (Modified): a hit, about 1 ns, and no other core is told.' }; }
+    if (mine === 'E') { st[c][L] = 'M'; cnt.ns += HIT; return { cls: 'ms-ok', text: head + 'It holds the only copy (Exclusive), so it can write at once: the state becomes <b>Modified</b> with no message to anyone.' }; }
+    const why = lay === 'same' && v !== (o === 0 ? 'x' : 'y') ? ` Core ${o} never uses <code>${v}</code>; it only wanted <code>${o === 0 ? 'x' : 'y'}</code>, which is in the same line.` : '';
+    if (mine === 'S') {
+      st[c][L] = 'M'; if (theirs !== 'I') st[o][L] = 'I'; cnt.inval++; cnt.ns += INVAL;
+      return { cls: 'ms-warn', text: head + `Its copy is Shared, so before writing it must make core ${o} <b>invalidate</b> its copy: about 30 ns. Core ${c} is now Modified, core ${o} Invalid.` + why };
+    }
+    if (theirs !== 'I') {
+      st[c][L] = 'M'; st[o][L] = 'I'; cnt.xfer++; cnt.ns += XFER;
+      return { cls: 'ms-bad', text: head + `Its copy is Invalid. It must <b>fetch the line from core ${o} and invalidate it there</b>: about 60 ns. Core ${c} is now Modified, core ${o} Invalid.` + why };
+    }
+    st[c][L] = 'M'; cnt.mem++; cnt.ns += MEM;
+    return { cls: '', text: head + 'No cache has the line. It is fetched from memory for writing, about 100 ns, and arrives owned: <b>Modified</b>.' };
+  }
+  function render() {
+    const line = (i, vars) => `<div class="ms-line"><b>line ${i}</b>${vars.map((v) => `<span class="ms-var">${v}</span>`).join('')}<span>${vars.length === 2 ? '48 bytes of other data' : '56 bytes of padding'}</span></div>`;
+    $('#msMem').innerHTML = lay === 'same' ? line(0, ['x', 'y']) : line(0, ['x']) + line(1, ['y']);
+    $('#msCores').innerHTML = [0, 1].map((c) => `<div class="ms-core"><h6>Core ${c}</h6><small>runs thread ${c ? 'B' : 'A'}, which uses ${c ? 'y' : 'x'}</small>` +
+      Array.from({ length: nLines() }, (_, L) => `<div class="ms-st"><span class="ms-badge ms-${st[c][L]}">${FULL[st[c][L]]}</span>its copy of line ${L}</div>`).join('') + '</div>').join('');
+    const d = $('#msDesc');
+    d.className = 'ms-desc ' + (last ? last.cls : '');
+    d.innerHTML = last ? last.text : 'Both caches are empty: every line is Invalid in both. Start with <b>Core 0: read x</b>.';
+    $('#msStats').innerHTML = `<div class="stat"><div class="k">Accesses</div><div class="v">${cnt.ops.toLocaleString('en-GB')}</div></div>
+      <div class="stat ${cnt.xfer > 4 ? 'bad' : ''}"><div class="k">Line transfers</div><div class="v">${cnt.xfer.toLocaleString('en-GB')}</div></div>
+      <div class="stat"><div class="k">Invalidations</div><div class="v">${cnt.inval}</div></div>
+      <div class="stat acc"><div class="k">Time</div><div class="v" style="font-size:18px">${cnt.ns >= 1000 ? (cnt.ns / 1000).toFixed(1) + '<small> µs</small>' : cnt.ns + '<small> ns</small>'}</div></div>
+      <div class="stat ${cnt.ops && cnt.ns / cnt.ops > 20 ? 'bad' : cnt.ops ? 'good' : ''}"><div class="k">Per access</div><div class="v">${cnt.ops ? (cnt.ns / cnt.ops).toFixed(1) : '–'}<small> ns</small></div></div>`;
+  }
+  $$('[data-op]').forEach((b) => { b.onclick = () => { const [c, v, k] = b.dataset.op.split(','); last = access(+c, v, k); render(); }; });
+  $('#msBulk').onclick = () => {
+    const b = { xfer: cnt.xfer, ns: cnt.ns, inval: cnt.inval };
+    for (let i = 0; i < 1000; i++) access(i % 2, i % 2 ? 'y' : 'x', 'w');
+    const x = cnt.xfer - b.xfer, ns = cnt.ns - b.ns;
+    last = x > 10
+      ? { cls: 'ms-bad', text: `1,000 writes, 500 by each core, each to its own variable. Because <code>x</code> and <code>y</code> share a line, <b>${x.toLocaleString('en-GB')} of them had to fetch the line back from the other core</b>. Total ${(ns / 1000).toFixed(1)} µs: about ${(ns / 1000).toFixed(0)} ns per write, for work that takes 1 ns. This is false sharing.` }
+      : { cls: 'ms-ok', text: `1,000 writes, 500 by each core. Each core owns its own line, so after the first write every one is a hit in its own cache. <b>Line transfers: ${x}.</b> Total ${(ns / 1000).toFixed(1)} µs, about ${(ns / 1000).toFixed(1)} ns per write.` };
+    render();
+  };
+  $('#msReset').onclick = () => { reset(); render(); };
+  $('#msLay').addEventListener('segchange', (e) => { lay = e.detail; reset(); render(); });
+  reset(); render();
+})();
+</script>
 </body>
 </html>

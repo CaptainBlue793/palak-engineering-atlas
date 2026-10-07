@@ -6,33 +6,327 @@
 <title>Case Study: Load-Balancer Failover</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('net-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .lf-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .lf-row > span { font-size:12.5px; color:var(--muted); min-width:150px; }
+  .lf-chart { margin-top:14px; border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:10px 12px 6px; }
+  .lf-chart h6 { margin:0 0 8px; font-size:12px; font-weight:600; color:var(--muted); }
+  .lf-bars { display:flex; align-items:flex-end; gap:2px; height:110px; border-bottom:1.5px solid var(--border); }
+  .lf-bars span { flex:1 1 0; min-width:0; height:100%; display:flex; flex-direction:column-reverse; }
+  .lf-bars i { display:block; width:100%; transition:height .25s; }
+  .lf-bars i.lf-err { background:var(--red); } .lf-bars i.lf-slow { background:var(--amber); } .lf-bars i.lf-saved { background:var(--green); opacity:.55; }
+  .lf-axis { display:flex; justify-content:space-between; font-size:11.5px; color:var(--muted); margin-top:4px; }
+  .lf-key { display:flex; flex-wrap:wrap; gap:6px 16px; margin-top:8px; font-size:12.5px; color:var(--muted); }
+  .lf-key span { display:inline-flex; align-items:center; gap:6px; }
+  .lf-key span i { width:11px; height:11px; border-radius:3px; display:inline-block; }
+  .lf-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .lf-desc.lf-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .lf-desc.lf-mid { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
 </head>
 <body data-chapter="46">
-<!-- net:placeholder -->
 <main class="content">
 
   <section class="hero">
-    <div class="eyebrow"><span class="pill accent">Chapter 46</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Case Study: <span class="grad">Load-Balancer Failover</span></h1>
-    <p class="lead">A backend dies mid-traffic: health checks, connection draining and what users actually see.</p>
+    <div class="eyebrow"><span class="pill accent">Chapter 46</span><span class="pill">Case Study</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Load-Balancer <span class="grad">Failover</span></h1>
+    <p class="lead">A service runs on four servers behind a load balancer, so that losing one doesn't matter. Then one is lost, at a quarter past two on a busy afternoon, and for the next half minute a quarter of all requests fail. The redundancy was real, and the half minute is the time it took the balancer to find out. This case study follows that failure second by second: what the balancer sees, what users see, and which settings shorten the gap. It then covers the two related situations, removing a server on purpose without dropping a request, and the load balancer itself failing.</p>
+    <ul class="objectives">
+      <li><span>Work out how long a balancer takes to stop using a failed server, for a crash and for a freeze</span></li>
+      <li><span>Say which requests may be retried on another server, and which may not</span></li>
+      <li><span>Describe the steps of draining a server before it is removed</span></li>
+      <li><span>Explain how a pair of load balancers shares one address with VRRP, and what a failover costs</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + CLI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Load balancers, and active and passive health checks:</b> <a href="24-load-balancers-l4-l7.html">Chapter 24</a>. This chapter starts where that one's health-check section ends.</li>
+        <li><b>ARP, and gratuitous ARP:</b> <a href="03-arp.html">Chapter 3</a>.</li>
+        <li><b>Retries and retry budgets:</b> <a href="32-service-mesh-mtls.html">Chapter 32</a>.</li>
+        <li><b>Resets and timeouts:</b> <a href="14-tcp-teardown-time-wait.html">Chapter 14</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Health-check timing</li>
-    <li>Draining connections</li>
-    <li>Retries and idempotency</li>
-    <li>Active–passive LB pairs and VRRP</li>
-  </ol>
+  <h2>Three ways a server fails</h2>
+  <p>How long a failure takes to detect depends on how the server stops, because the balancer learns of it from what comes back.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>The process crashes</th><th>The host freezes or is cut off</th><th>The server is sick</th></tr></thead>
+      <tbody>
+        <tr><td><b>Example</b></td><td>An unhandled exception. The out-of-memory killer</td><td>A kernel panic, a failed power supply, a pulled cable</td><td>A full disk, a lost database connection, a bad deploy</td></tr>
+        <tr><td><b>A new connection gets</b></td><td>A reset, at once. The kernel is alive and nothing is listening</td><td>Nothing. The SYN goes unanswered</td><td>Accepted normally</td></tr>
+        <tr><td><b>A request gets</b></td><td>An immediate error</td><td>Silence, until a timeout</td><td>A 500, often very quickly</td></tr>
+        <tr><td><b>Detected</b></td><td>Fast, by anything</td><td>Slowly, since every signal is a timeout</td><td>Only by a check that looks at the response</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The middle column is the hard one, and it is common. A machine that has stopped can't send a reset to say so. Everything the balancer sends it disappears, and all the balancer can do is wait.</p>
+
+  <h2>Health-check timing</h2>
+  <p><a href="24-load-balancers-l4-l7.html">Chapter 24</a> worked out the usual result: a check every 10 seconds, with three failures required, leaves a dead server in rotation for about 30 seconds. In general:</p>
+<pre class="code">time to eject  =  interval × failures required  +  the probe's timeout     <span class="c"># at worst</span>
+
+<span class="c"># interval 10 s, 3 failures, timeout 2 s   →  up to 32 s</span>
+<span class="c"># interval  5 s, 3 failures, timeout 2 s   →  up to 17 s</span>
+<span class="c"># interval  1 s, 3 failures, timeout 1 s   →  up to  4 s</span></pre>
+  <p>It is tempting to set every number as low as it will go, and there is a cost on the other side. A server that pauses for two seconds to collect garbage, or answers one probe slowly under load, is ejected by an aggressive check, and its share of the traffic lands on the others, which are now more likely to answer slowly themselves. Checks that are too sensitive can take a healthy fleet apart at the moment it is busiest. Three practices keep them stable: require several consecutive failures to eject and several successes to return, bring a returning server back with a gradually rising share of traffic, and never let the check eject more than a set fraction of the fleet.</p>
+
+  <h2>Try it: thirty-six seconds after a server dies</h2>
+  <p>Four servers share 400 requests a second. At time zero one of them stops. Four-fifths of the requests are reads that can safely be repeated, and one-fifth are writes that can't.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">What users see</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="lf-row"><span>The server</span><div class="seg" id="lfMode"><button data-v="crash">crashes: connections are refused</button><button class="active" data-v="freeze">freezes: requests hang</button></div></div>
+      <div class="lf-row"><span>Active check every</span><div class="seg" id="lfInt"><button class="active" data-v="10">10 s</button><button data-v="5">5 s</button><button data-v="1">1 s</button></div></div>
+      <div class="lf-row"><span>Passive ejection</span><div class="seg" id="lfPas"><button class="active" data-v="0">off</button><button data-v="1">after 5 failed requests in a row</button></div></div>
+      <div class="lf-row"><span>Retry on another server</span><div class="seg" id="lfRet"><button class="active" data-v="0">off</button><button data-v="1">for requests that are safe to repeat</button></div></div>
+      <div class="lf-chart">
+        <h6>Requests sent to the failed server, each second</h6>
+        <div class="lf-bars" id="lfBars"></div>
+        <div class="lf-axis"><span>it fails</span><span>12 s</span><span>24 s</span><span>36 s</span></div>
+        <div class="lf-key"><span><i style="background:var(--red)"></i>failed</span><span><i style="background:var(--amber)"></i>answered after a 3 s wait</span><span><i style="background:var(--green);opacity:.55"></i>retried elsewhere at once</span></div>
+      </div>
+      <div class="lf-desc" id="lfDesc"></div>
+      <div class="stats" id="lfStats"></div>
+    </div>
+    <div class="panel-foot">Each server receives 100 requests a second. Active checks need three failures, with a timeout of 2 s, or 1 s at the fastest setting. A request to the frozen server times out after 3 s. The model takes the worst case for active checks: the server fails just after passing one.</div>
+  </div>
+
+  <p>Things to notice. With the defaults, a frozen server stays in rotation for 32 seconds and 3,200 requests are lost, each after the user has waited three seconds for it. A check every second reduces that to 400, at the risk of ejecting servers that are only slow. Passive ejection treats the two kinds of failure very differently. A crashed server refuses connections instantly, five failures arrive within a twentieth of a second, and only five requests are affected. A frozen server gives no signal until the first requests time out three seconds later, by which time 305 have been sent to it. Retrying on another server rescues the four-fifths that are safe to repeat: at once for a crash, and after the timeout for a freeze, when the user gets a slow answer in place of an error. The writes can't be rescued this way, because the balancer can't tell whether the frozen server acted on them.</p>
+
+  <h2>Retries and idempotency</h2>
+  <p>A retry is safe when doing the request twice has the same effect as doing it once. That property is <b>idempotency</b>. What the balancer needs to know is how far the first attempt got.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>What happened to the first attempt</th><th>May it be retried on another server?</th></tr></thead>
+      <tbody>
+        <tr><td><b>The connection was refused or never opened</b></td><td>Yes, always. The server never saw the request</td></tr>
+        <tr><td><b>A GET, HEAD, PUT or DELETE was sent, and nothing came back</b></td><td>Yes. These are defined so that repeating them is harmless</td></tr>
+        <tr><td><b>A POST was sent, and nothing came back</b></td><td>Not by the balancer. The order may have been placed, or the payment taken</td></tr>
+        <tr><td><b>A POST carrying an idempotency key</b></td><td>Yes. The server remembers the key and returns the first result instead of acting again</td></tr>
+        <tr><td><b>Part of a response had already been sent to the client</b></td><td>No. It can't be taken back</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c"># A client making a payment safe to retry, by naming the operation</span>
+<span class="k">import</span> uuid, requests
+
+key = <span class="f">str</span>(uuid.<span class="f">uuid4</span>())                     <span class="c"># made once per payment, and reused on every retry of it</span>
+<span class="k">for</span> attempt <span class="k">in</span> <span class="f">range</span>(<span class="m">3</span>):
+    <span class="k">try</span>:
+        r = requests.<span class="f">post</span>(<span class="s">"https://api.example.com/payments"</span>, json=payment,
+                          headers={<span class="s">"Idempotency-Key"</span>: key}, timeout=<span class="m">3</span>)
+        <span class="k">break</span>
+    <span class="k">except</span> requests.exceptions.RequestException:
+        <span class="k">continue</span>                               <span class="c"># the server will recognise the key if the first attempt got through</span></pre>
+  <p>Retries have to be limited as well as safe. One retry of a failed request is cheap. Retrying everything, at every layer, during a partial outage multiplies the load on the servers that are left (<a href="32-service-mesh-mtls.html">Chapter 32</a>).</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">The broken server that took most of the traffic</div><p>Engineers at Amazon have described a kind of failure that reverses what a load balancer is for. A fleet sits behind a balancer that sends each new request to the server with the fewest requests in progress, which is normally the best policy, since it steers work away from servers that are busy or slow. One server develops a fault that makes it fail every request immediately: a missing dependency, a bad configuration file, a full disk. It still answers the balancer's health check, because the check only asks whether the process is up. Now consider what the balancer sees. The healthy servers each have dozens of requests in progress, taking tens of milliseconds apiece. The broken one never has any, because each request it receives is finished, with an error, in a fraction of a millisecond. By the balancer's measure it is the least loaded server in the fleet at every moment, so it is given the next request, and the one after that. A single faulty machine in a fleet of dozens can end up receiving most of the traffic and failing all of it, while every dashboard shows it as healthy and fast. Engineers call this a black hole. The defences are a health check that exercises real work on the server, passive ejection on error rate, and clients that retry on a different server. A health check that only asks whether the process is up would not have caught this.</p></div>
+  </div>
+
+  <h2>Draining connections</h2>
+  <p>Most servers that leave a pool haven't failed. They are being deployed to, or scaled in, or moved, many times a day. Done abruptly, each removal cuts off the requests in progress and looks to users like a small outage. Done properly it is invisible, and the procedure is called <b>draining</b>.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>The server is told to stop</b> by a deploy, a scale-in or an operator</li>
+      <li data-k="step"><b>It is marked as draining</b> the balancer is told directly, or the server starts failing its readiness check while continuing to serve</li>
+      <li data-k="step"><b>The balancer sends it no new requests</b> and requests already in progress continue</li>
+      <li data-k="step"><b>Idle keep-alive connections are closed politely</b> with <code>Connection: close</code> on the last response, or a GOAWAY frame in HTTP/2</li>
+      <li data-k="decision"><b>Have all requests finished, or has the drain timeout passed?</b> typically 30 seconds, and longer for uploads and WebSockets</li>
+      <li data-k="end"><b>The process exits</b> and anything still open is cut</li>
+    </ol>
+    <figcaption><b>Removing a server without dropping a request.</b> The order matters: traffic must stop arriving before the process stops listening.</figcaption>
+  </figure>
+<pre class="code"><span class="c"># The server's half: on SIGTERM, fail readiness first, keep serving, then stop</span>
+<span class="k">import</span> signal, threading, time
+
+draining = threading.<span class="f">Event</span>()
+
+<span class="k">def</span> <span class="f">on_sigterm</span>(signum, frame):
+    draining.<span class="f">set</span>()                             <span class="c"># /ready now returns 503, and the balancer stops choosing us</span>
+    time.<span class="f">sleep</span>(<span class="m">10</span>)                             <span class="c"># long enough for every balancer to have noticed</span>
+    server.<span class="f">shutdown</span>()                          <span class="c"># stop accepting, and finish what is in progress</span>
+
+signal.<span class="f">signal</span>(signal.SIGTERM, on_sigterm)
+
+<span class="c"># The balancer's half, in two common systems</span>
+<span class="c">#   AWS target group:   deregistration_delay.timeout_seconds = 30</span>
+<span class="c">#   Kubernetes:         terminationGracePeriodSeconds: 45, with a preStop hook that sleeps for 10 s</span></pre>
+  <p>The ten-second pause is the part most often left out. Telling the balancers takes time: a health check has to fail, or an update has to reach every proxy (<a href="31-kubernetes-networking.html">Chapter 31</a>). A server that stops listening the moment it is asked to will refuse requests from balancers that haven't yet heard.</p>
+
+  <h2>Active–passive LB pairs and VRRP</h2>
+  <p>The balancer protects the service from a server failing, and something has to protect the service from the balancer failing. The classic arrangement is two balancers sharing one address. Clients and DNS know only a <b>virtual IP</b>. One balancer, the master, holds it and handles all the traffic, and the other, the backup, stands by. <b>VRRP</b>, the Virtual Router Redundancy Protocol, decides which is which.</p>
+  <figure class="seq" data-actors="Master|Backup|Switch and hosts">
+    <ol>
+      <li data-m="0>1">advertisement: "I am master, priority 150"<small>Every second, to a multicast address on the LAN.</small></li>
+      <li data-m="0>0" data-k="fail">the master loses power</li>
+      <li data-m="1>1" data-k="note">no advertisement for three intervals: about 3.6 s</li>
+      <li data-m="1>2">gratuitous ARP: "10.0.0.100 is here now"<small>The switch learns which port to use, and hosts update their ARP caches.</small></li>
+      <li data-m="2>1" data-k="reply">traffic for 10.0.0.100</li>
+      <li data-m="1>2">advertisement: "I am master, priority 100"</li>
+    </ol>
+    <figcaption><b>A VRRP failover.</b> The address moves in a few seconds. Nothing is reconfigured on the clients, and DNS is not involved.</figcaption>
+  </figure>
+<pre class="code"><span class="c"># keepalived on the master. The backup has the same block with state BACKUP and priority 100.</span>
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority <span class="m">150</span>
+    advert_int <span class="m">1</span>
+    virtual_ipaddress { <span class="m">10.0.0.100/24</span> }
+    track_script { chk_haproxy }          <span class="c"># give up the address if the proxy itself has died</span>
+}</pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+      <tbody>
+        <tr><td><b>How long is the gap?</b></td><td>Three missed advertisements and a little more: about 3.6 s with the defaults, and under a second if tuned</td></tr>
+        <tr><td><b>What happens to open connections?</b></td><td>They break, unless the pair synchronises its connection table. The backup has never heard of them and answers their packets with resets. Clients reconnect</td></tr>
+        <tr><td><b>What if the link between the two fails, and both are alive?</b></td><td>Each stops hearing the other and both claim the address: a split brain. Use more than one path between them</td></tr>
+        <tr><td><b>Does the old master take the address back when it returns?</b></td><td>By default yes, which causes a second interruption. Many operators turn that off</td></tr>
+        <tr><td><b>What is the weakness?</b></td><td>Half the capacity is idle, and it only works within one LAN</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Larger systems use a different design. Routers spread traffic across many balancers by ECMP, each balancer announces the service's address, and consistent hashing lets any balancer handle any connection, so that losing one moves only its share (<a href="30-data-center-networks.html">Chapter 30</a>, <a href="26-anycast-cdn.html">Chapter 26</a>). Cloud load balancers do this out of sight. A pair with a floating address is still what stands in front of many databases and smaller services.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Leaving health-check timing at its defaults</b> without working out what 30 seconds of failures costs.</li>
+      <li><b>Timeouts longer than users will wait.</b> A 60-second timeout to a frozen server means users give up long before the balancer does.</li>
+      <li><b>Retrying requests that aren't idempotent.</b> A retried payment is a double charge.</li>
+      <li><b>Stopping the process and removing it from the balancer at the same moment.</b> Requests arrive at a closed port until the balancer catches up.</li>
+      <li><b>A health check that tests only that the process is up.</b> Sick servers pass it.</li>
+      <li><b>Never testing the failover.</b> A backup balancer that hasn't taken the address in a year has a configuration a year old.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is connection draining, and why is it needed?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Draining is how you take a server out of a load balancer's pool without failing the requests it is handling. When a server is to be removed, for a deploy or a scale-in, the balancer stops sending it new requests but leaves existing connections alone, so in-flight requests can finish. Idle keep-alive connections are closed gracefully, with <code>Connection: close</code> or an HTTP/2 GOAWAY, so clients open their next connection to another server. After all requests have completed, or a drain timeout such as 30 seconds has passed, the server is shut down. Without it, every deploy would cut off whatever requests happened to be in progress, and users would see errors many times a day. The detail that matters is ordering: the server must keep accepting requests for a short while after it is told to stop, because the balancers take a moment to learn that it is leaving; so the usual pattern is to fail the readiness check first, wait, and only then stop listening.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> One of four backends freezes without crashing. Walk me through what users experience, and how you would reduce it.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A frozen host is the worst case because it sends nothing back, no reset and no error, so everything is detected by timeout. A quarter of requests are routed to it and hang. The active health check has to fail several times: with a 10-second interval and three failures required, plus the probe timeout, it stays in rotation for around 30 seconds. During that time each of those requests waits for the balancer's backend timeout and then fails, so users see a quarter of requests being slow and then erroring. To reduce it I'd work on three things. Detection: shorter intervals and sensible timeouts for the active check, though not so aggressive that slow-but-healthy servers get ejected, and passive ejection, outlier detection, on real traffic; noting that passive detection of a freeze still costs one request timeout, so the backend timeout should be close to the real p99 and not a default of 60 seconds. Rescue: have the balancer retry on a different backend for connection failures and for idempotent requests, with a retry budget, and use idempotency keys so that important writes can be retried as well. A short connect timeout helps a lot, since a frozen host won't complete a handshake for new connections, and an unanswered SYN is always safe to retry. And blast radius: enough spare capacity that three servers can carry the load, and a limit on how much of the fleet health checks may eject. I'd then test it by actually freezing a server, for example with a firewall rule that drops its packets.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A crash is detected quickly, because the kernel refuses connections. A freeze is detected only through timeouts.</li>
+      <li>Time to eject is about the check interval times the failures required, plus the probe timeout. Work it out for your settings.</li>
+      <li>Passive ejection reacts to real traffic within milliseconds for errors, and within one request timeout for silence.</li>
+      <li>Retries on another server rescue idempotent requests. Writes need an idempotency key before they can be repeated.</li>
+      <li>To drain: stop new requests, let those in progress finish, close idle connections, and only then stop the process.</li>
+      <li>A pair of balancers shares a virtual IP with VRRP. Failover takes seconds, and breaks open connections unless state is synchronised.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A health check runs every 5 s, needs 3 consecutive failures, and has a 2 s timeout. A server freezes just after passing a check. For about how long does it keep receiving traffic?</p>
+      <div class="opts">
+        <button class="opt">2 seconds</button>
+        <button class="opt">5 seconds</button>
+        <button class="opt">17 seconds</button>
+        <button class="opt">60 seconds</button>
+      </div>
+      <div class="explain">Three probes at 5, 10 and 15 seconds, and the last one takes 2 more seconds to time out.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why does passive ejection remove a crashed server almost instantly, and a frozen one only after seconds?</p>
+      <div class="opts">
+        <button class="opt">A crashed server's connections are refused at once, while a frozen server gives no response until requests time out</button>
+        <button class="opt">Passive checks run less often for frozen servers</button>
+        <button class="opt">Crashed servers notify the balancer</button>
+        <button class="opt">Frozen servers still answer health checks</button>
+      </div>
+      <div class="explain">Passive ejection counts failures, and a failure by silence is only known when the timeout expires.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Which failed request may a load balancer safely retry on another server?</p>
+      <div class="opts">
+        <button class="opt">A POST that creates an order, sent with no response received</button>
+        <button class="opt">Any request, as long as it is retried only once</button>
+        <button class="opt">A response that was half delivered to the client</button>
+        <button class="opt">A GET that was sent with no response received, or any request whose connection was refused</button>
+      </div>
+      <div class="explain">A GET is idempotent, and a refused connection means the server never saw the request.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">During a deploy, what does draining a server mean?</p>
+      <div class="opts">
+        <button class="opt">Killing the process and letting clients retry</button>
+        <button class="opt">Sending it no new requests, letting requests in progress finish, and then stopping it</button>
+        <button class="opt">Clearing its cache</button>
+        <button class="opt">Lowering its weight to half</button>
+      </div>
+      <div class="explain">Traffic must stop arriving before the process stops listening.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In a VRRP pair the master fails. How does traffic for the virtual IP reach the backup?</p>
+      <div class="opts">
+        <button class="opt">DNS is updated to the backup's address</button>
+        <button class="opt">Clients are reconfigured</button>
+        <button class="opt">The backup stops hearing advertisements, takes over the address, and sends a gratuitous ARP so that the LAN delivers to it</button>
+        <button class="opt">The switch detects the failure and reroutes</button>
+      </div>
+      <div class="explain">The address stays the same. Only the machine answering for it changes.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = NET;
+  const cfg = { mode: 'freeze', int: 10, pas: 0, ret: 0 };
+  const RATE = 100, REQ_TIMEOUT = 3, NEED = 3, SAFE = 0.8, SPAN = 36;   // requests/s to one server; seconds; failures; share of idempotent requests; chart width in seconds
+  const n = (x) => Math.round(x).toLocaleString('en-GB');
+  function render() {
+    const freeze = cfg.mode === 'freeze';
+    const probeTimeout = Math.min(2, cfg.int);
+    const active = cfg.int * NEED + (freeze ? probeTimeout : 0);
+    const passive = (freeze ? REQ_TIMEOUT : 0) + 5 / RATE;            // five failures have to come back
+    const eject = cfg.pas ? Math.min(active, passive) : active;
+    const sent = RATE * eject;
+    const rescued = cfg.ret ? sent * SAFE : 0, errors = sent - rescued;
+    const slow = freeze ? rescued : 0;                                 // rescued after waiting for the timeout
+    $('#lfBars').innerHTML = Array.from({ length: SPAN }, (_, s) => {
+      const part = Math.max(0, Math.min(1, eject - s));                // share of this second before ejection
+      const tot = part * 100, good = cfg.ret ? tot * SAFE : 0, bad = tot - good;
+      return `<span title="second ${s + 1}"><i class="lf-err" style="height:${bad}%"></i><i class="${freeze ? 'lf-slow' : 'lf-saved'}" style="height:${good}%"></i></span>`;
+    }).join('');
+    const secs = (x) => (x < 1 ? +(x * 1000).toFixed(0) + ' ms' : +x.toFixed(2) + ' s');
+    const d = $('#lfDesc'); let text, cls;
+    const how = cfg.pas && passive < active ? `Passive ejection removes it after ${secs(eject)}: ${freeze ? 'the first five requests have to time out before anything is known' : 'five refused connections in a row take a twentieth of a second'}.` : `The active check removes it after ${secs(eject)}: three failed probes${freeze ? ', the last of which takes ' + probeTimeout + ' s to time out' : ''}.`;
+    const out = cfg.ret ? (freeze ? `${n(slow)} safe requests wait ${REQ_TIMEOUT} s, are retried on another server and succeed. The ${n(errors)} writes fail, because nobody knows whether the frozen server acted on them.` : `${n(rescued)} safe requests are retried on another server immediately and the user notices nothing. The ${n(errors)} writes are returned as errors.`) : (freeze ? `All ${n(sent)} requests sent to it hang for ${REQ_TIMEOUT} s and then fail.` : `All ${n(sent)} requests sent to it fail immediately.`);
+    text = `<b>${how}</b> ${out}`;
+    cls = errors > 500 ? 'lf-bad' : errors > 20 ? 'lf-mid' : '';
+    d.className = 'lf-desc ' + cls; d.innerHTML = text;
+    $('#lfStats').innerHTML = `<div class="stat ${eject > 10 ? 'bad' : eject > 1 ? 'warn' : 'good'}"><div class="k">In rotation for</div><div class="v">${secs(eject)}</div></div>
+      <div class="stat"><div class="k">Requests sent to it</div><div class="v">${n(sent)}</div></div>
+      <div class="stat ${errors > 500 ? 'bad' : errors > 20 ? 'warn' : 'good'}"><div class="k">Errors users saw</div><div class="v">${n(errors)}</div></div>
+      <div class="stat ${slow ? 'warn' : 'good'}"><div class="k">Slow, then answered</div><div class="v">${n(slow)}</div></div>`;
+  }
+  $('#lfMode').addEventListener('segchange', (e) => { cfg.mode = e.detail; render(); });
+  $('#lfInt').addEventListener('segchange', (e) => { cfg.int = +e.detail; render(); });
+  $('#lfPas').addEventListener('segchange', (e) => { cfg.pas = +e.detail; render(); });
+  $('#lfRet').addEventListener('segchange', (e) => { cfg.ret = +e.detail; render(); });
+  render();
+})();
+</script>
 </body>
 </html>

@@ -6,34 +6,287 @@
 <title>Kernel Networking: NICs, Interrupts &amp; Zero-Copy</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('net-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .kr-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .kr-row > span { font-size:12.5px; color:var(--muted); min-width:150px; }
+  .kr-box { margin-top:14px; border:1px solid var(--border); border-radius:12px; background:var(--surface); padding:10px 12px; }
+  .kr-box h6 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .kr-cpu { display:flex; height:30px; border-radius:8px; overflow:hidden; background:var(--surface-3); }
+  .kr-cpu i { font-style:normal; font-size:11px; font-weight:700; color:#fff; display:flex; align-items:center; justify-content:center; white-space:nowrap; overflow:hidden; min-width:0; }
+  .kr-cpu .kr-irq { background:var(--red); } .kr-cpu .kr-stk { background:#0e7490; } .kr-cpu .kr-app { background:#15803d; } .kr-cpu .kr-spin { background:#7c3aed; }
+  .kr-key { display:flex; flex-wrap:wrap; gap:6px 16px; font-size:12px; color:var(--muted); margin-top:8px; }
+  .kr-key i { display:inline-block; width:11px; height:11px; border-radius:3px; margin-right:5px; vertical-align:-1px; }
+  .kr-flow { display:flex; height:22px; border-radius:6px; overflow:hidden; background:var(--surface-3); margin-top:12px; }
+  .kr-flow i { display:block; height:100%; }
+  .kr-flow .kr-ok { background:var(--accent); } .kr-flow .kr-lost { background:var(--red); opacity:.6; }
+  .kr-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent); min-height:66px; }
+  .kr-desc.kr-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .kr-desc.kr-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
 </head>
 <body data-chapter="34">
-<!-- net:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 34</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
     <h1>Kernel Networking: <span class="grad">NICs, Interrupts &amp; Zero-Copy</span></h1>
-    <p class="lead">From wire to socket: NIC queues, interrupts and NAPI, sendfile, and kernel bypass with DPDK.</p>
+    <p class="lead">Every chapter so far has treated a host as a point: packets arrive, and <code>recv()</code> returns bytes. Between those two events is a long path through the machine, from the network card's memory through an interrupt, the kernel's protocol code and a queue, to a copy into the program. On a 10-gigabit link the smallest packets arrive every 67 nanoseconds, which is less time than one cache miss takes. That path is where a server's network capacity is decided, where packets are dropped without any counter that an application normally reads, and where the biggest efficiency gains of the last twenty years were made. This chapter follows a packet up the stack, and then looks at the ways the fastest systems shorten the journey or skip it.</p>
+    <ul class="objectives">
+      <li><span>Trace a received packet from the network card to the application, and say where it can be dropped</span></li>
+      <li><span>Explain receive-side scaling and the offloads a network card performs</span></li>
+      <li><span>Explain why interrupts alone fail under load, and what NAPI does about it</span></li>
+      <li><span>Count the copies in sending a file, and explain how zero-copy removes them</span></li>
+      <li><span>Explain what kernel bypass and XDP are, and what they cost</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + CLI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Sockets, and what <code>recv</code> and <code>send</code> do:</b> <a href="p5-python-sockets.html">P5</a>.</li>
+        <li><b>The 5-tuple and hashing flows:</b> <a href="p3-clients-servers-ports.html">P3</a> and <a href="30-data-center-networks.html">Chapter 30</a>.</li>
+        <li><b>Socket buffers and the receive window:</b> <a href="12-flow-control.html">Chapter 12</a> and <a href="33-tcp-performance.html">Chapter 33</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>NIC ring buffers and RSS</li>
-    <li>Interrupts and NAPI polling</li>
-    <li>The socket buffer</li>
-    <li>sendfile and zero-copy</li>
-    <li>DPDK and XDP</li>
-  </ol>
+  <h2>From the wire to the socket</h2>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>A frame arrives at the network card</b> which checks it and copies it into memory the driver set aside earlier: the receive ring</li>
+      <li data-k="decision"><b>Is the ring full?</b> the frame is dropped by the card. The kernel never sees it</li>
+      <li data-k="step"><b>The card raises an interrupt</b> the CPU stops what it was doing and runs the driver's handler, which does almost nothing except schedule the real work</li>
+      <li data-k="step"><b>The kernel polls the ring</b> taking packets in batches and wrapping each in its packet structure</li>
+      <li data-k="step"><b>Protocol processing</b> firewall rules, the IP layer, then TCP or UDP: checksums, sequence numbers, ACKs</li>
+      <li data-k="decision"><b>Is the socket's receive buffer full?</b> a UDP datagram is dropped here. TCP shrinks its window instead</li>
+      <li data-k="store"><b>The data is queued on the socket</b> and a process blocked in recv or epoll is woken</li>
+      <li data-k="end"><b>The application calls recv</b> and the data is copied from kernel memory into the program's buffer</li>
+    </ol>
+    <figcaption><b>The receive path.</b> There are three queues on it, the ring, a per-CPU backlog and the socket buffer, and each one can overflow. Each has its own drop counter, and none of them is in the application's logs.</figcaption>
+  </figure>
+<pre class="code">$ ethtool -S eth0 | grep -E <span class="s">'rx_missed|rx_dropped|rx_no_buffer'</span>      <span class="c"># dropped by the card: the ring was full</span>
+     rx_missed_errors: <span class="m">48213</span>
+$ cat /proc/net/softnet_stat | awk <span class="s">'{print $2, $3}'</span>                <span class="c"># per CPU: packets dropped, and times the kernel ran out of budget</span>
+00000000 0000011a
+$ netstat -su | grep -i <span class="s">'buffer errors'</span>                             <span class="c"># UDP datagrams dropped because the socket's buffer was full</span>
+    <span class="m">9127</span> receive buffer errors</pre>
+
+  <h2>NIC ring buffers and RSS</h2>
+  <p>The <b>receive ring</b> is a fixed circle of slots, typically 512 to 4,096 of them, each pointing at a block of memory. The card fills slots and the kernel empties them. It absorbs bursts, and it is the first place a packet can be lost: if the kernel doesn't empty the ring fast enough, the card overwrites nothing and drops the new arrival.</p>
+  <p>One ring emptied by one CPU core would limit a 64-core server to the packet rate of a single core. So modern cards have many rings. With <b>receive-side scaling</b> (RSS), the card hashes each packet's 5-tuple and uses the result to choose a ring, each of which interrupts a different core. It is the same trick as ECMP in <a href="30-data-center-networks.html">Chapter 30</a>, for the same reasons: the load spreads over all the cores, and every packet of one connection reaches the same core, in order, with that connection's state already in its cache.</p>
+<pre class="code">$ ethtool -l eth0 | grep Combined                  <span class="c"># how many queues, each with its own interrupt</span>
+Combined:       <span class="m">16</span>
+$ ethtool -g eth0 | grep -A1 <span class="s">'Current'</span>              <span class="c"># how many slots in each receive ring</span>
+RX:             <span class="m">1024</span>
+$ grep eth0 /proc/interrupts | head -3              <span class="c"># one line per queue: which CPU handled how many interrupts</span>
+ 98:   <span class="m">8112345</span>     0         0  ...  eth0-TxRx-0
+ 99:         0  <span class="m">7998121</span>      0  ...  eth0-TxRx-1</pre>
+  <p>The card also takes over work that used to cost CPU time on every packet. These <b>offloads</b> explain something that puzzles everyone the first time they capture packets on a server:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Offload</th><th>What happens</th><th>What you notice</th></tr></thead>
+      <tbody>
+        <tr><td><b>Checksum offload</b></td><td>The card computes and verifies IP and TCP checksums</td><td>tcpdump on the sender shows "incorrect checksum" on outgoing packets, which haven't been filled in yet</td></tr>
+        <tr><td><b>Segmentation offload</b> (TSO, GSO)</td><td>The kernel hands down one "packet" of up to 64 KB, and the card or driver cuts it into MTU-sized segments</td><td>Captures on the sender show packets far larger than 1,500 bytes</td></tr>
+        <tr><td><b>Receive offload</b> (GRO, LRO)</td><td>Consecutive segments of one flow are merged into one large packet before the protocol stack sees them</td><td>Captures on the receiver show large packets too. The wire carried normal ones</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The stack's cost is mostly per packet, not per byte, so handing it one 64 KB unit in place of 45 small ones is a large saving. It also means that a capture taken on a host shows what the kernel saw, which isn't quite what was on the cable.</p>
+
+  <h2>Interrupts and NAPI polling</h2>
+  <p>An interrupt is the right way to learn about a packet that arrives once a second: the CPU does other work and is told when there is something to do. At a hundred thousand packets a second it becomes expensive, since each interrupt costs a couple of microseconds of saving state and switching context before any real work is done. At a million a second it is fatal. The CPU spends all of its time entering and leaving the interrupt handler, the code that would process the packets never gets to run, and the machine does no useful work while being completely busy. This is <b>receive livelock</b>.</p>
+  <p>Linux's answer, called <b>NAPI</b>, is to change mode with the load. The first packet raises an interrupt. The driver then <i>switches the card's receive interrupts off</i> and asks the kernel to poll the ring. The kernel takes packets in batches of up to 64, and keeps polling for as long as it keeps finding them. Only when the ring is empty are interrupts switched on again. A quiet system gets the low latency of interrupts, and a busy one gets the efficiency of polling, with about one interrupt for every batch.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One core receiving packets</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="kr-row"><span>Packets arriving</span><div class="seg" id="krRate"><button data-v="10000">10,000 / s</button><button class="active" data-v="100000">100,000 / s</button><button data-v="1000000">1 million / s</button><button data-v="10000000">10 million / s</button></div></div>
+      <div class="kr-row"><span>Receive path</span><div class="seg" id="krMode"><button data-v="irq">an interrupt per packet</button><button class="active" data-v="napi">NAPI: interrupt, then poll</button><button data-v="bypass">kernel bypass (DPDK)</button></div></div>
+      <div class="kr-row"><span>Queues and cores (RSS)</span><div class="seg" id="krCores"><button class="active" data-v="1">1</button><button data-v="4">4</button><button data-v="8">8</button></div></div>
+      <div class="kr-box"><h6>Where each core's time goes</h6><div class="kr-cpu" id="krCpu"></div>
+        <div class="kr-key"><span><i style="background:var(--red)"></i>entering and leaving interrupts</span><span><i style="background:#0e7490"></i>the kernel's protocol stack</span><span><i style="background:#15803d"></i>the application</span><span><i style="background:#7c3aed"></i>polling an empty ring</span></div>
+        <h6 style="margin-top:14px">Of the packets that arrive</h6><div class="kr-flow" id="krFlow"></div>
+        <div class="kr-key"><span><i style="background:var(--accent)"></i>delivered to the application</span><span><i style="background:var(--red);opacity:.6"></i>dropped</span></div></div>
+      <div class="kr-desc" id="krDesc"></div>
+      <div class="stats" id="krStats"></div>
+    </div>
+    <div class="panel-foot">A model with round costs: 2 µs to take an interrupt, 1 µs for the kernel to process a packet, 0.5 µs for the application to use it, and 0.08 µs per packet in total for a bypass framework. RSS divides the packets evenly among the cores.</div>
+  </div>
+
+  <p>Things to notice. At 100,000 packets a second everything works, and interrupt-per-packet spends more of the core on interrupts (20%) than on the packets themselves. At a million a second, interrupt-per-packet delivers <b>nothing</b>: the core is 100% busy in interrupt handlers and every packet is dropped, which is livelock. NAPI at the same rate delivers about 650,000 and drops the rest cheaply at the card, with the core fully used for real work. Spread the load over four cores with RSS and all of the million get through. At 10 million a second the kernel's path can't keep up even with eight cores, and bypass handles it on one, because it spends 0.08 µs on a packet where the kernel spends 1.5. Look at bypass at the lowest rate too: the core is still at 100%, spinning on an empty ring, because it never sleeps.</p>
+
+  <h2>The socket buffer</h2>
+  <p>After protocol processing, the data waits in the socket's receive buffer until the program asks for it. This is the buffer of <a href="12-flow-control.html">Chapter 12</a>. If the program is slow, TCP's advertised window closes and the sender waits, which costs time and loses nothing. UDP has no such signal, so a full buffer means dropped datagrams, counted only in the "receive buffer errors" shown earlier.</p>
+  <p>The last step is a <b>copy</b>. <code>recv()</code> copies bytes from kernel memory into the program's own buffer, and <code>send()</code> copies them the other way. A copy runs at several gigabytes a second, so nobody notices for small messages. For a server whose whole job is moving large amounts of data that it never looks at, the copies are most of the work.</p>
+
+  <h2>sendfile and zero-copy</h2>
+<pre class="code"><span class="c"># Serving a file the plain way: every byte crosses into the program and back out</span>
+<span class="k">while</span> chunk := f.<span class="f">read</span>(<span class="m">65536</span>):          <span class="c"># copy 1: page cache → the program's buffer</span>
+    conn.<span class="f">sendall</span>(chunk)                <span class="c"># copy 2: the program's buffer → socket buffer</span>
+
+<span class="c"># With sendfile: the kernel links the cached pages straight into the socket</span>
+os.<span class="f">sendfile</span>(conn.<span class="f">fileno</span>(), f.<span class="f">fileno</span>(), <span class="m">0</span>, size)       <span class="c"># no copies through the program, and one system call</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th><code>read</code> + <code>send</code></th><th><code>sendfile</code></th><th><code>MSG_ZEROCOPY</code></th></tr></thead>
+      <tbody>
+        <tr><td><b>Data comes from</b></td><td>A file, by way of the program</td><td>A file</td><td>The program's own memory</td></tr>
+        <tr><td><b>Copies made by the CPU</b></td><td>Two</td><td>None</td><td>None: the pages are pinned and the card reads from them</td></tr>
+        <tr><td><b>System calls per chunk</b></td><td>Two</td><td>One for the whole file</td><td>One, plus reading a completion notice later</td></tr>
+        <tr><td><b>Can the data be changed on the way</b></td><td>Yes</td><td>No. TLS needs the kernel to do the encryption</td><td>Yes, before sending</td></tr>
+        <tr><td><b>Worth it for</b></td><td>Small messages</td><td>Static files, video segments, log shipping</td><td>Large sends, tens of kilobytes or more</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Zero-copy is why a static file server or a message broker can fill a 10-gigabit link with a fraction of one core. Kafka's throughput rests on it: the broker sends stored message batches from the page cache to consumers with <code>sendfile</code> and never brings them into its own memory.</p>
+
+  <h2>DPDK and XDP</h2>
+  <p>The kernel's path is general. It handles every protocol, applies firewall rules, accounts for memory and wakes processes, and for that it spends a microsecond or two on each packet, which is roughly a million packets a second per core. A 100-gigabit card can deliver 148 million small packets a second. For software whose only job is moving packets, such as routers, load balancers, firewalls and mobile network cores, two approaches get past the limit.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Kernel stack</th><th>XDP</th><th>Kernel bypass (DPDK)</th></tr></thead>
+      <tbody>
+        <tr><td><b>Packets are handled</b></td><td>By the full protocol stack</td><td>By a small verified program run inside the driver, before the kernel builds its packet structure</td><td>By your program in user space, which owns the card</td></tr>
+        <tr><td><b>Learns of packets by</b></td><td>Interrupts and NAPI polling</td><td>The same</td><td>Polling continuously. No interrupts at all</td></tr>
+        <tr><td><b>Packets per core</b></td><td>About 1 million</td><td>10 million or more for simple decisions</td><td>10 to 20 million</td></tr>
+        <tr><td><b>The kernel's features</b> (TCP, firewall, tcpdump)</td><td>All</td><td>Kept, for packets the program passes up</td><td>Gone. The program brings its own</td></tr>
+        <tr><td><b>CPU when idle</b></td><td>Near zero</td><td>Near zero</td><td>100% of each dedicated core</td></tr>
+        <tr><td><b>Used for</b></td><td>Nearly all applications</td><td>Dropping attack traffic, layer-4 load balancing, container networking</td><td>Software routers and switches, telecom, trading systems</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">Cloudflare: how to drop ten million packets a second</div><p>A service under a volumetric attack has one job that matters above all others, which is to throw the attack packets away for less than it costs the attacker to send them. In 2018 Cloudflare's Marek Majkowski measured the options on a single core of an ordinary server, sending it floods of small packets and discarding them at different points on the receive path. Letting the packets reach an application that read and ignored them managed about 175,000 a second. Dropping them with a firewall rule in the usual place reached about 600,000, since each packet had still been wrapped in the kernel's packet structure and carried part-way up the stack first. Moving the rule earlier in the path reached about 1.7 million. An <b>XDP</b> program, run by the network driver on the raw packet in the receive ring before anything is allocated for it, discarded <b>10 million</b> packets a second on that one core. The same packet is fifty times more expensive to drop if you wait until it reaches the application. Unlike full bypass, XDP leaves the kernel in charge of everything the program lets through, so legitimate traffic still gets the normal TCP stack and all the normal tools still work. Cloudflare built its attack filtering on it, Facebook built its layer-4 load balancer on it, and it is the reason a modern server can ride out a flood that would have needed dedicated hardware ten years earlier.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Looking for packet loss only on the network.</b> Check the host's own counters: the card's ring, the per-CPU backlog, the socket buffers.</li>
+      <li><b>All of a card's interrupts on one core.</b> One core at 100% in softirq while the others idle. Check <code>/proc/interrupts</code> and the RSS settings.</li>
+      <li><b>Trusting packet sizes and checksums in a capture taken on the host.</b> Offloads mean it isn't what was on the wire.</li>
+      <li><b>A UDP service with a default receive buffer.</b> Bursts overflow it silently. Size the buffer and watch the error counter.</li>
+      <li><b>Reaching for kernel bypass first.</b> It costs dedicated cores, your own protocol stack and most of your debugging tools. Tune the kernel path, then consider XDP.</li>
+      <li><b>Copying bulk data through the application.</b> For files and stored messages, <code>sendfile</code> is simpler as well as faster.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What happens inside a Linux machine between a packet arriving at the network card and an application reading it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The network card receives the frame and writes it by DMA into a slot of its receive ring, a set of buffers the driver allocated in advance. If the card has multiple queues, it first hashes the packet's 5-tuple to choose a queue, which is receive-side scaling, so that flows are spread over CPU cores. The card raises an interrupt on that queue's core. The driver's handler does very little: it disables further receive interrupts for the queue and schedules NAPI polling. In softirq context the kernel then pulls packets from the ring in batches, builds an sk_buff for each, possibly merges segments with GRO, and passes them up through netfilter, IP and TCP or UDP. TCP validates sequence numbers, generates ACKs and places the data on the socket's receive queue; the process waiting in <code>recv</code> or <code>epoll_wait</code> is woken. When the application calls <code>recv</code>, the data is copied from kernel memory into its buffer. Drops can occur at the ring if the kernel is too slow to drain it, at the per-CPU backlog, or at the socket buffer for UDP.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A server shows packet loss under load although the network path is clean, and one CPU core is at 100% while the others are mostly idle. What is going on?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>All the receive processing is landing on one core. That core is saturated in softirq, you would see ksoftirqd busy on it, so it can't drain the card's receive ring fast enough, and the card drops incoming frames when the ring is full; those show up as <code>rx_missed</code> or <code>rx_dropped</code> in <code>ethtool -S</code>, not as anything on the network. I'd check <code>/proc/interrupts</code> to see how the card's queue interrupts are distributed across CPUs, <code>ethtool -l</code> for the number of queues configured, and <code>/proc/net/softnet_stat</code> for drops and budget exhaustion per CPU. Likely causes: the card is configured with a single queue; RSS is on but the interrupts are all pinned to one core, or irqbalance isn't spreading them; or the traffic is a single flow or a tunnel whose outer headers all hash alike, so that RSS has nothing to spread. Fixes: enable more queues and spread their interrupts across cores; for traffic that hashes to one queue, turn on software steering (RPS) or change the hash inputs; increase the ring size to absorb bursts; and make sure GRO is on to reduce the per-packet cost.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A received packet goes from the card's ring, through an interrupt and batched polling, up the protocol stack to a socket buffer, and is then copied to the application.</li>
+      <li>Each queue on that path can overflow. Host-side drop counters are separate from anything the network reports.</li>
+      <li>RSS hashes flows onto several rings and cores. Offloads let the stack handle large units, so host captures don't match the wire.</li>
+      <li>An interrupt per packet collapses under load. NAPI takes one interrupt and then polls in batches.</li>
+      <li><code>sendfile</code> and zero-copy sends move data without copying it through the application.</li>
+      <li>The kernel stack handles about a million packets a second per core. XDP and kernel bypass handle ten times that by doing far less per packet.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A server's network card reports a rising <code>rx_missed_errors</code> count. What does that mean?</p>
+      <div class="opts">
+        <button class="opt">Packets were corrupted on the cable</button>
+        <button class="opt">Frames arrived when the receive ring was full, because the kernel wasn't emptying it fast enough</button>
+        <button class="opt">The application's buffer was too small</button>
+        <button class="opt">TCP retransmitted segments</button>
+      </div>
+      <div class="explain">The loss is inside the host, before the kernel ever saw the packets.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does receive-side scaling do?</p>
+      <div class="opts">
+        <button class="opt">Enlarges the receive ring under load</button>
+        <button class="opt">Compresses incoming packets</button>
+        <button class="opt">Sends each packet to every core</button>
+        <button class="opt">Hashes each flow to one of several receive queues, each served by a different CPU core</button>
+      </div>
+      <div class="explain">Load spreads across cores, and every packet of a connection stays on one core, in order.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why does a design that takes one interrupt per packet fail at very high packet rates?</p>
+      <div class="opts">
+        <button class="opt">The CPU spends all its time entering and leaving interrupt handlers, and never runs the code that processes packets</button>
+        <button class="opt">Interrupts are limited to 1,000 a second</button>
+        <button class="opt">The network card overheats</button>
+        <button class="opt">Packets arrive out of order</button>
+      </div>
+      <div class="explain">Receive livelock. NAPI avoids it by turning interrupts off and polling while there is work.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A capture taken on a sending server shows TCP packets of 30,000 bytes on a 1,500-byte Ethernet link. What explains it?</p>
+      <div class="opts">
+        <button class="opt">The link uses jumbo frames</button>
+        <button class="opt">The capture tool is faulty</button>
+        <button class="opt">Segmentation offload: the kernel handed down one large unit, and the card split it into normal segments after the capture point</button>
+        <button class="opt">IP fragmentation</button>
+      </div>
+      <div class="explain">The capture sees what the kernel sent to the driver. The wire carried MTU-sized segments.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does a kernel-bypass framework such as DPDK give up in exchange for its speed?</p>
+      <div class="opts">
+        <button class="opt">Nothing</button>
+        <button class="opt">The kernel's protocol stack and tools, and it occupies dedicated cores at 100% even when idle</button>
+        <button class="opt">The ability to use more than one core</button>
+        <button class="opt">Support for packets larger than 64 bytes</button>
+      </div>
+      <div class="explain">The application owns the card and polls it constantly, so everything the kernel provided must be replaced.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = NET;
+  const IRQ = 2e-6, STACK = 1e-6, APP = 0.5e-6, FAST = 0.08e-6;
+  const cfg = { rate: 100000, mode: 'napi', cores: 1 };
+  const num = (x) => (x >= 1e6 ? Number((x / 1e6).toFixed(2)) + ' million' : Math.round(x).toLocaleString('en-GB'));
+  function one(r) {                                        // one core receiving r packets a second
+    if (cfg.mode === 'bypass') { const d = Math.min(r, 1 / FAST); return { d, irq: 0, tIrq: 0, tStack: 0, tApp: d * FAST, spin: 1 - d * FAST, irqs: 0 }; }
+    if (cfg.mode === 'irq') { const tIrq = Math.min(1, r * IRQ), d = Math.min(r, (1 - tIrq) / (STACK + APP)); return { d, tIrq, tStack: d * STACK, tApp: d * APP, spin: 0, irqs: Math.min(r, 1 / IRQ) }; }
+    const per = r <= 50000 ? 1 : 1 / 64, cost = STACK + APP + per * IRQ, d = Math.min(r, 1 / cost);     // NAPI: one interrupt per packet when quiet, one per batch of 64 when busy
+    return { d, tIrq: d * per * IRQ, tStack: d * STACK, tApp: d * APP, spin: 0, irqs: d * per };
+  }
+  function render() {
+    const per = cfg.rate / cfg.cores, c = one(per), delivered = c.d * cfg.cores, dropped = cfg.rate - delivered, busy = c.tIrq + c.tStack + c.tApp + c.spin;
+    const seg = (cls, v, label) => (v > 0.004 ? `<i class="${cls}" style="width:${(v * 100).toFixed(1)}%" title="${label}: ${(v * 100).toFixed(0)}%">${v > 0.08 ? (v * 100).toFixed(0) + '%' : ''}</i>` : '');
+    $('#krCpu').innerHTML = seg('kr-irq', c.tIrq, 'interrupts') + seg('kr-stk', c.tStack, 'protocol stack') + seg('kr-app', c.tApp, 'application') + seg('kr-spin', c.spin, 'polling an empty ring');
+    $('#krFlow').innerHTML = `<i class="kr-ok" style="width:${(delivered / cfg.rate * 100).toFixed(1)}%"></i><i class="kr-lost" style="width:${(dropped / cfg.rate * 100).toFixed(1)}%"></i>`;
+    const d = $('#krDesc'); let cls = '', text;
+    if (cfg.mode === 'irq' && delivered < 1) { cls = 'kr-bad'; text = `<b>Receive livelock.</b> ${num(per)} interrupts a second at 2 µs each is more than a whole core. The interrupt handlers run back to back, the code that would process the packets never gets a turn, and every packet is dropped. The machine is completely busy and does nothing.`; }
+    else if (dropped > 1) { cls = cfg.mode === 'irq' ? 'kr-bad' : 'kr-warn'; text = `<b>${cfg.cores > 1 ? 'The cores are' : 'The core is'} saturated.</b> ${num(delivered)} packets a second are delivered and ${num(dropped)} are dropped` + (cfg.mode === 'napi' ? ` at the card, when its ring is full. That is the cheapest place to lose them: the kernel spends nothing on a packet it never picks up, and the core's time all goes on packets that do arrive. More cores, by RSS, would carry more.` : cfg.mode === 'irq' ? `. ${(c.tIrq * 100).toFixed(0)}% of each core goes on interrupt overhead, leaving too little for the packets.` : '. Even at 0.08 µs a packet, one core has a limit.'); }
+    else if (cfg.mode === 'bypass') text = `<b>Everything is delivered, with the kernel left out.</b> The program reads packets straight from the card's ring in a loop, at 0.08 µs each. Only ${(c.tApp * 100).toFixed(c.tApp < 0.1 ? 1 : 0)}% of the core is spent on packets. The rest is the loop spinning on an empty ring, which shows as 100% CPU in every monitoring tool and can't be given to anything else.`;
+    else if (cfg.mode === 'irq') text = `<b>It works at this rate.</b> Each packet costs an interrupt, 2 µs, before the 1.5 µs of real work: ${(c.tIrq * 100).toFixed(0)}% of the core goes on the overhead of being told. The cost grows in step with the packet rate.`;
+    else text = `<b>It works, with little overhead.</b> ` + (per <= 50000 ? 'At this rate packets are sparse, so NAPI behaves like plain interrupts: one each. That keeps latency low when the machine is quiet.' : `Packets now arrive close enough together that each interrupt is followed by a poll that picks up a whole batch, up to 64 at a time: about ${num(c.irqs)} interrupts a second for ${num(per)} packets.`);
+    d.className = 'kr-desc ' + cls; d.innerHTML = text;
+    $('#krStats').innerHTML = `<div class="stat ${dropped > 1 ? (delivered < 1 ? 'bad' : 'warn') : 'good'}"><div class="k">Delivered</div><div class="v">${num(delivered)} / s</div></div>
+      <div class="stat ${dropped > 1 ? 'bad' : ''}"><div class="k">Dropped</div><div class="v">${num(dropped)} / s</div></div>
+      <div class="stat"><div class="k">Interrupts per core</div><div class="v">${num(c.irqs)} / s</div></div>
+      <div class="stat ${busy > 0.99 ? 'warn' : ''}"><div class="k">Each core is</div><div class="v">${Math.round(busy * 100)}% busy</div></div>`;
+  }
+  $('#krRate').addEventListener('segchange', (e) => { cfg.rate = +e.detail; render(); });
+  $('#krMode').addEventListener('segchange', (e) => { cfg.mode = e.detail; render(); });
+  $('#krCores').addEventListener('segchange', (e) => { cfg.cores = +e.detail; render(); });
+  render();
+})();
+</script>
 </body>
 </html>

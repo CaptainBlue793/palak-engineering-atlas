@@ -6,33 +6,271 @@
 <title>Clocks on One Machine</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ck-chart { width:100%; height:auto; display:block; margin-top:12px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; }
+  .ck-chart .ck-wall { fill:none; stroke:var(--red); stroke-width:2.4; }
+  .ck-chart .ck-mono { fill:none; stroke:var(--accent); stroke-width:2.4; stroke-dasharray:6 4; }
+  .ck-chart .ck-op { fill:var(--accent-soft); }
+  .ck-chart .ck-ev { stroke:var(--amber); stroke-width:1.5; stroke-dasharray:3 3; }
+  .ck-chart text { font-family:var(--mono); font-size:10.5px; fill:var(--muted); }
+  .ck-chart .ck-grid { stroke:var(--border); stroke-width:1; }
+  .ck-row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px; font-size:14px; color:var(--text-2); }
+  .ck-row input { flex:1; min-width:200px; accent-color:var(--accent); }
+  .ck-row output { font-family:var(--mono); font-weight:700; color:var(--accent); min-width:80px; }
+  .ck-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); }
+  .ck-res.ck-ok { background:var(--green-soft); } .ck-res.ck-bad { background:var(--red-soft); } .ck-res.ck-warn { background:var(--amber-soft); }
+</style>
 </head>
 <body data-chapter="0.5">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 5</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 30 min</span></div>
-    <h1>Clocks on One <span class="grad">Machine</span></h1>
-    <p class="lead">Wall-clock vs monotonic time, clock jumps, and why System.currentTimeMillis lies.</p>
+    <h1>Clocks on <span class="grad">One Machine</span></h1>
+    <p class="lead">Before two machines can disagree about the time, one machine has to disagree with itself. Every server has two clocks that answer different questions: "what time is it?" and "how long has it been?". They behave differently when NTP corrects the time, when a leap second arrives, or when someone fixes a wrong clock by hand, and code that asks the first clock the second question breaks in exactly those moments. This chapter sorts out which clock to use for what, in Java, before <a href="06-ntp-clock-skew.html">Chapter 6</a> adds the network.</p>
+    <ul class="objectives">
+      <li>Tell the wall clock from the monotonic clock, and name the Java call for each</li>
+      <li>Explain how NTP slews and steps the wall clock, and what each does to running code</li>
+      <li>Describe leap seconds and leap smearing, and the outages they caused</li>
+      <li>Measure durations, timeouts and leases with the monotonic clock</li>
+      <li>Inject a Clock so time-dependent code can be tested</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Timeouts and deadlines</b> from <a href="p2-rpc-timeouts.html">P2</a>: every one of them is a duration measured on some clock.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Wall clock vs monotonic clock</li>
-    <li>NTP adjustments and jumps</li>
-    <li>Leap seconds</li>
-    <li>Measuring durations correctly</li>
-  </ol>
+  <h2>Two clocks in every machine</h2>
+  <p>The <b>wall clock</b> (time of day) tells you what time it is in the world: 2026-10-01T14:03:22Z. It is what you put in a log line or show a user. Because it is supposed to match real time, the operating system <i>adjusts</i> it: NTP corrects it, an administrator can set it, a virtual machine restored from a snapshot can wake up hours in the past. So it can jump forwards or backwards.</p>
+  <p>The <b>monotonic clock</b> tells you how much time has passed since some arbitrary point, usually boot. Its absolute value means nothing, and you can't compare it between machines or even across a reboot. What it promises is the one thing the wall clock can't: <b>it never goes backwards</b>. That makes it the only correct clock for measuring durations.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Clock</th><th>Java</th><th>Linux</th><th>Can jump?</th><th>Compare across machines?</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td>Wall clock</td><td><code>Instant.now()</code>, <code>System.currentTimeMillis()</code></td><td><code>CLOCK_REALTIME</code></td><td>Yes, forwards and backwards</td><td>Roughly, within clock skew</td><td>Timestamps for humans, logs, "created at", expiry dates</td></tr>
+        <tr><td>Monotonic clock</td><td><code>System.nanoTime()</code></td><td><code>CLOCK_MONOTONIC</code></td><td>Never backwards (rate can be adjusted slightly)</td><td>No: arbitrary starting point</td><td>Durations, timeouts, deadlines, rate limits, lease timers</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>How the wall clock moves</h2>
+  <p>A quartz oscillator drifts: a typical server clock gains or loses tens of microseconds per second, a few seconds a day if nothing corrects it. NTP measures the offset against time servers and corrects it in one of two ways:</p>
+  <ul>
+    <li><b>Slewing</b> for small offsets: the kernel runs the clock slightly fast or slow, by at most 500 parts per million (0.5 ms per second), until the offset is gone. Time never jumps, but correcting a 400 ms error takes over 13 minutes.</li>
+    <li><b>Stepping</b> for large offsets: the clock is set to the right value at once. Classic <code>ntpd</code> steps when the offset exceeds 128 ms; <code>chrony</code> steps only when configured (<code>makestep</code>), typically at boot. A step can move the time backwards.</li>
+  </ul>
+  <p>Then there are the steps nobody planned: an operator running <code>date -s</code>, a VM resumed after a pause or migrated to a host with a different clock, a container restored from a checkpoint. Any code that subtracts two wall-clock readings is exposed to all of them.</p>
+
+  <h2>Leap seconds</h2>
+  <p>The Earth's rotation is slightly irregular, so UTC has occasionally inserted a <b>leap second</b>, 23:59:60, to stay within 0.9 s of solar time; 27 have been added since 1972. Unix time pretends every day has exactly 86,400 seconds, so on most systems the leap second shows up as one second being <b>repeated</b>: the wall clock goes backwards by a second at midnight. Code that assumed time only moves forward broke in famous ways (see the use case below). Large operators now <b>smear</b> the leap second instead: Google and AWS run their clocks very slightly slow over the 24 hours around it, so there is no repeated second, at the cost of being up to half a second off from strict UTC during the smear. In 2022 the General Conference on Weights and Measures voted to stop inserting leap seconds by 2035, but the code that mishandles them will be around for a long time.</p>
+
+  <h2>Measuring time correctly in Java</h2>
+<pre class="code"><span class="c">// WRONG: a duration from the wall clock. An NTP step makes it negative or huge.</span>
+<span class="k">long</span> start = <span class="t">System</span>.<span class="f">currentTimeMillis</span>();
+<span class="f">replicateBatch</span>();
+<span class="k">long</span> tookMs = <span class="t">System</span>.<span class="f">currentTimeMillis</span>() - start;
+
+<span class="c">// RIGHT: durations from the monotonic clock.</span>
+<span class="k">long</span> t0 = <span class="t">System</span>.<span class="f">nanoTime</span>();
+<span class="f">replicateBatch</span>();
+<span class="t">Duration</span> took = <span class="t">Duration</span>.<span class="f">ofNanos</span>(<span class="t">System</span>.<span class="f">nanoTime</span>() - t0);
+
+<span class="c">// Comparing two nanoTime readings: subtract, don't compare directly (the value may overflow).</span>
+<span class="k">boolean</span> expired = <span class="t">System</span>.<span class="f">nanoTime</span>() - leaseExpiresAtNanos &gt;= <span class="m">0</span>;   <span class="c">// not: now &gt;= expiresAt</span></pre>
+  <p>The last line follows the <code>nanoTime</code> Javadoc: the value can be negative and can wrap around after about 292 years of uptime, so the only meaningful operation is subtracting two readings taken in the same JVM. It's a habit worth having even if the wrap never happens.</p>
+  <p>For code you want to test, don't call either clock directly. Inject one. Java's <code>java.time.Clock</code> covers the wall clock; for the monotonic clock, a one-method interface is enough, and a fake implementation lets a test advance time by an hour instantly:</p>
+<pre class="code"><span class="k">public interface</span> <span class="t">Ticker</span> { <span class="k">long</span> <span class="f">nanos</span>(); }                      <span class="c">// monotonic time source</span>
+
+<span class="k">public final class</span> <span class="t">Lease</span> {
+	<span class="k">private final</span> <span class="t">Ticker</span> ticker;
+	<span class="k">private final long</span> expiresAt;
+
+	<span class="t">Lease</span>(<span class="t">Ticker</span> ticker, <span class="t">Duration</span> ttl) {
+		<span class="k">this</span>.ticker = ticker;
+		<span class="k">this</span>.expiresAt = ticker.<span class="f">nanos</span>() + ttl.<span class="f">toNanos</span>();
+	}
+	<span class="k">boolean</span> <span class="f">valid</span>() { <span class="k">return</span> ticker.<span class="f">nanos</span>() - expiresAt &lt; <span class="m">0</span>; }
+}
+
+<span class="t">Ticker</span> real = <span class="t">System</span>::<span class="f">nanoTime</span>;                            <span class="c">// production</span>
+<span class="k">var</span> fake = <span class="k">new</span> <span class="t">AtomicLong</span>(); <span class="t">Ticker</span> test = fake::<span class="f">get</span>;       <span class="c">// tests: fake.addAndGet(...)</span></pre>
+  <p>Watch what each clock does when NTP intervenes in the middle of an operation:</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One machine, two clocks: what NTP does to your measurements</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls"><div class="seg" id="ckEv"><button class="active" data-v="back">NTP steps back 2 s</button><button data-v="fwd">Clock fixed: +30 s</button><button data-v="leap">Leap second</button><button data-v="slew">NTP slews 400 ms</button></div></div>
+      <div class="ck-row"><label for="ckStart">Operation starts at (real time)</label><input type="range" id="ckStart" min="0" max="50" step="0.5" value="26"><output id="ckStartV"></output></div>
+      <svg class="ck-chart" id="ckChart" viewBox="0 0 640 220" role="img" aria-label="Wall clock and monotonic clock readings against real time"></svg>
+      <div class="stats" id="ckStats"></div>
+      <div class="ck-res" id="ckRes"></div>
+    </div>
+    <div class="panel-foot">The operation takes 8 real seconds and arms a 5-second timeout when it starts. The adjustment happens at real time 30 s (amber line). The solid red line is the wall clock's offset from real time; the dashed line is the monotonic clock, which never jumps. The shaded band is the operation.</div>
+  </div>
+
+  <figure class="seq" data-actors="Leader|Wall clock|NTP daemon|Follower">
+    <ol>
+      <li data-m="0>0">lease valid until wall time 12:00:10.000</li>
+      <li data-m="0>1">now? → 12:00:09.900 (lease still valid)</li>
+      <li data-m="2>1" data-k="bad">step back 2 s</li>
+      <li data-m="0>1">now? → 12:00:08.050 (real time 12:00:10.050)</li>
+      <li data-m="0>3" data-k="bad">serve read as leader<small>The lease really expired 50 ms ago, and a new leader may already be accepting writes. This leader serves stale data for 2 more seconds.</small></li>
+    </ol>
+    <figcaption><b>A wall-clock lease outlives itself.</b> Measured on the monotonic clock, the lease would have expired on time. <a href="32-leases-fencing.html">Chapter 32</a> shows why even that isn't enough across machines, and what fixes it.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🌐</div>
+    <div class="body"><div class="title">Use case: the leap second that took down DNS</div><p>At midnight UTC on 1 January 2017, a leap second was inserted. Cloudflare's DNS server, written in Go, measured how long upstream resolvers took to answer by subtracting two wall-clock times. During the repeated second, some of those durations came out <b>negative</b>. The value was passed to a random-number function that panics on a negative argument, and DNS resolution failed for a portion of Cloudflare's customers until the code was patched. Go itself changed afterwards: since Go 1.9, <code>time.Now()</code> carries a monotonic reading, and subtracting two such times uses it. Five years earlier, the 30 June 2012 leap second had triggered a Linux kernel timer bug that sent many Java servers to 100% CPU at once, among them Cassandra and Hadoop clusters at several large sites. Both incidents happened on every affected machine at the same instant: a textbook correlated failure (<a href="p4-failure-arithmetic.html">P4</a>).</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Measuring durations with <code>currentTimeMillis</code></b> or <code>Instant.now()</code>. Use <code>nanoTime</code>.</li>
+      <li><b>Timeouts, leases and rate limiters on the wall clock.</b> A step forward expires them all at once; a step back extends them.</li>
+      <li><b>Comparing <code>nanoTime</code> values with &lt; or &gt;</b> instead of subtracting, or comparing them between JVMs or machines.</li>
+      <li><b>Assuming time never repeats.</b> Leap seconds and backward steps make two events seconds apart look out of order.</li>
+      <li><b>Calling the clock directly in logic you want to test.</b> Inject a <code>Clock</code> or <code>Ticker</code>.</li>
+      <li><b>Turning off NTP to "avoid jumps".</b> The clock then drifts by seconds a day; fix the code, not the clock.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What's the difference between <code>System.currentTimeMillis()</code> and <code>System.nanoTime()</code>, and when do you use each?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div><code>currentTimeMillis</code> reads the wall clock: milliseconds since the Unix epoch, meaningful to people and roughly comparable across machines, but it can jump when NTP steps the clock, an operator sets it, or a leap second is inserted. <code>nanoTime</code> reads a monotonic clock: the absolute value is meaningless, it can't be compared across JVMs, but it never goes backwards. I use the wall clock for timestamps I record or show, and the monotonic clock for anything that measures elapsed time: latencies, timeouts, deadlines, leases, rate limiters.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A failure detector marks a peer dead if no heartbeat arrived for 3 seconds. One night every node in the cluster declares every other node dead at the same moment. What could cause that?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The detector is probably measuring "time since last heartbeat" with the wall clock, and the wall clock jumped forward on every node at once, for example NTP stepping all clocks after a time-server problem was fixed, or a VM host resuming guests. A forward step makes every "last heartbeat" look older than 3 seconds instantly, so every peer is suspected together, which can trigger mass failovers or elections. The fix is to measure intervals with the monotonic clock (<code>nanoTime</code>), and to treat simultaneous suspicion of many peers as a sign the detector, not the peers, has a problem.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>The wall clock answers "what time is it?" and can jump; the monotonic clock answers "how long has it been?" and never goes backwards.</li>
+      <li>NTP slews small errors (at most 0.5 ms per second) and steps large ones, possibly backwards.</li>
+      <li>Leap seconds repeat a second on most systems; smearing avoids the repeat; they caused real, fleet-wide outages.</li>
+      <li>Measure durations, timeouts, deadlines and leases with <code>System.nanoTime()</code>, by subtracting readings.</li>
+      <li>Use the wall clock only for timestamps people or other systems read.</li>
+      <li>Inject a clock so time-dependent logic can be tested without waiting.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which Java call should a heartbeat-based failure detector use to measure time since the last heartbeat?</p>
+      <div class="opts">
+        <button class="opt">System.currentTimeMillis()</button>
+        <button class="opt">Instant.now()</button>
+        <button class="opt">System.nanoTime()</button>
+        <button class="opt">LocalDateTime.now()</button>
+      </div>
+      <div class="explain">Elapsed time needs the monotonic clock. The other three read the wall clock, which can jump when NTP or an operator changes it.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">NTP finds the local clock 50 ms fast. What does a typical NTP daemon do?</p>
+      <div class="opts">
+        <button class="opt">Slews: runs the clock slightly slow until the offset is gone, without any jump</button>
+        <button class="opt">Steps the clock back 50 ms immediately</button>
+        <button class="opt">Reboots the machine</button>
+        <button class="opt">Nothing; 50 ms is within tolerance</button>
+      </div>
+      <div class="explain">Small offsets are slewed (at most 500 ppm). ntpd steps only above 128 ms by default; chrony steps only when configured to.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why did some programs compute negative durations during the leap second of 31 December 2016?</p>
+      <div class="opts">
+        <button class="opt">The monotonic clock ran backwards</button>
+        <button class="opt">NTP servers sent invalid packets</button>
+        <button class="opt">Java's Duration class can't represent leap seconds</button>
+        <button class="opt">They subtracted wall-clock readings, and the wall clock repeated a second</button>
+      </div>
+      <div class="explain">Unix time has no 23:59:60, so most systems repeat 23:59:59. A duration measured across that repeat on the wall clock can come out negative.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How should two System.nanoTime() readings, a and b, be compared to ask "is b later than a"?</p>
+      <div class="opts">
+        <button class="opt">b &gt; a</button>
+        <button class="opt">b - a &gt; 0</button>
+        <button class="opt">Convert both to Instant first</button>
+        <button class="opt">They can't be compared at all</button>
+      </div>
+      <div class="explain">nanoTime values can be negative and can wrap, so the Javadoc says to subtract and compare the difference with zero. Readings from different JVMs are not comparable at all.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A leader holds a lease measured on the wall clock. NTP steps its clock back 2 seconds just before the lease ends. What happens?</p>
+      <div class="opts">
+        <button class="opt">The lease ends 2 seconds early</button>
+        <button class="opt">Nothing; leases ignore clock changes</button>
+        <button class="opt">The leader believes its lease is valid for 2 seconds longer than it really is, and may act as leader after a new one exists</button>
+        <button class="opt">The lease is renewed automatically</button>
+      </div>
+      <div class="explain">Stepping back makes the wall clock read earlier, so the lease's end appears further away. Lease timers belong on the monotonic clock.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  const T = 60, EV = 30, OP = 8, TO = 5;
+  let ev = 'back';
+  // Wall-clock offset from real time (seconds) at real time t, for each event.
+  function offset(t) {
+    if (ev === 'back') return t < EV ? 0 : -2;
+    if (ev === 'fwd') return t < EV ? -30 : 0;            // the clock was 30 s slow; someone fixes it
+    if (ev === 'leap') return t < EV ? 0 : -1;            // 23:59:59 repeats once
+    return t < EV ? 0.4 : Math.max(0, 0.4 - (t - EV) * 0.0005);   // 400 ms fast, slewed at 500 ppm
+  }
+  const wall = (t) => t + offset(t);
+  // When does a timer armed at real time s for d seconds fire, if it watches clock c?
+  function fireAt(c, s, d) { const target = c(s) + d; for (let i = 0; i <= (T + 40) * 1000; i++) { const t = s + i / 1000; if (c(t) >= target) return t; } return Infinity; }
+  const f3 = (x) => (x >= 0 ? '' : '−') + Math.abs(x).toFixed(3) + ' s';
+
+  function draw() {
+    const s = +$('#ckStart').value; $('#ckStartV').textContent = s.toFixed(1) + ' s';
+    const W = 560, x0 = 50, yMid = 110;
+    const lo = ev === 'fwd' ? -32 : ev === 'slew' ? -0.2 : -3, hi = ev === 'fwd' ? 4 : ev === 'slew' ? 0.6 : 1.2;
+    const X = (t) => x0 + t / T * W, Y = (o) => 20 + (hi - o) / (hi - lo) * 170;
+    let svg = '';
+    [lo, 0, hi].forEach((o) => { svg += `<line class="ck-grid" x1="${x0}" y1="${Y(o)}" x2="${x0 + W}" y2="${Y(o)}"/><text x="4" y="${Y(o) + 4}">${o > 0 ? '+' : ''}${o.toFixed(ev === 'slew' ? 1 : 0)} s</text>`; });
+    svg += `<rect class="ck-op" x="${X(s)}" y="18" width="${X(s + OP) - X(s)}" height="174"/>`;
+    svg += `<line class="ck-ev" x1="${X(EV)}" y1="14" x2="${X(EV)}" y2="196"/><text x="${X(EV) + 4}" y="14" style="fill:var(--amber)">adjustment</text>`;
+    let wp = ''; for (let t = 0; t <= T; t += 0.25) { if (t === EV) wp += ` ${X(t)},${Y(offset(t - 0.001))}`; wp += ` ${X(t)},${Y(offset(t))}`; }
+    svg += `<polyline class="ck-mono" points="${X(0)},${Y(0)} ${X(T)},${Y(0)}"/><polyline class="ck-wall" points="${wp}"/>`;
+    svg += `<text x="${x0}" y="212">0 s</text><text x="${x0 + W - 70}" y="212">real time 60 s</text><text x="${x0 + 150}" y="212" style="fill:var(--red)">— wall clock offset</text><text x="${x0 + 290}" y="212" style="fill:var(--accent)">- - monotonic</text>`;
+    $('#ckChart').innerHTML = svg;
+
+    const wallDur = wall(s + OP) - wall(s);
+    const wallFire = fireAt(wall, s, TO), monoFire = s + TO;
+    const spans = s < EV && s + OP > EV;
+    $('#ckStats').innerHTML = `
+      <div class="stat good"><div class="k">Real duration</div><div class="v">${f3(OP)}</div></div>
+      <div class="stat acc"><div class="k">nanoTime says</div><div class="v">${f3(OP)}</div></div>
+      <div class="stat ${Math.abs(wallDur - OP) > 0.01 ? 'bad' : ''}"><div class="k">currentTimeMillis says</div><div class="v">${f3(wallDur)}</div></div>
+      <div class="stat ${Math.abs(wallFire - monoFire) > 0.01 ? 'bad' : ''}"><div class="k">5 s wall timer fires after</div><div class="v">${isFinite(wallFire) ? f3(wallFire - s) : 'never'}</div></div>`;
+    const res = $('#ckRes');
+    if (!spans && ev !== 'slew') { res.className = 'ck-res'; res.innerHTML = `This operation doesn't span the adjustment at 30 s, so both clocks agree. Move it so the shaded band crosses the amber line.`; return; }
+    if (ev === 'back') { res.className = 'ck-res ck-bad'; res.innerHTML = `The wall clock measured <b>${f3(wallDur)}</b> for an 8-second operation, and the 5 s timeout fired after <b>${f3(wallFire - s)}</b>. A lease checked this way stays "valid" for 2 seconds too long. ${wallDur < 0 ? 'Negative durations crash code that assumes they can\'t happen.' : ''}`; }
+    else if (ev === 'fwd') { res.className = 'ck-res ck-bad'; res.innerHTML = `The wall clock jumped 30 s forward mid-operation: it measured <b>${f3(wallDur)}</b>, and the 5 s timeout fired after only <b>${f3(wallFire - s)}</b>. Every wall-clock timer on the machine expires at once: heartbeats look 30 s old, every peer is "dead", every lease "expired".`; }
+    else if (ev === 'leap') { res.className = 'ck-res ck-warn'; res.innerHTML = `The repeated second made the wall clock measure <b>${f3(wallDur)}</b>, and the timeout fired a second late. Any operation shorter than one second that spans the repeat measures a <b>negative</b> duration, which is exactly what crashed Cloudflare's DNS (below).`; }
+    else { res.className = 'ck-res ck-ok'; res.innerHTML = `Slewing changes the wall clock's <i>rate</i> by at most 0.5 ms per second, so this 8 s operation is mismeasured by only ${Math.round(Math.abs(wallDur - OP) * 1000)} ms, and nothing jumps. The price: removing a 400 ms error takes about 13 minutes. Slews are gentle; steps are what break code.`; }
+  }
+  $('#ckEv').addEventListener('segchange', (e) => { ev = e.detail; draw(); });
+  $('#ckStart').addEventListener('input', draw);
+  draw();
+})();
+</script>
 </body>
 </html>

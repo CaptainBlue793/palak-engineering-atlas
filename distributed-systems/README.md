@@ -1,35 +1,38 @@
 # Distributed Systems — Interactive Course
 
-Object-oriented design for the DIST interview round, in Java: from "what is a class, really" to a
-thread-safe movie-booking system. **46 chapters across four levels, plus an 8-chapter
-Prerequisites level** (P1–P8: classes and references, encapsulation, inheritance and dispatch,
-interfaces and generics, composition, value objects and immutability, exceptions, reading UML).
+How programs behave when they run on many machines that fail independently and share no clock, in Java:
+from "a remote call is not a local call" to Raft, CRDTs, Kafka and Spanner. **48 chapters across five
+levels, plus an 8-chapter Prerequisites level** (P1–P8: Java concurrency, RPC and timeouts, serialization,
+failure arithmetic, clocks on one machine, hashing, reading a systems paper, and a recap of the System
+Design building blocks).
 
 Static site, **zero dependencies**, no build step required to read it. Open `index.html` in a
 browser; progress, quiz scores and flashcard state are saved in `localStorage` under `dist-*` keys.
 
-> **Status: complete.** All 54 pages are written. Each chapter has at least one interactive panel,
-> Java listings in the house style, a comparison table, a real-world use case, a common-mistakes box,
-> an interview drill and a five-question quiz. `grep -l dist:placeholder *.html` should print nothing.
+> **Status: in progress.** The course home, glossary, mock-interview room and flashcards are ready;
+> chapters are being written in order. `grep -l dist:placeholder *.html` lists the ones still to come.
 
 ## The levels
 
 | Level | Chapters | What it covers |
 |---|---|---|
-| **Prerequisites** | P1–P8 | The Java object model, encapsulation, inheritance and dynamic dispatch, interfaces and generics, composition, value objects, exceptions, UML |
-| **Principles** | 1–8 | The DIST round, requirements to classes, SOLID, coupling and cohesion, relationships, class contracts, dependency injection |
-| **Design Patterns** | 9–21 | Singleton, factories, builder, adapter/facade/bridge, decorator/proxy, composite/flyweight, strategy, observer/mediator, command/memento, state, chain/template, iterator/visitor, combining patterns |
-| **Advanced DIST** | 22–30 | Thread-safe classes, producer-consumer and pools, extensibility, resilience, persistence, domain modeling, testing, refactoring, the interview playbook |
-| **Case Studies** | 31–46 | LRU cache, rate limiter, logger, pub-sub, task scheduler, file system, KV store with transactions, text editor, connection pool, parking lot, elevator, ticket booking, Splitwise, chess, vending machine/ATM, ride-hailing |
+| **Prerequisites** | P1–P8 | Java concurrency, RPC and timeouts, Protobuf, nines and MTBF, wall vs monotonic clocks, hashing, reading papers, System Design building blocks |
+| **Beginner** | 1–10 | The eight fallacies, system models, gRPC in Java, retries and idempotency, failure detectors, NTP and skew, Lamport and vector clocks, replication, CAP and PACELC |
+| **Intermediate** | 11–24 | Consistency models, quorums, leader election, primary–backup, state machine replication, Paxos, Raft (election, log replication), consistent hashing, partitioning, 2PC, sagas, gossip, Merkle trees |
+| **Advanced** | 25–36 | CRDTs, Dynamo-style stores, Chandy–Lamport snapshots, exactly-once delivery, Kafka internals, watermarks, ZooKeeper and etcd, leases and fencing tokens, PBFT, blockchain consensus, TrueTime, distributed tracing |
+| **Expert** | 37–40 | Jepsen and deterministic simulation testing, TLA+, FLP and other impossibility results, the interview playbook |
+| **Case Studies** | 41–48 | Spanner, Dynamo and DynamoDB, Kafka, etcd and Kubernetes, Cassandra, GFS and HDFS, MapReduce to Spark, a Jepsen split-brain report |
 
-Case studies that also appear in the System Design course link to the high-level version:
-same problem, different zoom.
+This course goes deeper into protocols and code than the System Design course's Expert level, and
+links to it wherever the two meet: System Design decides *which* building block to use, this course
+shows how the block keeps its promises when machines fail.
 
 ## Study tools
 
-- **`glossary.html`**: DIST terms, each linked to the chapter that introduces it
-- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes (270 cards)
-- **`mock-interview.html`**: timed room with 18 DIST problems, a phase timer, an 8-point rubric and notes saved locally
+- **`glossary.html`**: distributed-systems terms, each linked to the chapter that introduces it
+- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes
+- **`mock-interview.html`**: timed room with 18 design problems (idempotent payments to a global SQL
+  database), a phase timer that reserves time for the failure walkthrough, an 8-point rubric and notes saved locally
 
 ## Tools
 
@@ -46,6 +49,7 @@ chapters start being edited by hand.
 
 ## House style
 
-Every listing is Java written the same way: interface first, constructor injection into `final`
-fields, validation at the boundary, small classes, and each design naming its pattern and the
-extension it survives.
+Every listing is Java (17+) written the same way: every remote call has a deadline; a call has three
+outcomes (success, failure, unknown); retries carry an idempotency key; durations use
+`System.nanoTime()`, never the wall clock; messages are immutable `record`s and each node changes
+state in one place, one message at a time.

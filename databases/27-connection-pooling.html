@@ -6,33 +6,289 @@
 <title>Connection Pooling</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .cp-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .cp-row > span { font-size:12.5px; color:var(--muted); min-width:160px; }
+  .cp-flow { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:14px; }
+  @media (max-width:640px) { .cp-flow { grid-template-columns:1fr; } }
+  .cp-box { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; min-width:0; }
+  .cp-box h6 { margin:0 0 4px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .cp-box b { display:block; font-size:19px; font-family:var(--mono); }
+  .cp-box small { display:block; font-size:12px; color:var(--muted); margin-top:3px; }
+  .cp-box.cp-bad { border-color:var(--red); background:var(--red-soft); }
+  .cp-box.cp-ok { border-color:var(--green); }
+  .cp-meter { margin-top:14px; font-size:12.5px; color:var(--muted); }
+  .cp-bar { height:22px; border-radius:8px; border:1.5px solid var(--border); background:var(--surface-2); overflow:hidden; margin-top:5px; position:relative; }
+  .cp-bar i { display:block; height:100%; background:var(--green); transition:width .25s; }
+  .cp-bar i.cp-low { background:var(--red); }
+  .cp-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .cp-msg.cp-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .cp-msg.cp-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
 </head>
 <body data-chapter="27">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 27</span><span class="pill">Advanced</span><span class="pill">⏱ 40 min</span></div>
     <h1>Connection <span class="grad">Pooling</span></h1>
-    <p class="lead">Why connections are expensive, PgBouncer modes, and sizing a pool.</p>
+    <p class="lead">A PostgreSQL server has sixteen processor cores, and an application wants to open a thousand connections to it. The instinct is to let it, since more connections ought to mean more work done at once. They mean less. Each connection is a whole operating-system process, and a server running a thousand of them on sixteen cores spends its time switching between them and contending for locks, and gets less done than it would with fifty. A connection pool keeps a small number of connections open and shares them among many callers. This chapter covers what a connection costs, the two places a pool can live, what a pooler can and can't share, and how to choose its size.</p>
+    <ul class="objectives">
+      <li><span>Explain what a database connection costs to open and to keep</span></li>
+      <li><span>Configure an application pool, and see why it stops being enough when there are many application servers</span></li>
+      <li><span>Compare PgBouncer's session and transaction modes, and say what breaks in the second</span></li>
+      <li><span>Size a pool from the number of cores, and explain why smaller is usually better</span></li>
+      <li><span>Recognise connection exhaustion, and where the queue ought to be</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Connecting from Python:</b> <a href="p6-python-psycopg.html">P6</a>.</li>
+        <li><b>Transactions, and sessions left idle in one:</b> <a href="22-two-phase-locking.html">Chapter 22</a>.</li>
+        <li><b>Processes and context switches:</b> the <a href="../os/index.html">OS course</a>.</li>
+        <li><b>The round trips of a handshake:</b> <a href="../networks/38-latency-budgets.html">Networks, Chapter 38</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The cost of a connection</li>
-    <li>Application pools</li>
-    <li>PgBouncer: session vs transaction</li>
-    <li>Pool sizing</li>
-  </ol>
+  <h2>The cost of a connection</h2>
+  <p>PostgreSQL serves each connection with its own operating-system process, started when the client connects and ended when it leaves. That design is simple and robust, and it makes a connection a heavy thing.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Cost</th><th>When</th><th>How much</th></tr></thead>
+      <tbody>
+        <tr><td><b>Network handshakes</b></td><td>Opening</td><td>TCP, TLS and authentication: four or more round trips before the first query</td></tr>
+        <tr><td><b>Starting a process</b></td><td>Opening</td><td>A fork, and loading the catalogue information the session will need: a few milliseconds of server processor time</td></tr>
+        <tr><td><b>Memory</b></td><td>For as long as it is open</td><td>Several megabytes for each connection, more once it has run complex queries</td></tr>
+        <tr><td><b>Contention</b></td><td>While it is active</td><td>Every active process competes for cores, for locks on shared structures, and for the processor's caches</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="k">SHOW</span> max_connections;       <span class="c">-- 100 by default</span>
+
+<span class="k">SELECT</span> state, <span class="f">count</span>(*) <span class="k">FROM</span> pg_stat_activity <span class="k">WHERE</span> backend_type = <span class="s">'client backend'</span> <span class="k">GROUP BY</span> state;
+<span class="c">--  active              |   9      doing work right now</span>
+<span class="c">--  idle                | 412      open, and doing nothing</span>
+<span class="c">--  idle in transaction |   3      open, doing nothing, and holding locks and a snapshot</span>
+
+FATAL:  <span class="k">sorry, too many clients already</span>           <span class="c">-- what the next client gets when the limit is reached</span></pre>
+  <p>An application that opens a connection for each request pays the opening cost every time, which for a query of one millisecond is most of the request. An application that keeps a connection for each of its threads holds hundreds open, nearly all of them idle. The numbers above are typical: 424 connections, of which 9 are working.</p>
+
+  <h2>Application pools</h2>
+  <p>A <b>connection pool</b> is a small set of connections, opened once and kept. Code that needs the database borrows one, uses it for a transaction, and returns it. If all are in use, the borrower waits briefly for one to come back.</p>
+<pre class="code"><span class="k">from</span> psycopg_pool <span class="k">import</span> ConnectionPool
+
+pool = <span class="f">ConnectionPool</span>(
+    <span class="s">"host=db dbname=shop user=app"</span>,
+    min_size=<span class="m">4</span>, max_size=<span class="m">10</span>,       <span class="c"># never more than 10 connections from this process</span>
+    timeout=<span class="m">2.0</span>,                    <span class="c"># wait at most 2 s for a free connection, then raise</span>
+    max_lifetime=<span class="m">1800</span>,              <span class="c"># replace each connection after 30 minutes</span>
+)
+
+<span class="k">def</span> <span class="f">get_order</span>(order_id):
+    <span class="k">with</span> pool.<span class="f">connection</span>() <span class="k">as</span> conn:             <span class="c"># borrowed here …</span>
+        <span class="k">return</span> conn.<span class="f">execute</span>(<span class="s">"SELECT * FROM orders WHERE order_id = %s"</span>, (order_id,)).<span class="f">fetchone</span>()
+                                                <span class="c"># … committed and returned here</span></pre>
+  <p>A pool inside the application is the first thing to have, and for one or two application servers it is all that is needed. It stops being enough as the number of servers grows, because each process has a pool of its own and none of them knows about the others. Fifty containers with a pool of twenty each can open a thousand connections, and when an autoscaler doubles the containers during a traffic spike, the database is asked for two thousand at the moment it is busiest.</p>
+
+  <h2>PgBouncer: session vs transaction</h2>
+  <p>The answer is a second pool, outside the application and shared by all of it. <b>PgBouncer</b> is a small proxy that speaks PostgreSQL's protocol. Thousands of clients connect to it, which is cheap, since for PgBouncer a client is a few kilobytes of memory. It holds a few dozen real connections to the database and hands them out. The question is for how long a client keeps one.</p>
+  <figure class="seq" data-actors="Client A|Client B|PgBouncer|PostgreSQL: one connection">
+    <ol>
+      <li data-m="0>2">BEGIN</li>
+      <li data-m="2>3">assign the server connection to A, and forward</li>
+      <li data-m="0>2">UPDATE … ; COMMIT</li>
+      <li data-m="2>3">forward. The transaction ends, and the connection is free again</li>
+      <li data-m="0>0" data-k="note">A is still connected to PgBouncer, idle, holding nothing</li>
+      <li data-m="1>2">SELECT …</li>
+      <li data-m="2>3">assign the same server connection to B, and forward</li>
+      <li data-m="3>1" data-k="reply">rows</li>
+    </ol>
+    <figcaption><b>Transaction pooling.</b> One server connection serves many clients, a transaction at a time. Clients that are connected and idle cost the database nothing.</figcaption>
+  </figure>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Pool mode</th><th>A client holds a server connection</th><th>Sharing</th><th>What stops working</th></tr></thead>
+      <tbody>
+        <tr><td><b>Session</b></td><td>From connecting until disconnecting</td><td>Little. It only saves the cost of opening</td><td>Nothing</td></tr>
+        <tr><td><b>Transaction</b></td><td>From BEGIN to COMMIT</td><td>Great. A thousand mostly idle clients fit on twenty connections</td><td>Anything that must outlive a transaction on the same connection</td></tr>
+        <tr><td><b>Statement</b></td><td>For one statement</td><td>Greatest</td><td>Transactions of more than one statement</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Transaction mode is the one worth having, and the last column is its price. Consecutive transactions from one client may run on different server connections, so state that belongs to a <i>session</i> can't be relied on:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Feature</th><th>Under transaction pooling</th><th>Do this instead</th></tr></thead>
+      <tbody>
+        <tr><td><code>SET</code> for the session: <code>search_path</code>, <code>statement_timeout</code></td><td>Applies to whichever connection ran it, and leaks to the next client</td><td><code>SET LOCAL</code> inside the transaction, or set it for the role</td></tr>
+        <tr><td>Prepared statements</td><td>Prepared on one connection and executed on another, which doesn't know them</td><td>A recent PgBouncer that tracks them, or disable them in the driver</td></tr>
+        <tr><td>Advisory locks held for the session</td><td>Taken on one connection and never released by you</td><td>Transaction-level advisory locks</td></tr>
+        <tr><td><code>LISTEN</code> / <code>NOTIFY</code>, temporary tables, cursors held open</td><td>Tied to a connection you no longer have</td><td>A separate, direct connection for the code that needs them</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Pool sizing</h2>
+  <p>How many real connections should the pool hold? Far fewer than most people guess. A query makes progress only while it has a core, or is waiting for a disk. Connections beyond what the cores and disks can serve add no throughput. They add processes for the scheduler to rotate through, more parties contending for every lock inside the database, and more memory. A widely used starting point, from PostgreSQL's own documentation and the HikariCP project, is:</p>
+<pre class="code">connections  ≈  (cores × <span class="m">2</span>)  +  number of independent disks
+
+<span class="c"># 16 cores on SSD storage  →  about 33 connections, for the whole database, from all clients together</span></pre>
+  <p>The factor of two allows for the time a query spends waiting for I/O, during which another can use its core. What the formula implies matters more than its exact value: the right number is tens, on a machine that will happily accept thousands.</p>
+
+  <h2>Try it: the same server, five pool sizes</h2>
+  <p>A database server with 8 cores. Each query needs 4 ms of processor time and 4 ms of waiting for I/O, so the machine can do 2,000 queries a second at its best. Choose how many connections the pool allows and how much load arrives.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Throughput against pool size</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="cp-row"><span>Connections to the database</span><div class="seg" id="cpPool"><button data-v="4">4</button><button class="active" data-v="16">16</button><button data-v="64">64</button><button data-v="256">256</button><button data-v="1000">1,000: no pooling</button></div></div>
+      <div class="cp-row"><span>Queries arriving each second</span><div class="seg" id="cpLoad"><button data-v="500">500: a quiet hour</button><button data-v="1500">1,500: busy</button><button class="active" data-v="3000">3,000: a spike</button></div></div>
+      <div class="cp-flow">
+        <div class="cp-box" id="cpIn"></div><div class="cp-box" id="cpQ"></div><div class="cp-box" id="cpDb"></div>
+      </div>
+      <div class="cp-meter"><span id="cpMeterT"></span><div class="cp-bar"><i id="cpFill"></i></div></div>
+      <div class="cp-msg" id="cpMsg"></div>
+      <div class="stats" id="cpStats"></div>
+    </div>
+    <div class="panel-foot">The model: up to 16 queries can make progress at once, two for each core. With more than that active, each takes proportionally longer, and every extra active connection adds 0.4% of overhead through context switches and contention. When demand is within what the server can do, only as many connections are active as the work needs, whatever the limit.</div>
+  </div>
+
+  <p>Things to notice. In a quiet hour the pool size hardly matters: 500 queries a second keep four connections busy, and a limit of a thousand is as good as a limit of sixteen. The sizes differ under load. At 3,000 a second, more than the machine can do, a pool of 16 keeps the database at its peak of 2,000 and makes the excess wait in the pool. A pool of 256 lets all 256 run at once, and the database manages 1,020, about half. With no pool and a thousand connections it manages 405, a fifth of what it could do, during the spike when it is needed most. Each query also spends longer inside the database, 2.5 seconds against 8 ms, so locks are held longer and everything behind them is slower as well. A pool of 4 errs the other way: the machine is never stressed and is limited to 500 a second with cores sitting idle. The pool should be sized to the machine, and when more work arrives than the machine can do, the excess should wait in front of the database.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🎱</div>
+    <div class="body"><div class="title">The demonstration that made smaller pools respectable</div><p>The advice in this chapter runs against intuition, and for a long time it was ignored. What changed many minds was a recorded demonstration by Oracle's Real-World Performance group, which the authors of HikariCP, a widely used Java connection pool, wrote up and put at the centre of their guidance on pool sizing. The test had a web application simulating 9,600 concurrent users against a single database server. With the connection pool set to 2,048, which the application's developers had considered generous, requests waited about 33 ms in the pool's queue and then took about 77 ms in the database, and the database's own wait statistics were dominated by contention for internal locks and for processor time. The presenters changed nothing except the pool size. At 1,024 connections the figures barely moved. At 96 connections, on the same hardware with the same load, the queue wait fell to about 1 ms and the time in the database to about 2 ms. Response time had improved by a factor of around fifty, and throughput had risen, by removing nineteen out of every twenty connections. The requests were still queuing. They now queued in the pool, where waiting uses no resources, and no longer inside the database, where 2,048 processes had been competing for a few dozen cores. The HikariCP authors' summary was that most people want a small pool, saturated with threads waiting for connections.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Raising <code>max_connections</code> to cure "too many clients".</b> It moves the queue into the database, where it does the most harm.</li>
+      <li><b>Adding up nothing.</b> Pool size × processes × servers is the real number, and it changes whenever the application scales.</li>
+      <li><b>Transaction pooling with session state.</b> A <code>SET</code> on one transaction's connection turns up in a stranger's.</li>
+      <li><b>Holding a pooled connection across slow work:</b> an HTTP call, a sleep, a user's think time. The pool empties while the database is idle.</li>
+      <li><b>No checkout timeout.</b> When the pool is exhausted, callers wait for ever, where a clear error would have shed load.</li>
+      <li><b>A connection opened for each invocation of a serverless function.</b> A burst of invocations is a burst of handshakes. Put a pooler in between.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why use a connection pool, and where does it go?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because database connections are expensive and should be reused. Opening one costs a TCP and TLS handshake, authentication and, in PostgreSQL, a new server process; keeping one costs several megabytes and adds to contention when it is active. Without a pool, an application either pays that setup on every request or holds one connection per thread, most of them idle. A pool keeps a bounded set of connections open; code borrows one for the duration of a transaction and returns it, and callers wait when all are busy. It gives three things: no per-request setup cost, a hard cap on the load placed on the database, and a queue in a cheap place. There are two layers. An in-process pool in each application instance handles reuse. But each instance has its own, so with many instances the total can exceed what the database should take; then you add an external pooler such as PgBouncer between the applications and the database, which multiplexes thousands of client connections onto a few tens of server connections, usually in transaction mode.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your service gets "too many clients already" from PostgreSQL during traffic peaks. What do you do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First, I wouldn't raise max_connections as the fix; that lets more backends compete for the same cores and usually lowers throughput. I'd find out where the connections come from: group pg_stat_activity by application, user and state. Typically most are idle: many application instances each holding a pool, with the total, instances times processes times pool size, growing as the autoscaler adds instances during the peak. So the first fix is arithmetic: decide the number of server connections the database should run, roughly twice its cores, and make the sum of all pools fit under it. With more than a handful of instances that can't be done with in-process pools alone, so I'd put PgBouncer in transaction mode in front, with a default pool size near that target, and let the applications connect to it freely. I'd check the application for things that break under transaction pooling, session-level SETs, session advisory locks, LISTEN, and for anything that holds a connection for a long time: transactions left open across external calls, which show as "idle in transaction", and long-running queries. I'd set a checkout timeout so that when the pool is exhausted, requests fail fast with a clear error and the service sheds load instead of hanging. Then I'd watch pool wait time and active server connections: if requests queue in the pool while the database has idle capacity, the pool is too small; if the database is saturated, the answer is query tuning or more capacity, not more connections.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A PostgreSQL connection is a process. It costs handshakes and a fork to open, memory to keep, and contention when active.</li>
+      <li>An application pool reuses connections and caps them, for one process. Many processes need a shared pooler in front of the database.</li>
+      <li>PgBouncer in transaction mode lends a server connection for one transaction at a time, so thousands of clients fit on tens of connections.</li>
+      <li>Transaction pooling breaks session state: session SETs, session advisory locks, LISTEN and temporary tables.</li>
+      <li>The right pool size is about twice the number of cores. More connections lower throughput under load.</li>
+      <li>When demand exceeds capacity, let requests queue in the pool with a timeout, where waiting is free.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is a PostgreSQL connection expensive compared with, say, an HTTP connection to a web server?</p>
+      <div class="opts">
+        <button class="opt">PostgreSQL encrypts connections twice</button>
+        <button class="opt">Each connection gets its own server process, with its own memory, started when the client connects</button>
+        <button class="opt">Each connection locks a table</button>
+        <button class="opt">Connections are written to the WAL</button>
+      </div>
+      <div class="explain">A process for each connection is robust and heavy. A few hundred of them are a real burden on the server.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Forty application containers each have a pool with a maximum of 25 connections. What is the most the database may be asked to hold?</p>
+      <div class="opts">
+        <button class="opt">25</button>
+        <button class="opt">40</button>
+        <button class="opt">65</button>
+        <button class="opt">1,000</button>
+      </div>
+      <div class="explain">Each pool is independent, so the limits multiply. An external pooler is the way to share one limit.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">In PgBouncer's transaction mode, when is a server connection given back for other clients to use?</p>
+      <div class="opts">
+        <button class="opt">When the client's transaction ends</button>
+        <button class="opt">When the client disconnects</button>
+        <button class="opt">After every statement, even inside a transaction</button>
+        <button class="opt">After a fixed time</button>
+      </div>
+      <div class="explain">Between transactions the client holds no server connection, which is where the sharing comes from.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">An application runs <code>SET search_path = tenant_42</code> once after connecting, through PgBouncer in transaction mode. What happens?</p>
+      <div class="opts">
+        <button class="opt">It works as it would on a direct connection</button>
+        <button class="opt">PgBouncer rejects the statement</button>
+        <button class="opt">It applies to whichever server connection ran it. Later transactions may run on others without it, and other clients may inherit it</button>
+        <button class="opt">It applies to all clients at once, deliberately</button>
+      </div>
+      <div class="explain">Session state belongs to a server connection, and the client no longer has one of its own. Use SET LOCAL inside each transaction.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A database with 16 cores is overloaded, with 800 active connections. What is the likely effect of capping it at 40 with a pooler?</p>
+      <div class="opts">
+        <button class="opt">Throughput falls to a twentieth</button>
+        <button class="opt">Throughput rises, and the remaining requests wait in the pool</button>
+        <button class="opt">Nothing changes</button>
+        <button class="opt">Most queries fail</button>
+      </div>
+      <div class="explain">Only a few dozen queries can make progress at once. The rest were costing context switches and contention.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const BEST = 16, SERVICE = 8, PEAK = BEST * 1000 / SERVICE, OVERHEAD = 0.004, MB = 10;
+  const n = (x) => Math.round(x).toLocaleString('en-GB');
+  // Throughput and time in the database when `active` connections are all busy.
+  const serviceMs = (active) => (active <= BEST ? SERVICE : SERVICE * (active / BEST) * (1 + OVERHEAD * (active - BEST)));
+  const capacity = (pool) => pool * 1000 / serviceMs(pool);
+  function render() {
+    const pool = +$('#cpPool').dataset.value, load = +$('#cpLoad').dataset.value;
+    const needed = load * SERVICE / 1000;                       // connections the work needs when nothing is contended
+    const fits = needed <= Math.min(pool, BEST);                // the demand is within what the machine and the pool allow
+    const active = fits ? needed : pool;
+    const tput = fits ? load : capacity(pool), inDb = serviceMs(active), queued = Math.max(0, load - tput);
+    const eff = tput / PEAK;
+    $('#cpIn').className = 'cp-box'; $('#cpIn').innerHTML = `<h6>Arriving</h6><b>${n(load)}/s</b><small>queries from the application</small>`;
+    $('#cpQ').className = 'cp-box ' + (queued ? '' : 'cp-ok'); $('#cpQ').innerHTML = `<h6>Waiting in the pool</h6><b>${queued ? '+' + n(queued) + '/s' : 'none'}</b><small>${queued ? 'the queue grows by this much every second' : 'a connection is free when one is asked for'}</small>`;
+    $('#cpDb').className = 'cp-box ' + (active > BEST * 4 ? 'cp-bad' : 'cp-ok'); $('#cpDb').innerHTML = `<h6>In the database</h6><b>${n(active)} active</b><small>of ${n(pool)} allowed. Each query takes ${inDb >= 100 ? n(inDb) : +inDb.toFixed(1)} ms in there</small>`;
+    $('#cpMeterT').textContent = `Throughput: ${n(tput)} queries a second, ${Math.round(eff * 100)}% of the 2,000 this machine can do at its best`;
+    const fill = $('#cpFill'); fill.style.width = Math.min(100, eff * 100) + '%'; fill.className = !fits && eff < 0.7 ? 'cp-low' : '';
+    const m = $('#cpMsg'); let text, cls = '';
+    if (fits) text = `<b>The work fits.</b> ${n(load)} queries a second need about ${n(needed)} connections busy at any moment, and that is what the database has. The limit of ${n(pool)} isn't reached` + (pool > 64 ? `, so the large limit does no harm yet. It is the absence of a limit that will matter in a spike.` : '.');
+    else if (pool < BEST) { cls = 'cp-warn'; text = `<b>The pool is the bottleneck.</b> ${n(pool)} connections can run ${n(tput)} queries a second and no more, while the server has cores idle. ${n(queued)} queries a second are joining the queue. The pool is protecting the database more than it needs.`; }
+    else if (pool <= BEST * 2) text = `<b>The database is at its peak, and the excess waits outside.</b> ${n(pool)} connections keep every core busy without contention, for ${n(tput)} queries a second. The other ${n(queued)} a second queue in the pool, where waiting costs nothing, and will be shed by the checkout timeout if the spike lasts.`;
+    else { cls = 'cp-bad'; text = `<b>Too many queries are running at once.</b> All ${n(pool)} connections are active on 8 cores. Each query now takes ${n(inDb)} ms in the database, against 8 ms uncontended, and throughput has fallen to ${n(tput)} a second, ${Math.round(eff * 100)}% of what the same machine does with 16 connections. The queue is still growing, by ${n(queued)} a second, and now it is inside the database.`; }
+    m.className = 'cp-msg ' + cls; m.innerHTML = text;
+    $('#cpStats').innerHTML = `<div class="stat ${eff >= 0.99 || fits ? 'good' : eff < 0.7 ? 'bad' : 'warn'}"><div class="k">Throughput</div><div class="v">${n(tput)}<small>/s</small></div></div>
+      <div class="stat ${inDb > 100 ? 'bad' : inDb > 12 ? 'warn' : 'good'}"><div class="k">Time in the database, per query</div><div class="v">${inDb >= 100 ? n(inDb) : +inDb.toFixed(1)} <small>ms</small></div></div>
+      <div class="stat ${queued ? 'warn' : 'good'}"><div class="k">Queue growing by</div><div class="v">${n(queued)}<small>/s</small></div></div>
+      <div class="stat ${pool * MB > 2000 ? 'bad' : ''}"><div class="k">Memory for connections</div><div class="v">${pool * MB >= 1000 ? (pool * MB / 1000) + ' GB' : pool * MB + ' MB'}</div></div>`;
+  }
+  ['#cpPool', '#cpLoad'].forEach((s) => $(s).addEventListener('segchange', render));
+  render();
+})();
+</script>
 </body>
 </html>

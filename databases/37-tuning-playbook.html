@@ -6,34 +6,348 @@
 <title>Performance Tuning Playbook</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .tn-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .tn-row > span { font-size:12.5px; color:var(--muted); min-width:60px; }
+  .tn-list { margin-top:12px; display:grid; gap:6px; }
+  .tn-q { border:1.5px solid var(--border); border-radius:11px; background:var(--surface); padding:7px 11px; min-width:0; }
+  .tn-q.tn-top { border-color:var(--accent); }
+  .tn-q.tn-done { border-color:var(--green); background:var(--green-soft); }
+  .tn-q.tn-none { opacity:.7; }
+  .tn-q code { display:block; font-size:11.5px; overflow-wrap:anywhere; background:none; padding:0; }
+  .tn-meta { display:flex; flex-wrap:wrap; gap:2px 14px; margin-top:4px; font-size:11.5px; color:var(--muted); }
+  .tn-meta b { color:var(--text); }
+  .tn-meta .tn-key { color:var(--text); font-weight:700; }
+  .tn-bar { margin-top:5px; height:6px; border-radius:3px; background:var(--surface-2); overflow:hidden; }
+  .tn-bar i { display:block; height:100%; background:var(--accent); border-radius:3px; }
+  .tn-sql { margin-top:12px; font-family:var(--mono); font-size:12px; padding:8px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); white-space:pre-wrap; overflow-wrap:anywhere; min-height:20px; }
+  .tn-msg { margin-top:10px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .tn-msg.tn-warn { background:var(--amber-soft, var(--surface-2)); border-left-color:var(--amber, var(--accent)); }
+</style>
 </head>
 <body data-chapter="37">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 37</span><span class="pill">Expert</span><span class="pill">⏱ 45 min</span></div>
     <h1>Performance Tuning <span class="grad">Playbook</span></h1>
-    <p class="lead">pg_stat_statements, finding the top queries, fixing them, and the config that matters.</p>
+    <p class="lead">"The database is slow" is where most tuning starts, and it says nothing about where to look. The usual first moves are to raise some memory settings found in a blog post, or to chase the one query somebody remembers taking thirty seconds. Both are guesses. A database under load is spending its time somewhere specific, and PostgreSQL will report exactly where, statement by statement. The method is the same every time: measure where the time goes, fix the largest item, measure again. In nearly every case the largest items are a handful of queries, and the fix is an index or a change to the application. Configuration comes after that, and matters less. This chapter sets out the method, the fixes in order of return, and the few settings that are worth changing from their defaults.</p>
+    <ul class="objectives">
+      <li><span>Use <code>pg_stat_statements</code> to find where a database spends its time</span></li>
+      <li><span>Rank queries by total time, and say why mean time and call count each mislead</span></li>
+      <li><span>Match a costly query to the kind of fix it needs: an index, a rewrite, or fewer calls</span></li>
+      <li><span>Set the memory parameters that matter, and explain the danger in <code>work_mem</code></span></li>
+      <li><span>Tune autovacuum for large and busy tables</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Reading a plan:</b> <a href="17-explain.html">Chapter 17</a>, and <b>estimates:</b> <a href="19-cost-based-optimizer.html">Chapter 19</a>.</li>
+        <li><b>Indexes:</b> <a href="09-indexes-first-look.html">Chapter 9</a> and <a href="15-other-indexes.html">Chapter 15</a>.</li>
+        <li><b>The buffer pool:</b> <a href="12-buffer-pool.html">Chapter 12</a>.</li>
+        <li><b>Dead rows and VACUUM:</b> <a href="23-mvcc.html">Chapter 23</a>, which also covers transaction ID wraparound.</li>
+        <li><b>Connection pooling:</b> <a href="27-connection-pooling.html">Chapter 27</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>pg_stat_statements</li>
-    <li>Top queries by total time</li>
-    <li>Index fixes</li>
-    <li>Memory settings</li>
-    <li>Autovacuum tuning</li>
-  </ol>
+  <h2>pg_stat_statements</h2>
+  <p><code>pg_stat_statements</code> is an extension shipped with PostgreSQL that keeps running totals for every kind of statement the server executes. It strips the constants out of each statement, so that <code>WHERE user_id = 17</code> and <code>WHERE user_id = 94</code> are counted as one entry, <code>WHERE user_id = $1</code>, and for each entry it records how often it ran and what it cost.</p>
+<pre class="code"><span class="c"># postgresql.conf, then restart once</span>
+shared_preload_libraries = <span class="s">'pg_stat_statements'</span>
+track_io_timing = on                            <span class="c"># also record time spent reading and writing blocks</span></pre>
+<pre class="code"><span class="k">CREATE EXTENSION</span> pg_stat_statements;
+
+<span class="k">SELECT</span> <span class="f">left</span>(query, <span class="m">60</span>)                                      <span class="k">AS</span> query,
+       calls,
+       <span class="f">round</span>(mean_exec_time::numeric, <span class="m">2</span>)                     <span class="k">AS</span> mean_ms,
+       <span class="f">round</span>((total_exec_time / <span class="m">1000</span>)::numeric)               <span class="k">AS</span> total_s,
+       <span class="f">round</span>((<span class="m">100</span> * total_exec_time / <span class="f">sum</span>(total_exec_time) <span class="k">OVER</span> ())::numeric, <span class="m">1</span>) <span class="k">AS</span> pct
+<span class="k">FROM</span>   pg_stat_statements
+<span class="k">ORDER BY</span> total_exec_time <span class="k">DESC</span>
+<span class="k">LIMIT</span>  <span class="m">10</span>;
+
+<span class="k">SELECT</span> <span class="f">pg_stat_statements_reset</span>();               <span class="c">-- start a fresh measurement, for instance after a deploy</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Column</th><th>What it tells you</th></tr></thead>
+      <tbody>
+        <tr><td><code>calls</code>, <code>mean_exec_time</code>, <code>total_exec_time</code></td><td>How often, how long each time, and the product of the two</td></tr>
+        <tr><td><code>stddev_exec_time</code>, <code>max_exec_time</code></td><td>Whether the query is steady or occasionally terrible</td></tr>
+        <tr><td><code>rows</code></td><td>Rows returned in total. Divided by calls, a query returning 50,000 rows a time stands out</td></tr>
+        <tr><td><code>shared_blks_hit</code>, <code>shared_blks_read</code></td><td>Pages found in the buffer pool against pages fetched from outside it (<a href="12-buffer-pool.html">Chapter 12</a>)</td></tr>
+        <tr><td><code>temp_blks_written</code></td><td>Sorts and hashes that spilled to disk: a sign that <code>work_mem</code> is too small for this query</td></tr>
+        <tr><td><code>wal_bytes</code></td><td>Which statements generate the write-ahead log, and so the replication traffic</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Top queries by total time</h2>
+  <p>The view can be sorted three ways, and they give three different lists. Sorting by <b>mean time</b> finds the slowest statements, which tend to be reports and exports that run a few times a day. Sorting by <b>calls</b> finds the most frequent, which tend to be primary-key lookups that are already as fast as they can be. Sorting by <b>total time</b>, the mean multiplied by the calls, finds the statements the server spends the most time executing. That is the load. A query that takes 2 ms and runs forty million times a day occupies the database for twenty-two hours of every twenty-four. A query that takes three minutes and runs twice occupies it for six minutes.</p>
+
+  <h2>Try it: nine queries, three ways to rank them</h2>
+  <p>One day of statistics from a busy application database. Choose an ordering and fix the queries from the top down. The load figure is the average number of queries executing at any instant.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">pg_stat_statements, 24 hours</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="tn-row"><span>Order by</span><div class="seg" id="tnSort"><button data-v="mean">mean time</button><button data-v="calls">calls</button><button class="active" data-v="total">total time</button></div></div>
+      <div class="controls">
+        <button class="btn sm primary" id="tnFix">Fix the top query in this order</button>
+        <button class="btn sm ghost" id="tnReset">↺ Reset</button>
+      </div>
+      <div class="tn-list" id="tnList"></div>
+      <div class="tn-sql" id="tnSql"></div>
+      <div class="tn-msg" id="tnMsg"></div>
+      <div class="stats" id="tnStats"></div>
+    </div>
+    <div class="panel-foot">Each bar is that query's share of the day's original load. "Fix" works on the highest query in the current order that hasn't been looked at yet, and the box below the list shows what was done. Fixed queries turn green and move down as their cost falls.</div>
+  </div>
+
+  <p>Things to notice. Ordered by total time, the first three fixes are two indexes and a partial index, and they remove 78% of the load. Ordered by mean time, the first three are an export, a report and a search: 9% between them, and the first two barely register. Ordered by calls, the top query is a primary-key lookup with nothing to fix, and three attempts remove 42%, all of it from the one query that also heads the total-time list. The session lookup at the top of that list takes under 2 ms, which is why it would never appear in a slow-query log and why nobody had looked at it. And two of the fixes aren't indexes at all: the view counter and the event inserts were already efficient statements, run far too often, and the saving came from the application calling them less.</p>
+
+  <h2>Index fixes</h2>
+  <p>Take each query at the top of the list and run it under <code>EXPLAIN (ANALYZE, BUFFERS)</code> with realistic parameters (<a href="17-explain.html">Chapter 17</a>). Most findings fall into a short list.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>What the plan shows</th><th>Likely cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><b>Seq Scan, with most rows removed by the filter</b></td><td>No index on the filtered column</td><td>Add one</td></tr>
+        <tr><td><b>Index Scan, then a Sort of many rows, then a Limit</b></td><td>The index finds the rows and doesn't supply the order</td><td>A composite index: the equality columns, then the sort column</td></tr>
+        <tr><td><b>Index Scan with a filter removing most rows</b></td><td>The index covers one condition and the others are checked row by row</td><td>Add the other columns to the index, or make it partial</td></tr>
+        <tr><td><b>Seq Scan although an index exists</b></td><td>A function or cast on the column, or a leading wildcard</td><td>An expression index, or a trigram index for patterns</td></tr>
+        <tr><td><b>Estimated rows far from actual rows</b></td><td>Stale or inadequate statistics (<a href="19-cost-based-optimizer.html">Chapter 19</a>)</td><td><code>ANALYZE</code>, a higher statistics target, or extended statistics</td></tr>
+        <tr><td><b>Index Scan with many heap fetches, for a few columns</b></td><td>Every row is fetched to read one more column</td><td>A covering index with <code>INCLUDE</code></td></tr>
+        <tr><td><b>A good plan, called a million times</b></td><td>The application, often an ORM loop (<a href="38-orms-n-plus-1.html">Chapter 38</a>)</td><td>Batch, cache, or fetch in one query</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Indexes have a cost as well, paid on every write. The same statistics show which ones aren't earning it.</p>
+<pre class="code"><span class="c">-- Indexes that have never been used since statistics were last reset</span>
+<span class="k">SELECT</span> relname <span class="k">AS</span> tbl, indexrelname <span class="k">AS</span> idx, <span class="f">pg_size_pretty</span>(<span class="f">pg_relation_size</span>(indexrelid)) <span class="k">AS</span> size
+<span class="k">FROM</span>   pg_stat_user_indexes
+<span class="k">WHERE</span>  idx_scan = <span class="m">0</span>
+<span class="k">ORDER BY</span> <span class="f">pg_relation_size</span>(indexrelid) <span class="k">DESC</span>;</pre>
+  <p>Before dropping one, check that it doesn't enforce a unique constraint and that the statistics cover a full business cycle, month-end included, and look at the replicas too, since an index may be used only by queries that run there.</p>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Measure</b> reset the statistics and let a representative period pass</li>
+      <li data-k="step"><b>Take the top query by total time</b> and run it under EXPLAIN (ANALYZE, BUFFERS)</li>
+      <li data-k="decision"><b>Is each call doing more work than it should?</b> a scan, a sort, a bad estimate</li>
+      <li data-k="step"><b>Yes: fix the query</b> an index, a rewrite, fresh statistics</li>
+      <li data-k="step"><b>No: fix the caller</b> batch, cache, or remove the loop</li>
+      <li data-k="store"><b>Measure again</b> confirm the total fell, and that nothing else rose</li>
+      <li data-k="end"><b>Stop when the top of the list is flat</b> and only then look at settings and hardware</li>
+    </ol>
+    <figcaption><b>The tuning loop.</b> One change at a time, each one measured.</figcaption>
+  </figure>
+
+  <h2>Memory settings</h2>
+  <p>PostgreSQL's defaults are chosen so that it starts on a very small machine, and a few of them are worth changing on any real server. The list is short. Most of the three hundred other settings are best left alone until a measurement points at one.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Setting</th><th>Default</th><th>A starting point, 64 GB server</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>shared_buffers</code></td><td>128 MB</td><td>16 GB, a quarter of memory</td><td>The buffer pool (<a href="12-buffer-pool.html">Chapter 12</a>). The operating system's cache holds the rest</td></tr>
+        <tr><td><code>effective_cache_size</code></td><td>4 GB</td><td>48 GB</td><td>Allocates nothing. Tells the planner how much data is likely to be cached, which makes index scans look cheaper</td></tr>
+        <tr><td><code>work_mem</code></td><td>4 MB</td><td>16 to 64 MB</td><td>Memory for <i>each</i> sort or hash, in <i>each</i> query</td></tr>
+        <tr><td><code>maintenance_work_mem</code></td><td>64 MB</td><td>1 to 2 GB</td><td>Memory for VACUUM and index builds</td></tr>
+        <tr><td><code>random_page_cost</code></td><td>4.0</td><td>1.1 on SSD</td><td>The planner's price for a random read. The default assumes a spinning disk and makes it avoid indexes</td></tr>
+        <tr><td><code>max_wal_size</code></td><td>1 GB</td><td>8 to 32 GB</td><td>Spaces checkpoints out under heavy writing (<a href="20-wal-recovery.html">Chapter 20</a>)</td></tr>
+        <tr><td><code>max_connections</code></td><td>100</td><td>100 to 300, behind a pooler</td><td>Kept low on purpose (<a href="27-connection-pooling.html">Chapter 27</a>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><code>work_mem</code> is the one that causes outages. It isn't a limit for a query or a connection. It is a limit for each sort and each hash operation, and a plan with four of them, run in parallel by three workers, may take a dozen times the setting. With <code>work_mem</code> at 256 MB and two hundred connections, a burst of complex queries can ask for more memory than the machine has, and the kernel's out-of-memory killer picks the database (the <a href="../os/index.html">OS course</a> has that incident as a case study). Keep the global value modest, and raise it for the session that runs a known large report: <code>SET work_mem = '512MB'</code>. The measurement that says it is too small is <code>temp_blks_written</code> in the statistics, or <code>Sort Method: external merge</code> in a plan.</p>
+
+  <h2>Autovacuum tuning</h2>
+  <p><a href="23-mvcc.html">Chapter 23</a> covered what VACUUM does and what holds it back. Autovacuum is the background process that runs it, and its defaults suit small tables. It vacuums a table when the dead rows exceed 20% of the table plus fifty rows. For a table of ten thousand rows that is prompt. For a table of five hundred million, a hundred million rows must die first, by which time the table and its indexes are badly bloated and the vacuum itself takes hours.</p>
+<pre class="code"><span class="c">-- Vacuum the big, busy tables at 1% dead rows, not 20%</span>
+<span class="k">ALTER TABLE</span> orders <span class="k">SET</span> (autovacuum_vacuum_scale_factor = <span class="m">0.01</span>, autovacuum_analyze_scale_factor = <span class="m">0.005</span>);
+
+<span class="c">-- Which tables are behind?</span>
+<span class="k">SELECT</span> relname, n_live_tup, n_dead_tup,
+       <span class="f">round</span>(<span class="m">100.0</span> * n_dead_tup / <span class="f">nullif</span>(n_live_tup + n_dead_tup, <span class="m">0</span>), <span class="m">1</span>) <span class="k">AS</span> dead_pct,
+       last_autovacuum
+<span class="k">FROM</span>   pg_stat_user_tables
+<span class="k">ORDER BY</span> n_dead_tup <span class="k">DESC</span> <span class="k">LIMIT</span> <span class="m">10</span>;</pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Symptom</th><th>Adjustment</th></tr></thead>
+      <tbody>
+        <tr><td><b>Large tables are vacuumed rarely, and bloat between runs</b></td><td>Lower <code>autovacuum_vacuum_scale_factor</code> for those tables, to 0.01 or 0.02</td></tr>
+        <tr><td><b>Autovacuum runs constantly and never catches up</b></td><td>It is throttled. Raise <code>autovacuum_vacuum_cost_limit</code> so that it does more work between pauses</td></tr>
+        <tr><td><b>Many large tables wait their turn</b></td><td>Raise <code>autovacuum_max_workers</code> from 3, and the cost limit with it, since the workers share one budget</td></tr>
+        <tr><td><b>Dead rows grow although autovacuum runs</b></td><td>No setting helps. Something is holding the horizon back: a long transaction, an abandoned replication slot (<a href="23-mvcc.html">Chapter 23</a>)</td></tr>
+        <tr><td><b>Plans go wrong some hours after a bulk load</b></td><td>Statistics are stale. Run <code>ANALYZE</code> after the load, and lower the analyse scale factor</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The instinct to turn autovacuum down when it seems to be using I/O is the wrong way round. The work doesn't go away. It accumulates as bloat, makes every query read more pages, and arrives later as a larger vacuum. A database with a vacuum problem needs autovacuum to run more often and faster.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🤖</div>
+    <div class="body"><div class="title">OpenAI: one PostgreSQL primary behind ChatGPT</div><p>OpenAI's engineers have described, in a conference talk in 2025 and an article early in 2026, how the database behind ChatGPT is run, and the surprise is the architecture: one PostgreSQL primary taking all the writes, with around fifty read replicas across regions serving reads, for a service with hundreds of millions of users. They didn't get there with exotic configuration. Their account is a list of the measures in this chapter, applied strictly. Reads go to replicas wherever a slightly stale answer is acceptable, so that the primary's capacity is kept for writes. Costly queries are hunted down one at a time: one incident they describe was traced to a single statement generated by an ORM that joined a dozen tables, and the fix was to break it up and move part of the work into the application. Connections go through a pooler, since a storm of new connections had taken the service down before. Timeouts are set on statements and on sessions left idle in a transaction, so that a forgotten transaction can't hold back VACUUM. Schema changes are restricted to those that don't rewrite a table and must get their lock within a few seconds or give up, as in <a href="34-schema-migrations.html">Chapter 34</a>. Rate limits at several layers stop a retry storm or a newly launched feature from flooding the database. And new write-heavy workloads aren't added to this database at all: those that can be sharded go to a separate, sharded store, which keeps the primary's write load from growing with every feature. Their own conclusion is that a single well-tuned PostgreSQL primary goes much further than is generally assumed for a workload dominated by reads, provided the write load is kept under control and every query on the primary is known and watched.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Tuning configuration before queries.</b> A missing index costs a factor of a thousand, and a setting rarely more than a few tens of per cent.</li>
+      <li><b>Ranking by mean time.</b> The slowest query is seldom the one loading the server.</li>
+      <li><b>A large global <code>work_mem</code>.</b> It multiplies by operations, workers and connections.</li>
+      <li><b>Adding indexes and never removing any.</b> Each one slows every write to its table.</li>
+      <li><b>Turning autovacuum down</b> to save I/O, and paying for it in bloat.</li>
+      <li><b>Changing several things at once,</b> so that nobody can say which one helped.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> The database server is at 90% CPU. How do you find out why?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I'd look at what the database is executing, in two views. For right now, pg_stat_activity: which queries are active, how long they've been running, and what they're waiting on, which tells me whether it is CPU work or lock waits. For the pattern over time, pg_stat_statements ordered by total execution time, which is calls multiplied by mean time; the top few entries are normally most of the load. I'd order by total, not by mean, since a 2 ms query run forty million times a day costs far more than a 30-second report run twice. Then for each of the top queries I'd run EXPLAIN (ANALYZE, BUFFERS) with realistic parameters and look for a sequential scan with most rows filtered out, a sort that an index could supply, or a row estimate far from the actual count. Typical fixes are an index built concurrently, a rewrite, or refreshed statistics. If the query is already efficient and is simply called too often, the fix is in the application: an N+1 loop, missing caching, or batching. After each change I'd reset or compare the statistics to confirm the load fell. I'd also check whether something changed recently: a deploy, a dropped index, or stale statistics after a bulk load.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why is setting <code>work_mem</code> to a large value dangerous, and how would you size it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because it isn't a per-connection or per-query limit. It is the amount each sort or hash node may use before spilling to disk, and a single query can have several such nodes; with parallel query, each worker gets its own allowance for each node, and hash operations may use a multiple of it. So worst-case memory is roughly work_mem times nodes per query times parallel workers times concurrent queries. At 256 MB with 200 connections, a burst of reporting queries can demand tens of gigabytes beyond shared_buffers, and on Linux the OOM killer will terminate a backend, which makes PostgreSQL restart and drop every connection. To size it, I'd start from the memory left after shared_buffers and the OS cache I want to keep, divide by the realistic number of concurrently active queries, which with a pooler is small and known, and by two or three nodes each; that usually lands between 16 and 64 MB. Then I'd measure: temp_blks_written in pg_stat_statements and log_temp_files show which queries spill. If it is a few known heavy reports, I'd raise work_mem for those sessions or roles only, with SET or ALTER ROLE, and leave the global value conservative. And I'd keep max_connections low behind a pooler, since that is the multiplier that matters most.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Tuning is a loop: measure, fix the largest item, measure again.</li>
+      <li><code>pg_stat_statements</code> ordered by total time shows where the database's time goes. Mean time and call count each point at the wrong queries.</li>
+      <li>Most of the load is a few queries, and most fixes are an index or a change to how often the application asks.</li>
+      <li>Change a handful of settings from their defaults: <code>shared_buffers</code>, <code>effective_cache_size</code>, <code>random_page_cost</code>, <code>max_wal_size</code>, and a careful <code>work_mem</code>.</li>
+      <li><code>work_mem</code> applies to each sort and hash in each query, so a large global value risks running out of memory.</li>
+      <li>On big tables, make autovacuum run sooner and faster. Turning it down stores up bloat.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Query A takes 1.5 ms and runs 30 million times a day. Query B takes 40 seconds and runs 10 times a day. Which loads the server more?</p>
+      <div class="opts">
+        <button class="opt">B: it is far slower</button>
+        <button class="opt">A: 45,000 seconds of execution against 400</button>
+        <button class="opt">They are about equal</button>
+        <button class="opt">It can't be told from these figures</button>
+      </div>
+      <div class="explain">Load is calls multiplied by mean time. A is over a hundred times B.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why does <code>pg_stat_statements</code> replace constants with <code>$1</code>, <code>$2</code>?</p>
+      <div class="opts">
+        <button class="opt">To hide sensitive data</button>
+        <button class="opt">To save disk space</button>
+        <button class="opt">Because it only tracks prepared statements</button>
+        <button class="opt">So that executions of the same statement with different values are counted together</button>
+      </div>
+      <div class="explain">Otherwise every user ID would be its own entry, and no totals would be visible.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A query does an index scan on <code>customer_id</code>, sorts 40,000 rows by <code>created_at</code>, and returns 20. What is the fix?</p>
+      <div class="opts">
+        <button class="opt">A composite index on <code>(customer_id, created_at)</code>, so that the index supplies the order and the scan stops at 20</button>
+        <button class="opt">A larger <code>work_mem</code>, so that the sort is faster</button>
+        <button class="opt">A separate index on <code>created_at</code></button>
+        <button class="opt">More <code>shared_buffers</code></button>
+      </div>
+      <div class="explain">More memory makes the sort quicker. The right index removes it.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q"><code>work_mem</code> is set to 200 MB on a server with 300 connections. What is the risk?</p>
+      <div class="opts">
+        <button class="opt">Queries become slower</button>
+        <button class="opt">The buffer pool shrinks</button>
+        <button class="opt">Each sort or hash in each query may use that much, so a busy moment can exhaust memory</button>
+        <button class="opt">None: it is a cap on the whole server</button>
+      </div>
+      <div class="explain">The limit is for each operation. Many concurrent complex queries multiply it.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A 400-million-row table is bloated, and autovacuum reaches it about once a week. What should change?</p>
+      <div class="opts">
+        <button class="opt">Disable autovacuum on it and run <code>VACUUM FULL</code> monthly</button>
+        <button class="opt">Lower its <code>autovacuum_vacuum_scale_factor</code>, so that it is vacuumed after 1% of rows are dead, not 20%</button>
+        <button class="opt">Raise <code>shared_buffers</code></button>
+        <button class="opt">Lower <code>autovacuum_vacuum_cost_limit</code></button>
+      </div>
+      <div class="explain">The default threshold scales with table size. Large tables need a smaller fraction.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const DAY = 86400;
+  // calls a day, mean ms; fix gives new calls and mean (null = nothing to fix).
+  const Q = [
+    { q: 'SELECT user_id, expires_at FROM sessions WHERE token = $1', calls: 41e6, mean: 1.9, name: 'Session lookup: add the missing index', fix: { calls: 41e6, mean: 0.04 },
+      sql: 'CREATE UNIQUE INDEX CONCURRENTLY sessions_token_key ON sessions (token);',
+      why: 'Every request ran a sequential scan of the sessions table, since <code>token</code> had no index. At under 2 ms nobody had noticed.' },
+    { q: 'SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20', calls: 3.2e6, mean: 14, name: 'Recent orders: put the sort column in the index', fix: { calls: 3.2e6, mean: 0.3 },
+      sql: 'CREATE INDEX CONCURRENTLY orders_customer_created_idx\n  ON orders (customer_id, created_at DESC);',
+      why: 'The index on <code>customer_id</code> alone found every order the customer had ever placed, and all of them were sorted to keep twenty. Now the scan reads twenty index entries, already in order, and stops.' },
+    { q: 'SELECT count(*) FROM notifications WHERE user_id = $1 AND NOT read', calls: 9.5e6, mean: 3.1, name: 'Unread count: a partial index', fix: { calls: 9.5e6, mean: 0.08 },
+      sql: 'CREATE INDEX CONCURRENTLY notifications_unread_idx\n  ON notifications (user_id) WHERE NOT read;',
+      why: 'Nearly all notifications have been read. An index holding only the unread ones is small, and the count reads a handful of entries.' },
+    { q: 'SELECT product_id, name FROM products WHERE name ILIKE $1', calls: 18000, mean: 850, name: 'Product search: a trigram index', fix: { calls: 18000, mean: 12 },
+      sql: 'CREATE EXTENSION IF NOT EXISTS pg_trgm;\nCREATE INDEX CONCURRENTLY products_name_trgm_idx\n  ON products USING gin (name gin_trgm_ops);',
+      why: 'A pattern beginning with a wildcard can\'t use a B-tree, so each search read the whole table. A trigram index (<a href="15-other-indexes.html">Chapter 15</a>) finds the candidates directly.' },
+    { q: 'UPDATE products SET view_count = view_count + 1 WHERE product_id = $1', calls: 6e6, mean: 2.4, name: 'View counter: fewer calls', fix: { calls: 4e5, mean: 2.4 },
+      sql: '-- application change: add up views in memory, write each product\'s total once a minute\nUPDATE products SET view_count = view_count + $2 WHERE product_id = $1;',
+      why: 'No index helps a statement that is already a primary-key update. The application now counts views in memory and writes totals once a minute: fifteen times fewer updates, and fifteen times fewer dead rows for autovacuum.' },
+    { q: 'INSERT INTO events (user_id, kind, payload, created_at) VALUES ($1, $2, $3, $4)', calls: 22e6, mean: 0.25, name: 'Event inserts: batches of 100', fix: { calls: 2.2e5, mean: 6 },
+      sql: '-- application change: one statement for 100 rows\nINSERT INTO events (user_id, kind, payload, created_at) VALUES (…), (…), (…) …;',
+      why: 'Each insert was quick already. A hundred rows in one statement saves ninety-nine round trips and ninety-nine commits.' },
+    { q: 'SELECT date_trunc(\'month\', created_at), sum(total) FROM orders GROUP BY 1', calls: 24, mean: 48000, name: 'Revenue report: move it to a replica', fix: { calls: 0, mean: 48000 },
+      sql: '-- point the reporting job at a read replica',
+      why: 'It runs hourly and takes 48 seconds. Moving it is sensible for other reasons, such as the snapshot it holds open, and it makes almost no difference to the primary\'s load.' },
+    { q: 'SELECT * FROM customers ORDER BY customer_id  -- nightly export', calls: 2, mean: 190000, name: 'Export: move it to a replica', fix: { calls: 0, mean: 190000 },
+      sql: '-- point the export job at a read replica',
+      why: 'The slowest statement in the list, by a long way, and the least important: three minutes, twice a day.' },
+    { q: 'SELECT * FROM users WHERE user_id = $1', calls: 55e6, mean: 0.03, name: 'User lookup: nothing to fix', fix: null,
+      sql: '-- no change',
+      why: 'A primary-key lookup in 0.03 ms is as fast as a query gets. It is the most frequent statement and under 1% of the load. The only saving left is to ask less often, with a cache in the application.' },
+  ];
+  const BASE = Q.reduce((a, x) => a + x.calls * x.mean / 1000, 0);
+  let st;
+  const cur = (i) => { const x = Q[i]; return st.s[i] === 'done' ? x.fix : x; };
+  const tot = (i) => cur(i).calls * cur(i).mean / 1000;
+  const fc = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + ' M' : n >= 1e3 ? Math.round(n / 1e3) + ' k' : String(n);
+  const fm = (ms) => ms >= 1000 ? Math.round(ms / 1000) + ' s' : ms >= 10 ? Math.round(ms) + ' ms' : ms >= 1 ? ms.toFixed(1) + ' ms' : ms.toFixed(2) + ' ms';
+  const ft = (s) => s >= 3600 ? (s / 3600).toFixed(1) + ' h' : s >= 60 ? Math.round(s / 60) + ' min' : Math.round(s) + ' s';
+  const pc = (x) => (x < 10 ? x.toFixed(1) : Math.round(x)) + '%';
+  const order = () => { const k = $('#tnSort').dataset.value; const v = (i) => k === 'mean' ? (cur(i).calls ? cur(i).mean : 0) : k === 'calls' ? cur(i).calls : tot(i); return Q.map((_, i) => i).sort((a, b) => v(b) - v(a) || a - b); };
+  function reset() { st = { s: Q.map(() => 'todo'), last: null }; draw(); }
+  function draw() {
+    const k = $('#tnSort').dataset.value, ord = order(), next = ord.find((i) => st.s[i] === 'todo'), now = Q.reduce((a, _, i) => a + tot(i), 0);
+    $('#tnList').innerHTML = ord.map((i) => { const c = cur(i), t = tot(i), moved = st.s[i] === 'done' && c.calls === 0;
+      return `<div class="tn-q ${st.s[i] === 'done' ? 'tn-done' : st.s[i] === 'none' ? 'tn-none' : ''} ${i === next ? 'tn-top' : ''}"><code>${Q[i].q}</code><div class="tn-meta">${moved ? '<span>now on a replica</span>' : `<span class="${k === 'calls' ? 'tn-key' : ''}">${fc(c.calls)} calls</span><span class="${k === 'mean' ? 'tn-key' : ''}">${fm(c.mean)} mean</span><span class="${k === 'total' ? 'tn-key' : ''}">${ft(t)} total</span>`}<b>${pc(t / BASE * 100)} of the original load</b>${st.s[i] === 'done' ? '<span>✓ fixed</span>' : st.s[i] === 'none' ? '<span>nothing to fix</span>' : ''}</div><div class="tn-bar"><i style="width:${(t / BASE * 100).toFixed(1)}%"></i></div></div>`; }).join('');
+    const m = $('#tnMsg');
+    if (st.last === null) { $('#tnSql').textContent = '-- the fix applied will appear here'; m.className = 'tn-msg'; m.innerHTML = `<b>Before any fix.</b> ${ft(BASE)} of query execution in a day of 24 hours: on average ${(BASE / DAY).toFixed(2)} queries running at every instant. The highlighted query is the one this ordering sends you to first.`; }
+    else { const x = Q[st.last], saved = (x.calls * x.mean / 1000 - tot(st.last)) / BASE * 100; $('#tnSql').textContent = x.sql; m.className = 'tn-msg ' + (saved < 1 ? 'tn-warn' : ''); m.innerHTML = `<b>${x.name}.</b> ${x.why} ${x.fix ? `Load removed: <b>${pc(saved)}</b> of the original.` : 'Load removed: <b>none</b>.'}`; }
+    $('#tnFix').disabled = next === undefined;
+    const removed = (BASE - now) / BASE * 100, tried = st.s.filter((x) => x !== 'todo').length;
+    $('#tnStats').innerHTML = `<div class="stat acc"><div class="k">Load now</div><div class="v">${(now / DAY).toFixed(2)} <small>queries running</small></div></div>
+      <div class="stat"><div class="k">Load at the start</div><div class="v">${(BASE / DAY).toFixed(2)}</div></div>
+      <div class="stat ${removed > 50 ? 'good' : removed > 10 ? 'warn' : tried ? 'bad' : ''}"><div class="k">Load removed</div><div class="v">${pc(removed)}</div></div>
+      <div class="stat"><div class="k">Queries looked at</div><div class="v">${tried} <small>of ${Q.length}</small></div></div>`;
+  }
+  $('#tnFix').onclick = () => { const i = order().find((x) => st.s[x] === 'todo'); if (i === undefined) return; st.s[i] = Q[i].fix ? 'done' : 'none'; st.last = i; draw(); };
+  $('#tnReset').onclick = reset;
+  $('#tnSort').addEventListener('segchange', draw);
+  reset();
+})();
+</script>
 </body>
 </html>

@@ -6,33 +6,312 @@
 <title>RPC &amp; Timeouts</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .to-chart { width:100%; height:auto; display:block; margin-top:12px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; }
+  .to-chart .to-bar { fill:var(--accent); opacity:.75; }
+  .to-chart .to-bar.to-late { fill:var(--red); opacity:.75; }
+  .to-chart .to-cut { stroke:var(--red); stroke-width:2; stroke-dasharray:5 4; }
+  .to-chart .to-pct { stroke:var(--muted); stroke-width:1; stroke-dasharray:2 3; }
+  .to-chart text { font-family:var(--mono); font-size:10.5px; fill:var(--muted); }
+  .to-chart text.to-cutl { fill:var(--red); font-weight:700; }
+  .to-row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px; font-size:14px; color:var(--text-2); }
+  .to-row input[type=range] { flex:1; min-width:200px; accent-color:var(--accent); }
+  .to-row output { font-family:var(--mono); font-weight:700; color:var(--accent); min-width:70px; }
+  .to-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); }
+  .to-res.to-ok { background:var(--green-soft); } .to-res.to-bad { background:var(--red-soft); } .to-res.to-warn { background:var(--amber-soft); }
+</style>
 </head>
 <body data-chapter="0.2">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 2</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 40 min</span></div>
     <h1>RPC &amp; <span class="grad">Timeouts</span></h1>
-    <p class="lead">A remote call is not a local call: latency, partial failure, and why every call needs a timeout.</p>
+    <p class="lead">A remote procedure call looks like a method call: <code>inventory.reserve(sku, 2)</code>. It isn't one. It crosses a network that can lose, delay or duplicate the request, to a process that can be slow, overloaded or dead, and it can come back with no answer at all. This chapter covers the mental model the rest of the course depends on: where an RPC can fail, why <b>every call needs a timeout</b>, how to choose that timeout from real latency data, why deadlines beat per-hop timeouts, and the uncomfortable third outcome every distributed program has to handle: <b>"I don't know if it happened."</b></p>
+    <ul class="objectives">
+      <li>List the places an RPC can fail and what the caller sees in each case</li>
+      <li>Explain why a timeout leaves the outcome unknown, not failed</li>
+      <li>Choose a timeout from a latency distribution and a target false-timeout rate</li>
+      <li>Propagate a deadline across several hops instead of resetting timeouts</li>
+      <li>Model success, failure and unknown as three types in Java</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Futures and executors</b> from <a href="p1-java-concurrency.html">P1</a>: every remote call in this course returns a <code>CompletableFuture</code>.</li>
+        <li><b>Latency numbers and percentiles</b> (p50, p99) at the level of the System Design course: <a href="../system-design/01-foundations.html">Foundations</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>What an RPC is</li>
-    <li>Latency and partial failure</li>
-    <li>Timeouts and deadlines</li>
-    <li>The three outcomes: success, failure, unknown</li>
-  </ol>
+  <h2>A remote call is not a local call</h2>
+  <p>RPC frameworks work hard to make a remote call look local: you call a method on a generated stub, it serializes the arguments, sends them, waits, and deserializes the reply. That convenience hides every difference that matters. The table lists them; the rest of this course is largely about the last three rows.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Property</th><th>Local method call</th><th>Remote procedure call</th></tr></thead>
+      <tbody>
+        <tr><td>Latency</td><td>Nanoseconds, very predictable</td><td>0.1–1 ms in one data centre, 50–200 ms across continents, with a long tail</td></tr>
+        <tr><td>Arguments</td><td>Passed by reference, nothing copied</td><td>Serialized to bytes and copied; no shared objects (<a href="p3-serialization.html">P3</a>)</td></tr>
+        <tr><td>Versions</td><td>Caller and callee compiled together</td><td>Deployed separately; old and new versions talk to each other</td></tr>
+        <tr><td>Failure</td><td>The whole process fails together</td><td><b>Partial failure:</b> the callee can die while the caller lives</td></tr>
+        <tr><td>Outcome</td><td>Returns or throws, always</td><td>Returns, throws, or <b>never answers</b></td></tr>
+        <tr><td>Duplicates</td><td>Each call runs exactly once</td><td>A retried request may run twice (<a href="04-retries-idempotency.html">Chapter 4</a>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Where an RPC can fail</h2>
+  <p>Follow one call, a client asking a payment service to charge a card, and list everything that can go wrong. The request can be lost on the way. The server can crash before doing the work, or <i>after</i> doing it but before replying. The reply can be lost on the way back. Or nothing is lost at all, and the server is just slow: a garbage-collection pause, a queue behind a burst of traffic, a slow disk.</p>
+  <figure class="seq" data-actors="Client|Network|Payment service|Card network">
+    <ol>
+      <li data-m="0>1">charge(order 81, £40)</li>
+      <li data-m="1>2">request delivered</li>
+      <li data-m="2>3">authorise £40</li>
+      <li data-m="3>2" data-k="reply">approved: card charged</li>
+      <li data-m="2>2">write "paid" to database</li>
+      <li data-m="2>1" data-k="fail">reply lost (or service crashes now)</li>
+      <li data-m="0>0" data-k="fail">300 ms pass… TimeoutException<small>The client cannot tell this apart from "request lost", "service crashed before charging" or "service is just slow".</small></li>
+    </ol>
+    <figcaption><b>The worst case is a success the client never hears about.</b> The card was charged and the order marked paid, yet the client's code is sitting in a <code>catch (TimeoutException e)</code> block.</figcaption>
+  </figure>
+  <p>From the client's side, all of these failures look the same: <b>no reply arrived in time.</b> That is the central fact of distributed computing, and it's why the next chapters spend so long on retries, idempotency and failure detection. A call has three outcomes, not two:</p>
+  <ul>
+    <li><b>Success:</b> a reply arrived saying the work was done.</li>
+    <li><b>Known failure:</b> a reply arrived saying it was <i>not</i> done: validation error, "not leader", "overloaded, try later". The server tells you it rejected the request <i>before</i> acting.</li>
+    <li><b>Unknown:</b> no reply. The work may have happened completely, partly, or not at all, and it may still be happening.</li>
+  </ul>
+  <p>Code that treats a timeout as a failure ("the charge didn't go through, show an error") is wrong in the case that costs the most money. Make the third outcome a type, so the compiler forces every caller to deal with it:</p>
+<pre class="code"><span class="k">public sealed interface</span> <span class="t">Outcome</span>&lt;<span class="t">T</span>&gt; {
+	<span class="k">record</span> <span class="t">Ok</span>&lt;<span class="t">T</span>&gt;(<span class="t">T</span> value) <span class="k">implements</span> <span class="t">Outcome</span>&lt;<span class="t">T</span>&gt; {}
+	<span class="k">record</span> <span class="t">Rejected</span>&lt;<span class="t">T</span>&gt;(<span class="t">String</span> reason) <span class="k">implements</span> <span class="t">Outcome</span>&lt;<span class="t">T</span>&gt; {}   <span class="c">// definitely not applied</span>
+	<span class="k">record</span> <span class="t">Unknown</span>&lt;<span class="t">T</span>&gt;(<span class="t">Throwable</span> cause) <span class="k">implements</span> <span class="t">Outcome</span>&lt;<span class="t">T</span>&gt; {}  <span class="c">// may or may not have applied</span>
+}
+
+<span class="t">Outcome</span>&lt;<span class="t">Receipt</span>&gt; <span class="f">charge</span>(<span class="t">ChargeRequest</span> req) {
+	<span class="k">try</span> {
+		<span class="t">HttpResponse</span>&lt;<span class="t">String</span>&gt; res = http.<span class="f">send</span>(<span class="f">post</span>(req).<span class="f">timeout</span>(<span class="t">Duration</span>.<span class="f">ofMillis</span>(<span class="m">300</span>)).<span class="f">build</span>(), <span class="f">ofString</span>());
+		<span class="k">return switch</span> (res.<span class="f">statusCode</span>()) {
+			<span class="k">case</span> <span class="m">200</span> -&gt; <span class="k">new</span> <span class="t">Outcome.Ok</span>&lt;&gt;(<span class="t">Receipt</span>.<span class="f">parse</span>(res.<span class="f">body</span>()));
+			<span class="k">case</span> <span class="m">400</span>, <span class="m">402</span>, <span class="m">409</span> -&gt; <span class="k">new</span> <span class="t">Outcome.Rejected</span>&lt;&gt;(res.<span class="f">body</span>());   <span class="c">// server says: not done</span>
+			<span class="k">default</span> -&gt; <span class="k">new</span> <span class="t">Outcome.Unknown</span>&lt;&gt;(<span class="k">new</span> <span class="t">IOException</span>(<span class="s">"HTTP "</span> + res.<span class="f">statusCode</span>()));
+		};
+	} <span class="k">catch</span> (<span class="t">HttpTimeoutException</span> e) {
+		<span class="k">return new</span> <span class="t">Outcome.Unknown</span>&lt;&gt;(e);                                 <span class="c">// NOT a failure</span>
+	} <span class="k">catch</span> (<span class="t">IOException</span> | <span class="t">InterruptedException</span> e) {
+		<span class="k">return new</span> <span class="t">Outcome.Unknown</span>&lt;&gt;(e);                                 <span class="c">// connection reset mid-call: also unknown</span>
+	}
+}</pre>
+  <p>Notice that a 500 or 503 is filed as <code>Unknown</code> too. Unless the service documents that an error status means "nothing was done", you can't assume it. A load balancer can return 502 after the backend has already committed.</p>
+
+  <h2>Every call needs a timeout</h2>
+  <p>Without a timeout, a call to a hung server waits forever, and so does the thread making it, and the request that thread was serving. A few hundred of those and your service is down because a dependency is slow. Java's defaults won't save you: <code>java.net.http.HttpClient</code> has no request timeout unless you set one, and the old <code>URLConnection</code> defaults its connect and read timeouts to 0, meaning infinite.</p>
+  <p>Choosing the number is a trade-off. Too long, and callers pile up behind a sick dependency. Too short, and you time out calls that were about to succeed: each one is wasted work, and if you retry it, extra load on a service that was merely busy. Drag the timeout and see both effects:</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Timeout lab: 20,000 calls to an inventory service</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls"><div class="seg" id="toMode"><button class="active" data-v="healthy">Healthy</button><button data-v="gc">GC pauses</button><button data-v="busy">Overloaded</button></div></div>
+      <div class="to-row"><label for="toCut">Client timeout</label><input type="range" id="toCut" min="20" max="1500" step="10" value="300"><output id="toCutV"></output></div>
+      <svg class="to-chart" id="toChart" viewBox="0 0 640 170" role="img" aria-label="Latency histogram with the timeout marked"></svg>
+      <div class="stats" id="toStats"></div>
+      <div class="to-res" id="toRes"></div>
+    </div>
+    <div class="panel-foot">Latencies are simulated: a log-normal body (median about 40 ms when healthy) plus a few lost packets. <b>GC pauses</b> adds a 750 ms stall to 0.5% of calls; <b>Overloaded</b> slows every call. A call that times out was usually still processed by the server, so its outcome is unknown to the client.</div>
+  </div>
+
+  <p>The useful rule, from Amazon's Builders' Library: <b>decide what rate of false timeouts you can accept, then read that percentile off the dependency's latency distribution.</b> If 0.1% false timeouts is acceptable, set the timeout near the dependency's p99.9 latency, plus a little margin. That ties the number to measurements instead of a guess, and it makes clear that the timeout must be revisited when the dependency's latency changes. In the GC-pause setting you can see the trap: the p99 is fast, but 0.5% of calls stall, so a timeout set from the p99 times out on every stall.</p>
+
+  <h2>Deadlines, not per-hop timeouts</h2>
+  <p>A user request rarely makes one call. The API gateway calls the order service, which calls inventory, which calls the database. If each hop has its own fresh 1-second timeout, the user can wait far longer than a second, and worse, the inner services keep working on a request whose caller gave up long ago. A <b>deadline</b> fixes both: the edge sets an absolute time by which the whole request must finish, every hop passes it on, and each hop gives its own calls only the time that is left.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Gateway</b>Deadline = now + 800 ms; 790 ms left after parsing</li>
+      <li data-k="step"><b>Order service</b>Receives 790 ms; spends 30 ms; calls inventory with 760 ms left</li>
+      <li data-k="step"><b>Inventory</b>Receives 760 ms; queries the database with 740 ms left</li>
+      <li data-k="decision"><b>Time left &lt; work needed?</b>Fail fast with DEADLINE_EXCEEDED instead of starting work nobody will read</li>
+      <li data-k="end"><b>Reply</b>Arrives before 800 ms, or the whole chain gave up together</li>
+    </ol>
+    <figcaption><b>One budget for the whole request.</b> gRPC sends the remaining time in the <code>grpc-timeout</code> header, and Java's gRPC stubs apply it with <code>withDeadlineAfter</code>; <a href="03-grpc-java.html">Chapter 3</a> shows the full code.</figcaption>
+  </figure>
+<pre class="code"><span class="c">/** An absolute deadline on the monotonic clock. Pass it down; never reset it. */</span>
+<span class="k">public record</span> <span class="t">Deadline</span>(<span class="k">long</span> atNanos) {
+	<span class="k">public static</span> <span class="t">Deadline</span> <span class="f">in</span>(<span class="t">Duration</span> d) { <span class="k">return new</span> <span class="t">Deadline</span>(<span class="t">System</span>.<span class="f">nanoTime</span>() + d.<span class="f">toNanos</span>()); }
+	<span class="k">public</span> <span class="t">Duration</span> <span class="f">remaining</span>() { <span class="k">return</span> <span class="t">Duration</span>.<span class="f">ofNanos</span>(<span class="t">Math</span>.<span class="f">max</span>(<span class="m">0</span>, atNanos - <span class="t">System</span>.<span class="f">nanoTime</span>())); }
+	<span class="k">public boolean</span> <span class="f">expired</span>() { <span class="k">return</span> <span class="f">remaining</span>().<span class="f">isZero</span>(); }
+}
+
+<span class="t">Outcome</span>&lt;<span class="t">Stock</span>&gt; <span class="f">reserve</span>(<span class="t">Sku</span> sku, <span class="k">int</span> qty, <span class="t">Deadline</span> deadline) {
+	<span class="k">if</span> (deadline.<span class="f">remaining</span>().<span class="f">toMillis</span>() &lt; <span class="m">5</span>) <span class="k">return new</span> <span class="t">Outcome.Rejected</span>&lt;&gt;(<span class="s">"deadline exceeded"</span>);   <span class="c">// don't start</span>
+	<span class="k">return</span> inventoryClient.<span class="f">reserve</span>(sku, qty, deadline.<span class="f">remaining</span>());                 <span class="c">// budget shrinks per hop</span>
+}</pre>
+  <p>The deadline is measured with <code>System.nanoTime()</code>, the monotonic clock, because the wall clock can jump (<a href="p5-clocks-on-one-machine.html">P5</a>). Between machines you send the <i>remaining duration</i>, never an absolute wall-clock time, since the two machines' clocks disagree.</p>
+
+  <h2>Living with "unknown"</h2>
+  <p>Once a call can end in <code>Unknown</code>, the caller needs a plan for it. There are only a few, and every chapter that follows uses one of them:</p>
+  <ul>
+    <li><b>Make it safe to retry.</b> Send an idempotency key so a second attempt returns the first result instead of charging again. This is the default for writes (<a href="04-retries-idempotency.html">Chapter 4</a>).</li>
+    <li><b>Ask.</b> Look the result up by a client-chosen ID: "what happened to order 81's charge?" This only works if the ID was chosen before the first attempt.</li>
+    <li><b>Reconcile later.</b> Record the attempt, show "processing" to the user, and let a background job compare your records with the other side's. Payment systems do this every night.</li>
+    <li><b>Make the operation naturally idempotent.</b> "Set the price to £40" can be repeated safely; "add £40" cannot.</li>
+  </ul>
+
+  <div class="callout usecase">
+    <div class="ico">💳</div>
+    <div class="body"><div class="title">Use case: the double charge</div><p>A mobile app calls <code>POST /charges</code> with a 10-second timeout on a train. The request reaches the server and the card is charged, but the reply is lost when the train enters a tunnel. The app shows "Payment failed, try again", the user taps again, and is charged twice. Stripe's API is designed around exactly this: clients send an <code>Idempotency-Key</code> header, the server stores the result of the first request under that key, and a retry with the same key gets the stored result instead of a second charge. The fix lives on <i>both</i> sides: the client must treat the timeout as "unknown" and retry with the same key, and the server must remember keys.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>No timeout at all</b>, often because the HTTP or database client's default is infinite. Set connect and request timeouts on every client.</li>
+      <li><b>Treating a timeout as a failure</b> and telling the user "not done" when it may have been done.</li>
+      <li><b>Choosing timeouts by gut feel</b> ("5 seconds seems safe") instead of from the dependency's latency percentiles.</li>
+      <li><b>Resetting the timeout at every hop</b>, so the user waits for the sum, and inner services work on abandoned requests.</li>
+      <li><b>Sending wall-clock deadlines between machines.</b> Send the remaining duration; clocks disagree.</li>
+      <li><b>Assuming a 5xx means nothing happened.</b> Unless the API promises it, a server error is also an unknown outcome.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Your service called another service and got a timeout. Did the operation happen?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I can't know from the timeout alone. The request might have been lost, the server might have crashed before or after doing the work, the reply might have been lost, or the server might still be working on it. So a timeout is an unknown outcome, not a failure. What I do next depends on the operation: if it's idempotent or I sent an idempotency key, I retry with the same key; if I chose a request ID up front, I can query for the result; otherwise I record it as pending and reconcile later. What I must not do is tell the user it failed.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How would you choose the timeout for calls from your checkout service to the inventory service?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Start from data: look at inventory's latency distribution as seen by the client, including the network, and pick an acceptable false-timeout rate. If 0.1% is acceptable, the timeout sits around inventory's p99.9 plus a margin. Then check it against the caller's own budget: if checkout must answer in 800 ms and inventory is one of three sequential calls, inventory gets whatever part of the remaining deadline is left, and I'd propagate a deadline rather than set independent timeouts. I'd watch for bimodal latency, like GC pauses, where p99 is fast but a few percent of calls stall, and I'd monitor the timeout rate as its own alert, because a rising timeout rate is often the first sign the dependency is in trouble.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>An RPC adds latency, serialization, version skew and partial failure to a method call.</li>
+      <li>Lost request, crash before, crash after, lost reply and slow server all look identical to the caller: no reply.</li>
+      <li>A call has three outcomes: success, known failure, and unknown. Model unknown as its own type.</li>
+      <li>Every call needs a timeout; choose it from the dependency's latency percentiles and an acceptable false-timeout rate.</li>
+      <li>Propagate one deadline through every hop, measured on the monotonic clock and sent as a remaining duration.</li>
+      <li>Handle unknown with idempotent retries, lookups by client-chosen ID, or reconciliation.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A client's call to a payment service times out. What does the client know about the charge?</p>
+      <div class="opts">
+        <button class="opt">It failed, so it is safe to tell the user to try again</button>
+        <button class="opt">It succeeded, because the server must have received it</button>
+        <button class="opt">Nothing certain: the charge may have happened, may not have, or may still be in progress</button>
+        <button class="opt">It will be rolled back automatically by the network</button>
+      </div>
+      <div class="explain">A lost request, a crash before or after the charge, a lost reply and a slow server all look the same from the client: no reply in time.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A dependency's latency is p50 = 30 ms, p99 = 120 ms, p99.9 = 400 ms. You can accept about 0.1% of calls timing out falsely. Which timeout fits?</p>
+      <div class="opts">
+        <button class="opt">A little above 400 ms</button>
+        <button class="opt">30 ms, the median</button>
+        <button class="opt">120 ms, the p99</button>
+        <button class="opt">30 seconds, to be safe</button>
+      </div>
+      <div class="explain">Pick the percentile that matches the false-timeout rate you accept (0.1% means p99.9) and add margin. The p99 would time out 1% of calls that would have succeeded.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A request passes through three services, each with its own 1-second timeout on the next call. What is the problem?</p>
+      <div class="opts">
+        <button class="opt">Timeouts don't work across more than two services</button>
+        <button class="opt">The innermost service always times out first</button>
+        <button class="opt">gRPC forbids nested timeouts</button>
+        <button class="opt">The user can wait well over a second, and inner services keep working on requests whose callers have already given up</button>
+      </div>
+      <div class="explain">Per-hop timeouts don't share a budget. A propagated deadline gives each hop only the time left, so the chain gives up together.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why should a deadline be sent between machines as a remaining duration rather than an absolute wall-clock time?</p>
+      <div class="opts">
+        <button class="opt">Durations take fewer bytes</button>
+        <button class="opt">The machines' clocks disagree, so an absolute time from one machine means a different instant on another</button>
+        <button class="opt">Absolute times can't be serialized in Protobuf</button>
+        <button class="opt">The receiving machine has no clock</button>
+      </div>
+      <div class="explain">Clock skew between machines can be milliseconds or seconds. A remaining duration, measured locally on each side's monotonic clock, avoids it.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which reply can a client safely treat as "definitely not applied"?</p>
+      <div class="opts">
+        <button class="opt">A 504 Gateway Timeout from the load balancer</button>
+        <button class="opt">A connection reset halfway through reading the response</button>
+        <button class="opt">A 400 validation error that the API documents as returned before any work is done</button>
+        <button class="opt">A TimeoutException after 300 ms</button>
+      </div>
+      <div class="explain">Only an explicit rejection that the server promises happens before acting is a known failure. Gateway errors, resets and timeouts are all unknown outcomes.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  const N = 20000, MAXX = 1500, BIN = 25;
+  let mode = 'healthy';
+
+  // Deterministic random numbers, so the histogram doesn't flicker between redraws.
+  function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  function sample(m) {
+    const r = rng(7 + m.length), out = [];
+    for (let i = 0; i < N; i++) {
+      const z = Math.sqrt(-2 * Math.log(r() || 1e-9)) * Math.cos(2 * Math.PI * r());
+      let lat = m === 'busy' ? 160 * Math.exp(0.7 * z) : 40 * Math.exp(0.45 * z);
+      if (m === 'gc' && r() < 0.005) lat += 700 + r() * 100;      // a stop-the-world pause
+      const lost = r() < 0.004;                                    // packet or reply lost: no answer ever
+      const lostReply = lost && r() < 0.5;                         // half the time the work was already done
+      out.push({ lat: lost ? Infinity : lat, applied: !lost || lostReply });
+    }
+    return out;
+  }
+  const cache = {};
+  const data = (m) => cache[m] || (cache[m] = sample(m));
+  const pct = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+  const ms = (x) => !isFinite(x) ? '∞' : x >= 1000 ? (x / 1000).toFixed(2) + ' s' : Math.round(x) + ' ms';
+
+  function draw() {
+    const cut = +$('#toCut').value; $('#toCutV').textContent = cut + ' ms';
+    const d = data(mode), lats = d.map((x) => x.lat).filter(isFinite).sort((a, b) => a - b);
+    const p50 = pct(lats, .5), p99 = pct(lats, .99), p999 = pct(lats, .999);
+    const bins = new Array(MAXX / BIN).fill(0);
+    lats.forEach((l) => { if (l < MAXX) bins[Math.floor(l / BIN)]++; });
+    const top = Math.max(...bins), W = 600, H = 130, x0 = 30, y0 = 145;
+    const X = (v) => x0 + v / MAXX * W;
+    let svg = bins.map((c, i) => { const h = c ? Math.max(1.5, Math.sqrt(c / top) * H) : 0; return `<rect class="to-bar ${i * BIN >= cut ? 'to-late' : ''}" x="${X(i * BIN) + .5}" y="${y0 - h}" width="${W / bins.length - 1}" height="${h}"/>`; }).join('');
+    [['p50', p50], ['p99', p99], ['p99.9', p999]].forEach(([n, v], i) => { if (v < MAXX) svg += `<line class="to-pct" x1="${X(v)}" y1="${y0}" x2="${X(v)}" y2="18"/><text x="${Math.min(X(v) + 3, 560)}" y="${26 + i * 12}">${n} ${ms(v)}</text>`; });
+    svg += `<line class="to-cut" x1="${X(cut)}" y1="${y0}" x2="${X(cut)}" y2="8"/><text class="to-cutl" x="${Math.min(X(cut) + 4, 560)}" y="14">timeout</text>`;
+    svg += `<line x1="${x0}" y1="${y0}" x2="${x0 + W}" y2="${y0}" stroke="var(--border-strong)"/><text x="${x0}" y="160">0</text><text x="${x0 + W - 34}" y="160">1.5 s</text><text x="${x0 + W / 2 - 40}" y="160">latency (√ scale)</text>`;
+    $('#toChart').innerHTML = svg;
+
+    const ok = d.filter((x) => x.lat <= cut).length, to = N - ok;
+    const toApplied = d.filter((x) => x.lat > cut && x.applied).length;
+    const falseTo = d.filter((x) => x.lat > cut && isFinite(x.lat)).length;   // would have answered, just later
+    const f = (n) => (n / N * 100).toFixed(2) + '%';
+    $('#toStats').innerHTML = `
+      <div class="stat good"><div class="k">Answered in time</div><div class="v">${f(ok)}</div></div>
+      <div class="stat ${to / N > .01 ? 'bad' : 'warn'}"><div class="k">Timed out</div><div class="v">${f(to)}</div></div>
+      <div class="stat"><div class="k">…would have answered</div><div class="v">${f(falseTo)}</div></div>
+      <div class="stat bad"><div class="k">…but were applied</div><div class="v">${to ? Math.round(toApplied / to * 100) : 0}<small>% of timeouts</small></div></div>`;
+    const res = $('#toRes');
+    if (cut < p99) { res.className = 'to-res to-bad'; res.innerHTML = `<b>Too tight.</b> The timeout is below p99 (${ms(p99)}), so ${f(falseTo)} of calls are abandoned although they would have answered. Most of them were processed anyway: the client sees "unknown" while the server did the work, and a retry adds load to a healthy service.`; }
+    else if (cut < p999) { res.className = 'to-res to-warn'; res.innerHTML = `<b>Between p99 and p99.9.</b> ${f(falseTo)} false timeouts. ${mode === 'gc' ? 'The 750 ms GC stalls all land past the timeout: p99 looks fast, but 0.5% of calls stall for 750 ms.' : 'Acceptable if a percent-level false-timeout rate is fine for this call.'}`; }
+    else if (cut > p999 * 3 && cut > 400) { res.className = 'to-res to-warn'; res.innerHTML = `<b>Very loose.</b> Almost no false timeouts, but a lost request now holds a caller for ${ms(cut)}, ${Math.round(cut / p50)}× the median. If the dependency hangs, threads and requests pile up behind this number.`; }
+    else { res.className = 'to-res to-ok'; res.innerHTML = `<b>Near p99.9 (${ms(p999)}).</b> ${f(falseTo)} false timeouts, and a lost request is detected in ${ms(cut)}. The remaining timeouts are mostly genuinely lost messages, and still unknown outcomes: ${toApplied} of ${to} timed-out calls had been applied.`; }
+  }
+  $('#toMode').addEventListener('segchange', (e) => { mode = e.detail; draw(); });
+  $('#toCut').addEventListener('input', draw);
+  draw();
+})();
+</script>
 </body>
 </html>

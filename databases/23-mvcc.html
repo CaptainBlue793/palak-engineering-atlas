@@ -6,34 +6,357 @@
 <title>MVCC: Many Versions, No Read Locks</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .mv-cols { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(0,1fr); gap:12px; margin-top:14px; }
+  @media (max-width:820px) { .mv-cols { grid-template-columns:1fr; } }
+  .mv-box { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; min-width:0; }
+  .mv-box h6 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .mv-vers { list-style:none; margin:0; padding:0; }
+  .mv-v { display:grid; grid-template-columns:64px minmax(0,1fr); gap:10px; align-items:center; padding:7px 9px; border:1.5px solid var(--border-strong); border-radius:10px; margin-top:6px; background:var(--surface-2); font-size:12.5px; }
+  .mv-v > b { font-family:var(--mono); font-size:17px; text-align:center; }
+  .mv-v code { font-size:11.5px; }
+  .mv-v small { display:block; color:var(--muted); font-size:11.5px; margin-top:2px; }
+  .mv-v .mv-tags { display:flex; flex-wrap:wrap; gap:4px; margin-top:4px; }
+  .mv-v .mv-tags i { font-style:normal; font-size:10.5px; font-weight:700; padding:1px 7px; border-radius:8px; background:var(--green); color:#fff; }
+  .mv-v .mv-tags i.mv-new { background:var(--accent); }
+  .mv-v.mv-dead { border-color:var(--red); background:var(--red-soft); opacity:.8; }
+  .mv-v.mv-pend { border-style:dashed; border-color:var(--amber); background:var(--amber-soft); }
+  .mv-list { list-style:none; margin:0; padding:0; font-size:12.5px; }
+  .mv-list li { padding:5px 0; border-bottom:1px solid var(--border); }
+  .mv-list li:last-child { border-bottom:0; }
+  .mv-list code { font-size:11.5px; }
+  .mv-empty { color:var(--muted); font-size:12.5px; }
+  .mv-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--border); min-height:52px; }
+  .mv-msg.mv-good { background:var(--green-soft); border-left-color:var(--green); }
+  .mv-msg.mv-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .mv-msg.mv-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="23">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 23</span><span class="pill">Intermediate</span><span class="pill">⏱ 55 min</span></div>
-    <h1>MVCC: <span class="grad">Many Versions, No Read Locks</span></h1>
-    <p class="lead">How PostgreSQL and MySQL keep old row versions so readers never block writers, and VACUUM.</p>
+    <h1>MVCC: Many Versions, <span class="grad">No Read Locks</span></h1>
+    <p class="lead">A report that takes ten minutes to run has to see the data as it stood at one moment, while thousands of writes land during those ten minutes. With locks alone the report would have to hold off every writer, or the writers the report. Nearly every modern database solves this another way: a writer doesn't overwrite a row, it makes a new version and leaves the old one where it is, and each reader is shown the version that was current when it began. This is multiversion concurrency control, MVCC. It is why a <code>SELECT</code> in PostgreSQL never waits for an <code>UPDATE</code>. It also explains why tables grow when nothing is being added, what VACUUM is for, and one of the few ways a healthy PostgreSQL can refuse all writes.</p>
+    <ul class="objectives">
+      <li><span>Explain how row versions are marked with the transactions that created and ended them</span></li>
+      <li><span>Say what a snapshot contains and apply the visibility rule to a version</span></li>
+      <li><span>Compare PostgreSQL's versions in the table with InnoDB's undo log</span></li>
+      <li><span>Explain what VACUUM does, and what stops it from doing it</span></li>
+      <li><span>Explain transaction ID wraparound and how to stay clear of it</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Tuple headers, dead tuples and HOT updates:</b> <a href="11-pages-heap-files.html">Chapter 11</a>.</li>
+        <li><b>Snapshots as behaviour, at each isolation level:</b> <a href="21-isolation-anomalies.html">Chapter 21</a>.</li>
+        <li><b>Row locks, which writers still take:</b> <a href="22-two-phase-locking.html">Chapter 22</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Row versions and xmin/xmax</li>
-    <li>Snapshots</li>
-    <li>Postgres vs MySQL undo logs</li>
-    <li>VACUUM and bloat</li>
-    <li>Transaction ID wraparound</li>
-  </ol>
+  <h2>Row versions and xmin/xmax</h2>
+  <p>Every transaction that changes data is given a number, its <b>transaction ID</b> or xid, from a counter that only goes up. Every row version carries two of these numbers in its header (<a href="11-pages-heap-files.html">Chapter 11</a>): <code>xmin</code>, the transaction that created the version, and <code>xmax</code>, the transaction that deleted or replaced it, or 0 if none has.</p>
+<pre class="code"><span class="k">SELECT</span> xmin, xmax, ctid, balance <span class="k">FROM</span> accounts <span class="k">WHERE</span> id = <span class="m">1</span>;
+<span class="c">--  xmin | xmax | ctid  | balance</span>
+<span class="c">--   742 |    0 | (0,1) |     100        created by transaction 742, and still current</span>
+
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> balance = <span class="m">80</span> <span class="k">WHERE</span> id = <span class="m">1</span>;     <span class="c">-- this is transaction 760</span>
+
+<span class="c">-- The page now holds two versions of the row:</span>
+<span class="c">--   742 |  760 | (0,1) |     100        ended by 760: visible only to transactions that began before it committed</span>
+<span class="c">--   760 |    0 | (0,2) |      80        created by 760: the current version</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Statement</th><th>What it does to versions</th></tr></thead>
+      <tbody>
+        <tr><td><code>INSERT</code></td><td>Writes one version, with <code>xmin</code> set to this transaction</td></tr>
+        <tr><td><code>DELETE</code></td><td>Sets <code>xmax</code> on the current version. Nothing is removed</td></tr>
+        <tr><td><code>UPDATE</code></td><td>Both: sets <code>xmax</code> on the old version and writes a complete new one</td></tr>
+        <tr><td><code>ROLLBACK</code></td><td>Nothing at all to the rows. The transaction is recorded as aborted, and its versions are invisible from then on</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Whether a given xid committed, aborted or is still running is kept in a small, heavily cached structure called the commit log. That is why a rollback in PostgreSQL is instant however much the transaction wrote: one status changes, and every version it created stops counting.</p>
+
+  <h2>Snapshots</h2>
+  <p>A reader doesn't lock anything. When it begins it takes a <b>snapshot</b>, which is a short description of which transactions had committed at that instant: the next xid not yet handed out, and the list of xids still in progress. For each row version it meets, it applies one rule.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>A row version</b> with its xmin and xmax</li>
+      <li data-k="decision"><b>Had xmin committed before my snapshot?</b> no: the version didn't exist for me. Skip it</li>
+      <li data-k="decision"><b>Is xmax unset?</b> yes: nobody has ended this version. I see it</li>
+      <li data-k="decision"><b>Had xmax committed before my snapshot?</b> yes: the version was already gone. Skip it</li>
+      <li data-k="end"><b>Otherwise I see it</b> whoever is replacing it hadn't committed when I began, or has rolled back</li>
+    </ol>
+    <figcaption><b>The visibility rule.</b> Of all the versions of a row, exactly one passes for any snapshot, or none if the row didn't exist then.</figcaption>
+  </figure>
+<pre class="code"><span class="k">SELECT</span> <span class="f">pg_current_snapshot</span>();      <span class="c">-- 758:763:758,761</span>
+<span class="c">--   everything below 758 has finished · 763 is the next xid to be given out · 758 and 761 are still running</span></pre>
+  <p>The isolation levels of <a href="21-isolation-anomalies.html">Chapter 21</a> are choices about when a snapshot is taken. At Read Committed each statement takes a new one, so each statement sees the latest commits. At Repeatable Read the transaction keeps its first one, so it sees one moment throughout. Writers still lock the rows they change (<a href="22-two-phase-locking.html">Chapter 22</a>), so two writers of one row wait for each other, and readers and writers never do.</p>
+
+  <h2>Try it: one row and its versions</h2>
+  <p>Account 1 starts with a balance of £100. Update it, commit or roll back, open readers that hold their snapshots, and run VACUUM. Watch which version each reader sees, and which versions VACUUM is allowed to remove.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Versions and snapshots</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <button class="btn sm primary" id="mvUpd">UPDATE: take £10 off</button>
+        <button class="btn sm" id="mvCommit">COMMIT it</button>
+        <button class="btn sm" id="mvRoll">ROLLBACK it</button>
+        <button class="btn sm" id="mvOpen">Open a reader</button>
+        <button class="btn sm" id="mvClose">Close the oldest reader</button>
+        <button class="btn sm" id="mvVac">🧹 VACUUM</button>
+        <button class="btn sm ghost" id="mvReset">↺ Reset</button>
+      </div>
+      <div class="mv-cols">
+        <div class="mv-box"><h6>Versions of the row, on the page</h6><ol class="mv-vers" id="mvVers"></ol></div>
+        <div class="mv-box"><h6>Who is looking</h6><ul class="mv-list" id="mvWho"></ul></div>
+      </div>
+      <div class="mv-msg" id="mvMsg"></div>
+      <div class="stats" id="mvStats"></div>
+    </div>
+    <div class="panel-foot">A reader here is a transaction at Repeatable Read, holding the snapshot it took when it was opened. "A new query" is what a fresh statement would see at this instant. VACUUM may remove an old version only if it was replaced before the oldest open snapshot was taken, or was written by a transaction that rolled back.</div>
+  </div>
+
+  <p>Things to notice. Update without committing, and a new query still sees £100: the new version exists on the page and is invisible to everyone but its author. Commit, and new queries see £90, while a reader opened earlier goes on seeing £100 for as long as it stays open. Neither waited for the other. Roll an update back, and its version stays on the page as garbage. Now open a reader, then update and commit five times, and run VACUUM. Nothing is removed. The oldest reader's snapshot could still be asked for any of those versions, so all of them have to stay. Close the reader and VACUUM again, and they all go. In a real database that reader is a forgotten session or a slow report, the row is every row in every table, and the dead versions that can't be removed are the bloat.</p>
+
+  <h2>Postgres vs MySQL undo logs</h2>
+  <p>Every MVCC database keeps old versions. Where it keeps them is the largest design difference between PostgreSQL and InnoDB.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>PostgreSQL</th><th>MySQL InnoDB, and Oracle</th></tr></thead>
+      <tbody>
+        <tr><td><b>An update</b></td><td>Writes a new version elsewhere in the table and leaves the old one in place</td><td>Changes the row in place, and copies the old values to a separate <b>undo log</b></td></tr>
+        <tr><td><b>The table holds</b></td><td>Every version, live and dead, mixed together</td><td>Only the newest version of each row</td></tr>
+        <tr><td><b>A reader needing an old version</b></td><td>Finds it in the table directly</td><td>Starts from the current row and applies undo records backwards until it reaches its snapshot</td></tr>
+        <tr><td><b>Rollback</b></td><td>Instant</td><td>Must apply the undo records, taking about as long as the transaction did</td></tr>
+        <tr><td><b>Indexes</b></td><td>A new entry in every index for each new version, unless the update is HOT</td><td>Secondary indexes change only if an indexed column changed</td></tr>
+        <tr><td><b>Clean-up</b></td><td>VACUUM scans tables for dead versions</td><td>A purge thread discards undo that no snapshot needs</td></tr>
+        <tr><td><b>A long-running transaction causes</b></td><td>Dead versions to pile up in tables and indexes, which stay enlarged afterwards</td><td>The undo log to grow, and old reads to slow as they walk longer chains. The tables themselves stay compact</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>PostgreSQL's design makes reads of old versions and rollbacks cheap, and pays for it in table bloat and extra index writes. InnoDB keeps its tables tidy and pays when a reader has to reconstruct history. <a href="43-case-uber-postgres-mysql.html">Chapter 43</a> is about a company for whom this difference decided the choice of database.</p>
+
+  <h2>VACUUM and bloat</h2>
+  <p>Dead versions take up space in pages, and every scan has to step over them. <b>VACUUM</b> is the process that deals with them, and <b>autovacuum</b> runs it on each table once enough of the table has changed, by default 20% of its rows.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>VACUUM does</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><b>Removes dead row versions</b> and their index entries</td><td>So that the space can be reused for new rows. It doesn't shrink the file</td></tr>
+        <tr><td><b>Updates the free space map</b></td><td>So that inserts can find the room it has made (<a href="11-pages-heap-files.html">Chapter 11</a>)</td></tr>
+        <tr><td><b>Updates the visibility map</b></td><td>So that index-only scans can skip the table (<a href="17-explain.html">Chapter 17</a>'s fourth plan)</td></tr>
+        <tr><td><b>Freezes old row versions</b></td><td>To prevent transaction ID wraparound, described below</td></tr>
+        <tr><td><b>Collects statistics</b>, as autovacuum's ANALYZE</td><td>For the planner (<a href="19-cost-based-optimizer.html">Chapter 19</a>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>VACUUM can remove a version only if no snapshot anywhere could still see it. The oldest snapshot in the whole system sets a line, and nothing that died after it can be removed, in any table. Four things hold that line back, and they are the first things to check when a table is bloated:</p>
+<pre class="code"><span class="c">-- 1. Long-running and idle-in-transaction sessions</span>
+<span class="k">SELECT</span> pid, state, <span class="f">now</span>() - xact_start <span class="k">AS</span> age, backend_xmin, <span class="f">left</span>(query, <span class="m">40</span>)
+<span class="k">FROM</span> pg_stat_activity <span class="k">WHERE</span> backend_xmin <span class="k">IS NOT NULL</span> <span class="k">ORDER BY</span> <span class="f">age</span>(backend_xmin) <span class="k">DESC</span>;
+<span class="c">-- 2. Replication slots that no one is reading from</span>
+<span class="k">SELECT</span> slot_name, active, xmin, catalog_xmin <span class="k">FROM</span> pg_replication_slots;
+<span class="c">-- 3. Prepared transactions that were never finished</span>
+<span class="k">SELECT</span> gid, prepared <span class="k">FROM</span> pg_prepared_xacts;
+<span class="c">-- 4. A standby with hot_standby_feedback on, running a long query</span>
+
+<span class="c">-- How much is dead, and when was it last cleaned?</span>
+<span class="k">SELECT</span> relname, n_live_tup, n_dead_tup, last_autovacuum <span class="k">FROM</span> pg_stat_user_tables <span class="k">ORDER BY</span> n_dead_tup <span class="k">DESC LIMIT</span> <span class="m">5</span>;</pre>
+
+  <h2>Transaction ID wraparound</h2>
+  <p>A transaction ID is a 32-bit number, so there are about four billion of them, and a busy database uses that many in months. PostgreSQL treats the numbers as a circle: for any xid, the two billion before it are "the past" and the two billion after it are "the future". This works as long as no row version in the database is more than two billion transactions old. If one were, its xmin would cross to the other side of the circle and appear to be in the future, and the row would vanish from every query.</p>
+  <p>To prevent that, VACUUM <b>freezes</b> old versions: it marks them as "older than everything, visible to all", after which their xmin no longer matters. Autovacuum forces a freezing pass over any table whose oldest unfrozen row is 200 million transactions old, whether or not the table has changed. If something prevents that pass for long enough, the database protects itself in the only way left:</p>
+<pre class="code">WARNING:  database "app" must be vacuumed within 39985967 transactions
+ERROR:    <span class="k">database is not accepting commands that assign new XIDs to avoid wraparound data loss</span> in database "app"
+
+<span class="k">SELECT</span> datname, <span class="f">age</span>(datfrozenxid) <span class="k">AS</span> xid_age <span class="k">FROM</span> pg_database <span class="k">ORDER BY</span> xid_age <span class="k">DESC</span>;   <span class="c">-- alert well before 1 billion</span></pre>
+  <p>At that point reads still work and every write is refused, until a VACUUM has been run to completion on the offending tables, which on a large table can take many hours.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧟</div>
+    <div class="body"><div class="title">Sentry, July 2015: most of a day without writes</div><p>Sentry collects error reports from other companies' applications, and in 2015 it stored them in PostgreSQL at a rate of thousands of writes a second, each of which used a transaction ID. On 20 July its main database stopped accepting writes. Nothing had crashed. The database had come within a few million transactions of wraparound, and had shut the door on new transaction IDs exactly as it is designed to. Autovacuum had been running the whole time, trying to freeze the largest tables before the deadline. The tables were too large and too busy, and the vacuum was configured too gently, throttled so as not to disturb the workload, so it was consuming old transaction IDs more slowly than the application was issuing new ones. The gap had been closing for weeks, and no alert had been watching it. Once the database had stopped, the only cure was to let VACUUM finish, and on tables of that size an unthrottled vacuum still took hours. Sentry's engineers shortened it in the end by truncating a large table whose contents they could afford to lose, and the service was down for most of a working day. Their published account led many teams to add the alert they hadn't had, on the age of the oldest unfrozen transaction ID, and to make autovacuum more aggressive on large tables. Mailchimp's Mandrill service lost over a day to the same cause in 2019. VACUUM is easy to regard as housekeeping that can be postponed when the database is busy, and these two outages came from postponing it.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Turning autovacuum off, or throttling it hard, "because it slows things down".</b> Bloat slows them more, and wraparound stops them.</li>
+      <li><b>Long-lived transactions:</b> a report run on the primary, a session left idle in a transaction. They pin dead rows in every table, not just the ones they read.</li>
+      <li><b>Forgetting replication slots.</b> A slot whose consumer has gone holds back clean-up indefinitely.</li>
+      <li><b>Expecting VACUUM to shrink files.</b> It frees space inside them. Only a rewrite returns it.</li>
+      <li><b>Updating every row of a large table in one statement.</b> The table doubles in size, and the old half is dead until vacuumed. Do it in batches.</li>
+      <li><b>No alert on transaction ID age.</b> It is the one number that warns of wraparound, weeks ahead.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is MVCC, and what problem does it solve?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Multiversion concurrency control means the database keeps several versions of a row instead of overwriting it, so that readers and writers don't block each other. Under pure locking, a reader would take a shared lock and a writer an exclusive one, so a long report would stall all updates to what it reads, or be stalled by them. With MVCC, an update creates a new version of the row and marks the old one as superseded, both tagged with the transaction IDs responsible. Each reader works from a snapshot, a record of which transactions had committed when it started, and for every row sees the version that was current as of that snapshot, ignoring changes from transactions that committed later or are still in progress. So a reader gets a consistent view without taking locks, and writers carry on. Writers still lock rows against other writers. The cost is that old versions accumulate and must be cleaned up once no snapshot needs them: VACUUM in PostgreSQL, the purge of undo logs in InnoDB. A long-running transaction delays that clean-up for everyone.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A table in PostgreSQL holds 10 GB of live data and occupies 80 GB. Autovacuum runs on it regularly. What is going on?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The table is bloated: most of its pages are dead row versions or free space. Since autovacuum is running, the question is why it isn't keeping up, and there are two families of cause. The first is that vacuum runs but isn't allowed to remove the dead rows, because something holds the xmin horizon back: a long-running transaction, a session idle in transaction, an inactive replication slot, an orphaned prepared transaction, or a standby with hot_standby_feedback running long queries. I'd check pg_stat_activity ordered by the age of backend_xmin, pg_replication_slots and pg_prepared_xacts; the vacuum's verbose output would also say "dead row versions cannot be removed yet". The second is that vacuum can remove rows but too slowly or too rarely for the write rate: the default trigger of 20% of the table is a lot of dead rows on a big table, and the cost-based throttling may make each run take hours. I'd lower autovacuum_vacuum_scale_factor for that table and raise its cost limit. A third possibility is a past event, such as a mass update or a period with a stuck transaction, that bloated the table once; vacuum has since made the space reusable but can't return it, so the file stays at 80 GB. Either way, once the cause is fixed, the existing bloat needs a rewrite to reclaim: pg_repack or VACUUM FULL in a maintenance window, since plain VACUUM only truncates empty pages at the end of the file. I'd also check the indexes, which bloat in the same way.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>An update writes a new row version and marks the old one. Each version records the transaction that created it and the one that ended it.</li>
+      <li>A reader takes a snapshot and sees, for each row, the version that was committed and current at that moment. Readers and writers don't block each other.</li>
+      <li>Rollback is instant in PostgreSQL: the transaction is marked aborted and its versions are ignored.</li>
+      <li>PostgreSQL keeps old versions in the table and removes them with VACUUM. InnoDB updates in place and keeps old values in an undo log.</li>
+      <li>A dead version can be removed only when no snapshot can see it, so one old transaction or forgotten replication slot causes bloat everywhere.</li>
+      <li>Transaction IDs are 32 bits and wrap round. VACUUM must freeze old rows in time, or the database stops accepting writes.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In PostgreSQL, what does an <code>UPDATE</code> of one row do physically?</p>
+      <div class="opts">
+        <button class="opt">Overwrites the row's bytes in place</button>
+        <button class="opt">Copies the old row to an undo log and overwrites it</button>
+        <button class="opt">Writes a complete new version of the row, and sets <code>xmax</code> on the old one</button>
+        <button class="opt">Rewrites the whole page</button>
+      </div>
+      <div class="explain">The old version stays, for the benefit of any transaction whose snapshot predates the update.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A row version has xmin = 760 and xmax = 0. Your snapshot was taken while transaction 760 was still in progress. Do you see it?</p>
+      <div class="opts">
+        <button class="opt">No: its creator hadn't committed when the snapshot was taken</button>
+        <button class="opt">Yes: xmax is 0, so it is current</button>
+        <button class="opt">Yes, but only at Read Committed</button>
+        <button class="opt">Only if 760 later commits</button>
+      </div>
+      <div class="explain">The first test is whether xmin had committed before the snapshot. It hadn't, and a snapshot doesn't change afterwards.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why is <code>ROLLBACK</code> instant in PostgreSQL, even after a transaction has changed a million rows?</p>
+      <div class="opts">
+        <button class="opt">The changes were only in memory</button>
+        <button class="opt">The undo log is applied in the background</button>
+        <button class="opt">The rows are locked until they are cleaned</button>
+        <button class="opt">The transaction is marked as aborted, and every version it wrote is ignored from then on</button>
+      </div>
+      <div class="explain">The million dead versions remain on the pages until VACUUM removes them.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">VACUUM runs on a table and removes almost nothing, though the table is full of dead rows. What is the most likely reason?</p>
+      <div class="opts">
+        <button class="opt">The table has too many indexes</button>
+        <button class="opt">A long-running transaction or an unused replication slot still holds an old snapshot</button>
+        <button class="opt">VACUUM only works when the database is idle</button>
+        <button class="opt">The dead rows are in the visibility map</button>
+      </div>
+      <div class="explain">A version can be removed only when no snapshot anywhere could still need it.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What is transaction ID wraparound, and how is it prevented?</p>
+      <div class="opts">
+        <button class="opt">Too many transactions at once. Prevented by connection pooling</button>
+        <button class="opt">A deadlock between old and new transactions. Prevented by lock timeouts</button>
+        <button class="opt">The 32-bit counter coming round to values used by old rows, which would then seem to be in the future. Prevented by VACUUM freezing old rows</button>
+        <button class="opt">The WAL filling the disk. Prevented by checkpoints</button>
+      </div>
+      <div class="explain">If freezing is prevented for long enough, PostgreSQL refuses new transaction IDs to protect the data.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  let st;
+  function reset() {
+    st = { next: 101, status: { 100: 'c' }, vers: [{ val: 100, xmin: 100, xmax: 0 }], writer: null, readers: [], rn: 0, removed: 0, msg: null, cls: '' };
+    draw();
+  }
+  // A snapshot: the next xid, and the xids in progress when it was taken.
+  const snap = () => ({ next: st.next, active: new Set(st.writer ? [st.writer] : []) });
+  const committedBefore = (xid, s) => st.status[xid] === 'c' && xid < s.next && !s.active.has(xid);
+  const sees = (v, s) => committedBefore(v.xmin, s) && (v.xmax === 0 || !committedBefore(v.xmax, s));
+  const seen = (s) => st.vers.find((v) => sees(v, s));
+  const current = () => st.vers.find((v) => st.status[v.xmin] === 'c' && (v.xmax === 0 || st.status[v.xmax] !== 'c'));
+  // The horizon: the oldest transaction that any open snapshot still regards as unfinished. VACUUM may remove
+  // a version only if it was replaced by a transaction older than that, or was written by one that aborted.
+  const horizon = () => Math.min(st.next, st.writer || Infinity, ...st.readers.map((r) => Math.min(r.s.next, ...r.s.active)));
+  const dead = (v) => (st.status[v.xmin] === 'a') || (st.status[v.xmin] === 'c' && v.xmax !== 0 && st.status[v.xmax] === 'c' && v.xmax < horizon());
+  const say = (m, c) => { st.msg = m; st.cls = c; };
+  function update() {
+    if (st.writer) return say(`<b>This UPDATE would wait.</b> Transaction ${st.writer} has changed the row and not yet finished, so it holds the row's lock. Writers do block other writers. Commit it or roll it back first.`, 'mv-warn');
+    const cur = current(), xid = st.next++; st.status[xid] = 'p'; st.writer = xid;
+    cur.xmax = xid; st.vers.push({ val: cur.val - 10, xmin: xid, xmax: 0 });
+    say(`<b>Transaction ${xid} updates the row.</b> It writes a new version, £${cur.val - 10}, with xmin ${xid}, and sets xmax on the old one to ${xid}. It hasn't committed, so every snapshot still regards ${xid} as in progress, and everyone but its author still sees £${cur.val}.`, '');
+  }
+  function commit() {
+    if (!st.writer) return say('No transaction is open. Run an UPDATE first.', '');
+    const xid = st.writer; st.status[xid] = 'c'; st.writer = null;
+    const v = st.vers.find((x) => x.xmin === xid), held = st.readers.length;
+    say(`<b>Transaction ${xid} commits.</b> One status changes in the commit log. New queries now see £${v.val}.` + (held ? ` The ${held} open reader${held > 1 ? 's' : ''} took ${held > 1 ? 'their snapshots' : 'its snapshot'} before this, and ${held > 1 ? 'go' : 'goes'} on seeing what ${held > 1 ? 'they' : 'it'} saw. Nobody waited for anybody.` : ''), 'mv-good');
+  }
+  function rollback() {
+    if (!st.writer) return say('No transaction is open. Run an UPDATE first.', '');
+    const xid = st.writer; st.status[xid] = 'a'; st.writer = null;
+    say(`<b>Transaction ${xid} rolls back.</b> Nothing on the page was touched: ${xid} is marked as aborted, so the version it wrote is invisible to everyone for ever, and the xmax it set on the old version is disregarded. The version it wrote is now garbage, waiting for VACUUM.`, 'mv-warn');
+  }
+  function open() {
+    if (st.readers.length >= 3) return say('Three readers are open, which is enough to see the effect. Close one first.', '');
+    const r = { name: 'R' + (++st.rn), s: snap() }; st.readers.push(r);
+    const v = seen(r.s);
+    say(`<b>Reader ${r.name} opens and takes a snapshot.</b> It regards every transaction below ${r.s.next} as finished${r.s.active.size ? ', except ' + [...r.s.active].join(', ') + ', which is still running' : ''}. It sees £${v.val} now and will go on seeing it, whatever is committed later, until it closes.`, '');
+  }
+  function close() {
+    if (!st.readers.length) return say('No reader is open.', '');
+    const r = st.readers.shift();
+    say(`<b>Reader ${r.name} closes.</b> Its snapshot is released. Any versions that were being kept only for its sake are now dead.`, '');
+  }
+  function vacuum() {
+    const d = st.vers.filter(dead), stuck = st.vers.filter((v) => !d.includes(v) && v !== current() && !(st.writer && v.xmin === st.writer));
+    st.vers = st.vers.filter((v) => !d.includes(v)); st.removed += d.length;
+    // an xmax left behind by an aborted transaction means nothing: clear it, as freezing would
+    st.vers.forEach((v) => { if (v.xmax && st.status[v.xmax] === 'a') v.xmax = 0; });
+    if (d.length) say(`<b>VACUUM removed ${d.length} dead version${d.length > 1 ? 's' : ''}.</b> No snapshot, present or future, could have seen ${d.length > 1 ? 'them' : 'it'}. The space is free for reuse.` + (stuck.length ? ` ${stuck.length} old version${stuck.length > 1 ? 's' : ''} had to stay: ${stuck.length > 1 ? 'they were' : 'it was'} replaced after the oldest open snapshot was taken.` : ''), 'mv-good');
+    else if (stuck.length) say(`<b>VACUUM removed nothing.</b> There ${stuck.length > 1 ? 'are ' + stuck.length + ' old versions' : 'is 1 old version'} on the page, and VACUUM may not touch ${stuck.length > 1 ? 'any of them' : 'it'}: ${stuck.length > 1 ? 'they were all' : 'it was'} replaced after reader ${st.readers[0] ? st.readers[0].name : ''} took its snapshot, and nothing newer than the oldest open snapshot can be removed. This is bloat being made.`, 'mv-bad');
+    else say('<b>VACUUM found nothing to remove.</b> Every version on the page is visible to someone.', '');
+  }
+  function draw() {
+    const cur = current(), fresh = seen(snap());
+    $('#mvVers').innerHTML = st.vers.map((v) => {
+      const sx = (x) => (x === 0 ? '0' : `${x} <small style="display:inline">(${st.status[x] === 'c' ? 'committed' : st.status[x] === 'a' ? 'aborted' : 'in progress'})</small>`);
+      const who = st.readers.filter((r) => sees(v, r.s)).map((r) => `<i>${r.name}</i>`).join('') + (v === fresh ? '<i class="mv-new">a new query</i>' : '');
+      const isDead = dead(v), pend = st.status[v.xmin] === 'p';
+      return `<li class="mv-v${isDead ? ' mv-dead' : pend ? ' mv-pend' : ''}"><b>£${v.val}</b><div><code>xmin ${sx(v.xmin)} · xmax ${sx(v.xmax)}</code><small>${isDead ? 'dead: nobody can see it. VACUUM may remove it' : pend ? 'not yet committed: visible only to its own transaction' : who ? 'seen by' : 'superseded, and kept because an open snapshot predates its replacement'}</small>${who ? `<div class="mv-tags">${who}</div>` : ''}</div></li>`;
+    }).join('');
+    $('#mvWho').innerHTML = `<li><b>A new query</b> sees <b>£${fresh.val}</b><br><code>snapshot: next xid ${st.next}${st.writer ? ', ' + st.writer + ' in progress' : ''}</code></li>` +
+      (st.readers.map((r) => `<li><b>Reader ${r.name}</b> sees <b>£${seen(r.s).val}</b><br><code>snapshot: next xid ${r.s.next}${r.s.active.size ? ', ' + [...r.s.active].join(', ') + ' in progress' : ''}</code></li>`).join('') || '<li class="mv-empty">No reader is holding a snapshot.</li>') +
+      (st.writer ? `<li><b>Writer ${st.writer}</b> is in progress, holding the row's lock</li>` : '');
+    const m = $('#mvMsg'); m.className = 'mv-msg ' + (st.cls || '');
+    m.innerHTML = st.msg || 'One row, one version: £100, created by transaction 100, which committed long ago. Update it, and look at what a new query sees before and after you commit.';
+    const d = st.vers.filter(dead).length, kept = st.vers.length - d - 1 - (st.writer ? 1 : 0);
+    $('#mvStats').innerHTML = `<div class="stat ${st.vers.length > 3 ? 'warn' : ''}"><div class="k">Versions on the page</div><div class="v">${st.vers.length}</div></div>
+      <div class="stat ${d ? 'warn' : 'good'}"><div class="k">Dead: VACUUM can remove</div><div class="v">${d}</div></div>
+      <div class="stat ${kept > 0 ? 'bad' : 'good'}"><div class="k">Old, and pinned by a reader</div><div class="v">${Math.max(0, kept)}</div></div>
+      <div class="stat"><div class="k">Oldest open snapshot</div><div class="v">${st.readers.length ? 'xid ' + st.readers[0].s.next : 'none'}</div></div>
+      <div class="stat"><div class="k">Removed by VACUUM so far</div><div class="v">${st.removed}</div></div>`;
+  }
+  const on = (id, fn) => { $(id).onclick = () => { fn(); draw(); }; };
+  on('#mvUpd', update); on('#mvCommit', commit); on('#mvRoll', rollback); on('#mvOpen', open); on('#mvClose', close); on('#mvVac', vacuum);
+  $('#mvReset').onclick = reset;
+  reset();
+})();
+</script>
 </body>
 </html>

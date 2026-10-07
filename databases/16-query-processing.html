@@ -6,34 +6,347 @@
 <title>How a Query Runs</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .qp-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .qp-row > span { font-size:12.5px; color:var(--muted); min-width:70px; }
+  .qp-sql { margin-top:12px; font-family:var(--mono); font-size:12.5px; padding:8px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); overflow-wrap:anywhere; }
+  .qp-cols { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.15fr); gap:12px; margin-top:12px; }
+  @media (max-width:820px) { .qp-cols { grid-template-columns:1fr; } }
+  .qp-box { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; min-width:0; }
+  .qp-box h6 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .qp-plan { list-style:none; margin:0; padding:0; }
+  .qp-plan li { margin-top:6px; padding:7px 10px; border-radius:9px; border:1.5px solid var(--border-strong); background:var(--surface-2); font-family:var(--mono); font-size:12.5px; }
+  .qp-plan li small { display:block; font-family:var(--font); font-size:11.5px; color:var(--muted); margin-top:2px; }
+  .qp-plan li.qp-on { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .qp-plan li.qp-done { opacity:.6; }
+  .qp-rows { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:5px; }
+  .qp-r { border:1.5px solid var(--border); border-radius:8px; padding:4px 3px; text-align:center; font-family:var(--mono); font-size:11.5px; background:var(--surface-2); opacity:.55; }
+  .qp-r small { display:block; font-family:var(--font); font-size:10px; color:var(--muted); }
+  .qp-r.qp-read { opacity:1; border-color:var(--border-strong); }
+  .qp-r.qp-pass { opacity:1; border-color:var(--amber); background:var(--amber-soft); }
+  .qp-r.qp-out { opacity:1; border-color:var(--green); background:var(--green-soft); font-weight:700; }
+  .qp-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--border); min-height:52px; }
+  .qp-msg.qp-good { background:var(--green-soft); border-left-color:var(--green); }
+  .qp-msg.qp-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
 </head>
 <body data-chapter="16">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 16</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>How a Query <span class="grad">Runs</span></h1>
-    <p class="lead">Parse, rewrite, plan, execute: the Volcano iterator model and a query traced end to end.</p>
+    <p class="lead">SQL says what you want and nothing about how to get it. Between the text you send and the rows that come back, the database turns the first into the second in four stages: it checks that the text is valid SQL, works out what the names in it refer to, chooses one way of computing the answer out of many, and then runs that choice. Knowing the stages tells you where an error message comes from, why the same query can take a millisecond or a minute depending on the plan, why <code>LIMIT 10</code> can stop a scan after ten rows or after ten million, and what the output of <code>EXPLAIN</code> is a picture of. This chapter follows one query through all four.</p>
+    <ul class="objectives">
+      <li><span>Name the stages a query passes through and what each produces</span></li>
+      <li><span>Say at which stage a given error is raised</span></li>
+      <li><span>Explain the iterator model: how operators pull rows from each other one at a time</span></li>
+      <li><span>Tell a pipelined operator from a blocking one, and predict when LIMIT can stop early</span></li>
+      <li><span>Explain what vectorised execution changes, and why analytical databases use it</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The logical order of a SELECT's clauses:</b> <a href="04-group-by-aggregates.html">Chapter 4</a>.</li>
+        <li><b>Sequential scans and index scans:</b> <a href="09-indexes-first-look.html">Chapter 9</a>.</li>
+        <li><b>Relational algebra, which is what a plan is made of:</b> <a href="p7-sets-relational-algebra.html">P7</a>.</li>
+        <li><b>Python generators:</b> used here to model operators.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Parse and analyse</li>
-    <li>Rewrite</li>
-    <li>Plan</li>
-    <li>Execute: the iterator model</li>
-    <li>Vectorised execution</li>
-  </ol>
+  <h2>Four stages</h2>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>SQL text</b> a string arrives from the client</li>
+      <li data-k="step"><b>Parse</b> check the grammar and build a tree of the statement's structure</li>
+      <li data-k="step"><b>Analyse</b> look up every table, column, function and type in the catalogue, and check permissions</li>
+      <li data-k="step"><b>Rewrite</b> replace views with their definitions, and add row-level security conditions</li>
+      <li data-k="decision"><b>Plan</b> consider the ways to compute the result, estimate what each costs, and keep the cheapest</li>
+      <li data-k="step"><b>Execute</b> run the plan's operators, which pull rows from each other</li>
+      <li data-k="end"><b>Rows</b> sent to the client as they are produced</li>
+    </ol>
+    <figcaption><b>The life of a query.</b> The first three stages decide what the query means, and planning and execution decide how it is carried out.</figcaption>
+  </figure>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Stage</th><th>Produces</th><th>Errors raised here</th><th>Typical time</th></tr></thead>
+      <tbody>
+        <tr><td><b>Parse</b></td><td>A parse tree</td><td><code>syntax error at or near "FORM"</code></td><td>Microseconds</td></tr>
+        <tr><td><b>Analyse</b></td><td>A query tree, with every name resolved to an object and every expression given a type</td><td><code>column "custmer_id" does not exist</code>, <code>operator does not exist: integer = text</code>, <code>permission denied</code></td><td>Microseconds</td></tr>
+        <tr><td><b>Rewrite</b></td><td>A query tree with views expanded</td><td>Rarely any</td><td>Microseconds</td></tr>
+        <tr><td><b>Plan</b></td><td>A plan tree of operators</td><td>None, but a bad choice here is the cause of most slow queries</td><td>0.1 ms to tens of ms, growing fast with the number of joins</td></tr>
+        <tr><td><b>Execute</b></td><td>Rows</td><td><code>division by zero</code>, <code>duplicate key value</code>, deadlocks, timeouts</td><td>Microseconds to hours</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Parse and analyse</h2>
+  <p>The parser knows the grammar of SQL and nothing about your database. It will accept <code>SELECT nonsense FROM nowhere</code>, because that is a well-formed statement. The analyser then opens the system catalogue, the tables in which the database describes itself, and resolves every name. It finds that <code>orders</code> is a table with a particular identity, that <code>total_cents</code> is its fourth column and of type <code>bigint</code>, and that <code>&gt;</code> applied to a <code>bigint</code> and an integer literal means a specific comparison function. If it must convert a type to make an expression work, it inserts the conversion here.</p>
+<pre class="code"><span class="k">SELECT</span> o.order_id, o.total_cents
+<span class="k">FROM</span> orders o
+<span class="k">WHERE</span> o.total_cents &gt; <span class="m">10000</span>
+<span class="k">ORDER BY</span> o.total_cents <span class="k">DESC</span>
+<span class="k">LIMIT</span> <span class="m">3</span>;</pre>
+  <p>After analysis this is no longer text. It is a tree which says: from the relation with this identity, take the rows for which this function of column 4 returns true, order them by column 4 descending, keep three, and output columns 1 and 4. Nothing yet says how.</p>
+
+  <h2>Rewrite</h2>
+  <p>A view is a stored query (<a href="05-subqueries-ctes.html">Chapter 5</a>). The rewriter substitutes the view's definition wherever its name appears, so that the planner sees one large query over base tables and can optimise across the boundary: a filter written against the view can be pushed down to an index on the table beneath. Row-level security works the same way, by adding each policy's condition to the query's <code>WHERE</code> clause. This is why a view costs nothing in itself, and why a query against a harmless-looking view can be very expensive: you are running whatever the view contains.</p>
+
+  <h2>Plan</h2>
+  <p>For the query above there are several ways to get the answer: read the whole table, filter it and sort what is left; or, if there is an index on <code>total_cents</code>, read the index backwards from its largest value and stop after three rows. With joins the number of possibilities multiplies, since the tables can be joined in any order and by three different algorithms (<a href="18-join-algorithms.html">Chapter 18</a>). The <b>planner</b> estimates the cost of each candidate from statistics about the data and picks the cheapest (<a href="19-cost-based-optimizer.html">Chapter 19</a>). Its output is a <b>plan</b>: a tree of operators, each of which does one simple thing.</p>
+<pre class="code"><span class="k">EXPLAIN</span> <span class="k">SELECT</span> … ;                     <span class="c">-- shows the plan without running it</span>
+
+ Limit
+   -&gt;  Sort
+         Sort Key: total_cents DESC
+         -&gt;  Seq Scan on orders
+               Filter: (total_cents &gt; 10000)</pre>
+  <p>Planning is work, and for a short query it can take longer than running it. A <b>prepared statement</b> lets a client send the text once, with placeholders, and execute it many times, so that parsing and analysis aren't repeated, and often planning isn't either. Most drivers do this for you (<a href="p6-python-psycopg.html">P6</a>).</p>
+
+  <h2>Execute: the iterator model</h2>
+  <p>Every operator in the plan offers the same small interface: "give me your next row". This is the <b>iterator model</b>, also called the Volcano model after the system that introduced it. The executor asks the root of the tree for a row. The root asks its child, which asks its own child, down to a scan that reads a row from a table. The row travels back up, changed or discarded by each operator on the way. Then the executor asks for the next. Python's generators behave in exactly this way, and three operators take a dozen lines:</p>
+<pre class="code"><span class="k">def</span> <span class="f">seq_scan</span>(table, predicate):
+    <span class="k">for</span> row <span class="k">in</span> table:                       <span class="c"># one row is read each time someone asks</span>
+        <span class="k">if</span> <span class="f">predicate</span>(row):
+            <span class="k">yield</span> row
+
+<span class="k">def</span> <span class="f">sort</span>(child, key):
+    rows = <span class="f">sorted</span>(child, key=key)            <span class="c"># has to consume ALL of its input before it can yield anything</span>
+    <span class="k">yield from</span> rows
+
+<span class="k">def</span> <span class="f">limit</span>(child, n):
+    <span class="k">for</span> i, row <span class="k">in</span> <span class="f">enumerate</span>(child):
+        <span class="k">if</span> i == n:
+            <span class="k">return</span>                           <span class="c"># stops asking: the child never produces another row</span>
+        <span class="k">yield</span> row
+
+plan = <span class="f">limit</span>(<span class="f">sort</span>(<span class="f">seq_scan</span>(orders, <span class="k">lambda</span> r: r.total_cents &gt; <span class="m">10000</span>), key=<span class="k">lambda</span> r: -r.total_cents), <span class="m">3</span>)
+<span class="k">for</span> row <span class="k">in</span> plan:                            <span class="c"># the executor: keep asking the root</span>
+    <span class="f">send_to_client</span>(row)</pre>
+  <p>Two properties of this design explain a lot of behaviour.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Pipelined operators</th><th>Blocking operators</th></tr></thead>
+      <tbody>
+        <tr><td><b>Behaviour</b></td><td>Pass each row on as soon as they have it</td><td>Must read all their input before producing their first row</td></tr>
+        <tr><td><b>Examples</b></td><td>Scans, filters, nested-loop join, merge join, Limit</td><td>Sort, hash aggregate, the build side of a hash join</td></tr>
+        <tr><td><b>Memory</b></td><td>One row at a time</td><td>The whole input, in <code>work_mem</code> or spilled to disk</td></tr>
+        <tr><td><b>First row arrives</b></td><td>Almost at once</td><td>After everything beneath has finished</td></tr>
+        <tr><td><b>With LIMIT above</b></td><td>Work stops as soon as enough rows have come through</td><td>The limit saves nothing below the blocking operator</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Try it: pull rows through a plan</h2>
+  <p>A table of twelve orders. The query wants orders of more than £100, three of them. Choose a version of the query, and call <code>next()</code> on the root of its plan until it has no more rows.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">The iterator model, one row at a time</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="qp-row"><span>Query</span><div class="seg" id="qpPlan"><button class="active" data-v="a">any three</button><button data-v="b">the three largest, by sorting</button><button data-v="c">the three largest, with an index</button></div></div>
+      <div class="qp-sql" id="qpSql"></div>
+      <div class="controls">
+        <button class="btn sm primary" id="qpNext">Call next() on the root</button>
+        <button class="btn sm" id="qpAll">Run to the end</button>
+        <button class="btn sm ghost" id="qpReset">↺ Reset</button>
+      </div>
+      <div class="qp-cols">
+        <div class="qp-box"><h6>The plan</h6><ol class="qp-plan" id="qpTree"></ol></div>
+        <div class="qp-box"><h6>The table: 12 orders</h6><div class="qp-rows" id="qpRows"></div></div>
+      </div>
+      <div class="qp-msg" id="qpMsg"></div>
+      <div class="stats" id="qpStats"></div>
+    </div>
+    <div class="panel-foot">Each order shows its number and its total in pounds. A row is outlined when the scan has read it, amber when it has passed the filter and is waiting inside an operator, and green when it has been returned to the client. The number beside each operator is how many rows it has produced so far.</div>
+  </div>
+
+  <p>Things to notice. Asking for any three rows over £100, the scan reads six rows and stops. The other six are never touched, because Limit stopped asking. Asking for the three largest by sorting, the first call to <code>next()</code> does almost all of the work: Sort has to pull every row out of the scan before it can know which is largest, so all twelve are read before one is returned, and the limit has saved nothing. With an index on the total, the same three rows come back after reading three rows. The index is already in order, so the plan needs no Sort and has no blocking operator, and Limit can stop it early. All three plans give a correct answer to their query. The cost differs fourfold on twelve rows, and on twelve million the same plans differ by a factor of millions.</p>
+
+  <h2>Vectorised execution</h2>
+  <p>The iterator model has a fixed cost for every row at every operator: a function call that can't be predicted, a few branches to find out what type of value it has, and a result handed back. For a query that fetches twenty rows, that cost is nothing. For an analytical query that adds up a billion values, it is nearly all of the work, since the addition is one machine instruction and the machinery round it is dozens.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>One row at a time</th><th>Vectorised</th><th>Compiled</th></tr></thead>
+      <tbody>
+        <tr><td><b>Each call returns</b></td><td>One row</td><td>A batch of about a thousand values of one column</td><td>Nothing: there are no calls</td></tr>
+        <tr><td><b>Inner loop</b></td><td>Interpreted afresh for each row</td><td>A tight loop over an array, which the processor can run with SIMD instructions</td><td>Machine code generated for this one query</td></tr>
+        <tr><td><b>Overhead for each value</b></td><td>Tens of instructions</td><td>About one</td><td>About one</td></tr>
+        <tr><td><b>Best for</b></td><td>Short transactional queries</td><td>Scans and aggregates over many rows of few columns</td><td>The same, with more complex expressions</td></tr>
+        <tr><td><b>Used by</b></td><td>PostgreSQL, MySQL, SQLite</td><td>DuckDB, ClickHouse, Snowflake</td><td>PostgreSQL's JIT for expressions; several research engines</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><b>Vectorised execution</b> keeps the same tree of operators and changes what flows between them: each call returns a batch of values, stored column by column. The overhead is then paid once for a thousand values, and the work inside an operator becomes a simple loop over an array. It goes naturally with storing tables by column (<a href="28-column-stores-olap.html">Chapter 28</a>), and the two together are why an analytical database can aggregate a billion rows in a second on one machine.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧮</div>
+    <div class="body"><div class="title">When compiling a query took longer than running it</div><p>PostgreSQL gained a just-in-time compiler in version 11, and from version 12 it was switched on by default. It attacks the overhead described above: for a query that the planner expects to be expensive, it generates machine code for the query's own expressions, the filter conditions and the column extraction, using LLVM, so that they need not be interpreted for every row. On long analytical queries this gives a real improvement. The decision to compile, though, is made from the planner's estimate of cost before the query has run, and compiling takes time itself, anything from a few milliseconds to several hundred. After upgrading, a number of teams found certain queries had become slower, and <code>EXPLAIN ANALYZE</code> showed why in a line they hadn't seen before: a query that executed in 20 ms was spending 400 ms being compiled first. The usual cause was a cost estimate that was far too high. A query over a table with hundreds of partitions, or one where the planner expected millions of rows and found a few, crossed the threshold and paid for compilation that could never be repaid. The remedies are to raise <code>jit_above_cost</code>, to fix the estimate, or, as many transactional systems do, to turn JIT off, since their queries are all short. The case shows the stages of this chapter interacting. A mistake at the planning stage, a wrong estimate, led to wasted work at the start of execution, and it could only be found because the tool reports the time spent in each stage separately.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Assuming <code>LIMIT</code> makes a query cheap.</b> It does only when nothing blocking sits beneath it. With <code>ORDER BY</code> and no suitable index, everything is read first.</li>
+      <li><b>Treating a view as a table.</b> It is expanded into your query. Read its definition before you join five of them.</li>
+      <li><b>Building SQL strings with the values pasted in,</b> so that every execution is a new statement to parse and plan, as well as an injection risk (<a href="p6-python-psycopg.html">P6</a>).</li>
+      <li><b>Blaming "the database" for a slow query</b> without finding the stage. It is nearly always the plan that was chosen, and occasionally the time taken to choose it.</li>
+      <li><b>Fetching a huge result into memory in the application</b> when the database would have streamed it row by row through a cursor.</li>
+      <li><b>Expecting a transactional database to do analytics at warehouse speed.</b> Row-at-a-time execution has a cost for every row that no index removes.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What happens between sending a SQL query and getting rows back?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Four stages. The parser checks the syntax and builds a parse tree. The analyser resolves every name against the catalogue, tables, columns, functions and operators, checks types and permissions, and produces a query tree; that is where "column does not exist" comes from. The rewriter expands views into their definitions and applies row-level security. Then the planner takes that logical description and decides how to execute it: which access path to use for each table, sequential scan or an index, the join order and join algorithms, where to sort or aggregate. It enumerates alternatives, estimates the cost of each from table statistics, and picks the cheapest; its output is a tree of physical operators, which is what EXPLAIN prints. Finally the executor runs that tree using the iterator model: it repeatedly asks the root operator for the next row, each operator asks its children, and rows flow up from the scans, being filtered, joined and sorted on the way, and are sent to the client as they are produced. With prepared statements, the parse and analysis, and often the plan, are reused across executions.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Two queries both end in <code>LIMIT 10</code>. One returns in a millisecond and the other takes a minute. How can that be?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>LIMIT only saves work if the plan beneath it is pipelined, meaning rows flow through one at a time, so that when Limit stops calling next() its children simply stop. In the fast query, the plan is something like Limit over an index scan that already produces rows in the required order, or over a scan with a filter and no ordering: the executor reads until ten rows have come through and stops. In the slow query there is a blocking operator between the Limit and the data: typically a Sort, because of an ORDER BY with no matching index, or a hash aggregate for GROUP BY or DISTINCT, or a window function. A blocking operator has to consume its entire input before it can emit its first row, so the full scan, join and sort all happen, and Limit then discards all but ten rows. PostgreSQL does optimise the sort into a top-N heap that keeps only ten rows in memory, but it still has to read every input row. There is a third case: a pipelined plan where matches are rare, such as an index scan in ORDER BY order with a selective filter applied afterwards, which may walk millions of index entries before finding ten that pass. I'd look at the plan with EXPLAIN ANALYZE: the node where the actual row count drops from millions to ten shows where the work was done, and the usual fix is an index that provides both the filter and the order.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A query is parsed, analysed, rewritten, planned and executed. The first three settle what it means, and the last two how it is done.</li>
+      <li>Syntax errors come from the parser, unknown names and type mismatches from the analyser, and run-time errors from the executor.</li>
+      <li>A view is expanded into the query before planning, so it costs whatever its definition costs.</li>
+      <li>A plan is a tree of operators. The executor pulls rows from the root, and each operator pulls from its children.</li>
+      <li>Pipelined operators pass rows on at once, and blocking ones such as Sort need all their input first. LIMIT saves work only above pipelined operators.</li>
+      <li>Vectorised engines pass batches of column values between operators, which removes most of the cost per row for analytical queries.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">At which stage is <code>ERROR: column "custmer_id" does not exist</code> raised?</p>
+      <div class="opts">
+        <button class="opt">Parsing</button>
+        <button class="opt">Analysis, when names are looked up in the catalogue</button>
+        <button class="opt">Planning</button>
+        <button class="opt">Execution</button>
+      </div>
+      <div class="explain">The statement is grammatical, so the parser accepts it. The analyser is the first stage that knows what columns exist.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A query selects from a view with a <code>WHERE</code> clause. What does the planner see?</p>
+      <div class="opts">
+        <button class="opt">The view's stored results, to which the filter is applied</button>
+        <button class="opt">Two separate queries, run one after the other</button>
+        <button class="opt">A temporary table created from the view</button>
+        <button class="opt">One query over the base tables, with the view's definition substituted in</button>
+      </div>
+      <div class="explain">The rewriter expands the view, so the filter can be pushed down to the tables and their indexes.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">In the iterator model, what does the executor do to get a result row?</p>
+      <div class="opts">
+        <button class="opt">It asks the root operator for its next row, and each operator asks its children in turn</button>
+        <button class="opt">It runs each operator to completion, from the bottom up</button>
+        <button class="opt">It pushes every table row up through the tree</button>
+        <button class="opt">It runs all operators in parallel</button>
+      </div>
+      <div class="explain">Rows are pulled on demand, one at a time, which is what lets an operator such as Limit stop the ones below it.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q"><code>SELECT … ORDER BY total DESC LIMIT 3</code> runs on a table with no index on <code>total</code>. How many rows does the scan read?</p>
+      <div class="opts">
+        <button class="opt">3</button>
+        <button class="opt">About 3, depending on the data</button>
+        <button class="opt">All of them: Sort needs its whole input before it can return the first row</button>
+        <button class="opt">None: the planner refuses the query</button>
+      </div>
+      <div class="explain">Sort is a blocking operator, so the Limit above it can't cut the scan short.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why do analytical databases pass batches of column values between operators and not single rows?</p>
+      <div class="opts">
+        <button class="opt">Batches use less memory</button>
+        <button class="opt">The overhead of each call is paid once for a thousand values, and the inner loops become simple array operations</button>
+        <button class="opt">Single rows can't be aggregated</button>
+        <button class="opt">It makes transactions safer</button>
+      </div>
+      <div class="explain">For a scan of a billion values, the interpretation overhead for each row is most of the cost.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const TOT = [40, 120, 75, 310, 95, 180, 60, 250, 30, 140, 220, 85];        // order n has total TOT[n-1]
+  const ROWS = TOT.map((t, i) => ({ id: i + 1, total: t }));
+  const PLANS = {
+    a: { sql: 'SELECT * FROM orders WHERE total > 100 LIMIT 3;', nodes: [['Limit 3', 'stops asking after three rows'], ['Seq Scan on orders', 'filter: total > 100']] },
+    b: { sql: 'SELECT * FROM orders WHERE total > 100 ORDER BY total DESC LIMIT 3;', nodes: [['Limit 3', 'stops asking after three rows'], ['Sort by total DESC', 'blocking: needs all of its input first'], ['Seq Scan on orders', 'filter: total > 100']] },
+    c: { sql: 'SELECT * FROM orders WHERE total > 100 ORDER BY total DESC LIMIT 3;   -- with an index on total', nodes: [['Limit 3', 'stops asking after three rows'], ['Index Scan Backward on orders_total_idx', 'from the largest total downwards, while total > 100']] },
+  };
+  let st;
+  const plan = () => $('#qpPlan').dataset.value;
+  function reset() { st = { read: new Set(), pass: new Set(), out: [], calls: 0, pos: 0, sorted: null, done: false, firstAfter: null, prod: [0, 0, 0], on: -1, msg: null, cls: '' }; draw(); }
+  const pounds = (r) => `order ${r.id} (£${r.total})`;
+  // The scan's own next(): read rows until one passes the filter.
+  function scanNext(log) {
+    while (st.pos < ROWS.length) { const r = ROWS[st.pos++]; st.read.add(r.id); if (r.total > 100) { st.pass.add(r.id); log.pass = r; return r; } log.skipped++; }
+    return null;
+  }
+  function next() {
+    if (st.done) return;
+    st.calls++; const p = plan(), last = PLANS[p].nodes.length - 1;
+    if (st.out.length === 3) { st.done = true; st.on = 0; st.cls = 'qp-good';
+      const unread = ROWS.length - st.read.size;
+      st.msg = `<b>Limit has already returned three rows, so it answers "no more" without asking its child.</b> ` + (p === 'a' ? `The scan was left where it stood: ${unread} rows of the table were never read.` : p === 'b' ? 'Nothing was saved, though: Sort had read the whole table on the first call.' : `The index scan was left where it stood. ${unread} rows of the table were never read, and no sort was needed.`);
+      return; }
+    let row, msg;
+    if (p === 'a') {
+      const log = { skipped: 0 }; row = scanNext(log); st.calls++;
+      msg = `Limit asked the scan, which read ${log.skipped + 1} row${log.skipped ? 's' : ''}` + (log.skipped ? `, rejected ${log.skipped} at the filter,` : '') + ` and returned ${pounds(row)}.`;
+    } else if (p === 'b') {
+      st.calls++;
+      if (!st.sorted) {
+        const buf = []; let r; const log = { skipped: 0 };
+        while ((r = scanNext(log))) { buf.push(r); st.calls++; } st.calls++;
+        st.sorted = buf.sort((x, y) => y.total - x.total); st.prod[2] = buf.length;
+        msg = `Limit asked Sort for one row. Sort can't know which row is largest until it has seen them all, so it called the scan ${buf.length + 1} times, which read all 12 rows and passed up the ${buf.length} over £100. Sort ordered them, and only then returned ${pounds(st.sorted[0])}.`;
+      } else msg = `Sort already holds its rows in order, so it handed over the next one, ${pounds(st.sorted[st.out.length])}, without reading anything.`;
+      row = st.sorted[st.out.length]; st.prod[1]++;
+    } else {
+      st.calls++;
+      const order = ROWS.slice().sort((x, y) => y.total - x.total); row = order[st.out.length]; st.read.add(row.id); st.pass.add(row.id);
+      msg = `Limit asked the index scan, which stepped to the next entry in the index, read that one row from the table, and returned ${pounds(row)}. The index is already in order of total.`;
+    }
+    st.out.push(row); st.prod[0]++; st.prod[last] = p === 'b' ? st.prod[last] : st.prod[last] + 1;
+    if (st.firstAfter === null) st.firstAfter = st.read.size;
+    st.on = last; st.cls = p === 'b' && st.out.length === 1 ? 'qp-warn' : '';
+    st.msg = `<b>next() returned ${pounds(row)}: row ${st.out.length} of 3.</b> ` + msg;
+  }
+  function draw() {
+    const p = plan(), P = PLANS[p];
+    $('#qpSql').textContent = P.sql;
+    $('#qpTree').innerHTML = P.nodes.map((nd, i) => `<li class="${st.done ? 'qp-done' : i <= st.on && st.on >= 0 ? 'qp-on' : ''}" style="margin-left:${i * 18}px">${i ? '→ ' : ''}${nd[0]} <span style="float:right">${st.prod[i]} row${st.prod[i] === 1 ? '' : 's'}</span><small>${nd[1]}</small></li>`).join('');
+    const outIds = new Set(st.out.map((r) => r.id));
+    $('#qpRows').innerHTML = ROWS.map((r) => `<div class="qp-r ${outIds.has(r.id) ? 'qp-out' : st.pass.has(r.id) ? 'qp-pass' : st.read.has(r.id) ? 'qp-read' : ''}">${r.id}<small>£${r.total}</small></div>`).join('');
+    const m = $('#qpMsg'); m.className = 'qp-msg ' + (st.cls || '');
+    m.innerHTML = st.msg || 'Nothing has run yet. The plan exists, and no row has been read. Each press asks the root for one row.';
+    $('#qpNext').disabled = st.done; $('#qpAll').disabled = st.done;
+    $('#qpStats').innerHTML = `<div class="stat ${st.read.size === 12 ? 'bad' : st.read.size ? 'good' : ''}"><div class="k">Table rows read</div><div class="v">${st.read.size} <small>of 12</small></div></div>
+      <div class="stat acc"><div class="k">Rows returned</div><div class="v">${st.out.length}</div></div>
+      <div class="stat"><div class="k">Rows read before the first result</div><div class="v">${st.firstAfter === null ? '–' : st.firstAfter}</div></div>
+      <div class="stat"><div class="k">Calls to next(), all operators</div><div class="v">${st.calls}</div></div>`;
+  }
+  $('#qpNext').onclick = () => { next(); draw(); };
+  $('#qpAll').onclick = () => { while (!st.done) next(); draw(); };
+  $('#qpReset').onclick = reset;
+  $('#qpPlan').addEventListener('segchange', reset);
+  reset();
+})();
+</script>
 </body>
 </html>
