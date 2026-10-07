@@ -6,34 +6,329 @@
 <title>Multi-Region Deployments</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('ops-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .mr-ctl { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:12px 18px; margin-bottom:14px; }
+  .mr-ctl .mr-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .mr-svg { width:100%; height:auto; display:block; border:1px solid var(--border); border-radius:12px; background:var(--surface); }
+  .mr-svg .mr-grid { stroke:var(--border); stroke-width:1; }
+  .mr-svg .mr-cap { stroke:var(--text); stroke-width:1.2; stroke-dasharray:5 4; }
+  .mr-svg .mr-err { fill:none; stroke:var(--red); stroke-width:2.4; }
+  .mr-svg .mr-util { fill:none; stroke:var(--accent); stroke-width:2.4; }
+  .mr-svg text { font-size:11px; fill:var(--muted); font-family:var(--mono); }
+  .mr-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="33">
-<!-- ops:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 33</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>Multi-Region <span class="grad">Deployments</span></h1>
-    <p class="lead">Routing users to regions, data replication choices, and failing over a whole region.</p>
+    <p class="lead">Running in more than one region is the most expensive reliability decision a team makes, and the one most often made for the wrong reason. It protects against exactly one thing, the loss of a region, and it brings new ways to fail: traffic that goes to the wrong place, data that disagrees with itself, and surviving regions that fall over under the load they inherit. This chapter is about operating such a system: how users are steered between regions, what the managed global databases actually promise, what has to be true for a failover to work on the day, and how cells limit the damage of every other kind of failure. The simulator takes a region away and shows what happens to the others.</p>
+    <ul class="objectives">
+      <li><span>Decide whether a system needs more than one region, and say what it will cost</span></li>
+      <li><span>Steer users with DNS policies, health checks and anycast, and know the limits of each</span></li>
+      <li><span>Compare the replication models of managed global databases</span></li>
+      <li><span>Explain static stability and why failover must not depend on a control plane</span></li>
+      <li><span>Work out how much spare capacity each region needs to absorb the loss of one</span></li>
+      <li><span>Describe a cell-based architecture and what it limits</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Bash · Docker · K8s · Terraform listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Disaster recovery strategies, RPO and RTO:</b> <a href="32-disaster-recovery.html">Chapter 32</a>. Multi-region is the top of that ladder.</li>
+        <li><b>The design questions</b> (who accepts writes, conflicts, the cost of distance): the System Design course's <a href="../system-design/22-multi-region.html">chapter on multi-region</a>, and <a href="../databases/25-replication.html">replication</a> in the Databases course. This chapter does not repeat them.</li>
+        <li><b>DNS and anycast:</b> the Networks course's <a href="../networks/26-anycast-cdn.html">chapter on anycast and CDNs</a>.</li>
+        <li><b>Progressive rollouts:</b> <a href="17-deployment-strategies.html">Chapter 17</a>. Regions are the largest stage of a rollout.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why multi-region</li>
-    <li>Global load balancing</li>
-    <li>Data replication</li>
-    <li>Regional failover</li>
-    <li>Cell-based architecture</li>
-  </ol>
+  <h2>Why multi-region</h2>
+  <p>There are three honest reasons to run in several regions.</p>
+  <ul>
+    <li><b>Surviving the loss of a region.</b> Rare, but it happens to every provider, and for some businesses hours of downtime are not acceptable.</li>
+    <li><b>Latency.</b> A user in Sydney talking to a server in Virginia waits about a quarter of a second per round trip, before any work is done. The only fix is a server nearer the user.</li>
+    <li><b>Law.</b> Some data must stay inside a country or a region.</li>
+  </ul>
+  <p>And there is a set of costs that should be stated just as plainly. The compute bill rises by half or doubles. Data transfer between regions is charged (<a href="31-finops.html">Chapter 31</a>). Every data store needs a replication story. Every deployment, secret, alert and runbook now exists several times. Most important of all: the commonest cause of outages is a team's own change, and a change deployed to every region at once breaks every region at once. Multiple regions do nothing for that unless the rollout is staged.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Shape</th><th>How it works</th><th>Protects against</th><th>Main difficulty</th></tr></thead>
+      <tbody>
+        <tr><td><b>One region, several zones</b></td><td>The default from <a href="02-cloud-fundamentals.html">Chapter 2</a></td><td>Server and zone failures</td><td>None new. Enough for most systems</td></tr>
+        <tr><td><b>Active–passive</b></td><td>A second region on standby (pilot light or warm)</td><td>Loss of the region, in minutes</td><td>The standby is untested until the day it is needed</td></tr>
+        <tr><td><b>Active–active, one writer</b></td><td>Every region serves reads; writes go to one home region</td><td>Loss of a region; read latency</td><td>Write latency from far regions; moving the writer during a failover</td></tr>
+        <tr><td><b>Active–active, many writers</b></td><td>Every region accepts reads and writes</td><td>Loss of a region; read and write latency</td><td>Conflicting writes, and an application designed around them</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Global load balancing</h2>
+  <p>Something has to send each user to a region, and take a region out when it is unhealthy. There are two mechanisms.</p>
+  <p><b>DNS-based steering</b> answers the name lookup differently for different users. The provider's DNS service offers routing policies: <b>latency</b> (the region with the fastest path from the user's resolver), <b>geolocation</b> (by the user's country, for data-residency rules), <b>weighted</b> (a percentage split, for gradual migrations) and <b>failover</b> (a primary and a backup). Each record can be tied to a <b>health check</b>, and an unhealthy region simply stops being given out.</p>
+<pre class="code"><span class="k">resource</span> <span class="s">"aws_route53_health_check"</span> <span class="s">"london"</span> {
+  fqdn              = <span class="s">"london.api.example.com"</span>
+  type              = <span class="s">"HTTPS"</span>
+  resource_path     = <span class="s">"/healthz"</span>
+  request_interval  = 30
+  failure_threshold = 3                               <span class="c"># 3 failures 30 s apart: about 90 s to notice</span>
+}
+
+<span class="k">resource</span> <span class="s">"aws_route53_record"</span> <span class="s">"api_london"</span> {
+  zone_id         = aws_route53_zone.main.zone_id
+  name            = <span class="s">"api.example.com"</span>
+  type            = <span class="s">"A"</span>
+  set_identifier  = <span class="s">"london"</span>
+  health_check_id = aws_route53_health_check.london.id
+  <span class="k">latency_routing_policy</span> { region = <span class="s">"eu-west-2"</span> }
+  <span class="k">alias</span> {
+    name                   = aws_lb.london.dns_name
+    zone_id                = aws_lb.london.zone_id
+    evaluate_target_health = true
+  }
+}   <span class="c"># and one more record per region, with the same name</span></pre>
+  <p>DNS steering is simple and works with anything. Its weakness is the cache. Every answer carries a lifetime (the TTL), and until it expires, resolvers and clients keep using the old address. A 60-second TTL means a failover takes effect for most users within a couple of minutes. Some clients, and some long-lived connection pools, hold addresses far longer than the TTL says.</p>
+  <p><b>Anycast steering</b> avoids the cache. The service has one IP address, announced from many locations, and the network delivers each packet to the nearest healthy one (AWS Global Accelerator, and the global load balancers of Google Cloud and Cloudflare, work this way). Taking a region out changes routing inside the provider's network within seconds, and no client has to look anything up again.</p>
+  <figure class="seq" data-actors="User|DNS service|London|Frankfurt">
+    <ol>
+      <li data-m="1>2" data-k="async">health check every 30 s: healthy</li>
+      <li data-m="0>1">where is api.example.com?</li>
+      <li data-m="1>0" data-k="reply">London's address, valid for 60 s</li>
+      <li data-m="2>2" data-k="bad">London fails</li>
+      <li data-m="0>2" data-k="fail">requests fail: the cached address still points here</li>
+      <li data-m="1>2" data-k="fail">third failed health check, about 90 s after the failure</li>
+      <li data-m="0>1">the cached answer expires; ask again</li>
+      <li data-m="1>0" data-k="reply">Frankfurt's address</li>
+      <li data-m="0>3">requests succeed, a little further away</li>
+    </ol>
+    <figcaption><b>A DNS failover.</b> The outage for a London user lasts for the detection time plus whatever is left of the cached answer. Nothing in Frankfurt had to change, which is the property the next section is about.</figcaption>
+  </figure>
+  <p>One caution about health checks. If the check in every region depends on the same thing, say a shared login service, then one failure marks every region unhealthy and the steering layer has nowhere to send anyone. Keep regional health checks about the region, and configure the steering to <b>fail open</b>: when everything looks unhealthy, send traffic anyway.</p>
+
+  <h2>Data replication</h2>
+  <p>Stateless services are easy to run in many regions. The data is where the decisions are, and the managed global databases have each made a different one.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Service</th><th>Writes accepted in</th><th>Replication</th><th>What you give up</th></tr></thead>
+      <tbody>
+        <tr><td><b>Aurora Global Database</b>, and cross-region replicas generally</td><td>One region</td><td>Asynchronous, typically under a second behind</td><td>Far-away users write slowly; a failover loses the last moments and moves the writer</td></tr>
+        <tr><td><b>DynamoDB global tables</b></td><td>Every region</td><td>Asynchronous, both ways. If two regions change the same item, the later write wins</td><td>The earlier of two conflicting writes disappears without an error</td></tr>
+        <tr><td><b>Spanner</b>, CockroachDB</td><td>Every region</td><td>Synchronous: a write is agreed by a majority of regions before it is confirmed</td><td>Every write waits for a round trip between regions</td></tr>
+        <tr><td><b>Object storage replication</b></td><td>The source bucket</td><td>Asynchronous, seconds to minutes</td><td>Recently written objects may be missing after a failover</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Whichever you choose, three things become operational duties. <b>Replication lag is a signal</b> to graph and alert on, because it is the data you would lose right now (<a href="24-slos-alerting.html">Chapter 24</a>). <b>Users notice inconsistency at the edges:</b> someone who writes in one region and is then routed to another may not see their own change, so keep a user on one region for the length of a session where you can. And <b>requests will be repeated</b> across a failover, so writes need the idempotency keys covered in the Distributed Systems course's <a href="../distributed-systems/04-retries-idempotency.html">chapter on retries</a>.</p>
+
+  <h2>Regional failover</h2>
+  <p>A failover plan has one property that matters more than its speed: it must still work while the provider is having a bad day. That leads to the idea of <b>static stability</b>: when a region fails, the others carry on <i>without anything having to change</i>.</p>
+  <p>Cloud services have two parts. The <b>data plane</b> does the work: running instances serve requests, load balancers forward them, DNS answers queries. The <b>control plane</b> makes changes: launching instances, editing records, creating load balancers. Data planes are built to be far more robust, and during large incidents the control plane is the part that struggles, because every customer is trying to launch capacity somewhere else at once. A plan that says "when the region fails, we scale up the other one" depends on the control plane at its worst moment. A statically stable plan has the capacity already running.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Capacity is already there</b> each region runs with enough room to take its share of a lost region's traffic</li>
+      <li data-k="decision"><b>Detection is automatic</b> health checks fail; no person or API call is needed to stop sending traffic</li>
+      <li data-k="step"><b>Traffic moves</b> by anycast in seconds, or as DNS answers expire</li>
+      <li data-k="store"><b>The data follows</b> the writer is moved if there is one; the lag at that moment is the loss</li>
+      <li data-k="step"><b>Nothing global is in the path</b> no step needs a service that lives only in the failed region</li>
+      <li data-k="end"><b>People confirm and communicate</b> then plan the return for a quiet day</li>
+    </ol>
+    <figcaption><b>A statically stable failover.</b> The fifth step is found by audit: list everything the failover touches, including the CI system, the container registry, the secrets store and the identity provider, and ask where each one lives.</figcaption>
+  </figure>
+  <p>The capacity sum is simple and frequently got wrong. With <code>N</code> regions sharing traffic equally, losing one multiplies the load on each survivor by <code>N / (N − 1)</code>. For the survivors to cope, each region must normally run below <code>(N − 1) / N</code> of its capacity: under 50% with two regions, under 67% with three. Three regions at 60% cost less than two at 45% and are just as safe, which is one reason large systems use three. Run hotter than the limit and the failover does not save you: the surviving regions are pushed past their capacity, and an overloaded service does less useful work than a busy one, because it spends its effort on requests that time out before they finish.</p>
+  <p>Regions are also the last and largest stage of a rollout. A change goes to one region, is watched for long enough to see problems, and only then goes to the next (<a href="17-deployment-strategies.html">Chapter 17</a>). This is the only way multiple regions protect you from your own changes. <a href="44-case-aws-us-east-1-2021.html">Chapter 44</a> studies an incident in which control planes and global dependencies decided who stayed up.</p>
+
+  <h2>Cell-based architecture</h2>
+  <p>Regions limit the damage of a place failing. <b>Cells</b> limit the damage of everything else. A cell is a complete, independent copy of the service: its own servers, queues and databases, serving a fixed subset of customers. In front of the cells sits a thin <b>router</b> that knows which customer lives in which cell and does nothing else.</p>
+  <ul>
+    <li><b>Blast radius.</b> A bad deployment, a poisoned request, a full disk or a runaway customer takes out one cell. With twenty cells, that is 5% of customers and not all of them.</li>
+    <li><b>Deployment.</b> Changes roll out one cell at a time, so the first cell is a canary with real traffic and a hard wall around it.</li>
+    <li><b>Scale.</b> A cell has a maximum size, and you test at that size. Growth means adding cells, not making an untested giant.</li>
+  </ul>
+  <p>The costs are real. Anything that spans cells (a search across all customers, moving a customer from one cell to another) needs special machinery. The router is shared by everyone, so it has to be simple enough to be near-perfect. And cells cost a little more than one pooled fleet. AWS builds its own services this way and describes the pattern publicly. Slack moved to a cellular design by availability zone after incidents in which one zone's trouble spread to the whole service, and Salesforce has long placed each customer on a named instance, which is why its outages are reported per instance.</p>
+
+  <h2>Simulator: lose a region</h2>
+  <p>Traffic is shared equally between the regions. At time zero one of them fails completely. Choose how hot the regions were running, how users are steered, and whether new capacity can be added during the incident.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Can the survivors carry it?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="mr-ctl">
+        <div><div class="mr-l">Regions</div><div class="seg" id="mrN"><button class="active" data-v="2">Two</button><button data-v="3">Three</button></div></div>
+        <div><div class="mr-l">How full each region normally runs</div><div class="seg" id="mrU"><button data-v="0.45">45%</button><button class="active" data-v="0.6">60%</button><button data-v="0.8">80%</button></div></div>
+        <div><div class="mr-l">How users are steered</div><div class="seg" id="mrTtl"><button data-v="0">Anycast</button><button class="active" data-v="60">DNS, 60 s TTL</button><button data-v="300">DNS, 5 min TTL</button><button data-v="3600">DNS, 1 hour TTL</button></div></div>
+        <div><div class="mr-l">Adding capacity during the incident</div><div class="seg" id="mrScale"><button class="active" data-v="ok">Works: ready in 10 minutes</button><button data-v="impaired">Control plane impaired: not possible</button></div></div>
+      </div>
+      <svg class="mr-svg" id="mrSvg" viewBox="0 0 640 220" role="img" aria-label="Failed requests and surviving-region load over thirty minutes"></svg>
+      <div class="legend"><span><i style="background:var(--red)"></i>requests failing, % of all traffic</span><span><i style="background:var(--accent)"></i>load on each surviving region, % of its capacity</span></div>
+      <div class="stats" id="mrStats"></div>
+      <div class="mr-why" id="mrWhy"></div>
+    </div>
+    <div class="panel-foot">Health checks take 90 seconds to declare the region dead. With DNS, the failed region's users move over evenly as their cached answers expire; with anycast they move at once. A region loaded beyond its capacity loses useful output in proportion: at 120% load it completes 80% of its capacity, at 150% half, at 200% nothing. Extra capacity, when it can be added, is requested at detection and arrives 10 minutes later.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul id="mr-notes">
+    <li><b>The starting design</b> is two regions at 60%, which sounds comfortable. When one fails the other is asked for 120% of its capacity. With extra capacity arriving after ten minutes, <b>13.5%</b> of all requests in the half-hour fail and normal service returns after <b>11.5 minutes</b>.</li>
+    <li><b>Now impair the control plane,</b> as happens in large incidents. No capacity arrives, <b>34.1%</b> of requests fail and the service does not recover within the half-hour. The surviving region completes only 67% of what it receives.</li>
+    <li><b>Lower the regions to 45%.</b> Only 3.5% of requests fail and service is normal after 2.5 minutes, with or without the control plane. This is static stability, and it costs capacity equal to 222% of the traffic.</li>
+    <li><b>Three regions at 60%</b> give 2.3% and 2.5 minutes, for capacity equal to 167% of the traffic. Safer and cheaper than two regions at 45%, because each survivor takes only half of the lost region's load.</li>
+    <li><b>Switch to anycast:</b> 1.7% and 90 seconds, which is the detection time and nothing else. A five-minute TTL gives 4.5%.</li>
+    <li><b>Two regions at 80%, control plane impaired:</b> <b>73%</b> of requests fail. The survivor is asked for 160% and completes a quarter of what it receives. One region's outage has become everyone's.</li>
+    <li><b>Set a one-hour TTL</b> on any stable design: 25.8% of requests fail with three regions and 38.7% with two, because more than half of the failed region's users are still being sent there when the half-hour ends.</li>
+    <li>Of the 48 settings, 24 are statically stable. In 9 the survivors are overloaded until capacity arrives, in 10 the overload lasts the whole half-hour, and in 5 it has not started yet only because an hour-long TTL is holding the users back.</li>
+  </ul>
+
+  <div class="callout usecase">
+    <div class="ico">🎬</div>
+    <div class="body"><div class="title">Use case: Netflix and the seven-minute evacuation</div><p>On Christmas Eve 2012 a fault in a load-balancing service in one AWS region stopped Netflix streaming for many customers on one of the busiest viewing nights of the year. Netflix ran in that one region. Over the following year it rebuilt the service to run actively in several regions at once, with customer data replicated between them, so that any region could serve any customer. The company then did the part most organisations skip: it practised. It regularly moved all traffic out of a healthy region on purpose, in production, to prove that the others could carry it. Those exercises exposed the real bottleneck, which was the one this chapter's simulator shows. Steering users away was quick. Making the remaining regions big enough to receive them was slow, because scaling up hundreds of services took most of an hour, and the old process started that scaling only after the decision to evacuate. In 2018 Netflix described a project that cut the evacuation from about 45 minutes to under ten. The main change was to stop depending on scaling in the moment: capacity for the failover was kept in a state that could take traffic almost immediately, and the long chain of steps was reduced to a few. The lesson is the order of operations. A failover is as fast as its slowest dependency, that dependency is usually capacity, and the only way to find out is to evacuate a region on a day when nothing is wrong.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Going multi-region before being good at one region.</b> It multiplies whatever operational weakness you already have.</li>
+      <li><b>Running each of two regions at 70%.</b> The survivor would need 140% of its capacity.</li>
+      <li><b>A failover plan that begins with "scale up".</b> It depends on the control plane during the incident.</li>
+      <li><b>Deploying to all regions at the same time.</b> Your own change is then a global outage.</li>
+      <li><b>A hidden single-region dependency:</b> the identity provider, the CI system, the image registry, a feature-flag service, a control-plane API that lives in one region.</li>
+      <li><b>Long DNS TTLs on names you intend to fail over,</b> and clients that never look the name up again.</li>
+      <li><b>Health checks that share a dependency,</b> so every region turns unhealthy together. Fail open.</li>
+      <li><b>Not watching replication lag.</b> You find out how much data you lost afterwards.</li>
+      <li><b>Last-writer-wins with data that cannot afford to lose a write,</b> such as balances or stock counts.</li>
+      <li><b>Never evacuating a region on purpose.</b> The first test is then the real event.</li>
+      <li><b>A cell router that does real work.</b> It is the one thing every cell shares; keep it trivial.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is static stability?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A system is statically stable if it keeps working through a failure without needing to change anything. For regions, that means when one fails, the others already have the capacity running to take its traffic, and the traffic moves by health checks alone. Nothing has to be launched, reconfigured or approved. It matters because the parts of a cloud that make changes, the control planes, are the least reliable parts during a big incident: everyone is trying to launch capacity at once. The practical consequence is pre-provisioned headroom. With N regions, each must run below (N − 1)/N of capacity, so under half with two and under two-thirds with three. It costs money all year, and it is the difference between a failover that works and one that overloads the survivors.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your service runs active–active in two regions. During a real regional outage, the surviving region also went down. What do you investigate?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I would start from the timeline and look for which of four usual causes it was. First, capacity. What was each region's utilisation before the event? If they were above 50%, the survivor was asked for more than it had. I would check whether autoscaling tried to add capacity and how long that took, or whether it failed because the provider's control plane was also degraded, or because we hit a quota in that region. Second, the shape of the load. Failed requests are retried, so the survivor may have received more than double: I would look at retry rates, connection storms as clients reconnected, and cold caches, since the survivor had to serve keys it had never loaded. Third, shared dependencies. Was there something both regions used that lived only in the failed one, such as the primary database, an auth service or a configuration store? Did the database failover complete, and did the application in the surviving region find the new writer? Fourth, the steering. Did health checks mark the survivor unhealthy once it slowed down, leaving nowhere to send users? From that I would expect action items of a familiar kind: a utilisation ceiling that is enforced and alerted on, load shedding so that an overloaded region serves what it can and does not collapse, retry budgets and backoff in clients, removal or replication of the single-region dependency, fail-open steering, and then a scheduled evacuation exercise to prove it, because this outage was the first time the plan had been run.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Multi-region protects against losing a region, helps latency and satisfies residency rules. It does not protect against your own changes unless rollouts are staged by region.</li>
+      <li>Steer with DNS policies and health checks, or with anycast to avoid cached answers. Fail open.</li>
+      <li>Managed global databases choose between one writer, last-writer-wins and synchronous agreement. Know which you bought.</li>
+      <li>Static stability: the capacity is already running and failover needs no control-plane call.</li>
+      <li>With N regions, run each below (N − 1)/N of capacity: 50% for two, 67% for three.</li>
+      <li>An overloaded survivor does less work, not more. Shed load before it collapses.</li>
+      <li>Cells give every failure a wall: one cell's customers, not everyone.</li>
+      <li>Evacuate a region on purpose, regularly. That is the only real test.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A service runs in three regions with equal traffic. What is the highest utilisation each region can normally run at and still absorb the loss of one region?</p>
+      <div class="opts">
+        <button class="opt">About 33%</button>
+        <button class="opt">50%</button>
+        <button class="opt">About 67%</button>
+        <button class="opt">90%</button>
+      </div>
+      <div class="explain">Losing one of three multiplies each survivor's load by 3/2. To stay at or below 100%, each must normally be at or below 2/3.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is "scale up the other region when one fails" a weak failover plan?</p>
+      <div class="opts">
+        <button class="opt">Scaling up is more expensive during an outage</button>
+        <button class="opt">It depends on the control plane and on spare capacity being available at the moment both are under most strain</button>
+        <button class="opt">Autoscaling cannot be used in two regions</button>
+        <button class="opt">DNS cannot point to newly launched instances</button>
+      </div>
+      <div class="explain">Statically stable designs have the capacity running already, so the failover needs only the data plane.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What is the main advantage of anycast steering over DNS steering during a failover?</p>
+      <div class="opts">
+        <button class="opt">Clients keep the same IP address, so there is no cached DNS answer to wait out</button>
+        <button class="opt">It encrypts traffic between regions</button>
+        <button class="opt">It replicates data faster</button>
+        <button class="opt">It needs no health checks</button>
+      </div>
+      <div class="explain">With anycast the routing changes inside the provider's network. With DNS, users keep the old address until their cached answer expires, and some clients keep it longer.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Two regions both accept writes to a table that resolves conflicts by "last writer wins". Two users change the same record in different regions within the same second. What happens?</p>
+      <div class="opts">
+        <button class="opt">Both changes are merged</button>
+        <button class="opt">Both writes are rejected</button>
+        <button class="opt">The table becomes read-only until an operator chooses</button>
+        <button class="opt">One change is kept and the other is silently discarded</button>
+      </div>
+      <div class="explain">Last-writer-wins keeps the write with the later timestamp. Neither user sees an error. It is fine for some data and dangerous for counters and balances.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A service is split into twenty cells. A deployment with a serious bug goes to the first cell. Roughly what share of customers is affected?</p>
+      <div class="opts">
+        <button class="opt">All of them</button>
+        <button class="opt">About 5%</button>
+        <button class="opt">About 50%</button>
+        <button class="opt">None: cells cannot run buggy code</button>
+      </div>
+      <div class="explain">Each cell serves a fixed subset of customers and shares nothing with the others, so the damage stops at the cell's wall: one twentieth.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = OPS;
+  const TD = 90, WINDOW = 1800, DT = 10, SCALE = 600;
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  function sim(N, u, ttl, scale) {
+    const C0 = (1 / N) / u, Lfinal = 1 / (N - 1), rows = [];
+    for (let t = 0; t <= WINDOW; t += DT) {
+      const m = t < TD ? 0 : ttl === 0 ? 1 : Math.min(1, (t - TD) / ttl);
+      const L = 1 / N + (1 / N) * m / (N - 1);
+      const C = scale === 'ok' && t >= TD + SCALE ? Math.max(C0, Lfinal / 0.75) : C0;
+      const served = Math.min(L, C * clamp(2 - L / C, 0, 1));
+      rows.push({ t, err: (1 / N) * (1 - m) + (N - 1) * (L - served), util: L / C });
+    }
+    let rec = null; for (let i = rows.length - 1; i >= 0 && rows[i].err < 1e-12; i--) rec = rows[i].t;
+    return { rows, failed: rows.reduce((s, r) => s + r.err, 0) / rows.length, rec, peak: Math.max(...rows.map((r) => r.util)), after: u * N / (N - 1), paid: 1 / u };
+  }
+  const mins = (s) => s < 120 ? s + ' s' : (s / 60).toFixed(s % 60 ? 1 : 0) + ' min';
+  function draw() {
+    const N = +($('#mrN').dataset.value || 2), u = +($('#mrU').dataset.value || 0.6), ttl = +($('#mrTtl').dataset.value || 60), scale = $('#mrScale').dataset.value || 'ok';
+    const R = sim(N, u, ttl, scale), W = 640, H = 220, L = 44, B = 24, T = 10, x = (t) => L + t / WINDOW * (W - L - 8), y = (v) => H - B - Math.min(v, 2) / 2 * (H - B - T);
+    let g = '';
+    [0, 0.5, 1, 1.5, 2].forEach((v) => { g += `<line class="${v === 1 ? 'mr-cap' : 'mr-grid'}" x1="${L}" x2="${W - 8}" y1="${y(v)}" y2="${y(v)}"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v * 100}%</text>`; });
+    [0, 5, 10, 15, 20, 25, 30].forEach((mn) => { g += `<text x="${x(mn * 60)}" y="${H - 7}" text-anchor="middle">${mn} min</text>`; });
+    g += `<polyline class="mr-util" points="${R.rows.map((r) => x(r.t).toFixed(1) + ',' + y(r.util).toFixed(1)).join(' ')}"/><polyline class="mr-err" points="${R.rows.map((r) => x(r.t).toFixed(1) + ',' + y(r.err).toFixed(1)).join(' ')}"/>`;
+    $('#mrSvg').innerHTML = g;
+    const pct = (v, d) => (v * 100).toFixed(d === undefined ? 0 : d) + '%', stable = R.after <= 1 + 1e-9;
+    $('#mrStats').innerHTML = `<div class="stat ${R.failed < 0.05 ? 'good' : R.failed < 0.2 ? 'warn' : 'bad'}"><div class="k">Requests failed in the first 30 minutes</div><div class="v">${pct(R.failed, 1)}</div></div>`
+      + `<div class="stat ${R.rec === null ? 'bad' : R.rec <= 300 ? 'good' : 'warn'}"><div class="k">Back to normal after</div><div class="v" style="font-size:19px">${R.rec === null ? 'not within 30 min' : mins(R.rec)}</div></div>`
+      + `<div class="stat ${stable ? 'good' : 'bad'}"><div class="k">Each survivor's load with all traffic moved</div><div class="v">${pct(R.after)}</div></div>`
+      + `<div class="stat"><div class="k">Capacity paid for, against the traffic</div><div class="v">${pct(R.paid)}</div></div>`;
+    const limit = (N - 1) / N, over = R.rows.some((r) => r.util > 1 + 1e-9);
+    let why;
+    if (stable) why = `<b>Statically stable.</b> ${N === 2 ? 'Two' : 'Three'} regions at ${pct(u)} are under the ${pct(limit)} limit, so the ${N === 2 ? 'survivor takes' : 'survivors take'} everything at ${pct(R.after)} and no capacity had to be added. The failures you see are the failed region's own users, waiting for ${ttl === 0 ? 'the 90 seconds of detection' : 'detection and then for their cached DNS answers to expire'}.${ttl === 3600 ? ' With an hour-long TTL, most of them are still waiting when the half-hour ends.' : ''}`;
+    else if (!over) why = `<b>The survivors have not been overloaded, but only because the users are arriving so slowly.</b> With an hour-long TTL most of the failed region's users are still being sent to it when the half-hour ends. ${scale === 'ok' ? 'The extra capacity arrived before they did.' : `When they do arrive, a survivor will be asked for ${pct(R.after)} of its capacity, and nothing can be added.`} A slow failover is not a safe one: those users were failing the whole time.`;
+    else if (scale === 'ok') why = `<b>The survivors were overloaded until help arrived.</b> At ${pct(u)} each, ${N === 2 ? 'two' : 'three'} regions are over the ${pct(limit)} limit: a survivor is asked for ${pct(R.after)} of its capacity, and an overloaded region completes less than a full one. New capacity landed 10 minutes after detection. Until then, an outage of one region was a partial outage of every region.`;
+    else why = `<b>One region failed, and the outage did not stay there.</b> A survivor is asked for ${pct(R.after)} of its capacity, and nothing can be added because the control plane is struggling too. Once all the traffic has moved it completes only ${pct((2 - R.after) / R.after)} of the requests it receives, for as long as the incident lasts. Running below ${pct(limit)} would have needed no rescue.`;
+    const kind = stable ? 'stable' : !over ? 'late' : scale === 'ok' ? 'rescued' : 'spread';
+    $('#mrWhy').innerHTML = why;
+    $('#mrWhy').dataset.x = JSON.stringify({ kind, failed: R.failed, rec: R.rec, peak: R.peak, after: R.after, paid: R.paid, pts: R.rows.length, lines: document.querySelectorAll('#mrSvg polyline').length });
+  }
+  ['#mrN', '#mrU', '#mrTtl', '#mrScale'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
