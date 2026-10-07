@@ -6,33 +6,351 @@
 <title>Tracing with OpenTelemetry</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('ops-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .tr-ctl { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px 18px; }
+  .tr-ctl .tr-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .tr-bars { margin-top:16px; display:grid; gap:9px; }
+  .tr-row { display:grid; grid-template-columns:minmax(0,190px) minmax(0,1fr) 92px; gap:10px; align-items:center; font-size:12.5px; }
+  @media (max-width:640px) { .tr-row { grid-template-columns:1fr; gap:2px; } }
+  .tr-track { position:relative; height:16px; border-radius:8px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; }
+  .tr-track i { position:absolute; left:0; top:0; bottom:0; border-radius:8px; background:var(--accent); min-width:2px; }
+  .tr-track i.tr-e { background:var(--red); } .tr-track i.tr-s { background:var(--amber); } .tr-track i.tr-c { background:var(--green); }
+  .tr-row b { font-family:var(--mono); text-align:right; }
+  @media (max-width:640px) { .tr-row b { text-align:left; } }
+  .tr-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  .tr-why ul { margin:6px 0 0; padding-left:20px; }
+</style>
 </head>
 <body data-chapter="23">
-<!-- ops:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 23</span><span class="pill">Intermediate</span><span class="pill">⏱ 40 min</span></div>
     <h1>Tracing with <span class="grad">OpenTelemetry</span></h1>
-    <p class="lead">Spans across services, the OpenTelemetry collector, and sampling.</p>
+    <p class="lead">Metrics say the checkout is slow. Logs say what each service did. Neither tells you where the 2.3 seconds went when one request crossed six services. A trace does: it is the record of one request's whole journey, with the time spent in every hop. This chapter is about running tracing in production, which is mostly three decisions. How do services get instrumented without rewriting them? What sits between the services and the tracing backend? And, since keeping every trace of a busy system costs more than the system itself, which traces do you keep? OpenTelemetry is the standard that answers the first two, and the simulator explores the third.</p>
+    <ul class="objectives">
+      <li><span>Explain what a trace and a span are, and how context travels between services</span></li>
+      <li><span>Describe OpenTelemetry's parts: API, SDK, semantic conventions, OTLP and the Collector</span></li>
+      <li><span>Instrument a service on Kubernetes with configuration, not code</span></li>
+      <li><span>Lay out collectors as node agents and a gateway, and say what each does</span></li>
+      <li><span>Compare head-based and tail-based sampling by what they keep and what they cost</span></li>
+      <li><span>Explain why statistics computed from sampled traces can be badly wrong</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Bash · Docker · K8s · Terraform listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>How spans nest, how to read a trace waterfall and how context propagation works</b> are taught in the Distributed Systems course: <a href="../distributed-systems/36-distributed-tracing.html">distributed tracing</a>. This chapter recaps them in a few lines and concentrates on operating the pipeline.</li>
+        <li><b>Metrics and RED:</b> <a href="21-metrics-prometheus.html">Chapter 21</a>. <b>Correlation IDs in logs and the collector as a pipeline:</b> <a href="22-logging.html">Chapter 22</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Traces and spans</li>
-    <li>Instrumentation</li>
-    <li>The collector</li>
-    <li>Sampling strategies</li>
-  </ol>
+  <h2>Traces and spans</h2>
+  <p>A <b>span</b> is one timed operation: "handle POST /api/pay", "SELECT from orders", "call the acquirer". It has a name, a start time, a duration, a status, and attributes (key-value details such as the route, the status code or the database name). A <b>trace</b> is the set of spans that belong to one request, linked into a tree by parent IDs. Every span carries the same <b>trace ID</b>.</p>
+  <p>For the tree to form across services, each outgoing call has to carry the IDs along. The standard way is one HTTP header:</p>
+<pre class="code">traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  │                                │                └── flags: 01 = this trace is sampled
+             │  │                                └── the caller's span ID: the new span's parent
+             │  └── the trace ID, the same in every service
+             └── version</pre>
+  <p>The receiving service reads the header, starts its own span as a child, and passes a new header on with its own span ID. That is <b>context propagation</b>. The last field matters later in this chapter: the caller can tell everyone downstream whether this trace is being kept.</p>
+  <p>The three signals answer different questions, and good tooling lets you move between them. A metric shows that p99 latency rose. An <i>exemplar</i> on that metric links to one trace that was slow. The trace shows which service's span took the time. That span's trace ID finds the log lines written while it ran.</p>
+
+  <h2>OpenTelemetry</h2>
+  <p>For years every tracing vendor had its own client library, and choosing a backend meant choosing how your code was instrumented. <b>OpenTelemetry</b> (OTel) is the open standard that ended that. It is not a backend and stores nothing. It defines how telemetry is produced and transported, for traces, metrics and logs alike.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Part</th><th>What it is</th><th>Why it matters to an operator</th></tr></thead>
+      <tbody>
+        <tr><td><b>API and SDK</b></td><td>Libraries for each language that create spans and export them</td><td>Application code depends on a standard, not on a vendor</td></tr>
+        <tr><td><b>Auto-instrumentation</b></td><td>Agents and plugins that create spans for common frameworks, HTTP clients and database drivers without code changes</td><td>Tracing can be rolled out by the platform team</td></tr>
+        <tr><td><b>Semantic conventions</b></td><td>Agreed names for attributes: <code>http.request.method</code>, <code>db.system</code>, <code>service.name</code></td><td>Dashboards and queries work the same for every service</td></tr>
+        <tr><td><b>OTLP</b></td><td>The wire protocol, over gRPC (port 4317) or HTTP (4318)</td><td>Every backend accepts it, so switching backends is a configuration change</td></tr>
+        <tr><td><b>Collector</b></td><td>A standalone process that receives, processes and forwards telemetry</td><td>The place where you enrich, filter, sample and route, outside the applications</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Instrumentation</h2>
+  <p>There are two kinds, and you want both. <b>Automatic</b> instrumentation gives you a span for every incoming request, outgoing call and database query, which is enough to see where time goes between services. <b>Manual</b> instrumentation adds the spans and attributes only your code knows about: "price the basket", the tenant, the number of items. Start with automatic everywhere, then add manual spans where a trace shows a long, unexplained gap.</p>
+  <p>On Kubernetes, the OpenTelemetry Operator can inject the automatic agent into pods, so a team opts in with one annotation. The SDK is configured through standard environment variables, which keeps it out of the image.</p>
+<pre class="code"><span class="k">apiVersion</span>: opentelemetry.io/v1alpha1
+<span class="k">kind</span>: Instrumentation
+<span class="k">metadata</span>: { <span class="k">name</span>: default, <span class="k">namespace</span>: shop }
+<span class="k">spec</span>:
+  <span class="k">exporter</span>: { <span class="k">endpoint</span>: http://otel-agent.observability:4318 }
+  <span class="k">propagators</span>: [tracecontext, baggage]
+  <span class="k">sampler</span>: { <span class="k">type</span>: parentbased_traceidratio, <span class="k">argument</span>: <span class="s">"0.1"</span> }
+<span class="c">---</span>
+<span class="c"># in the Deployment's pod template: ask the operator to inject the Java agent</span>
+  <span class="k">template</span>:
+    <span class="k">metadata</span>:
+      <span class="k">annotations</span>:
+        <span class="k">instrumentation.opentelemetry.io/inject-java</span>: <span class="s">"true"</span>
+<span class="c">---</span>
+<span class="c"># or set the SDK's standard variables yourself</span>
+          <span class="k">env</span>:
+            - { <span class="k">name</span>: OTEL_SERVICE_NAME,            <span class="k">value</span>: checkout }
+            - { <span class="k">name</span>: OTEL_EXPORTER_OTLP_ENDPOINT, <span class="k">value</span>: <span class="s">"http://otel-agent.observability:4318"</span> }
+            - { <span class="k">name</span>: OTEL_TRACES_SAMPLER,          <span class="k">value</span>: parentbased_traceidratio }
+            - { <span class="k">name</span>: OTEL_TRACES_SAMPLER_ARG,      <span class="k">value</span>: <span class="s">"0.1"</span> }
+            - { <span class="k">name</span>: OTEL_RESOURCE_ATTRIBUTES,     <span class="k">value</span>: <span class="s">"deployment.environment=prod,service.version=4.18.2"</span> }</pre>
+  <p>Span attributes can hold high-cardinality values that would be ruinous as metric labels (<a href="21-metrics-prometheus.html">Chapter 21</a>): an order ID or a tenant is exactly what makes a trace findable. The rule about secrets and personal data from Chapter 22 applies unchanged.</p>
+
+  <h2>The collector</h2>
+  <p>Applications could export straight to the tracing backend. In practice they send to a <b>Collector</b>, for the same reasons logs go through an agent: the application hands its spans off quickly and forgets them, and everything else (retries, batching, adding Kubernetes metadata, removing sensitive attributes, sampling, sending to two backends during a migration) is configuration in one place. A collector is a pipeline of <b>receivers</b>, <b>processors</b> and <b>exporters</b>, and the usual layout has two tiers.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>SDK</b> in each pod creates spans and sends them in batches over OTLP</li>
+      <li data-k="step"><b>Agent collector</b> one per node: receives from local pods, adds pod, namespace and node, protects itself with a memory limit</li>
+      <li data-k="step"><b>Load balancing</b> all spans of one trace are sent to the same gateway instance, by trace ID</li>
+      <li data-k="decision"><b>Gateway collector</b> a small Deployment: tail sampling, redaction, span-derived metrics</li>
+      <li data-k="store"><b>Backend</b> Tempo, Jaeger or a vendor: stores traces and serves searches</li>
+      <li data-k="end"><b>Query</b> find by trace ID, or by service, duration and attributes</li>
+    </ol>
+    <figcaption><b>The path of a span.</b> The third step exists only because of tail sampling: a decision about a whole trace can be made only where the whole trace is.</figcaption>
+  </figure>
+<pre class="code"><span class="c"># Gateway collector: decide which traces to keep, after they have finished</span>
+<span class="k">receivers</span>:
+  <span class="k">otlp</span>: { <span class="k">protocols</span>: { <span class="k">grpc</span>: {}, <span class="k">http</span>: {} } }
+<span class="k">processors</span>:
+  <span class="k">memory_limiter</span>: { <span class="k">check_interval</span>: 1s, <span class="k">limit_percentage</span>: <span class="m">80</span> }
+  <span class="k">tail_sampling</span>:
+    <span class="k">decision_wait</span>: 10s                         <span class="c"># hold every trace this long, so that late spans arrive</span>
+    <span class="k">policies</span>:
+      - { <span class="k">name</span>: errors, <span class="k">type</span>: status_code, <span class="k">status_code</span>: { <span class="k">status_codes</span>: [ERROR] } }
+      - { <span class="k">name</span>: slow,   <span class="k">type</span>: latency,     <span class="k">latency</span>: { <span class="k">threshold_ms</span>: <span class="m">1000</span> } }
+      - { <span class="k">name</span>: rest,   <span class="k">type</span>: probabilistic, <span class="k">probabilistic</span>: { <span class="k">sampling_percentage</span>: <span class="m">1</span> } }
+  <span class="k">batch</span>: {}
+<span class="k">connectors</span>:
+  <span class="k">spanmetrics</span>: {}                              <span class="c"># request rate, errors and duration, computed from every span</span>
+<span class="k">exporters</span>:
+  <span class="k">otlp/tempo</span>: { <span class="k">endpoint</span>: tempo.observability:4317, <span class="k">tls</span>: { <span class="k">insecure</span>: <span class="m">true</span> } }
+  <span class="k">prometheusremotewrite</span>: { <span class="k">endpoint</span>: http://prometheus.monitoring:9090/api/v1/write }
+<span class="k">service</span>:
+  <span class="k">pipelines</span>:
+    <span class="k">traces/metrics</span>: { <span class="k">receivers</span>: [otlp], <span class="k">processors</span>: [memory_limiter], <span class="k">exporters</span>: [spanmetrics] }   <span class="c"># before sampling</span>
+    <span class="k">traces</span>:         { <span class="k">receivers</span>: [otlp], <span class="k">processors</span>: [memory_limiter, tail_sampling, batch], <span class="k">exporters</span>: [otlp/tempo] }
+    <span class="k">metrics</span>:        { <span class="k">receivers</span>: [spanmetrics], <span class="k">exporters</span>: [prometheusremotewrite] }</pre>
+  <p>Note the order in the last block. Metrics are derived from <i>all</i> spans in one pipeline, and only then is the trace stream sampled in another. The simulator shows why that order is not optional.</p>
+
+  <h2>Sampling strategies</h2>
+  <p>A service handling a thousand requests a second, with eight spans per request, produces hundreds of gigabytes of trace data a day. Nearly all of it describes requests that were fast and correct and that nobody will ever look at. <b>Sampling</b> is choosing which traces to keep, and there are two places to choose.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Head-based sampling</th><th>Tail-based sampling</th></tr></thead>
+      <tbody>
+        <tr><td><b>Decided</b></td><td>When the trace starts, in the first service</td><td>After the trace has finished, in a collector</td></tr>
+        <tr><td><b>Knows</b></td><td>Nothing yet: not whether it will fail or be slow</td><td>Everything: status, duration, every attribute</td></tr>
+        <tr><td><b>Rule</b></td><td>"Keep 10% of traces", chosen by trace ID</td><td>"Keep every error, everything over a second, and 1% of the rest"</td></tr>
+        <tr><td><b>Interesting traces kept</b></td><td>The same share as boring ones: 10% of errors</td><td>All of them</td></tr>
+        <tr><td><b>Cost in the services</b></td><td>Unsampled requests create almost no work</td><td>Every request is fully traced and exported</td></tr>
+        <tr><td><b>Cost in the pipeline</b></td><td>None</td><td>Collectors must buffer every span until the decision, and route by trace ID</td></tr>
+        <tr><td><b>Fits</b></td><td>Getting started; very high volume; a predictable budget</td><td>When you need the failed request, not a similar one</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Two details make head sampling work. The decision must be made <b>once</b> and followed by every service, which is what the <code>parentbased</code> sampler and the flag in <code>traceparent</code> are for: if each service rolled its own dice, most traces would be missing spans. And the choice should be a function of the trace ID, so that it is consistent and repeatable. The two approaches also combine well: head-sample at, say, 50% to halve the load on the services, then tail-sample what remains.</p>
+
+  <figure class="seq" data-actors="web|payments|Gateway collector|Backend">
+    <ol>
+      <li data-m="0>2" data-k="async">span: POST /api/pay, 1,840 ms, trace 4bf9…</li>
+      <li data-m="1>2" data-k="async">span: call acquirer, 1,790 ms, status ERROR, trace 4bf9…</li>
+      <li data-m="2>2">hold both in memory; wait 10 seconds for stragglers</li>
+      <li data-m="2>2">evaluate the policies: an ERROR span, and slower than 1 s. Keep</li>
+      <li data-m="2>3">export the whole trace</li>
+      <li data-m="0>2" data-k="async">meanwhile: 99 fast, successful traces arrive</li>
+      <li data-m="2>2" data-k="note">one of them is kept by the 1% rule; the other 98 are dropped</li>
+    </ol>
+    <figcaption><b>Tail sampling.</b> The collector keeps the trace because of how it ended. Both spans had to reach the same collector instance for that judgement to be possible.</figcaption>
+  </figure>
+
+  <h2>Simulator: which traces do you keep?</h2>
+  <p>50,000 requests pass through four services. One in a hundred fails and two in a hundred are slower than a second. Among the failures is the one a customer has just phoned about. Choose a sampling strategy and see what reaches the backend, what it costs, and what the stored traces would have you believe.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Sampling 50,000 traces</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="tr-ctl">
+        <div><div class="tr-l">Strategy</div>
+          <div class="seg" id="trSt"><button data-v="all">Keep everything</button><button class="active" data-v="head10">Head: 10%</button><button data-v="head1">Head: 1%</button><button data-v="tail">Tail: errors, slow, 1% of the rest</button></div></div>
+        <div><div class="tr-l">With head sampling, who decides</div>
+          <div class="seg" id="trWho"><button class="active" data-v="each">Each service, independently</button><button data-v="parent">The first service; the rest follow</button></div></div>
+        <div><div class="tr-l">Traffic</div>
+          <div class="seg" id="trRate"><button class="active" data-v="1000">1,000 requests a second</button><button data-v="20000">20,000 requests a second</button></div></div>
+      </div>
+      <div class="tr-bars" id="trBars"></div>
+      <div class="stats" id="trStats"></div>
+      <div class="tr-why" id="trWhy"></div>
+    </div>
+    <div class="panel-foot">The 50,000 traces are generated once with fixed random numbers and really sampled: head sampling keeps a trace when a hash of its ID falls under the rate, and with independent decisions each of the four services hashes with its own salt. A trace has 8 spans of about 500 bytes. Storage is priced at $0.30 per GB, as an illustration. The tail-sampling buffer is the traffic rate × a 10-second wait × the size of a trace.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>Keep everything.</b> 346 GB a day and $3,110 a month at a thousand requests a second. Switch the traffic to 20,000 a second: 6,912 GB a day and $62,208 a month. Nobody keeps everything for long.</li>
+    <li><b>Head sampling at 10%, each service deciding for itself.</b> 17,278 traces reach the backend, and 7 of them are complete. The rest are fragments: each service kept a different random tenth. The customer's request survives as a single span from one of its four services. You pay for a tenth of the data and get almost no usable traces.</li>
+    <li><b>Let the first service decide.</b> 5,068 traces, every one complete, for the same money. 51 of the 473 errors were kept, which is the 10% you asked for and no more. The customer's request is there, by luck.</li>
+    <li><b>Head sampling at 1%.</b> $32 a month. Three error traces out of 473, and the customer's request is not one of them. The p99 computed from the stored traces reads 1.50 seconds where the truth is 2.51: with so few slow traces in the sample, the tail of the distribution is simply missing.</li>
+    <li><b>Tail sampling.</b> All 473 errors and all 1,010 slow traces, in 3.9% of the volume, for $123. Then read the two red tiles. The stored traces show an error rate of 24% and a p99 of 3.94 seconds, for a service whose real figures are 0.9% and 2.51. The sample is perfect for debugging and useless for statistics.</li>
+    <li><b>Tail sampling at 20,000 requests a second.</b> The collectors hold 800 MB of spans in memory at every moment, and each service is tracing every request in full. Tail sampling moves cost from storage to the services and the pipeline. It does not remove it.</li>
+  </ul>
+
+  <div class="callout usecase">
+    <div class="ico">🚕</div>
+    <div class="body"><div class="title">Use case: Uber, Jaeger and sampling by endpoint</div><p>Uber began building its tracing system, Jaeger, in 2015, when its architecture was growing from hundreds of services towards thousands and a single ride request could touch dozens of them. It released Jaeger as open source in 2017, and the project later graduated from the Cloud Native Computing Foundation. In talks and articles about running it, Uber's engineers kept returning to sampling as the central operational problem. A single fixed rate does not work for a system like that. An endpoint called a hundred thousand times a second produces far more traces than anyone can use at 1%, while an endpoint called once a minute would, at the same 1%, produce a trace every couple of hours and be invisible. Their answer was to let the tracing backend compute a sampling rate per service and per endpoint from the traffic it observed, aiming at a target number of traces per second for each, and to push those rates back out to the client libraries, so that nobody had to maintain sampling configuration by hand. The busy endpoints were sampled hard and the quiet ones generously. The idea carries over directly to today's tools: decide what you want to be able to see for each kind of request, then set rates to get that, instead of choosing one percentage and hoping the interesting traces are in it.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Every service sampling for itself.</b> Traces arrive with holes in them. Use a parent-based sampler so one decision is followed everywhere.</li>
+      <li><b>Losing context at a boundary:</b> a queue, a thread pool, a proxy that strips headers. The trace splits in two.</li>
+      <li><b>Computing error rates or percentiles from sampled traces.</b> After tail sampling, the stored traces are mostly the bad ones. Derive metrics before sampling.</li>
+      <li><b>Tail sampling without routing by trace ID.</b> Each collector sees part of a trace and decides on part of the evidence.</li>
+      <li><b>No memory limit on collectors.</b> A traffic spike fills the tail-sampling buffer and the collector is killed, taking all telemetry with it.</li>
+      <li><b>Only automatic instrumentation.</b> You see that a service took 800 ms and not which step inside it.</li>
+      <li><b>Secrets and personal data in span attributes,</b> copied from request headers or bodies.</li>
+      <li><b>One sampling rate for every endpoint.</b> The busy ones drown the backend and the rare ones never appear.</li>
+      <li><b>Traces that nobody can reach from a metric or a log line.</b> Without exemplars and trace IDs in logs, tracing is a separate tool people forget to open.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the difference between head-based and tail-based sampling?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Head-based sampling decides when a trace begins, in the first service, usually by keeping a fixed share of trace IDs, and passes the decision downstream so every service agrees. It is cheap, because unsampled requests are barely traced, but it is blind: it keeps the same share of errors and slow requests as of ordinary ones. Tail-based sampling decides after the trace has completed, in a collector that has all its spans, so it can keep every error and every slow trace and a small share of the rest. The cost is that every request is fully traced, collectors must buffer spans for the waiting period, and all spans of a trace must be routed to the same collector. Many setups use a moderate head rate to cap volume and tail sampling on what is left.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your team introduces tail sampling, and a week later the tracing backend's dashboards show a 40% error rate while users report nothing unusual. What happened?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Nothing happened to the service. The dashboards are computing statistics from the stored traces, and the stored traces are no longer a fair sample. Tail sampling keeps every error and only about 1% of the successes, so if the true error rate is 1%, the kept set is roughly one error for every successful trace, and a ratio taken over it reads near 50%. The same bias inflates latency percentiles, because every slow trace is kept. The fix is to stop deriving rates and percentiles from sampled data. Either compute request rate, error ratio and duration from all spans before the sampling step, with a span-metrics connector in the collector feeding Prometheus, or use the services' own metrics, and use traces only as examples to inspect. I would also make sure the dashboards say which they show. As a sanity check for the future, the kept traces can carry their sampling probability as an attribute so that tools which understand it can re-weight counts, but an SLO should never depend on that.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A trace is one request's journey; spans are its timed steps; the <code>traceparent</code> header carries the IDs and the sampling flag between services.</li>
+      <li>OpenTelemetry standardises instrumentation and transport (OTLP) and stores nothing. The backend is replaceable.</li>
+      <li>Automatic instrumentation gets you every hop without code changes; add manual spans where it matters.</li>
+      <li>Collectors run as node agents and a gateway: enrich, limit memory, sample, redact, route.</li>
+      <li>Head sampling is cheap and blind. Tail sampling keeps the errors and the slow traces, and needs buffering and routing by trace ID.</li>
+      <li>One sampling decision per trace, followed by every service, or the traces have holes.</li>
+      <li>Never compute rates or percentiles from sampled traces: derive metrics before sampling.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What is OpenTelemetry?</p>
+      <div class="opts">
+        <button class="opt">A database for storing traces</button>
+        <button class="opt">A vendor-neutral standard and toolkit for producing and transporting traces, metrics and logs</button>
+        <button class="opt">A dashboard product</button>
+        <button class="opt">A replacement for Kubernetes</button>
+      </div>
+      <div class="explain">OpenTelemetry defines the APIs, SDKs, conventions, the OTLP protocol and the Collector. It stores nothing: a backend of your choice does that.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Four services each sample 10% of requests independently. Roughly what share of traces arrive complete, with spans from all four?</p>
+      <div class="opts">
+        <button class="opt">10%</button>
+        <button class="opt">40%</button>
+        <button class="opt">2.5%</button>
+        <button class="opt">0.01%</button>
+      </div>
+      <div class="explain">All four must independently say yes: 0.1 × 0.1 × 0.1 × 0.1 = 0.0001. A parent-based sampler makes one decision that all four follow, and every kept trace is complete.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A rare request fails, once. Which strategy is certain to have kept its trace?</p>
+      <div class="opts">
+        <button class="opt">Tail-based sampling with a policy that keeps every trace containing an error</button>
+        <button class="opt">Head-based sampling at 10%</button>
+        <button class="opt">Head-based sampling at 1%</button>
+        <button class="opt">Head-based sampling with a rate limit</button>
+      </div>
+      <div class="explain">A head sampler decides before the request has run and cannot know it will fail. Only a decision made after the trace completes can keep it for that reason.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why must all spans of a trace reach the same collector instance when tail sampling is used?</p>
+      <div class="opts">
+        <button class="opt">To compress them better</button>
+        <button class="opt">Because OTLP requires it</button>
+        <button class="opt">The keep-or-drop decision needs the whole trace; an instance holding half of it would decide on half the evidence</button>
+        <button class="opt">To keep spans in time order</button>
+      </div>
+      <div class="explain">The error span and the root span may arrive from different services. A load-balancing step keyed on trace ID puts them in front of one decision-maker.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Where should a service's request rate, error ratio and latency percentiles come from when traces are tail-sampled?</p>
+      <div class="opts">
+        <button class="opt">From the traces stored in the backend</button>
+        <button class="opt">From metrics computed over all requests, before sampling</button>
+        <button class="opt">From the 1% of ordinary traces only</button>
+        <button class="opt">From counting log lines</button>
+      </div>
+      <div class="explain">The stored traces deliberately over-represent errors and slow requests. Metrics from every span, or from the services themselves, are unaffected by what sampling keeps.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = OPS;
+  const N = 50000, SPANS = 8, SPAN_BYTES = 500, SERVICES = 4, WAIT = 10;
+  const hash = (id, salt) => ((Math.imul(id ^ Math.imul(salt + 1, 0x9e3779b1), 0x85ebca6b) >>> 0) ^ (Math.imul(id + salt * 7919, 0xc2b2ae35) >>> 15)) >>> 0;
+  const unit = (id, salt) => (hash(id, salt) % 1000003) / 1000003;
+  const TRACES = (() => {
+    let seed = 987654321; const rnd = () => { seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff; return (seed >>> 8) / 8388608; };
+    const out = [];
+    for (let i = 0; i < N; i++) { const r = rnd(), kind = r < 0.01 ? 'error' : r < 0.03 ? 'slow' : 'ok'; out.push({ id: i + 1, kind, ms: kind === 'slow' ? 1000 + rnd() * 3000 : kind === 'error' ? 50 + rnd() * 1500 : 40 + rnd() * 260 }); }
+    out[31415].kind = 'error'; out[31415].ms = 1840; out[31415].mine = true;          // the request the customer phoned about
+    return out;
+  })();
+  const pct = (a, q) => { const s = a.slice().sort((x, y) => x - y); return s.length ? s[Math.min(s.length - 1, Math.floor(q * s.length))] : 0; };
+  const opts = () => ({ st: $('#trSt').dataset.value || 'head10', who: $('#trWho').dataset.value || 'each', rate: +($('#trRate').dataset.value || 1000) });
+  function sample(o) {
+    const p = o.st === 'head10' ? 0.1 : o.st === 'head1' ? 0.01 : 1;
+    return TRACES.map((t) => {
+      if (o.st === 'all') return SERVICES;
+      if (o.st === 'tail') return t.kind !== 'ok' || unit(t.id, 99) < 0.01 ? SERVICES : 0;
+      if (o.who === 'parent') return unit(t.id, 0) < p ? SERVICES : 0;
+      let k = 0; for (let s = 0; s < SERVICES; s++) if (unit(t.id, s) < p) k++; return k;                    // how many of the four services kept their spans
+    });
+  }
+  function draw() {
+    const o = opts(), got = sample(o), head = o.st === 'head10' || o.st === 'head1';
+    const count = (f) => TRACES.reduce((s, t, i) => s + (f(t, i) ? 1 : 0), 0);
+    const tot = { ok: count((t) => t.kind === 'ok'), slow: count((t) => t.kind === 'slow'), error: count((t) => t.kind === 'error') };
+    const any = (i) => got[i] > 0, full = (i) => got[i] === SERVICES;
+    const kept = { ok: count((t, i) => t.kind === 'ok' && any(i)), slow: count((t, i) => t.kind === 'slow' && any(i)), error: count((t, i) => t.kind === 'error' && any(i)) };
+    const stored = kept.ok + kept.slow + kept.error, complete = count((t, i) => full(i)), spanFrac = got.reduce((s, k) => s + k, 0) / (N * SERVICES);
+    const mine = got[31415], gbDay = o.rate * 86400 * SPANS * SPAN_BYTES * spanFrac / 1e9, cost = gbDay * 30 * 0.30, bufferMB = o.st === 'tail' ? o.rate * WAIT * SPANS * SPAN_BYTES / 1e6 : 0;
+    const trueErr = tot.error / N, seenErr = stored ? kept.error / stored : 0, trueP99 = pct(TRACES.map((t) => t.ms), 0.99), seenP99 = pct(TRACES.filter((t, i) => any(i)).map((t) => t.ms), 0.99);
+    const bar = (label, k, n, cls) => `<div class="tr-row"><span>${label}</span><div class="tr-track"><i class="${cls}" style="width:${(n ? k / n * 100 : 0).toFixed(2)}%"></i></div><b>${k.toLocaleString('en-GB')} / ${n.toLocaleString('en-GB')}</b></div>`;
+    $('#trBars').innerHTML = bar('Ordinary traces kept', kept.ok, tot.ok, '') + bar('Slow traces kept (over 1 s)', kept.slow, tot.slow, 'tr-s') + bar('Error traces kept', kept.error, tot.error, 'tr-e') + bar('Kept traces that are complete', complete, stored, 'tr-c');
+    $('#trStats').innerHTML = `<div class="stat acc"><div class="k">Trace data stored</div><div class="v">${gbDay >= 100 ? Math.round(gbDay).toLocaleString('en-GB') : gbDay.toFixed(1)} GB a day <small>$${Math.round(cost).toLocaleString('en-GB')} a month</small></div></div>`
+      + `<div class="stat ${mine === SERVICES ? 'good' : 'bad'}"><div class="k">The customer's failed request</div><div class="v" style="font-size:17px">${mine === SERVICES ? 'kept, complete' : mine ? 'kept, ' + mine + ' of 4 services' : 'not kept'}</div></div>`
+      + `<div class="stat ${Math.abs(seenErr - trueErr) > 0.02 ? 'bad' : ''}"><div class="k">Error rate in the stored traces</div><div class="v">${(seenErr * 100).toFixed(1)}% <small>true: ${(trueErr * 100).toFixed(1)}%</small></div></div>`
+      + `<div class="stat ${seenP99 > trueP99 * 1.3 ? 'bad' : ''}"><div class="k">p99 in the stored traces</div><div class="v">${(seenP99 / 1000).toFixed(2)} s <small>true: ${(trueP99 / 1000).toFixed(2)} s</small></div></div>`
+      + `<div class="stat"><div class="k">Collector buffer for tail sampling</div><div class="v">${bufferMB ? (bufferMB >= 1000 ? (bufferMB / 1000).toFixed(1) + ' GB' : Math.round(bufferMB) + ' MB') : 'none'}</div></div>`;
+    const li = [];
+    if (o.st === 'all') li.push('Every trace is there, complete, and the statistics are exact. So is the bill: this is the price of never having to wonder.');
+    if (head && o.who === 'each') li.push(`<b>Only ${complete} of the ${stored.toLocaleString('en-GB')} stored traces are complete.</b> Each service kept its own random ${o.st === 'head10' ? 'tenth' : 'hundredth'}, so almost every trace is a fragment: a span from one service with no parent and no children. You are paying to store them and they answer nothing. Let the first service decide.`);
+    if (head && o.who === 'parent') li.push(`One decision per trace, followed by all four services: every stored trace is complete. ${kept.error} of the ${tot.error} error traces were kept, the same share as of everything else, because the decision was made before anyone knew how the request would end.`);
+    if (head) li.push(mine === SERVICES ? 'The customer\'s request happens to be among the kept ones. That was luck, at the odds of the sampling rate.' : mine ? 'Of the customer\'s request, only part survives: spans from some services and not others.' : '<b>The customer\'s request is gone.</b> You can look at other errors and hope they are the same problem.');
+    if (o.st === 'tail') { li.push(`<b>Every error and every slow trace is kept</b>, the customer's among them, in ${(spanFrac * 100).toFixed(1)}% of the volume.`); li.push(`<b>The stored traces now lie about the service.</b> They show an error rate of ${(seenErr * 100).toFixed(0)}% and a p99 of ${(seenP99 / 1000).toFixed(1)} s, against a true ${(trueErr * 100).toFixed(1)}% and ${(trueP99 / 1000).toFixed(2)} s, because the sample was chosen for being bad. Rates and percentiles must come from metrics made before sampling.`); li.push(`The gateway collectors hold ${bufferMB >= 1000 ? (bufferMB / 1000).toFixed(1) + ' GB' : Math.round(bufferMB) + ' MB'} of spans at any moment while they wait, and every service traces every request in full.`); }
+    $('#trWhy').innerHTML = `<ul>${li.map((x) => `<li>${x}</li>`).join('')}</ul>`;
+    $('#trWhy').dataset.x = JSON.stringify({ tot, kept, stored, complete, spanFrac, gbDay, cost, mine, trueErr, seenErr, trueP99, seenP99, bufferMB });
+  }
+  ['#trSt', '#trWho', '#trRate'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
