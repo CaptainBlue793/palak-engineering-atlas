@@ -134,3 +134,8 @@
   rewrites the whole file, so the same 122 characters were inserted into each committed bundle, which then differs from
   the previous one by exactly that insertion and still opens in headless Chrome. Checks: content audit 0 errors across all
   508 chapters, palette check and hub check pass. No release tag is published.
+- Merged (2026-10-08): pull request #7 into `main`, at the owner's request. This entry was written just before the merge,
+  so the merge commit's hash is in the Git history and not here. With this the Atlas has nine live courses and none
+  "coming soon": 508 chapters and about 370 hours. No release tag was published (the owner has not asked for one). Still
+  open: the README table's order, the Atlas home page's meta description and its static "four out now" fallback text, the
+  `.objectives li` fix in `style.css`, and the dates, figures and prices in the real-system write-ups, which are unverified.
