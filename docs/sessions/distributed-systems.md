@@ -80,3 +80,34 @@
 - Ch 46 GFS and HDFS: record append on three replicas of a chunk with five outcomes for each append (clean, failure on either secondary with retry, a record landing before the retry, client gives up), showing duplicates, dead regions and what a checksum-and-ID reader gets from each replica; fuzzed 300 runs, 2,573 appends (replicas always differ, no acknowledged record ever missing); master and chunkservers, read path, chunk size and placement, record-append guarantees table, master memory arithmetic and the small-files problem, HDFS HA with quorum journal and fencing, GFS vs HDFS table, Colossus; HDFS client in Java; use case Facebook's warehouse NameNode and AvatarNode
 - Ch 47 MapReduce to Spark: event-driven simulation of a 400-task job on 100 workers with 0, 3 or 10 slow machines at a third, tenth or thirtieth of normal speed, with and without backup tasks (30.7 s healthy; 119.4 s with three slow machines; 32.3 s with backups for 2.4% extra work), finish-time bars and both job times always shown; map and reduce in Hadoop Java, the job flow, why re-execution is safe, the shuffle and skew, stragglers with the paper's 891 s vs 1,283 s, RDDs, lineage, narrow and wide dependencies in Spark Java, batch to streaming by link to Ch 27 and 30; use case the 100 TB sort records of 2013 and 2014
 - Ch 48 Jepsen split-brain: a modelled partition test with four clients, three designs (async replication with failover, the same with a primary that stops when its replicas go quiet, majority acknowledgement), three partition lengths and two client placements, per-second outcome strips and a Jepsen-style report (60 of 210 acknowledged writes lost at 30 s; 20 with the bounded design; 0 with majority; 0 in every design when no client is beside the old primary); the 2013 Redis Sentinel report read in five steps, the three ingredients table, the same shape in MongoDB, Elasticsearch and Kafka, prevent vs bound vs document, redis.conf and Lettuce WAIT; use case the 2020 Redis-Raft analysis
+
+## 2026-10-07 — status: all 56 lessons written
+- Chapters 6 to 48 were written in session 2, one commit each (`DIST <n>: <title>`), on `feature/distributed-course`. With the
+  13 lessons from session 1 the course is complete: 8 prerequisites and 48 chapters, 2,485 minutes (41.4 hours) by the pills.
+- Every lesson has one interactive panel, driven through a headless-browser script before its commit. Where the panel
+  implements an algorithm it was also fuzzed or checked exhaustively and the result is quoted in the lesson: Paxos, Raft
+  elections and logs (16-18), CRDT merges (25), consistency-level overlap (26), Chandy-Lamport (27), delivery pipeline (28),
+  ISR replication (29), the ZooKeeper-style lock (31), PBFT quorums (33), the double-spend formula (34), the simulated Raft
+  election bug (37), the two-phase commit model checker (38), two-generals rules (39), list-watch-reconcile (44), tombstones
+  (45) and record append (46).
+- End-of-course checks: no placeholders left; all 56 pages swept at 1100 px and at 390 px with no script errors, no
+  overflow and the full structure; no bare tables outside `.table-wrap`; bundle rebuilt (60 pages, 2.54 MB, 280 flashcards);
+  content audit 0 errors for the course and across all courses; bundle, palette and hub checks (light, dark, 390 px) pass.
+- Decisions made while writing, so later sessions do not double-teach: the outbox is taught in Ch 22 and Ch 28 links back;
+  SWIM probing is in Ch 5 and dissemination in Ch 23; the Dynamo design as a pattern is Ch 26 and Amazon's story Ch 42; Kafka
+  delivery is Ch 28, broker internals Ch 29, history and KRaft migration Ch 43; TrueTime and commit wait are Ch 35 and
+  Spanner's architecture Ch 41; fencing is Ch 32; the etcd data model is Ch 31 and Kubernetes' use of it Ch 44; repair
+  mechanics are Ch 24 and the tombstone deadline Ch 45; the checkpoint mechanism is Ch 27 and Ch 30 links to it.
+- Case-study lessons (41-48) use the level pill `Case Study`, which the audit checks against `tools/chapters.cjs`.
+- Not verified against sources: the dates, figures and incident details in the real-system write-ups (S3 2008, Roblox 2021,
+  OpenAI 2024, Discord, Netflix 2011, Facebook's NameNode, the sort records, Jepsen's Redis and Kafka runs, DynamoDB and
+  Prime Day, F1, Fabric, Ethereum May 2023, Figma, Segment, The New York Times and others) were written from memory. They are
+  worth a read by the owner before release.
+- Needs a shared change (release, Step 4 of the playbook; not done, waiting for the owner's go-ahead): in `assets/atlas.js`
+  remove `soon: true` from the distributed-systems entry (line 196). `chapters` is already 56. `hours` is 44 and the lessons
+  total 2,485 minutes (41.4 hours), so 41 would match how Databases was set. In `README.md` add the Distributed Systems row to
+  the course table, drop it from "On the way", change the totals to 452 chapters (388 main + 64 prerequisites) and about 331
+  hours, and add `distributed-systems/` to the folder tree. Still open from before: the `.objectives li` flex fix in
+  `style.css`, the README table's order, the home page's meta description, and the unpublished `networks-v1.0.0` and
+  `databases-v1.0.0` releases.
+- Next: the owner's go-ahead, then Step 4 (shared edits, checks, pull request into main). After that, Cloud & DevOps.
