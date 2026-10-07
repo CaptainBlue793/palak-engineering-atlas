@@ -30,3 +30,4 @@
   from memory; figures and dates need checking against sources before they are quoted elsewhere.
 - Ch 1 DevOps & SRE: release-habits simulator (cadence x tests x approval x recovery over 12 seeded weeks; the four DORA metrics and a 99.9% error budget), delivery flow, nines table, roles table, interview rounds, Knight Capital use case
 - Ch 2 Cloud Fundamentals: placement simulator (zones x instances per zone x standby region x failure, 96 settings, with monthly cost), zonal/regional/global scopes, IaaS/PaaS/SaaS, provider name map, shared responsibility, an example bill, OVHcloud Strasbourg fire use case
+- Ch 3 Compute: one-day autoscaling simulator (fixed fleet vs tracking 70% or 50% CPU x 5 or 1 minute boot x on demand or spot, minute by minute with reclaims), instance type names and families, baked image vs install at boot, launch template and group in Terraform, spot notice handler, Netflix Aminator and Scryer use case
