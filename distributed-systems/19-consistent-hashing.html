@@ -6,34 +6,334 @@
 <title>Consistent Hashing</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ch-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .ch-row > span { font-size:12.5px; color:var(--muted); min-width:92px; }
+  .ch-view { display:grid; grid-template-columns:minmax(0,230px) minmax(0,1fr); gap:14px; align-items:center; margin-top:14px; }
+  @media (max-width:640px) { .ch-view { grid-template-columns:1fr; } .ch-ring { max-width:230px; margin:0 auto; } }
+  .ch-ring { width:100%; height:auto; display:block; }
+  .ch-ring .ch-track { fill:none; stroke:var(--border); stroke-width:10; }
+  .ch-ring text { font-size:11px; fill:var(--muted); text-anchor:middle; }
+  .ch-bars { display:grid; gap:5px; min-width:0; }
+  .ch-b { display:grid; grid-template-columns:30px minmax(0,1fr) 56px; gap:8px; align-items:center; font-size:12.5px; }
+  .ch-b b { font-family:var(--mono); }
+  .ch-b .ch-t { position:relative; height:16px; border-radius:5px; background:var(--surface-2); overflow:hidden; }
+  .ch-b .ch-t i { position:absolute; left:0; top:0; bottom:0; border-radius:5px; }
+  .ch-b .ch-t u { position:absolute; top:-2px; bottom:-2px; width:2px; background:var(--text); }
+  .ch-b span:last-child { text-align:right; font-variant-numeric:tabular-nums; color:var(--muted); }
+  .ch-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--border); min-height:52px; }
+  .ch-res.ch-good { background:var(--green-soft); border-left-color:var(--green); }
+  .ch-res.ch-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .ch-res.ch-warn { background:var(--amber-soft, var(--surface-2)); border-left-color:var(--amber, var(--accent)); }
+</style>
 </head>
 <body data-chapter="19">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 19</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Consistent <span class="grad">Hashing</span></h1>
-    <p class="lead">The hash ring, virtual nodes, and how few keys move when a node joins or leaves.</p>
+    <p class="lead">A cluster that stores more data than one machine can hold has to decide which machine each key lives on, and it has to make that decision the same way everywhere, quickly, with no table of every key. A hash function does that. <a href="p6-hashing.html">P6</a> showed the obvious scheme, <code>hash(key) mod N</code>, and its fatal property: change <i>N</i> by one and nearly every key moves to a different machine. <b>Consistent hashing</b> is the family of schemes in which changing the set of machines moves only the keys that have to move, about one in <i>N</i>. It is how Dynamo, Cassandra, memcached clients, content delivery networks and many load balancers place data. This chapter builds the hash ring properly, adds the virtual nodes that make it usable, and then covers two alternatives that have no ring at all.</p>
+    <ul class="objectives">
+      <li><span>Implement a hash ring with a sorted map, and find the replicas for a key</span></li>
+      <li><span>Explain what virtual nodes fix, and what they cost</span></li>
+      <li><span>Say which keys move when a node joins or leaves, and how many</span></li>
+      <li><span>Describe rendezvous hashing and jump hash, and where each beats a ring</span></li>
+      <li><span>Choose among them for a cache tier, a storage cluster and a numbered set of shards</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Placement hashes, <code>mod N</code> and the reshuffle problem</b> from <a href="p6-hashing.html">P6</a>. This chapter starts where that one stopped.</li>
+        <li><b>Leaderless replication and quorums</b> from <a href="09-replication-basics.html">Chapter 9</a> and <a href="12-quorums.html">Chapter 12</a>: the ring decides which N replicas a key has.</li>
+        <li><b>Balanced search trees</b>, in the <a href="../dsa/index.html">DSA course</a>, for the sorted map.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The ring</li>
-    <li>Virtual nodes</li>
-    <li>Adding and removing nodes</li>
-    <li>Rendezvous hashing</li>
-    <li>Jump hash</li>
-  </ol>
+  <h2>The ring</h2>
+  <p>Take the output range of a hash function, say 0 to 2<sup>32</sup> − 1, and bend it into a circle, so that the largest value is followed by 0. Hash each node's name to get its position on the circle. Hash each key the same way. <b>A key belongs to the first node at or after its position, going clockwise.</b> Each node therefore owns the arc of the circle that ends at its position and begins just after the previous node's.</p>
+  <p>The ring is a sorted map from position to node, and the lookup is "the smallest entry at or above this hash, or the first entry if there is none".</p>
+<pre class="code"><span class="k">final class</span> <span class="t">HashRing</span> {
+	<span class="k">private final</span> <span class="t">TreeMap</span>&lt;<span class="t">Long</span>, <span class="t">String</span>&gt; ring = <span class="k">new</span> <span class="t">TreeMap</span>&lt;&gt;();
+	<span class="k">private final int</span> vnodes;                                 <span class="c">// positions for each node: see the next section</span>
+
+	<span class="k">void</span> <span class="f">add</span>(<span class="t">String</span> node)    { <span class="k">for</span> (<span class="k">int</span> i = <span class="m">0</span>; i &lt; vnodes; i++) ring.<span class="f">put</span>(<span class="f">hash</span>(node + <span class="s">"#"</span> + i), node); }
+	<span class="k">void</span> <span class="f">remove</span>(<span class="t">String</span> node) { <span class="k">for</span> (<span class="k">int</span> i = <span class="m">0</span>; i &lt; vnodes; i++) ring.<span class="f">remove</span>(<span class="f">hash</span>(node + <span class="s">"#"</span> + i)); }
+
+	<span class="t">String</span> <span class="f">nodeFor</span>(<span class="t">String</span> key) {
+		<span class="k">var</span> e = ring.<span class="f">ceilingEntry</span>(<span class="f">hash</span>(key));               <span class="c">// first position at or after the key's</span>
+		<span class="k">return</span> (e != <span class="k">null</span> ? e : ring.<span class="f">firstEntry</span>()).<span class="f">getValue</span>();   <span class="c">// past the end: wrap round to the start</span>
+	}
+
+	<span class="c">/** The n distinct nodes that hold a key: keep walking clockwise, skipping repeats. */</span>
+	<span class="t">List</span>&lt;<span class="t">String</span>&gt; <span class="f">replicasFor</span>(<span class="t">String</span> key, <span class="k">int</span> n) {
+		<span class="k">var</span> found = <span class="k">new</span> <span class="t">LinkedHashSet</span>&lt;<span class="t">String</span>&gt;();
+		<span class="k">var</span> tail = ring.<span class="f">tailMap</span>(<span class="f">hash</span>(key), <span class="k">true</span>).<span class="f">values</span>();
+		<span class="k">for</span> (<span class="t">String</span> node : <span class="t">Iterables</span>.<span class="f">concat</span>(tail, ring.<span class="f">values</span>())) {
+			found.<span class="f">add</span>(node);
+			<span class="k">if</span> (found.<span class="f">size</span>() == n) <span class="k">break</span>;
+		}
+		<span class="k">return</span> <span class="t">List</span>.<span class="f">copyOf</span>(found);
+	}
+}</pre>
+  <p>Why this moves so little is easy to see on the circle. Adding a node places one new point. The keys between that point and the previous one, which belonged to the next node along, now belong to the new node. No other key is affected. Removing a node hands its arc to its successor and touches nothing else. With <i>N</i> nodes, a change moves about 1/<i>N</i> of the keys, where <code>mod N</code> moved nearly all of them.</p>
+  <p>The second method is what a replicated store uses. The <i>N</i> replicas of a key are the next <i>N</i> <i>distinct</i> nodes clockwise from it, which Dynamo called the key's preference list, and the quorum arithmetic of <a href="12-quorums.html">Chapter 12</a> is done over that list.</p>
+
+  <h2>Virtual nodes</h2>
+  <p>The ring as described has a practical flaw. Node positions are random, and a handful of random points cut a circle very unevenly. With five nodes, one will routinely own a third of the ring and another a twentieth. There is a second problem too: when a node leaves, its whole arc lands on a single neighbour, which may then be overloaded and fail in its turn.</p>
+  <p>The fix is to give each physical node many positions. Hash "A#0", "A#1", up to "A#127", and place node A at all 128 points. Each is a <b>virtual node</b>, or token. A's share of the ring is now the sum of 128 small arcs scattered around the circle, and the sum of many random pieces is close to its average.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>One position for each node</th><th>Many virtual nodes for each</th></tr></thead>
+      <tbody>
+        <tr><td><b>Balance of load</b></td><td>Poor. The busiest node may carry several times the fair share</td><td>Good. The spread shrinks roughly with the square root of the number of virtual nodes</td></tr>
+        <tr><td><b>When a node leaves</b></td><td>One neighbour inherits everything</td><td>Its load is shared out among all the others</td></tr>
+        <tr><td><b>When a node joins</b></td><td>It relieves one neighbour only</td><td>It takes a little from everyone</td></tr>
+        <tr><td><b>Machines of different sizes</b></td><td>No way to express it</td><td>Give a machine with twice the capacity twice the virtual nodes</td></tr>
+        <tr><td><b>Cost</b></td><td>N entries in the map</td><td>N × V entries, and that many ranges to track, repair and stream</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The last row is why the count isn't simply set as high as possible. Cassandra's default was 256 virtual nodes for each machine for some years. With hundreds of machines that meant tens of thousands of ranges for every repair and every topology change to work through, and the default was later reduced to 16, with the positions chosen deliberately to be even where they had been purely random.</p>
+
+  <h2>Try it: four ways to place 5,000 keys</h2>
+  <p>Five thousand keys and four nodes. Choose a placement scheme, look at how evenly the keys are spread, then add and remove nodes and count how many keys have to move.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Balance, and disruption on change</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="ch-row"><span>Scheme</span><div class="seg" id="chA"><button class="active" data-v="ring">hash ring</button><button data-v="hrw">rendezvous</button><button data-v="jump">jump hash</button><button data-v="mod">hash mod N</button></div></div>
+      <div class="ch-row"><span>Virtual nodes</span><div class="seg" id="chV"><button data-v="1">1</button><button class="active" data-v="16">16</button><button data-v="128">128</button></div></div>
+      <div class="controls">
+        <button class="btn sm primary" id="chAdd">Add a node</button>
+        <button class="btn sm" id="chLast">Remove the newest node</button>
+        <button class="btn sm" id="chFirst">Remove the oldest node</button>
+        <button class="btn sm ghost" id="chReset">↺ Reset</button>
+      </div>
+      <div class="ch-view">
+        <svg class="ch-ring" id="chRing" viewBox="0 0 220 220" role="img" aria-label="Positions of the nodes on the hash ring"></svg>
+        <div class="ch-bars" id="chBars"></div>
+      </div>
+      <div class="ch-res" id="chRes"></div>
+      <div class="stats" id="chStats"></div>
+    </div>
+    <div class="panel-foot">The hashes are real, computed in your browser, so the unevenness you see is what these schemes actually produce. Each bar is a node's share of the keys, and the dark mark is the fair share. The circle shows the ring's positions, coloured by node, and applies to the ring scheme only. The setting for virtual nodes also affects only the ring. "The fewest possible" is the number of keys that any scheme would have to move for that change.</div>
+  </div>
+
+  <p>Things to notice. On the ring with one position for each node, the shares are badly uneven, and with 16 they are tolerable, and with 128 nearly level. Add a node on the ring: about a fifth of the keys move, which is all that had to, and with many virtual nodes they come a little from every other node. Now switch to <code>hash mod N</code> and add a node: about four keys in five move. Rendezvous hashing is level without any virtual nodes and moves the minimum in every case. Jump hash is as level as rendezvous, using no table at all, and moves the minimum when a node is added or the newest one is removed. Remove the <i>oldest</i> node under jump hash, though, and most keys move: it knows the nodes only as numbers 0 to N − 1, and taking one out of the middle renumbers the rest.</p>
+
+  <h2>Adding and removing nodes</h2>
+  <p>In a cache, a key that moves is merely a miss: the new node fetches the value from the origin. In a store, the data has to move too, and that is the expensive part of any change.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>A node joins</b> and is given its positions on the ring, chosen at random or by an allocator</li>
+      <li data-k="step"><b>Work out what it now owns</b> for each position, the arc back to the previous position, and for a replicated store the arcs it now holds as second and third replica</li>
+      <li data-k="step"><b>Stream that data to it</b> from the nodes that held it, while they go on serving requests</li>
+      <li data-k="decision"><b>Has it caught up?</b> until then it takes writes for its ranges and isn't trusted for reads</li>
+      <li data-k="step"><b>Announce the new ring</b> to every node and client, by gossip (<a href="23-gossip.html">Chapter 23</a>) or through a coordination service</li>
+      <li data-k="end"><b>The old owners delete</b> what they no longer own</li>
+    </ol>
+    <figcaption><b>A node joining a storage ring.</b> The hashing decides what moves in an instant. Moving it takes hours.</figcaption>
+  </figure>
+  <p>Two cases should be kept apart. A <b>planned</b> change, adding capacity or retiring a machine, goes through the steps above and changes ownership for good. An <b>unplanned</b> one, a node that has crashed and may well be back in ten minutes, shouldn't. Re-replicating a terabyte for an outage that ends before the copying does is wasted work, and the copying itself loads the survivors. So stores leave the ring alone at first: requests for the dead node's ranges are served by its fellow replicas, with hinted handoff covering the writes it misses (<a href="12-quorums.html">Chapter 12</a>), and ownership changes only when an operator, or a long timeout, decides the node isn't coming back.</p>
+
+  <h2>Rendezvous hashing</h2>
+  <p><b>Rendezvous hashing</b>, also called highest random weight, reaches the same goal with no ring. For a given key, compute a score for every node by hashing the key and the node's name together. The key belongs to the node with the highest score.</p>
+<pre class="code"><span class="t">String</span> <span class="f">nodeFor</span>(<span class="t">String</span> key, <span class="t">Collection</span>&lt;<span class="t">String</span>&gt; nodes) {
+	<span class="k">return</span> nodes.<span class="f">stream</span>()
+			.<span class="f">max</span>(<span class="t">Comparator</span>.<span class="f">comparingLong</span>(node -&gt; <span class="f">hash</span>(key + <span class="s">"|"</span> + node)))
+			.<span class="f">orElseThrow</span>();
+}</pre>
+  <p>If a node is removed, the only keys affected are those for which it had the top score, and each of them falls to its own second choice, which is a different node for different keys, so the load is spread evenly over the survivors. If a node is added, it takes exactly the keys for which its score is now the highest. Balance is as good as the hash function, with no virtual nodes, and the top <i>k</i> scores give <i>k</i> replicas. The price is that every lookup computes a hash for every node. For ten or fifty nodes that is negligible. For ten thousand it isn't, and a ring's logarithmic lookup wins.</p>
+
+  <h2>Jump hash</h2>
+  <p><b>Jump consistent hash</b>, published by two Google engineers in 2014, is the smallest of the three: a function of a few lines, using no memory at all, that maps a key to a bucket number from 0 to N − 1.</p>
+<pre class="code"><span class="k">static int</span> <span class="f">jumpHash</span>(<span class="k">long</span> key, <span class="k">int</span> buckets) {
+	<span class="k">long</span> b = -<span class="m">1</span>, j = <span class="m">0</span>;
+	<span class="k">while</span> (j &lt; buckets) {
+		b = j;
+		key = key * <span class="m">2862933555777941757L</span> + <span class="m">1</span>;                        <span class="c">// a pseudo-random sequence seeded by the key</span>
+		j = (<span class="k">long</span>) ((b + <span class="m">1</span>) * ((<span class="k">double</span>) (<span class="m">1L</span> &lt;&lt; <span class="m">31</span>) / (<span class="k">double</span>) ((key &gt;&gt;&gt; <span class="m">33</span>) + <span class="m">1</span>)));
+	}
+	<span class="k">return</span> (<span class="k">int</span>) b;
+}</pre>
+  <p>The idea behind it: imagine the number of buckets growing from 1 upwards. Each time a bucket is added, a key should jump to the new bucket with probability 1/<i>n</i>, and otherwise stay. The function simulates those jumps directly, skipping ahead from one jump to the next, so it runs in time proportional to the logarithm of the bucket count. The distribution is almost perfectly even, better than a ring with any practical number of virtual nodes.</p>
+  <p>Its limitation is in its signature. It knows a <i>count</i> of buckets and nothing about their identities, so buckets can only be added and removed at the end. That suits storage shards, which are numbered, are never removed from the middle, and are each a replicated group that doesn't vanish when one machine fails. It doesn't suit a pool of cache servers, any of which may disappear.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Hash ring with virtual nodes</th><th>Rendezvous</th><th>Jump hash</th></tr></thead>
+      <tbody>
+        <tr><td><b>Lookup cost</b></td><td>Logarithmic in N × V</td><td>Linear in N</td><td>Logarithmic in N</td></tr>
+        <tr><td><b>Memory</b></td><td>N × V positions</td><td>The list of nodes</td><td>None</td></tr>
+        <tr><td><b>Balance</b></td><td>Good with enough virtual nodes</td><td>Very good</td><td>Nearly perfect</td></tr>
+        <tr><td><b>Remove any node</b></td><td>Yes</td><td>Yes</td><td>No: the last bucket only</td></tr>
+        <tr><td><b>Weighted nodes</b></td><td>More virtual nodes</td><td>A weighted score</td><td>Not directly</td></tr>
+        <tr><td><b>Typical use</b></td><td>Dynamo, Cassandra, memcached clients</td><td>Load balancers and proxies with tens of backends</td><td>Numbered shards in a storage system</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🎬</div>
+    <div class="body"><div class="title">Use case: Vimeo, and a ring that knows when a node is full</div><p>Consistent hashing balances <i>keys</i>, and <a href="p6-hashing.html">P6</a> pointed out that keys aren't load. Vimeo met the difference in 2016 in the service that packages video for streaming. Each video's index is expensive to compute and is cached in the memory of whichever server handled it, so requests for the same video should always go to the same server, and the load balancer chose servers by consistent hashing on the video's ID. That worked until a video became popular. All its requests went to one server, by design, and that server was overwhelmed while others sat idle. The alternative, sending each request to the least busy server, spread the load evenly and ruined the caching, since every server ended up computing every popular index for itself. Vimeo's engineers found a recent paper from Google researchers, "Consistent Hashing with Bounded Loads", which combines the two. Each server is given a cap, a fixed fraction above the current average load, 25% in Vimeo's configuration. A request goes to the server the ring chooses, as before, unless that server is at its cap, in which case it goes on round the ring to the next server that isn't. Most requests land where consistent hashing would have put them, so the caches stay effective, and no server can exceed the cap, however popular one key becomes. One of the engineers implemented the algorithm in HAProxy, the open-source load balancer, where it became a standard option, and Vimeo reported both the overload and most of the cache duplication gone. The original ring assumes that every key costs the same. Where that is false, the placement scheme has to be told about load as well as about keys.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>A ring with one position for each node.</b> The load is badly uneven, and a failure dumps everything on one neighbour.</li>
+      <li><b>A weak hash function.</b> Java's <code>String.hashCode</code> clusters similar names. Use a mixing hash such as Murmur3 or xxHash.</li>
+      <li><b>Taking the next N positions as replicas.</b> With virtual nodes several may be the same machine. Take the next N distinct nodes, and for real safety distinct racks.</li>
+      <li><b>Rebalancing the moment a node is unreachable.</b> Most outages are short, and moving data loads the survivors.</li>
+      <li><b>Jump hash for servers that can fail individually.</b> Removing a bucket from the middle renumbers the rest.</li>
+      <li><b>Assuming even keys means even load.</b> One hot key defeats any hash. Cap the load, or split the key.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is consistent hashing, and why not just use <code>hash(key) % N</code>?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>With hash mod N, the node for a key depends on N, so when a node is added or removed nearly every key maps to a different node. For a cache that is a storm of misses, and for a store it means moving almost all the data. Consistent hashing makes placement depend on positions rather than on a count. You hash each node to a point on a circle and each key to a point on the same circle, and a key belongs to the first node clockwise from it. Adding a node only takes over the arc between it and its predecessor, and removing one only hands its arc to its successor, so on average only about one Nth of the keys move, which is the minimum possible. In practice each physical node is placed at many points, virtual nodes, since a few random points divide the circle unevenly; with a hundred or so for each node, load evens out and a departing node's keys are spread across all the others. For replication you take the next N distinct nodes clockwise. I'd mention that there are ring-free alternatives: rendezvous hashing, which scores every node for each key and takes the highest, and jump hash, which is tiny and perfectly even but only supports adding and removing buckets at the end.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You run a consistent-hash ring of cache servers. One key becomes extremely hot and its server falls over. What are your options?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The ring is doing its job, sending one key to one node, and that is the problem, so more virtual nodes won't help: they balance the number of keys, not the traffic to a single key. Options, roughly from least to most invasive. Bounded loads: cap each server at some factor above the mean load, say 1.25, and when the chosen server is at its cap, spill to the next one on the ring. Most requests still hit the intended server, so cache locality is largely kept, and no server can be overwhelmed. Replicating the hot key: hash it to the top two or three servers, by rendezvous score or the next positions on the ring, and spread reads across them; that needs a way of identifying hot keys, either a static list or a counter in the client or proxy. Splitting the key: append a small random suffix on reads so that copies land on several servers, with the writer fanning out to all the suffixes. A local in-process cache in front for the hottest few keys, with a short lifetime, which removes the network hop entirely. And, on the server side, coalescing concurrent misses so that a thundering herd for the same key triggers one recomputation. I'd also look at why the server fell over rather than degraded: a concurrency limit and load shedding would have turned an outage into some slow requests. If the store behind the cache is the real bottleneck, the fix belongs there. For most cases I'd start with bounded loads in the proxy, since it needs no knowledge of which keys are hot.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>On a hash ring a key belongs to the first node clockwise from its hash. Changing the nodes moves about one key in N.</li>
+      <li>Virtual nodes give each machine many positions, which evens out the load and shares a departing node's keys among all the others.</li>
+      <li>Replicas are the next N distinct nodes round the ring.</li>
+      <li>In a store, placement changes in an instant and the data takes hours to move. Don't rebalance for a short outage.</li>
+      <li>Rendezvous hashing needs no ring and balances well, at a cost linear in the number of nodes for each lookup.</li>
+      <li>Jump hash is tiny and almost perfectly even, and only adds or removes at the end. No hash balances a hot key.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A hash ring has 10 nodes. An eleventh is added. Roughly what share of the keys move?</p>
+      <div class="opts">
+        <button class="opt">Nearly all of them</button>
+        <button class="opt">About one in eleven</button>
+        <button class="opt">Half</button>
+        <button class="opt">None</button>
+      </div>
+      <div class="explain">Only the keys in the arcs the new node takes over move to it. That is the least any scheme could move.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What do virtual nodes fix?</p>
+      <div class="opts">
+        <button class="opt">The cost of each lookup</button>
+        <button class="opt">Hot keys</button>
+        <button class="opt">The need for a hash function</button>
+        <button class="opt">Uneven arcs: with one position each, some nodes own far more of the ring than others</button>
+      </div>
+      <div class="explain">Many small arcs average out. They also spread a departing node's keys across everyone.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">On a ring with virtual nodes, how are the three replicas of a key chosen?</p>
+      <div class="opts">
+        <button class="opt">The next three distinct physical nodes clockwise from the key</button>
+        <button class="opt">The next three positions clockwise, whatever nodes they belong to</button>
+        <button class="opt">Three nodes chosen at random</button>
+        <button class="opt">The key is hashed three times</button>
+      </div>
+      <div class="explain">Adjacent positions may belong to the same machine, which would put two "replicas" on one disk.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What is the main cost of rendezvous hashing?</p>
+      <div class="opts">
+        <button class="opt">It balances load poorly</button>
+        <button class="opt">It moves most keys when a node changes</button>
+        <button class="opt">Each lookup computes a hash for every node, so it grows linearly with the number of nodes</button>
+        <button class="opt">It needs a large table in memory</button>
+      </div>
+      <div class="explain">Excellent for tens of nodes. With thousands, a ring's sorted lookup is cheaper.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is jump hash a poor fit for a pool of cache servers?</p>
+      <div class="opts">
+        <button class="opt">Its distribution is uneven</button>
+        <button class="opt">It maps keys to bucket numbers 0 to N − 1, so a server can't be removed from the middle without renumbering the rest</button>
+        <button class="opt">It uses too much memory</button>
+        <button class="opt">It is slower than a ring</button>
+      </div>
+      <div class="explain">It suits numbered shards that are only ever added at the end. Cache servers fail in any order.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  const K = 5000, MAXN = 10, MINN = 2;
+  const mix = (h) => { h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0; };
+  const hash = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); } return mix(h); };
+  const KEYS = Array.from({ length: K }, (_, i) => hash('key-' + i));
+  const M64 = (1n << 64n) - 1n;
+  function jump(key, n) { let k = BigInt(key) * 0x9E3779B97F4A7C15n & M64, b = -1, j = 0; while (j < n) { b = j; k = (k * 2862933555777941757n + 1n) & M64; j = Math.floor((b + 1) * (2147483648 / (Number(k >> 33n) + 1))); } return b; }
+  let st;
+  const alg = () => $('#chA').dataset.value, V = () => +$('#chV').dataset.value;
+  const hue = (id) => `hsl(${(id * 47 + 200) % 360} 62% 50%)`, nm = (id) => String.fromCharCode(65 + id);
+  function ringPoints() { const pts = []; st.nodes.forEach((id) => { for (let v = 0; v < V(); v++) pts.push([hash(nm(id) + '#' + v), id]); }); return pts.sort((a, b) => a[0] - b[0]); }
+  // Where every key lives, under the scheme and node list in force.
+  function place() {
+    const a = alg(), ns = st.nodes, n = ns.length, out = new Array(K);
+    if (a === 'ring') { const pts = ringPoints(); for (let i = 0; i < K; i++) { let lo = 0, hi = pts.length; while (lo < hi) { const m = (lo + hi) >> 1; if (pts[m][0] < KEYS[i]) lo = m + 1; else hi = m; } out[i] = pts[lo === pts.length ? 0 : lo][1]; } }
+    else if (a === 'hrw') { const nh = ns.map((id) => hash('node-' + nm(id))); for (let i = 0; i < K; i++) { let best = -1, who = 0; for (let j = 0; j < n; j++) { const s = mix(KEYS[i] ^ nh[j]); if (s > best) { best = s; who = ns[j]; } } out[i] = who; } }
+    else if (a === 'jump') for (let i = 0; i < K; i++) out[i] = ns[jump(KEYS[i], n)];
+    else for (let i = 0; i < K; i++) out[i] = ns[KEYS[i] % n];
+    return out;
+  }
+  function reset() { st = { nodes: [0, 1, 2, 3], next: 4, where: null, last: null }; st.where = place(); draw(); }
+  function change(kind) {
+    const before = st.where, n0 = st.nodes.length; let gone = null, min;
+    if (kind === 'add') { if (n0 >= MAXN) return; st.nodes.push(st.next++); min = Math.round(K / (n0 + 1)); }
+    else { if (n0 <= MINN) return; gone = kind === 'last' ? st.nodes.pop() : st.nodes.shift(); min = before.filter((x) => x === gone).length; }
+    st.where = place(); const moved = st.where.reduce((c, x, i) => c + (x !== before[i] ? 1 : 0), 0);
+    st.last = { kind, gone, moved, min, id: kind === 'add' ? st.next - 1 : gone }; draw();
+  }
+  function draw() {
+    const a = alg(), n = st.nodes.length, counts = {}; st.nodes.forEach((id) => { counts[id] = 0; }); st.where.forEach((id) => { counts[id]++; });
+    const fair = K / n, max = Math.max(...Object.values(counts)), min = Math.min(...Object.values(counts)), scale = Math.max(max, fair) * 1.08;
+    $('#chBars').innerHTML = st.nodes.map((id) => `<div class="ch-b"><b style="color:${hue(id)}">${nm(id)}</b><div class="ch-t"><i style="width:${(counts[id] / scale * 100).toFixed(1)}%;background:${hue(id)}"></i><u style="left:${(fair / scale * 100).toFixed(1)}%"></u></div><span>${(counts[id] / K * 100).toFixed(1)}%</span></div>`).join('');
+    let s = '<circle class="ch-track" cx="110" cy="110" r="88"/>';
+    if (a === 'ring') { const pts = ringPoints(), step = Math.ceil(pts.length / 400); pts.forEach(([h, id], i) => { if (i % step) return; const t = h / 4294967296 * 2 * Math.PI - Math.PI / 2; s += `<circle cx="${(110 + 88 * Math.cos(t)).toFixed(1)}" cy="${(110 + 88 * Math.sin(t)).toFixed(1)}" r="${pts.length > 100 ? 2.6 : 5}" fill="${hue(id)}"/>`; }); s += `<text x="110" y="106">${pts.length} positions</text><text x="110" y="122">${n} nodes</text>`; }
+    else s += `<text x="110" y="106">no ring in</text><text x="110" y="122">this scheme</text>`;
+    $('#chRing').innerHTML = s;
+    const r = $('#chRes'), L = st.last, ratio = max / fair; let kind = '', html;
+    const what = { ring: `a ring with ${V()} ${V() === 1 ? 'position' : 'positions'} for each node`, hrw: 'rendezvous hashing', jump: 'jump hash', mod: 'hash mod N' }[a];
+    if (!L) { kind = ratio > 1.5 ? 'bad' : ratio > 1.15 ? 'warn' : 'good'; html = `<b>${n} nodes, placed by ${what}.</b> A fair share is ${(100 / n).toFixed(0)}% of the keys. The busiest node has ${(max / K * 100).toFixed(1)}% and the quietest ${(min / K * 100).toFixed(1)}%${ratio > 1.5 ? ', which is badly uneven' : ratio > 1.15 ? ', which is uneven and usable' : ', which is close to level'}.`; }
+    else { const extra = L.moved - L.min, bad = L.moved > L.min * 1.5 + 50; kind = bad ? 'bad' : 'good';
+      const did = L.kind === 'add' ? `Node ${nm(L.id)} was added` : `Node ${nm(L.id)}, the ${L.kind === 'last' ? 'newest' : 'oldest'}, was removed`;
+      html = `<b>${did}: ${L.moved.toLocaleString('en-GB')} of 5,000 keys moved.</b> The fewest that could have moved is ${L.min.toLocaleString('en-GB')}${L.kind === 'add' ? ', the new node\'s fair share' : ', the keys that node held'}. `
+        + (bad ? (a === 'mod' ? `Under <code>mod N</code> a key's node depends on the count of nodes, so changing the count remaps almost everything: ${extra.toLocaleString('en-GB')} keys moved for no reason.` : a === 'jump' ? `Jump hash knows the nodes only as numbers 0 to ${n - (L.kind === 'add' ? 1 : 0)}. Taking the first one away renumbers all the others, and ${extra.toLocaleString('en-GB')} keys that had nothing to do with node ${nm(L.id)} moved.` : `${extra.toLocaleString('en-GB')} more than necessary.`)
+          : `${Math.abs(extra) < 40 ? 'That is as little disruption as there can be.' : 'Close to the minimum: the difference is the unevenness of the shares.'}${a === 'ring' && V() === 1 && L.kind !== 'add' ? ' All of them went to one neighbour, the next node round the ring.' : ''}`);
+    }
+    r.className = 'ch-res ' + (kind ? 'ch-' + kind : ''); r.innerHTML = html;
+    $('#chStats').innerHTML = `<div class="stat acc"><div class="k">Nodes</div><div class="v">${n}</div></div>
+      <div class="stat ${ratio > 1.5 ? 'bad' : ratio > 1.15 ? 'warn' : 'good'}"><div class="k">Busiest node, against a fair share</div><div class="v">${ratio.toFixed(2)}×</div></div>
+      <div class="stat"><div class="k">Quietest node</div><div class="v">${(min / fair).toFixed(2)}×</div></div>
+      <div class="stat ${!L ? '' : L.moved > L.min * 1.5 + 50 ? 'bad' : 'good'}"><div class="k">Keys moved by the last change</div><div class="v">${L ? L.moved.toLocaleString('en-GB') : '—'}</div></div>
+      <div class="stat"><div class="k">The fewest possible</div><div class="v">${L ? L.min.toLocaleString('en-GB') : '—'}</div></div>`;
+    $('#chAdd').disabled = n >= MAXN; $('#chLast').disabled = $('#chFirst').disabled = n <= MINN;
+    $$('#chV button').forEach((b) => { b.disabled = a !== 'ring'; });
+  }
+  $('#chAdd').onclick = () => change('add'); $('#chLast').onclick = () => change('last'); $('#chFirst').onclick = () => change('first'); $('#chReset').onclick = reset;
+  const redo = () => { st.where = place(); st.last = null; draw(); };
+  $('#chA').addEventListener('segchange', redo); $('#chV').addEventListener('segchange', redo);
+  reset();
+})();
+</script>
 </body>
 </html>

@@ -185,7 +185,7 @@
       topics: ['Raft & Paxos', 'Consistency', 'Clocks', 'CRDTs', 'Kafka', '8 case studies'],
       lang: 'Java',
       chapters: 56,
-      hours: 44,
+      hours: 41,
       c1: '#9333ea', c2: '#db2777', d1: '#c084fc', d2: '#f472b6',
       store: 'dist',
       indexVar: 'DIST_INDEX',
@@ -193,7 +193,6 @@
       first: 'p1-java-concurrency.html',
       dist: 'distributed-systems-course.html',
       release: null,
-      soon: true,
     },
     {
       id: 'cloud-devops',

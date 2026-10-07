@@ -6,34 +6,317 @@
 <title>Two-Phase Commit</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .tp-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .tp-row > span { font-size:12.5px; color:var(--muted); min-width:74px; }
+  .tp-nodes { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
+  @media (max-width:820px) { .tp-nodes { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .tp-n { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:8px 11px; min-width:0; font-size:13px; }
+  .tp-n h6 { margin:0 0 3px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .tp-n b { display:block; font-size:14.5px; }
+  .tp-n small { display:block; font-size:11.5px; color:var(--muted); min-height:17px; }
+  .tp-n code { display:block; font-size:11.5px; background:none; padding:0; color:var(--text-2); overflow-wrap:anywhere; min-height:17px; }
+  .tp-n.tp-prepared { border-color:var(--amber, var(--accent)); background:var(--amber-soft, var(--surface-2)); }
+  .tp-n.tp-committed { border-color:var(--green); background:var(--green-soft); }
+  .tp-n.tp-aborted { border-color:var(--text-2); background:var(--surface-2); }
+  .tp-n.tp-down { border-color:var(--red); background:var(--red-soft); opacity:.8; }
+  .tp-n.tp-coord { border-style:double; border-width:3px; }
+  .tp-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--border); min-height:68px; }
+  .tp-res.tp-good { background:var(--green-soft); border-left-color:var(--green); }
+  .tp-res.tp-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .tp-res.tp-warn { background:var(--amber-soft, var(--surface-2)); border-left-color:var(--amber, var(--accent)); }
+</style>
 </head>
 <body data-chapter="21">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 21</span><span class="pill">Intermediate</span><span class="pill">⏱ 50 min</span></div>
     <h1>Two-Phase <span class="grad">Commit</span></h1>
-    <p class="lead">Coordinator and participants, prepare and commit, and the blocking problem when the coordinator dies.</p>
+    <p class="lead">Once data is partitioned (<a href="20-partitioning-rebalancing.html">Chapter 20</a>), an ordinary operation can touch two machines. A transfer debits an account on one shard and credits an account on another. An order reduces stock in one database and records a payment in a second. Each machine can commit its own part atomically, as any database can. What is needed is for the parts to stand or fall together: if either commits, both must, and if either can't, neither may. That is the <b>atomic commit</b> problem, and <b>two-phase commit</b> is the classic answer, in use since the 1970s. It is simple and it is correct, and it has one notorious property: if the wrong machine fails at the wrong moment, the others are left holding locks, unable to go forward or back, for as long as that machine stays down. This chapter covers the protocol, each way it can fail, and how modern systems keep the idea and remove the wait.</p>
+    <ul class="objectives">
+      <li><span>State the atomic commit problem, and say how it differs from consensus</span></li>
+      <li><span>Run two-phase commit, and identify the moment at which the outcome is decided</span></li>
+      <li><span>Work out what each node does after a crash, from what it wrote to its log</span></li>
+      <li><span>Explain why a prepared participant is blocked when the coordinator fails</span></li>
+      <li><span>Say why three-phase commit didn't solve this in practice, and how commit over a consensus group does</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Transactions, atomicity and the write-ahead log on one machine</b>, in the Databases course: <a href="../databases/10-transactions-acid.html">Transactions &amp; ACID</a> and <a href="../databases/20-wal-recovery.html">WAL &amp; Recovery</a>.</li>
+        <li><b>Locks, and what holding them costs</b>: <a href="../databases/22-two-phase-locking.html">Locks &amp; Two-Phase Locking</a>. Two-phase <i>locking</i> is unrelated to two-phase <i>commit</i>, despite the name.</li>
+        <li><b>Consensus and replicated logs</b> from Chapters <a href="16-paxos.html">16</a> to <a href="18-raft-log-replication.html">18</a>, for the last section.</li>
+        <li><b>Timeouts, and the three outcomes of a remote call</b> from <a href="p2-rpc-timeouts.html">P2</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The protocol</li>
-    <li>Failure cases</li>
-    <li>Blocking</li>
-    <li>Three-phase commit</li>
-    <li>2PC over Paxos/Raft</li>
-  </ol>
+  <h2>The problem</h2>
+  <p>A transaction has done work at several nodes, the <b>participants</b>. Now it wants to commit. Atomic commit requires that every participant reaches the same outcome, commit or abort, that the outcome is commit only if every participant was able to commit, and that once a participant has decided, it never changes its mind.</p>
+  <p>This sounds like consensus, and it differs in the detail that causes all the trouble. In consensus, any proposed value may win, and a majority is enough to choose it, so a failed machine can be outvoted. In atomic commit <b>every participant has a veto</b>. A node that has run out of disk space, or found a constraint violated, must be able to force an abort. So the protocol needs an answer from every one of them, and a participant that can't be reached can't simply be ignored.</p>
+
+  <h2>The protocol</h2>
+  <p>One node acts as <b>coordinator</b>. It may be one of the participants or a separate service. The two phases are a vote and a decision.</p>
+  <figure class="seq" data-actors="Coordinator|Participant A|Participant B">
+    <ol>
+      <li data-m="0>1">PREPARE</li>
+      <li data-m="0>2">PREPARE</li>
+      <li data-m="1>1">can I commit? Yes: write "prepared" to the log, on disk. Keep every lock</li>
+      <li data-m="2>2">the same</li>
+      <li data-m="1>0" data-k="reply">YES</li>
+      <li data-m="2>0" data-k="reply">YES</li>
+      <li data-m="0>0">all voted yes: write "commit" to the log, on disk<small>this is the commit point. Whatever happens next, the transaction has committed</small></li>
+      <li data-m="0>1">COMMIT</li>
+      <li data-m="0>2">COMMIT</li>
+      <li data-m="1>0" data-k="reply">done<small>each participant commits, releases its locks and acknowledges</small></li>
+      <li data-m="2>0" data-k="reply">done</li>
+    </ol>
+    <figcaption><b>Two-phase commit with nothing going wrong.</b> Two round trips, and a forced write at every node before any lock is released: a "prepared" record at each participant, and the decision at the coordinator.</figcaption>
+  </figure>
+  <p>A participant that votes YES is making a promise with two halves. It will commit if told to, whatever happens to it in the meantime, a crash included, which is why it writes "prepared" to disk before the vote leaves. And it will <i>not</i> decide for itself: having said yes, it can no longer abort on its own, since the others may be committing. Until it hears the outcome it is <b>in doubt</b>, and it keeps every lock the transaction holds.</p>
+<pre class="code"><span class="c">// Coordinator</span>
+<span class="t">Outcome</span> <span class="f">commit</span>(<span class="t">TxnId</span> id, <span class="t">List</span>&lt;<span class="t">Participant</span>&gt; participants) {
+	log.<span class="f">force</span>(<span class="k">new</span> <span class="t">Begin</span>(id, participants));
+	<span class="k">boolean</span> allYes = participants.<span class="f">parallelStream</span>()
+			.<span class="f">allMatch</span>(p -&gt; p.<span class="f">prepare</span>(id, TIMEOUT) == <span class="t">Vote</span>.YES);       <span class="c">// no answer in time counts as NO</span>
+	<span class="t">Outcome</span> outcome = allYes ? <span class="t">Outcome</span>.COMMIT : <span class="t">Outcome</span>.ABORT;
+	log.<span class="f">force</span>(<span class="k">new</span> <span class="t">Decision</span>(id, outcome));                          <span class="c">// the commit point</span>
+	participants.<span class="f">forEach</span>(p -&gt; <span class="f">retryUntilAcknowledged</span>(() -&gt; p.<span class="f">finish</span>(id, outcome)));
+	log.<span class="f">append</span>(<span class="k">new</span> <span class="t">End</span>(id));                                      <span class="c">// everyone knows: the record can be forgotten</span>
+	<span class="k">return</span> outcome;
+}
+
+<span class="c">// Participant</span>
+<span class="t">Vote</span> <span class="f">prepare</span>(<span class="t">TxnId</span> id) {
+	<span class="k">if</span> (!<span class="f">ableToCommit</span>(id)) { <span class="f">rollback</span>(id); <span class="k">return</span> <span class="t">Vote</span>.NO; }        <span class="c">// free to abort alone: no promise was made</span>
+	log.<span class="f">force</span>(<span class="k">new</span> <span class="t">Prepared</span>(id, coordinator));                       <span class="c">// the promise must survive a crash</span>
+	<span class="k">return</span> <span class="t">Vote</span>.YES;                                               <span class="c">// locks stay held</span>
+}
+
+<span class="k">void</span> <span class="f">finish</span>(<span class="t">TxnId</span> id, <span class="t">Outcome</span> outcome) {                          <span class="c">// may be called more than once: must be idempotent</span>
+	<span class="k">if</span> (outcome == <span class="t">Outcome</span>.COMMIT) <span class="f">commitLocally</span>(id); <span class="k">else</span> <span class="f">rollback</span>(id);
+	log.<span class="f">force</span>(<span class="k">new</span> <span class="t">Done</span>(id, outcome));
+	<span class="f">releaseLocks</span>(id);
+}</pre>
+
+  <h2>Failure cases</h2>
+  <p>Every node recovers by reading its own log, and the log tells it what it had promised.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>What fails, and when</th><th>What the others do</th><th>What it does on recovery</th></tr></thead>
+      <tbody>
+        <tr><td><b>A participant, before voting</b></td><td>The coordinator times out, counts it as NO, and aborts</td><td>No "prepared" record: it had promised nothing, so it rolls back</td></tr>
+        <tr><td><b>A participant, after voting YES</b></td><td>The coordinator decides as usual, and keeps retrying the outcome to it</td><td>Finds "prepared" with no outcome. It is in doubt: it takes its locks again and asks the coordinator</td></tr>
+        <tr><td><b>The coordinator, before writing its decision</b></td><td>Participants that haven't voted may abort. Those that voted YES must wait</td><td>No decision record: it aborts, and tells everyone</td></tr>
+        <tr><td><b>The coordinator, after writing its decision</b></td><td>Any participant that hasn't heard must wait</td><td>Finds the decision, and sends it again to everyone</td></tr>
+        <tr><td><b>A message is lost</b></td><td>The sender times out and retries. Every message is safe to repeat</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Try it: break it at each point</h2>
+  <p>A coordinator and three participants, committing one transaction. Choose where something goes wrong, and step through what follows.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Two-phase commit, step by step</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="tp-row"><span>What goes wrong</span><div class="seg" id="tpS"><button class="active" data-v="ok">nothing</button><button data-v="no">B votes no</button><button data-v="pbefore">C crashes before voting</button><button data-v="pafter">C crashes after voting yes</button><button data-v="kcrash">the coordinator crashes after deciding</button><button data-v="partial">the coordinator crashes mid-announcement</button></div></div>
+      <div class="controls">
+        <button class="btn sm primary" id="tpNext">Next step</button>
+        <button class="btn sm ghost" id="tpReset">↺ Start again</button>
+      </div>
+      <div class="tp-nodes" id="tpNodes"></div>
+      <div class="tp-res" id="tpRes"></div>
+      <div class="stats" id="tpStats"></div>
+    </div>
+    <div class="panel-foot">Each card shows a node's state and the last record it forced to its log, which is all it will have after a crash. A padlock means the node is holding the transaction's locks, and other transactions that need those rows are waiting. Amber is "prepared": the node has voted yes and doesn't know the outcome.</div>
+  </div>
+
+  <p>Things to notice. With nothing wrong, the transaction commits after twelve messages and eight forced writes, and every participant held its locks from the first step to the last. When B votes no, or C never votes, the coordinator aborts and everyone rolls back: a participant that hasn't promised can always walk away. The last three scenarios are the instructive ones. When C crashes <i>after</i> voting yes, the transaction commits without it, and C comes back to find a promise in its log and no outcome: it has to ask. When the coordinator crashes after deciding and before telling anyone, the three participants are all prepared, all holding locks, and none of them knows the decision that is sitting on the coordinator's disk. They can ask each other, and each can only say "I voted yes too". They wait until the coordinator returns. In the last scenario one participant did hear before the crash, and that is enough: the others ask it, and finish.</p>
+
+  <h2>Blocking</h2>
+  <p>The panel's fifth scenario is the defect two-phase commit is known for. Between voting yes and learning the outcome, a participant is in doubt, and for that period its fate is in someone else's hands. If the coordinator is unreachable, the participant can't commit, since the decision may have been to abort. It can't abort, since the decision may have been to commit and another participant may already have acted on it. It can't release its locks, since either outcome needs them. A timeout doesn't help, since no amount of waiting tells it which.</p>
+  <p>Asking the other participants, called cooperative termination, resolves some cases. If any of them has already committed or aborted, that is the outcome. If any of them hasn't yet voted, it can refuse to, and everyone can abort. If all of them are prepared and none has heard, nothing can be concluded: the coordinator alone knows.</p>
+  <p>The cost is larger than the stuck transaction. Its locks block every other transaction that needs those rows, those block others, and in a busy database a single in-doubt transaction can stall a large share of the workload within seconds. The availability arithmetic is poor too. A transaction across five nodes needs all five and the coordinator to be working, so its availability is the product of theirs (<a href="p4-failure-arithmetic.html">P4</a>), and its latency is that of the slowest.</p>
+
+  <h2>Three-phase commit</h2>
+  <p>The blocking arises from one state. A prepared participant is one message away from committing and one message away from aborting, and can't tell which. <b>Three-phase commit</b> puts an extra round between the vote and the commit. After every participant has voted yes, the coordinator first sends PRE-COMMIT, which says "everyone agreed, and I am about to commit", and waits for acknowledgements. Only then does it send COMMIT. Now a participant that times out can reason from its own state: if it never received PRE-COMMIT, no participant can have committed yet, so aborting is safe. If it did, everyone voted yes, so committing is safe.</p>
+  <p>The reasoning holds if a node that doesn't answer has certainly crashed. It fails in a real network, where silence may mean a partition (<a href="02-system-models.html">Chapter 2</a>). Cut the participants into two groups after some have received PRE-COMMIT and some haven't, and one group times out and commits while the other times out and aborts. Three-phase commit removes blocking by assuming away the failure that matters most, and it costs a third round trip, so it is rarely used.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Two-phase commit</th><th>Three-phase commit</th><th>Commit over consensus groups</th></tr></thead>
+      <tbody>
+        <tr><td><b>Round trips</b></td><td>Two</td><td>Three</td><td>Two, each to a majority of a group</td></tr>
+        <tr><td><b>If the coordinator crashes</b></td><td>Prepared participants block until it recovers</td><td>They time out and decide</td><td>Another replica of the coordinator takes over in seconds</td></tr>
+        <tr><td><b>Under a network partition</b></td><td>Blocks, and stays correct</td><td>Can decide differently on each side</td><td>The majority side continues. Stays correct</td></tr>
+        <tr><td><b>Used in practice</b></td><td>Widely: XA, most databases</td><td>Hardly at all</td><td>Spanner, CockroachDB, and similar</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>2PC over Paxos and Raft</h2>
+  <p>Two-phase commit blocks since each piece of critical knowledge lives on one machine: the decision on the coordinator's disk, and each participant's promise on its own. The remedy that works is to keep the protocol and remove the single machines. Make each participant a consensus group, a few replicas kept identical by Raft or Paxos, as Chapters <a href="15-state-machine-replication.html">15</a> to <a href="18-raft-log-replication.html">18</a> described. "Prepared" then isn't a record on one disk. It is an entry in a replicated log, and if the group's leader dies, the new leader has it and carries on. Do the same for the coordinator's decision: record it as an entry in a replicated log, and any replica can answer the question "what happened to transaction 91?".</p>
+  <p>The protocol's messages are unchanged, and every failure in the table above now ends with "a new leader is elected, reads the log and continues", a pause of seconds where there was an outage of unknown length. Participants still hold locks while in doubt, and the doubt is brief. This is how Spanner and CockroachDB commit transactions that span ranges, and the Databases course follows one through in <a href="../databases/36-distributed-sql.html">Distributed SQL</a>. Jim Gray and Leslie Lamport showed in 2004 that the two ideas fit together exactly: ordinary two-phase commit is the special case of their combined protocol in which each group has a single member.</p>
+  <p>When the participants are independent services, with no shared protocol and no willingness to hold locks for each other, even this is the wrong tool. <a href="22-sagas.html">Chapter 22</a> covers what is used there.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧷</div>
+    <div class="body"><div class="title">Use case: the prepared transaction nobody finished</div><p>PostgreSQL implements the participant's half of two-phase commit, and its documentation carries an unusual warning about its own feature. An external coordinator runs <code>PREPARE TRANSACTION 'order-8812'</code> on each database involved, which is the vote: the transaction's state is written to disk, detached from the session that created it, and from then on it survives a restart of the server. Later the coordinator runs <code>COMMIT PREPARED 'order-8812'</code>, or <code>ROLLBACK PREPARED</code>. In between, the transaction is in doubt in exactly this chapter's sense, and PostgreSQL shows what that means for one machine. Every row lock the transaction took is still held, so other sessions that touch those rows wait. Its snapshot is still open, so VACUUM can't remove dead rows newer than it, anywhere in the database, and tables bloat (<a href="../databases/23-mvcc.html">Databases, MVCC</a>). Neither effect ends when the client disconnects or the server restarts, since surviving both is the purpose of the feature. If the coordinator crashes and loses its own record, or the application has a bug, the prepared transaction stays indefinitely. For that reason the setting that permits the feature, <code>max_prepared_transactions</code>, defaults to zero, and the documentation advises leaving it there unless a transaction manager is in use that is known to resolve its transactions. Operators who do use it monitor the view <code>pg_prepared_xacts</code> for entries older than a few minutes. When one is found, a person has to decide by hand whether to commit it or roll it back, without knowing what the other databases did. The standard that coordinators and databases speak, XA, has a name for a participant resolving a transaction on its own in this way: a heuristic decision. When it differs from the coordinator's, the result is the inconsistency the protocol existed to prevent.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>A participant voting yes before "prepared" is on disk.</b> After a crash it has forgotten a promise the others are relying on.</li>
+      <li><b>A prepared participant aborting on a timeout.</b> Another participant may already have committed.</li>
+      <li><b>A coordinator that keeps its decision in memory.</b> If it crashes, nobody can ever find out what was decided.</li>
+      <li><b>Calling it "distributed consensus".</b> Atomic commit needs every participant, where consensus needs a majority.</li>
+      <li><b>Two-phase commit across services owned by different teams.</b> Each holds locks at the mercy of the others' uptime.</li>
+      <li><b>No monitoring of in-doubt transactions.</b> One forgotten prepare can hold locks for days.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does two-phase commit work, and what is its main weakness?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It makes a transaction that spans several nodes commit on all of them or none. A coordinator runs two phases. In the prepare phase it asks every participant whether it can commit. A participant that can writes a durable "prepared" record, keeps its locks, and votes yes; one that can't votes no and rolls back. In the commit phase, if every vote was yes the coordinator durably records "commit", which is the point of no return, and tells everyone to commit; otherwise it records and sends "abort". Participants apply the outcome, release their locks and acknowledge. The weakness is blocking. Once a participant has voted yes, it can neither commit nor abort on its own: it must wait to hear the outcome. If the coordinator crashes after participants have voted and before they hear, they are stuck in doubt, holding locks, until the coordinator recovers, and those locks block other transactions. So a single machine failure can stall a large part of the system for an unbounded time. It also costs two round trips and several forced disk writes for each transaction, and needs every participant to be up.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How do systems like Spanner run distributed transactions without suffering from 2PC's blocking?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>They still use two-phase commit, but none of the parties is a single machine. Each participant is a replicated group, a Paxos or Raft group holding one range of the data, and the prepare record is written through that group's consensus log, so it survives the loss of any minority of its replicas. One participant group acts as coordinator, and its commit decision is likewise a replicated log entry. So the failures that block classic 2PC, the coordinator dying with the only copy of the decision, or a participant dying with the only copy of its promise, become leader failovers: a new leader is elected in seconds, finds the prepare or commit record in its log, and continues the protocol. Blocking isn't eliminated in theory, a group that loses its majority is stuck, but it is reduced to the availability of a quorum rather than of one node. The costs are that each phase is now a consensus round trip, so cross-range transactions are noticeably slower than single-range ones, which commit with one round and skip 2PC altogether; and participants still hold locks or write intents while prepared, so contention is still a concern. Systems reduce the latency with optimisations such as committing in parallel with the prepare when all participants are known, and they design schemas so that most transactions touch one range. Gray and Lamport's Paxos Commit paper is the formal version of this: 2PC is the special case with one acceptor.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Atomic commit: all participants commit or all abort, and every one has a veto. That is why it needs an answer from each.</li>
+      <li>Two-phase commit: participants vote and promise, then the coordinator decides. Its forced log record is the commit point.</li>
+      <li>A yes vote is durable and binding. The participant can't decide alone afterwards, and keeps its locks.</li>
+      <li>Recovery is read off the log: no "prepared" means abort, "prepared" with no outcome means ask.</li>
+      <li>If the coordinator fails while participants are prepared, they block. Three-phase commit avoids that only by ruling out partitions.</li>
+      <li>Running each participant and the coordinator as a consensus group keeps 2PC and turns blocking into a short failover.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">At what moment is a two-phase commit transaction's outcome decided?</p>
+      <div class="opts">
+        <button class="opt">When the last participant votes yes</button>
+        <button class="opt">When the first participant receives COMMIT</button>
+        <button class="opt">When the coordinator forces its decision record to disk</button>
+        <button class="opt">When every participant has acknowledged</button>
+      </div>
+      <div class="explain">Before that record, a coordinator crash leads to abort. After it, recovery will always find "commit" and carry it out.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A participant restarts and finds a "prepared" record for a transaction, with no outcome. What must it do?</p>
+      <div class="opts">
+        <button class="opt">Take the transaction's locks again and ask the coordinator for the outcome</button>
+        <button class="opt">Roll back, since the transaction didn't finish</button>
+        <button class="opt">Commit, since it voted yes</button>
+        <button class="opt">Delete the record</button>
+      </div>
+      <div class="explain">It promised to follow the decision, and doesn't know it. Guessing either way could contradict the others.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">The coordinator crashes after all three participants have voted yes and before any has heard the outcome. They ask each other. What do they learn?</p>
+      <div class="opts">
+        <button class="opt">That the transaction committed</button>
+        <button class="opt">That the transaction aborted</button>
+        <button class="opt">That they may decide by majority</button>
+        <button class="opt">Nothing: each knows only its own vote, so all three stay blocked</button>
+      </div>
+      <div class="explain">The decision exists only on the coordinator. If one of them had heard, or hadn't voted, they could finish.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is three-phase commit rarely used?</p>
+      <div class="opts">
+        <button class="opt">It still blocks when the coordinator crashes</button>
+        <button class="opt">Its timeouts are only safe if silence means a crash. Under a network partition two groups can decide differently</button>
+        <button class="opt">It needs synchronised clocks</button>
+        <button class="opt">It can't abort a transaction</button>
+      </div>
+      <div class="explain">It trades blocking for possible inconsistency in a real network, and adds a round trip.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How does running each participant as a Raft group change two-phase commit?</p>
+      <div class="opts">
+        <button class="opt">It removes the prepare phase</button>
+        <button class="opt">It lets a majority of participants outvote the rest</button>
+        <button class="opt">A prepare or commit record survives the loss of a machine, so a failure means a brief leader change and not an indefinite wait</button>
+        <button class="opt">It removes the need for locks</button>
+      </div>
+      <div class="explain">The protocol is the same. What changes is that no promise or decision lives on a single disk.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  const P = ['A', 'B', 'C'];
+  let st;
+  const fresh = () => ({ i: 0, msgs: 0, forces: 0, kind: '', msg: '', k: { state: 'init', up: true, log: '' }, p: P.map(() => ({ state: 'init', up: true, log: '', lock: true })) });
+  // Small helpers used by the scripts. Each step returns [kind, text].
+  const force = (node, rec) => { node.log = rec; st.forces++; };
+  const prep = (i) => { st.p[i].state = 'prepared'; force(st.p[i], 'prepared'); st.msgs += 2; };
+  const fin = (i, o) => { const p = st.p[i]; p.state = o; force(p, o === 'committed' ? 'commit' : 'abort'); p.lock = false; st.msgs += 2; };
+  const begin = () => { st.k.state = 'waiting'; force(st.k, 'begin'); return ['', '<b>The coordinator starts.</b> It logs the transaction and its three participants, and sends PREPARE to each. Every participant already holds locks from the work it did for this transaction.']; };
+  const decide = (o, why) => { st.k.state = o; force(st.k, o === 'committed' ? 'commit' : 'abort'); return [o === 'committed' ? 'good' : 'warn', `<b>The coordinator forces "${o === 'committed' ? 'commit' : 'abort'}" to its log.</b> ${why}`]; };
+  const allPrep = () => { [0, 1, 2].forEach(prep); return ['', '<b>All three vote YES.</b> Each first checked that it could commit, then forced "prepared" to its log, and only then replied. From this moment none of them may decide alone, and all three keep their locks.']; };
+  const SCRIPT = {
+    ok: [begin, allPrep, () => decide('committed', 'Three yes votes. This record is the commit point: the transaction has committed, though no participant knows it yet.'),
+      () => { [0, 1, 2].forEach((i) => fin(i, 'committed')); return ['good', '<b>COMMIT reaches all three.</b> Each makes its changes permanent, logs the outcome, releases its locks and acknowledges. The coordinator can now forget the transaction.']; }],
+    no: [begin, () => { prep(0); prep(2); const b = st.p[1]; b.state = 'aborted'; b.lock = false; st.msgs += 2; return ['warn', '<b>A and C vote YES. B votes NO.</b> B found it couldn\'t commit, a constraint failed, say. It made no promise, so it rolled back at once and released its locks. A and C are prepared and waiting.']; },
+      () => decide('aborted', 'One NO is enough. Every participant has a veto.'),
+      () => { fin(0, 'aborted'); fin(2, 'aborted'); return ['warn', '<b>ABORT reaches A and C.</b> They roll back and release their locks. Nothing was committed anywhere, which is the "none" half of all-or-none.']; }],
+    pbefore: [begin, () => { prep(0); prep(1); st.p[2].up = false; st.p[2].lock = false; return ['warn', '<b>A and B vote YES. C has crashed</b> and sends nothing. It hadn\'t written "prepared", so it has made no promise.']; },
+      () => decide('aborted', 'The coordinator waited for C\'s vote, timed out, and counted the silence as NO.'),
+      () => { fin(0, 'aborted'); fin(1, 'aborted'); return ['warn', '<b>ABORT reaches A and B.</b> They roll back and release their locks.']; },
+      () => { const c = st.p[2]; c.up = true; c.state = 'aborted'; c.lock = false; return ['warn', '<b>C restarts and reads its log.</b> There is no "prepared" record for this transaction, so it had promised nothing. It rolls the work back on its own authority. No message is needed, and the result agrees with everyone else\'s.']; }],
+    pafter: [begin, allPrep, () => { st.p[2].up = false; st.p[2].lock = false; return ['warn', '<b>C crashes</b> just after voting. Its "prepared" record is on its disk. Its locks were in memory and are gone. The coordinator has all three votes.']; },
+      () => decide('committed', 'Three yes votes were received, and C\'s crash doesn\'t take its vote back.'),
+      () => { fin(0, 'committed'); fin(1, 'committed'); st.msgs += 1; return ['warn', '<b>A and B commit and release their locks.</b> The COMMIT to C goes unanswered, and the coordinator keeps retrying. It can\'t forget this transaction until C acknowledges.']; },
+      () => { const c = st.p[2]; c.up = true; c.lock = true; st.msgs += 1; return ['warn', '<b>C restarts and reads its log: "prepared", and no outcome.</b> It is in doubt. It takes the transaction\'s locks again before serving anything, since the rows may be about to change, and asks the coordinator.']; },
+      () => { fin(2, 'committed'); return ['good', '<b>The coordinator answers COMMIT, and C commits.</b> All three agree. C was unable to decide for itself at any point after its vote.']; }],
+    kcrash: [begin, allPrep, () => { const r = decide('committed', 'Three yes votes.'); st.k.up = false; return ['bad', r[1] + ' <b>Then it crashes</b>, before sending a single COMMIT. The decision exists, on a disk nobody can read.']; },
+      () => { st.msgs += 6; return ['bad', '<b>The participants time out and ask each other.</b> A asks B and C: "did you hear?" Each answers "I voted yes and heard nothing". That is consistent with a commit and with an abort. All three are <b>blocked</b>: they can\'t commit, can\'t roll back, and can\'t release a lock.']; },
+      () => ['bad', '<b>Minutes pass.</b> Every other transaction that needs a row locked by this one is waiting behind it, on all three participants, and others are queueing behind those. The participants are healthy. They are waiting for one machine.'],
+      () => { st.k.up = true; return ['warn', '<b>The coordinator restarts and reads its log: "commit".</b> It doesn\'t need to remember anything else. It sends COMMIT to every participant again.']; },
+      () => { [0, 1, 2].forEach((i) => fin(i, 'committed')); return ['good', '<b>All three commit and release their locks.</b> The outcome is correct. The cost was the time everyone spent blocked, which was exactly as long as the coordinator was down.']; }],
+    partial: [begin, allPrep, () => { const r = decide('committed', 'Three yes votes.'); fin(0, 'committed'); st.k.up = false; return ['warn', r[1] + ' It sends COMMIT to A, which commits, <b>and then it crashes</b> before reaching B or C.']; },
+      () => { st.msgs += 4; return ['', '<b>B and C time out and ask the other participants.</b> A answers: "I was told to commit, and I have." A participant only ever commits on the coordinator\'s decision, so the decision must have been commit.']; },
+      () => { st.p[1].state = 'committed'; force(st.p[1], 'commit'); st.p[1].lock = false; st.p[2].state = 'committed'; force(st.p[2], 'commit'); st.p[2].lock = false; return ['good', '<b>B and C commit and release their locks,</b> with the coordinator still down. Cooperative termination worked here because one participant knew. Had the crash come one message earlier, nobody would have.']; }],
+  };
+  function reset() { st = fresh(); st.msg = '<b>Ready.</b> The transaction has done its work on A, B and C, and now wants to commit. Each participant holds locks on the rows it changed.'; draw(); }
+  function draw() {
+    const sc = SCRIPT[$('#tpS').dataset.value], label = { init: 'working', waiting: 'collecting votes', prepared: 'prepared, in doubt', committed: 'committed', aborted: 'aborted' };
+    const card = (n, title, coord) => `<div class="tp-n ${coord ? 'tp-coord' : ''} ${!n.up ? 'tp-down' : n.state === 'prepared' ? 'tp-prepared' : n.state === 'committed' ? 'tp-committed' : n.state === 'aborted' ? 'tp-aborted' : ''}"><h6>${title}</h6><b>${n.up ? label[n.state] : 'crashed ✖'}</b><small>${coord || !n.up ? '' : n.lock ? '🔒 holding locks' : 'locks released'}</small><code>${n.log ? 'log: ' + n.log : 'log: —'}</code></div>`;
+    $('#tpNodes').innerHTML = card(st.k, 'Coordinator', true) + st.p.map((p, i) => card(p, 'Participant ' + P[i])).join('');
+    const r = $('#tpRes'); r.className = 'tp-res ' + (st.kind ? 'tp-' + st.kind : ''); r.innerHTML = st.msg;
+    const locked = st.p.filter((p) => p.lock).length, doubt = st.p.filter((p) => p.state === 'prepared').length;
+    const states = new Set(st.p.map((p) => p.state)), outcome = st.k.state === 'committed' ? 'commit' : st.k.state === 'aborted' ? 'abort' : 'undecided';
+    $('#tpStats').innerHTML = `<div class="stat acc"><div class="k">Step</div><div class="v">${st.i} <small>of ${sc.length}</small></div></div>
+      <div class="stat ${outcome === 'commit' ? 'good' : outcome === 'abort' ? 'warn' : ''}"><div class="k">Decision</div><div class="v" style="font-size:16px">${outcome}</div></div>
+      <div class="stat ${doubt ? 'warn' : 'good'}"><div class="k">Participants in doubt</div><div class="v">${doubt}</div></div>
+      <div class="stat ${locked && st.i === sc.length ? 'bad' : locked ? 'warn' : 'good'}"><div class="k">Holding locks</div><div class="v">${locked}</div></div>
+      <div class="stat"><div class="k">Messages, and forced writes</div><div class="v">${st.msgs}, ${st.forces}</div></div>`;
+    $('#tpNext').disabled = st.i >= sc.length;
+    r.dataset.split = states.has('committed') && states.has('aborted') ? '1' : '';
+  }
+  $('#tpNext').onclick = () => { const sc = SCRIPT[$('#tpS').dataset.value]; if (st.i >= sc.length) return; const [kind, msg] = sc[st.i](); st.i++; st.kind = kind; st.msg = msg; draw(); };
+  $('#tpReset').onclick = reset;
+  $('#tpS').addEventListener('segchange', reset);
+  reset();
+})();
+</script>
 </body>
 </html>
