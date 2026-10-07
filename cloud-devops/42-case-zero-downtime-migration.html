@@ -6,33 +6,373 @@
 <title>Case Study: A Zero-Downtime Database Migration</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('ops-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .zm-flow { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; font-size:13px; margin-bottom:10px; }
+  .zm-flow span { padding:4px 10px; border-radius:999px; border:1px solid var(--border); background:var(--surface); font-family:var(--mono); font-size:12px; }
+  .zm-flow span.zm-on { border-color:var(--accent); color:var(--accent); font-weight:700; }
+  .zm-dbs { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; }
+  .zm-db { border:1px solid var(--border); border-radius:12px; padding:9px 10px; background:var(--surface); }
+  .zm-db h4 { margin:0 0 7px; font-size:13px; display:flex; justify-content:space-between; gap:6px; flex-wrap:wrap; }
+  .zm-db h4 small { font-weight:600; color:var(--muted); font-size:11.5px; }
+  .zm-cells { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:4px; }
+  @media (max-width:560px) { .zm-cells { grid-template-columns:repeat(4,minmax(0,1fr)); } }
+  .zm-cells i { font-style:normal; font-family:var(--mono); font-size:11px; text-align:center; padding:5px 0; border-radius:6px; background:var(--green-soft); color:var(--green); border:1px solid transparent; }
+  .zm-cells i.zm-stale { background:var(--amber-soft); color:var(--amber); border-color:var(--amber); font-weight:700; }
+  .zm-cells i.zm-miss { background:var(--surface-2); color:var(--muted); border:1px dashed var(--border); }
+  .zm-opts { display:flex; flex-wrap:wrap; gap:6px 16px; font-size:13.5px; margin:12px 0 4px; }
+  .zm-opts label { display:flex; gap:7px; align-items:center; cursor:pointer; }
+  .zm-msg { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; min-height:44px; }
+</style>
 </head>
 <body data-chapter="42">
-<!-- ops:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 42</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
     <h1>Case Study: <span class="grad">A Zero-Downtime Database Migration</span></h1>
-    <p class="lead">Moving a live service to a new database with dual writes, backfill, verification and cutover.</p>
+    <p class="lead">Replacing a stateless service is easy: start the new one, move the traffic, stop the old one. Replacing the database underneath a live service is the hardest routine job in operations, because the data cannot be in two places by magic and the service cannot stop while it is moved. This case study follows an online shop that moves its orders, 400 gigabytes of them, from an old self-managed MySQL server to a new managed PostgreSQL cluster while customers keep ordering. The method is slow, methodical and built from steps that can each be undone: write to both, copy the history, prove they match, move the reads, move the writes, and only then let go of the old system. The simulator lets you perform the migration yourself, in any order, and shows what each wrong order costs.</p>
+    <ul class="objectives">
+      <li><span>Compare three ways to move a database, and say when each fits</span></li>
+      <li><span>Break a migration into phases that can each be reversed</span></li>
+      <li><span>Implement dual writes that tolerate failure and concurrent updates</span></li>
+      <li><span>Backfill history without overwriting newer data</span></li>
+      <li><span>Verify with counts, checksums and shadow reads before trusting the new system</span></li>
+      <li><span>Plan the cutover, the rollback at each phase, and the point of no return</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Bash · Docker · K8s · Terraform listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Changing a schema in place</b> (expand and contract, online index builds, batched backfills): the Databases course's <a href="../databases/34-schema-migrations.html">chapter on schema migrations</a>. This chapter moves to a different database altogether and reuses those ideas.</li>
+        <li><b>Feature flags and gradual rollout:</b> <a href="17-deployment-strategies.html">Chapter 17</a>. Every phase here is switched by a flag.</li>
+        <li><b>Idempotent writes:</b> the Distributed Systems course's <a href="../distributed-systems/04-retries-idempotency.html">chapter on retries</a>.</li>
+        <li><b>Backups and point-in-time recovery,</b> the last line of defence throughout: <a href="32-disaster-recovery.html">Chapter 32</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The plan</li>
-    <li>Dual writes</li>
-    <li>Backfill and verification</li>
-    <li>Cutover and rollback plan</li>
-  </ol>
+  <h2>The plan</h2>
+  <p>The shop's <code>orders</code> data lives on a MySQL server that the company runs itself, on hardware that is out of support. It holds 400 GB, takes about 2,000 writes a second at peak, and is read by the checkout, the warehouse system and customer support. The goal is a managed PostgreSQL cluster in the cloud, with a tidied schema. The constraint is that the shop takes orders around the clock, and an hour of downtime costs more than the migration project.</p>
+  <p>There are three ways to move a database.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Approach</th><th>How</th><th>Downtime</th><th>Fits when</th></tr></thead>
+      <tbody>
+        <tr><td><b>Dump and restore</b></td><td>Stop writes, export, import, repoint the application</td><td>As long as the copy takes: hours for 400 GB</td><td>Small databases, or systems with a real maintenance window</td></tr>
+        <tr><td><b>Replication</b></td><td>A change-data-capture tool streams every change from old to new until they match; then a brief switch</td><td>Seconds to minutes at the switch</td><td>The schema stays the same or nearly so. Usually the first choice</td></tr>
+        <tr><td><b>Dual writes</b></td><td>The application writes to both databases itself, history is copied separately, and reads and writes are moved in stages</td><td>None, if done carefully</td><td>The data model is changing, or you want every step under the application's control and reversible</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The shop is changing engine and schema together, so it chooses dual writes. That is the most work and gives the most control. The plan is a sequence of phases, each one a small change behind a flag, and each with a way back.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Prepare</b> create the new cluster with Terraform, the new schema, dashboards for both databases</li>
+      <li data-k="step"><b>Dual write</b> every write goes to the old database, which is still the truth, and then to the new one</li>
+      <li data-k="step"><b>Backfill</b> copy the existing rows across, in batches, never overwriting anything newer</li>
+      <li data-k="decision"><b>Verify</b> compare the two until they match and stay matched for days</li>
+      <li data-k="step"><b>Move reads</b> to the new database, a small percentage at a time</li>
+      <li data-k="step"><b>Move writes</b> the new database becomes the truth; the old one is still written to, as the way back</li>
+      <li data-k="end"><b>Let go</b> stop writing to the old database, take a final backup, remove the dual-write code</li>
+    </ol>
+    <figcaption><b>Seven phases.</b> Everything before the last is reversible by flipping a flag. The order is not negotiable, and the simulator shows why.</figcaption>
+  </figure>
+  <p>Two decisions shape everything else. <b>One source of truth at a time.</b> At every moment exactly one database is authoritative, and the other is a follower being brought into line. And <b>rehearse.</b> The whole sequence is run first against a copy of production in a staging environment, with timings recorded, because the first attempt at any phase always finds something.</p>
+
+  <h2>Dual writes</h2>
+  <p>In the dual-write phase the application writes each change to the old database, and if that succeeds, to the new one. The old database remains the truth, and reads still come from it. Three problems have to be designed for.</p>
+  <p><b>The second write can fail.</b> The two databases cannot share a transaction, so sometimes the old one will accept a write and the new one will not: a timeout, a restart, a constraint the new schema enforces. The customer's order succeeded, so the request must not fail. The failure is recorded and repaired later, and counted on a dashboard, because a rate that is not zero is a bug to find.</p>
+  <p><b>Writes can arrive out of order.</b> Two updates to the same order, a few milliseconds apart, can reach the two databases in opposite orders, leaving each with a different final value. The defence is to make every write to the new database <b>conditional on a version</b>: apply it only if it is newer than what is there. Then order does not matter, and a write that is repeated does no harm.</p>
+<pre class="code"><span class="c">-- The write to the new database: an upsert that never goes backwards</span>
+<span class="k">INSERT INTO</span> orders (id, customer_id, status, total_pence, version, updated_at)
+<span class="k">VALUES</span> ($1, $2, $3, $4, $5, $6)
+<span class="k">ON CONFLICT</span> (id) <span class="k">DO UPDATE</span>
+   <span class="k">SET</span> customer_id = EXCLUDED.customer_id, status = EXCLUDED.status, total_pence = EXCLUDED.total_pence,
+       version = EXCLUDED.version, updated_at = EXCLUDED.updated_at
+ <span class="k">WHERE</span> orders.version &lt; EXCLUDED.version;        <span class="c">-- an older or repeated write changes nothing</span></pre>
+  <p><b>Some writes do not go through the application.</b> A nightly job, an administrator's script and a second service may all write to the old database directly. Each must be found, by searching the code and by watching the database's own log of connections, and either changed to dual write or covered by the repair job.</p>
+  <figure class="seq" data-actors="Checkout|Old database|New database|Repair queue">
+    <ol>
+      <li data-m="0>1">update order 8841 to "paid", version 7</li>
+      <li data-m="1>0" data-k="reply">committed: this is the truth</li>
+      <li data-m="0>2">the same update, only if stored version &lt; 7</li>
+      <li data-m="2>0" data-k="fail">timeout</li>
+      <li data-m="0>3" data-k="async">record: order 8841 needs copying. The customer's request still succeeds</li>
+      <li data-m="3>1" data-k="async">later: read order 8841 as it is now</li>
+      <li data-m="3>2">upsert it, only if newer</li>
+      <li data-m="2>3" data-k="reply">applied: the two agree again</li>
+    </ol>
+    <figcaption><b>A failed second write.</b> The old database's answer decides what the user sees. The gap is recorded, repaired from the truth and counted.</figcaption>
+  </figure>
+
+  <h2>Backfill and verification</h2>
+  <p>Dual writes handle every row that changes from now on. The <b>backfill</b> copies the rest: the years of orders nobody is touching. It must start <i>after</i> dual writes are on, or rows changed in between are missed, and it must use the same version-guarded upsert, or it will overwrite a fresh dual-written row with the stale copy it read an hour earlier.</p>
+<pre class="code"><span class="c"># backfill.sh: resumable, throttled, reading from a replica so that production is not slowed</span>
+last=$(cat checkpoint 2&gt;/dev/null || echo 0)
+<span class="k">while</span> <span class="k">true</span>; <span class="k">do</span>
+  next=$(<span class="f">copy_batch</span> --from mysql-replica --to postgres --after-id "$last" --limit 5000 --guarded)   <span class="c"># the upsert above</span>
+  [ -z "$next" ] &amp;&amp; <span class="k">break</span>
+  <span class="f">echo</span> "$next" &gt; checkpoint; last=$next
+  <span class="f">sleep</span> 0.2                                   <span class="c"># and slow down further if replication lag or database load rises</span>
+<span class="k">done</span></pre>
+  <p>At 5,000 rows per batch, the shop's 1.5 billion rows take about four days. That is fine. A backfill should be boring: restartable from its checkpoint, gentle on both databases, and watched.</p>
+  <p>Then comes the phase that is most often cut short, <b>verification</b>. The team does not believe the two databases match until three different checks say so.</p>
+  <ul>
+    <li><b>Counts and checksums</b> by range of keys: cheap, and they point at where a difference is.</li>
+    <li><b>Row-by-row comparison</b> of a continuous random sample, and of every row the repair queue has touched.</li>
+    <li><b>Shadow reads.</b> In production, each real read is still answered from the old database, and the same read is also sent to the new one in the background. The two answers are compared and any difference is logged. This tests the new schema and queries with real traffic, with no user depending on the result.</li>
+  </ul>
+<pre class="code"><span class="c">-- A checksum for one range of keys. Run the equivalent on both sides and compare the two lines.</span>
+<span class="k">SELECT</span> count(*), sum(version), md5(string_agg(id || ':' || status || ':' || total_pence, ',' <span class="k">ORDER BY</span> id))
+  <span class="k">FROM</span> orders <span class="k">WHERE</span> id &gt; 41000000 <span class="k">AND</span> id &lt;= 42000000;</pre>
+  <p>A difference is never just patched. Each one is traced to its cause: a writer that was missed, a time zone conversion, a column that rounds differently, text that is truncated. Fixing the cause and re-running the comparison is the work of this phase, and the exit condition is strict: zero differences from shadow reads for a week.</p>
+
+  <h2>Cutover and rollback plan</h2>
+  <p>With the databases proven equal, the move itself is two flag changes made days apart.</p>
+  <p><b>Reads first.</b> A flag sends 1% of reads to the new database, then 10%, then all, with latency and error rates watched at each step as in any canary. The old database is still the truth and still receives every write, so going back is a flag flip with nothing lost.</p>
+  <p><b>Then writes.</b> The order of the two writes is reversed: the new database is written first and is now the truth; the old one is written second and kept in step. This is the moment of real commitment, and the reason the old database keeps being written is that the migration may yet have to be undone. A problem that only shows under the full write load, or at month-end, can still be answered by switching back to a database that is current.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>If something goes wrong during</th><th>Roll back by</th><th>Data at risk</th></tr></thead>
+      <tbody>
+        <tr><td><b>Dual writes or backfill</b></td><td>Turning the dual-write flag off</td><td>None. The new database is simply discarded or refilled</td></tr>
+        <tr><td><b>Reads moving to new</b></td><td>Sending reads back to old</td><td>None. Old was the truth throughout</td></tr>
+        <tr><td><b>Writes on new, old kept in step</b></td><td>Reversing the write order and the reads</td><td>Only writes that failed to reach old, which the repair queue holds</td></tr>
+        <tr><td><b>After writes to old have stopped</b></td><td>Restoring from backup, or replaying from new to old by hand</td><td>Everything written since. This is the point of no return</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The shop keeps the old database in step for two weeks, through a month-end close, before the last phase. Then it stops the writes, takes a final backup of the old server and keeps it for a year, removes the dual-write code and the flags, and switches the server off. The cutovers are done mid-week, mid-morning, with the team present and other changes frozen. From first dual write to switch-off the project takes about seven weeks, and no customer notices any of it.</p>
+
+  <h2>Simulator: migrate twelve rows</h2>
+  <p>Twelve orders live in the old database, and customers keep changing them. Each cell shows the version of that row a database holds. Perform the migration with the buttons, in whatever order you like. "Send traffic" makes six writes and six reads.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Move the data without anyone noticing</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="zm-flow" id="zmFlow"></div>
+      <div class="zm-dbs">
+        <div class="zm-db"><h4>Old database <small id="zmOldTag"></small></h4><div class="zm-cells" id="zmOld"></div></div>
+        <div class="zm-db"><h4>New database <small id="zmNewTag"></small></h4><div class="zm-cells" id="zmNew"></div></div>
+      </div>
+      <div class="legend"><span><i style="background:var(--green)"></i>current</span><span><i style="background:var(--amber)"></i>out of date</span><span><i style="background:var(--muted)"></i>missing</span></div>
+      <div class="zm-opts">
+        <label><input type="checkbox" id="zmSafe" checked> backfill never overwrites a newer row</label>
+        <label><input type="checkbox" id="zmKeep" checked> after cutover, keep writing to old</label>
+        <label><input type="checkbox" id="zmFlaky"> one dual write in four fails</label>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="zmBurst">Send traffic</button>
+        <button class="btn sm ghost" id="zmDual">Turn dual writes on</button>
+        <button class="btn sm ghost" id="zmFill">Run backfill</button>
+        <button class="btn sm ghost" id="zmVerify">Verify</button>
+        <button class="btn sm ghost" id="zmRepair">Run repair job</button>
+        <button class="btn sm ghost" id="zmReads">Move reads to new</button>
+        <button class="btn sm ghost" id="zmCut">Cut writes over to new</button>
+        <button class="btn sm ghost" id="zmBack">Roll back to old</button>
+        <button class="btn sm ghost" id="zmDone">Switch off old</button>
+        <button class="btn sm ghost" id="zmReset">Reset</button>
+      </div>
+      <div class="stats" id="zmStats"></div>
+      <div class="zm-msg" id="zmMsg"></div>
+    </div>
+    <div class="panel-foot">A read is wrong if the database it was served from does not hold that row's latest version. The backfill copies a snapshot of the old database taken before the most recent burst of traffic, because a real backfill reads data that is minutes or hours old by the time it lands. The repair job copies from whichever database is currently the truth to the other, and never overwrites a newer row. A row is lost if neither database holds its latest version.</div>
+  </div>
+
+  <p><b>Things to try.</b> Press Reset between attempts; the traffic is the same each time, so the numbers below are what you will see.</p>
+  <ul id="zm-notes">
+    <li><b>The correct order:</b> dual writes on, traffic, backfill, traffic, verify, move reads, traffic, cut writes over, traffic, verify, switch off old. Both verifications report 12 of 12 matching, all 24 reads are correct, and the panel says nobody noticed.</li>
+    <li><b>Backfill first:</b> backfill, traffic, dual writes on, traffic, verify. <b>3 of 12 rows differ.</b> They changed after the backfill and before dual writes began, and nothing ever copied them.</li>
+    <li><b>An unguarded backfill:</b> untick the first option, then dual writes on, traffic, backfill, verify. <b>5 rows differ.</b> The backfill replaced fresh dual-written rows with the older copies in its snapshot.</li>
+    <li><b>Reads too early:</b> dual writes on, move reads, traffic. Two of the six reads return missing data. The new database only has the rows that happened to be written since.</li>
+    <li><b>No way back:</b> untick "keep writing to old", then dual writes on, traffic, backfill, move reads, cut over, traffic, roll back, traffic. The roll back succeeds mechanically and serves two wrong reads, because old missed everything written while it was not being kept in step.</li>
+    <li><b>Failing dual writes:</b> tick the third option, then dual writes on, traffic, backfill, traffic, traffic, verify. Two rows differ. Run the repair job and verify again: none. Failures are normal; unrecorded failures are the problem.</li>
+    <li><b>Switching off early:</b> dual writes on, cut over, move reads, switch off old. All 12 orders are lost.</li>
+    <li>In a test of 3,954 random button presses the migration reached "switched off" 46 times, and in all 46 users had been served wrong data on the way; 25 lost rows outright. In a second test that pressed buttons at random but obeyed three rules (never turn dual writes off, move reads only after a clean verify, cut over only after reads), it finished 38 times with no wrong read and no lost row.</li>
+  </ul>
+
+  <div class="callout usecase">
+    <div class="ico">💳</div>
+    <div class="body"><div class="title">Use case: Stripe's four steps for migrating subscriptions</div><p>In 2017 Stripe published an account of moving its subscriptions data to a new model, and it has become the standard description of this pattern. Subscriptions had originally been stored inside each customer's record, which had become limiting as the product grew. Stripe wanted them in their own table. There were hundreds of millions of them, the service takes payments continuously, and there could be no maintenance window. The engineers described the work as four steps. First, dual writing: every change was written to both the old place and the new table, and the existing data was copied across. Second, all read paths were changed to use the new table. Third, the write paths were changed to write to the new table as the primary store. Fourth, the old data was removed. Two details of how they did it are worth as much as the outline. To verify, they used a technique of running the old and new read paths side by side in production and comparing the results on real requests, with the old result still the one returned to the user, so that every difference surfaced before anything depended on the new code. And for the copy of existing data they did not run queries against the production database at all. They used an offline snapshot of the data in their batch-processing system to work out what needed copying, which kept the load of a very large scan away from the systems taking payments. The whole migration was, by design, a long series of small, boring, reversible deployments, with no cutover night.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Backfilling before dual writes are on.</b> Rows that change in between are silently missed.</li>
+      <li><b>A backfill that overwrites.</b> It replaces fresh rows with the stale copies it read earlier.</li>
+      <li><b>Failing the user's request when the second write fails.</b> The new database is not yet allowed to cause outages.</li>
+      <li><b>Ignoring dual-write failures</b> instead of recording, repairing and counting them.</li>
+      <li><b>Writers that bypass the application:</b> batch jobs, admin scripts, another service.</li>
+      <li><b>Verifying once with a row count.</b> Counts can match while contents differ.</li>
+      <li><b>Moving reads before verification is clean,</b> so users become the test.</li>
+      <li><b>Moving reads and writes in the same step.</b> Two changes, one of which cannot be told from the other when something breaks.</li>
+      <li><b>Stopping writes to the old database on cutover day.</b> The way back is gone before the new system has seen a full business cycle.</li>
+      <li><b>Never rehearsing</b> on production-sized data, so the timings are guesses.</li>
+      <li><b>Leaving the dual-write code and flags in place afterwards.</b> The migration is finished when they are deleted.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you migrate a live database to a new one without downtime?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>In reversible phases, with one source of truth at a time. First I make the application write every change to both databases, with the old one still authoritative and the write to the new one made idempotent and conditional on a version, so that failures and reordering cannot corrupt it. Then I backfill the existing rows in throttled batches using the same guarded upsert, so the backfill never overwrites newer data. Then I verify: checksums by key range, sampled row comparisons, and shadow reads in production that compare the two databases on real queries. Only when that is clean for a sustained period do I move reads to the new database, gradually, behind a flag. Then I move writes, making the new database the truth while still writing to the old one, so I can go back. After a full business cycle with no problems I stop writing to the old database, take a final backup and remove the migration code. If the schema is not changing, I would consider replication with change data capture instead, which gives the same result with less application work.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> During the dual-write phase, verification keeps finding a small number of rows that differ. What could cause that, and how do you find out?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A small persistent difference is the most informative thing that happens in a migration, so I would study the rows before repairing them. I would collect the differing rows and look for what they share: the column that differs, when they were last written, which code path or client wrote them. The usual causes fall into a few groups. A writer that bypasses the dual-write path: a batch job, a script, another service, or a database trigger. The old database's connection logs, or a column recording the writer, will show it. A race: two concurrent updates applied in different orders on the two sides, which shows up as rows written twice within milliseconds and means the write to the new database is not properly guarded by a version. Failed second writes that were swallowed and never queued for repair: I would check that the failure count matches the repair queue's intake. Transformation differences between the schemas: time zones, numeric precision and rounding, text encoding or truncation, nulls against empty strings, default values. Those show as the same column differing in the same way on every affected row. And the backfill itself: if it is not guarded, it rewrites recent rows with stale data, which shows as differences clustered just behind the backfill's position. For each hypothesis there is a cheap test, and I would fix the cause, repair the affected rows from the source of truth, and reset the clock on the verification period. I would not move reads while the number is above zero, even if it is small, because a rate of one in a million on a billion rows is a thousand customers with wrong orders.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Migrate in reversible phases: dual write, backfill, verify, move reads, move writes, let go.</li>
+      <li>Exactly one database is the truth at any moment. The other is being brought into line.</li>
+      <li>Writes to the follower are idempotent and conditional on a version, so failure and reordering are harmless.</li>
+      <li>Backfill after dual writes begin, in guarded, throttled, resumable batches.</li>
+      <li>Verify with checksums, samples and shadow reads, and trace every difference to its cause.</li>
+      <li>Keep writing to the old database after cutover. Stopping is the point of no return.</li>
+      <li>The migration ends when the old system is off and the migration code is deleted.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why must the backfill start after dual writes are switched on, and not before?</p>
+      <div class="opts">
+        <button class="opt">The backfill runs faster with dual writes on</button>
+        <button class="opt">Otherwise rows that change between the backfill and the start of dual writes are never copied</button>
+        <button class="opt">Dual writes create the new tables</button>
+        <button class="opt">The order does not matter</button>
+      </div>
+      <div class="explain">Dual writes cover every change from the moment they start. A backfill that ran earlier has no way to learn about changes made in the gap.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">During dual writes, the write to the old database succeeds and the write to the new one times out. What should the application do?</p>
+      <div class="opts">
+        <button class="opt">Return an error to the user</button>
+        <button class="opt">Roll back the write to the old database</button>
+        <button class="opt">Retry for ever before responding</button>
+        <button class="opt">Succeed for the user, and record the row for repair</button>
+      </div>
+      <div class="explain">The old database is still the truth, so the user's operation succeeded. The gap is recorded, repaired from the truth and counted.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does a shadow read do?</p>
+      <div class="opts">
+        <button class="opt">Answers the user from the old database and also runs the read on the new one, comparing the results</button>
+        <button class="opt">Sends 1% of users' reads to the new database</button>
+        <button class="opt">Reads from a backup</button>
+        <button class="opt">Caches the old database's answers</button>
+      </div>
+      <div class="explain">It tests the new database with real queries while no user depends on its answer. Differences are logged and investigated.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">After writes have been cut over to the new database, why keep writing to the old one for a while?</p>
+      <div class="opts">
+        <button class="opt">To keep the old servers warm</button>
+        <button class="opt">Because reads still come from it</button>
+        <button class="opt">So that a rollback is possible without losing data, if a problem appears later</button>
+        <button class="opt">To double the durability of each write</button>
+      </div>
+      <div class="explain">While the old database is kept current, switching back is a flag change. Once it stops being written, going back means losing or hand-replaying everything since.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is every write to the new database made conditional on a version number?</p>
+      <div class="opts">
+        <button class="opt">To make the writes faster</button>
+        <button class="opt">So that an older, repeated or out-of-order write cannot replace newer data</button>
+        <button class="opt">Because PostgreSQL requires it</button>
+        <button class="opt">To encrypt the rows</button>
+      </div>
+      <div class="explain">Dual writes, the backfill and the repair job can all deliver the same row at different times. A version guard means the newest always wins.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = OPS;
+  const N = 12; let S;
+  function reset() {
+    S = { old: {}, neu: {}, latest: {}, snap: {}, ver: N, dual: false, reads: 'old', writesOld: true, seed: 20261007, dualCount: 0, dualFails: 0, wrong: 0, readsDone: 0, bursts: 0, off: false, last: null, msg: 'Twelve orders, all in the old database. Customers are reading and writing them.' };
+    for (let k = 1; k <= N; k++) { S.old[k] = k; S.latest[k] = k; S.snap[k] = k; }
+  }
+  const rnd = (n) => { S.seed = (Math.imul(S.seed, 1103515245) + 12345) & 0x7fffffff; return (S.seed >>> 11) % n; };
+  const keys = () => Array.from({ length: N }, (_, i) => i + 1);
+  const opt = () => ({ safe: $('#zmSafe').checked, keep: $('#zmKeep').checked, flaky: $('#zmFlaky').checked });
+  const mismatched = () => keys().filter((k) => S.old[k] !== S.neu[k]);
+  const lost = () => keys().filter((k) => S.latest[k] > Math.max(S.off ? 0 : (S.old[k] || 0), S.neu[k] || 0));
+  const list = (a) => a.length > 6 ? a.slice(0, 6).join(', ') + ' and ' + (a.length - 6) + ' more' : a.join(', ');
+  function burst() {
+    const o = opt(), ev = { writes: [], reads: [] }; let wrong = 0;
+    S.snap = Object.assign({}, S.old);
+    for (let i = 0; i < 6; i++) {
+      const k = rnd(N) + 1; S.ver++; S.latest[k] = S.ver; let failed = false;
+      if (S.writesOld) { S.old[k] = S.ver; if (S.dual) { S.dualCount++; if (o.flaky && S.dualCount % 4 === 0) { failed = true; S.dualFails++; } else S.neu[k] = S.ver; } }
+      else { S.neu[k] = S.ver; if (o.keep) S.old[k] = S.ver; }
+      ev.writes.push({ k, v: S.ver, failed });
+    }
+    for (let i = 0; i < 6; i++) { const k = rnd(N) + 1, got = (S.reads === 'old' ? S.old : S.neu)[k]; const bad = got !== S.latest[k]; if (bad) wrong++; ev.reads.push({ k, bad }); }
+    S.wrong += wrong; S.readsDone += 6; S.bursts++; S.last = ev;
+    const failed = ev.writes.filter((w) => w.failed).length;
+    S.msg = `<b>Six writes, six reads.</b> Writes went to ${S.writesOld ? (S.dual ? 'old, then new' : 'old only') : (o.keep ? 'new, then old' : 'new only')}${failed ? `, and ${failed} of the writes to new failed` : ''}. Reads came from ${S.reads}${wrong ? `, and <b>${wrong} returned stale or missing data</b>` : ', all correct'}.`;
+  }
+  function backfill() {
+    const o = opt(); let copied = 0, regressed = 0;
+    keys().forEach((k) => { const v = S.snap[k]; if (v === undefined) return; if (S.neu[k] === undefined || S.neu[k] < v) { S.neu[k] = v; copied++; } else if (!o.safe && S.neu[k] > v) { S.neu[k] = v; regressed++; } });
+    S.msg = `<b>Backfill finished.</b> ${copied} row${copied === 1 ? '' : 's'} copied from the snapshot.${regressed ? ` <b>${regressed} newer row${regressed === 1 ? ' was' : 's were'} overwritten with older data</b>, because the backfill was not guarded.` : ''}${!S.dual && S.writesOld ? ' Dual writes are off, so anything that changes from now on will be missing.' : ''}`;
+  }
+  function verify() { const m = mismatched(); S.msg = m.length ? `<b>Verification: ${m.length} of ${N} rows differ</b> (orders ${list(m)}). Do not move reads yet. Find out why, then repair.` : `<b>Verification: all ${N} rows match.</b>${S.dual || !S.writesOld ? '' : ' Dual writes are off, so they will drift apart on the next write.'}`; }
+  function repair() { const src = S.writesOld ? S.old : S.neu, dst = S.writesOld ? S.neu : S.old; let n = 0; keys().forEach((k) => { if (src[k] !== undefined && (dst[k] === undefined || dst[k] < src[k])) { dst[k] = src[k]; n++; } }); S.msg = `<b>Repair job:</b> ${n} row${n === 1 ? '' : 's'} copied from ${S.writesOld ? 'old to new' : 'new to old'}, newest version winning.`; }
+  function act(a) {
+    if (S.off && a !== 'reset') return;
+    if (a === 'reset') { reset(); $('#zmSafe').checked = true; $('#zmKeep').checked = true; $('#zmFlaky').checked = false; }
+    else if (a === 'burst') burst();
+    else if (a === 'dual') { if (!S.writesOld) return; S.dual = !S.dual; S.msg = S.dual ? '<b>Dual writes on.</b> Every new write goes to old, then to new. Old is still the truth.' : '<b>Dual writes off.</b> The new database stops receiving changes.'; }
+    else if (a === 'fill') backfill();
+    else if (a === 'verify') verify();
+    else if (a === 'repair') repair();
+    else if (a === 'reads') { S.reads = S.reads === 'old' ? 'new' : 'old'; const m = keys().filter((k) => S.neu[k] !== S.latest[k]); S.msg = S.reads === 'new' ? `<b>Reads now come from the new database.</b>${m.length ? ` ${m.length} of its rows are stale or missing, and users will be shown them.` : ' Every row there is current.'}` : '<b>Reads are back on the old database.</b>'; }
+    else if (a === 'cut') { if (!S.writesOld) return; S.writesOld = false; S.msg = `<b>Writes cut over: the new database is now the truth.</b> ${opt().keep ? 'Each write also goes to old, so you can still go back.' : 'Nothing is written to old any more. From the next write, there is no way back without losing data.'}${S.reads === 'old' ? ' Reads are still served from old.' : ''}`; }
+    else if (a === 'back') { const stale = keys().filter((k) => S.old[k] !== S.latest[k]); S.writesOld = true; S.dual = true; S.reads = 'old'; S.msg = `<b>Rolled back: old is the truth again, with dual writes on.</b>${stale.length ? ` ${stale.length} order${stale.length === 1 ? '' : 's'} in old ${stale.length === 1 ? 'is' : 'are'} out of date, because old was not being written. Users now see old data for them.` : ' Old was fully current, so nothing was lost.'}`; }
+    else if (a === 'done') {
+      const bad = keys().filter((k) => S.neu[k] !== S.latest[k]);
+      if (S.reads !== 'new' || S.writesOld) S.msg = `<b>Not yet.</b> ${S.writesOld ? 'Writes still go to the old database first' : 'Reads still come from the old database'}. Switching it off now is an outage.`;
+      else { S.off = true; S.msg = bad.length ? `<b>Old database switched off, and ${bad.length} order${bad.length === 1 ? ' is' : 's are'} wrong in the new one.</b> Whatever the old database held for ${bad.length === 1 ? 'it' : 'them'} is gone: ${bad.length === 1 ? 'that order is' : 'those orders are'} lost.` : S.wrong ? `<b>Migration complete, but not unnoticed:</b> ${S.wrong} read${S.wrong === 1 ? '' : 's'} returned wrong data along the way.` : '<b>Migration complete.</b> Every order is current in the new database, no read was ever wrong, and nobody noticed. Now delete the dual-write code.'; }
+    }
+    draw();
+  }
+  function draw() {
+    const o = opt(), mm = mismatched(), ls = lost(), safeBack = keys().every((k) => S.old[k] === S.latest[k]);
+    const cell = (db, k) => { const v = db[k]; return `<i class="${v === undefined ? 'zm-miss' : v === S.latest[k] ? '' : 'zm-stale'}" title="order ${k}">${v === undefined ? '—' : 'v' + v}</i>`; };
+    $('#zmOld').innerHTML = S.off ? '<i class="zm-miss" style="grid-column:1 / -1">switched off</i>' : keys().map((k) => cell(S.old, k)).join('');
+    $('#zmNew').innerHTML = keys().map((k) => cell(S.neu, k)).join('');
+    const wOld = S.writesOld || o.keep, wNew = !S.writesOld || S.dual;
+    $('#zmOldTag').textContent = S.off ? '' : [S.writesOld ? 'truth' : '', wOld ? 'written' : 'not written', S.reads === 'old' ? 'read' : ''].filter(Boolean).join(' · ');
+    $('#zmNewTag').textContent = [!S.writesOld ? 'truth' : '', wNew ? 'written' : 'not written', S.reads === 'new' ? 'read' : ''].filter(Boolean).join(' · ');
+    const phase = S.off ? 6 : !S.writesOld ? (o.keep ? 5 : 6) : S.reads === 'new' ? 4 : S.dual ? 2 : 0;
+    $('#zmFlow').innerHTML = [[0, 'old only'], [2, 'dual writing'], [4, 'reads on new'], [5, 'writes on new, old in step'], [6, 'new only']].map(([p, t]) => `<span class="${p === phase ? 'zm-on' : ''}">${t}</span>`).join('→');
+    $('#zmStats').innerHTML = `<div class="stat ${S.wrong ? 'bad' : 'good'}"><div class="k">Wrong reads served to users</div><div class="v">${S.wrong} <small style="font-size:13px">of ${S.readsDone}</small></div></div>`
+      + `<div class="stat ${S.off ? '' : mm.length ? 'warn' : 'good'}"><div class="k">Rows that differ between the two</div><div class="v">${S.off ? '—' : mm.length}</div></div>`
+      + `<div class="stat ${ls.length ? 'bad' : 'good'}"><div class="k">Rows lost</div><div class="v">${ls.length}</div></div>`
+      + `<div class="stat ${S.off || !safeBack ? 'bad' : 'good'}"><div class="k">Can roll back to old without loss</div><div class="v">${S.off ? 'no' : safeBack ? 'yes' : 'no'}</div></div>`;
+    $('#zmMsg').innerHTML = S.msg;
+    $('#zmDual').textContent = S.dual ? 'Turn dual writes off' : 'Turn dual writes on'; $('#zmDual').disabled = !S.writesOld || S.off;
+    $('#zmReads').textContent = S.reads === 'old' ? 'Move reads to new' : 'Move reads back to old';
+    $('#zmCut').disabled = !S.writesOld || S.off; $('#zmBack').disabled = S.off || (S.writesOld && S.reads === 'old');
+    ['#zmBurst', '#zmFill', '#zmVerify', '#zmRepair', '#zmReads', '#zmDone'].forEach((id) => { $(id).disabled = S.off; });
+    $('#zmMsg').dataset.x = JSON.stringify({ old: S.old, neu: S.neu, latest: S.latest, snap: S.snap, dual: S.dual, reads: S.reads, writesOld: S.writesOld, wrong: S.wrong, readsDone: S.readsDone, dualFails: S.dualFails, dualCount: S.dualCount, off: S.off, last: S.last, mismatched: mm.length, lost: ls.length, safeBack, phase });
+  }
+  [['zmBurst', 'burst'], ['zmDual', 'dual'], ['zmFill', 'fill'], ['zmVerify', 'verify'], ['zmRepair', 'repair'], ['zmReads', 'reads'], ['zmCut', 'cut'], ['zmBack', 'back'], ['zmDone', 'done'], ['zmReset', 'reset']].forEach(([id, a]) => $('#' + id).addEventListener('click', () => act(a)));
+  ['#zmSafe', '#zmKeep', '#zmFlaky'].forEach((id) => $(id).addEventListener('change', draw));
+  reset(); draw();
+})();
+</script>
 </body>
 </html>
