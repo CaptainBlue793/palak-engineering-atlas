@@ -37,3 +37,4 @@
   (storage engines, MVCC, TCP, clocks on one machine), and this course does not re-teach them.
 
 ## Chapters, session 2 (one commit each)
+- Ch 6 Physical clocks, NTP & skew: NTP exchange lab (client offset, request and reply delay, drift, poll interval; estimate, hidden asymmetry error, delay bound, worst error before the next poll), NtpSample and LwwRegister in Java, LWW losing a newer write, PTP, Facebook ntpd to chrony
