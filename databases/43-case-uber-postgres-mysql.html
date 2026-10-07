@@ -6,34 +6,283 @@
 <title>Case Study: Uber’s Move from Postgres to MySQL</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ub-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .ub-row > span { font-size:12.5px; color:var(--muted); min-width:92px; }
+  .ub-h { margin:14px 0 6px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .ub-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(124px,1fr)); gap:7px; }
+  .ub-s { border:1.5px solid var(--border); border-radius:10px; background:var(--surface); padding:6px 10px; font-size:12.5px; min-width:0; opacity:.55; }
+  .ub-s b { display:block; font-size:12.5px; }
+  .ub-s small { display:block; font-size:11px; color:var(--muted); }
+  .ub-s.ub-w { opacity:1; border-color:var(--red); background:var(--red-soft); }
+  .ub-s.ub-main.ub-w { border-color:var(--accent); background:var(--accent-soft); }
+  .ub-sql { font-family:var(--mono); font-size:12px; padding:8px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); white-space:pre-wrap; overflow-wrap:anywhere; margin-top:12px; }
+  .ub-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .ub-msg.ub-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .ub-msg.ub-warn { background:var(--amber-soft, var(--surface-2)); border-left-color:var(--amber, var(--accent)); }
+</style>
 </head>
 <body data-chapter="43">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
-    <div class="eyebrow"><span class="pill accent">Chapter 43</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Case Study: <span class="grad">Uber’s Move from Postgres to MySQL</span></h1>
-    <p class="lead">Write amplification, replication and MVCC differences, and the arguments on both sides.</p>
+    <div class="eyebrow"><span class="pill accent">Chapter 43</span><span class="pill">Case Study</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Case Study: Uber's Move from <span class="grad">Postgres to MySQL</span></h1>
+    <p class="lead">In July 2016 Uber's engineering blog published an article called "Why Uber Engineering Switched from Postgres to MySQL". It was unusual for such posts in being a technical argument: it set out how PostgreSQL stores a row on disk and how it replicates, and claimed that those two design decisions were costing Uber dearly at its scale. It was read very widely, and within weeks several of PostgreSQL's most senior developers had published replies that agreed with parts of it and took other parts to pieces. Both sides were arguing about mechanisms this course has covered: row versions, index entries, the write-ahead log and replication. This case study goes through Uber's case and the replies, and what each engine's design costs. It doesn't end with a winner. The useful lesson is how to reason about a storage engine from the workload it has to carry.</p>
+    <ul class="objectives">
+      <li><span>Explain how an update in PostgreSQL can write to every index on a table, and when it doesn't</span></li>
+      <li><span>Contrast that with InnoDB's clustered primary key and its secondary indexes</span></li>
+      <li><span>Compare physical replication of the WAL with logical replication of row changes</span></li>
+      <li><span>Weigh Uber's claims against the replies, and say what has changed since</span></li>
+      <li><span>Read an engineering post of this kind as evidence about one workload</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Heap pages, tuple locations and HOT updates:</b> <a href="11-pages-heap-files.html">Chapter 11</a>.</li>
+        <li><b>B-trees:</b> <a href="13-b-trees.html">Chapter 13</a>.</li>
+        <li><b>The write-ahead log:</b> <a href="20-wal-recovery.html">Chapter 20</a>.</li>
+        <li><b>Row versions and VACUUM:</b> <a href="23-mvcc.html">Chapter 23</a>.</li>
+        <li><b>Replication:</b> <a href="25-replication.html">Chapter 25</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Uber's workload</li>
-    <li>Write amplification</li>
-    <li>Replication differences</li>
-    <li>The rebuttals</li>
-    <li>Lessons</li>
-  </ol>
+  <h2>Uber's workload</h2>
+  <p>Uber's first backend was a single Python application on PostgreSQL. The company had in fact moved <i>to</i> PostgreSQL from MySQL only three years before the article, and one of its engineers had given a conference talk about that migration. By 2016 the monolith had been broken into many services, the busiest data, trips above all, lived in a store Uber had built itself called Schemaless, a sharded, append-mostly layer on top of MySQL, and the remaining PostgreSQL databases were being moved onto it.</p>
+  <p>Four features of the workload matter for the argument. The tables were large and had many secondary indexes each. Rows were updated often, a trip's status and a driver's position among them. Data was replicated between data centres on opposite sides of the United States, where bandwidth is bought by the byte. And the databases had to be upgraded and kept running by a company growing very fast, with hundreds of engineers writing code against them.</p>
+
+  <h2>Write amplification</h2>
+  <p>The core of Uber's complaint follows from how PostgreSQL addresses rows. <a href="11-pages-heap-files.html">Chapter 11</a> showed that a row lives at a physical location in the heap, a page number and a slot, and <a href="23-mvcc.html">Chapter 23</a> that an update doesn't change a row in place: it writes a new version at a new location and leaves the old one for VACUUM. Every index entry in PostgreSQL points at a physical location. So when a row moves, <b>every index on the table needs a new entry pointing at the new location</b>, including the indexes on columns the update didn't touch.</p>
+  <p>Uber's example was a table of users with an index on the ID, one on the name and one on the year of birth. Changing one user's year of birth writes four things: the new row version, and a new entry in each of the three indexes. Each of those writes is also recorded in the WAL. With a dozen indexes on a table, one small logical change becomes more than a dozen physical writes. Uber called this write amplification.</p>
+  <p>MySQL's InnoDB engine is laid out differently. The table <i>is</i> its primary-key index: the rows are stored in the leaves of a B-tree ordered by primary key, which is called a clustered index. A secondary index entry holds the indexed value and the row's <b>primary key</b>, with no physical address. An update changes the row in place in the clustered index and puts the old version in a separate undo log. Secondary indexes on columns that didn't change aren't touched, since the primary key they hold is still correct.</p>
+  <figure class="seq" data-actors="Application|Heap table|Every index|WAL, then replicas">
+    <ol>
+      <li data-m="0>1">UPDATE users SET birth_year = 770 WHERE id = 4<small>PostgreSQL, where the new version can't stay on the same page</small></li>
+      <li data-m="1>1">write a new row version at a new location<small>the old one stays until VACUUM</small></li>
+      <li data-m="1>2">add an entry for the new location<small>in the index on id, the index on name, the index on birth_year</small></li>
+      <li data-m="1>3">log the new row version</li>
+      <li data-m="2>3">log each new index entry<small>three more records, for one changed column</small></li>
+      <li data-m="0-3" data-k="note">In InnoDB the same statement changes the row in place and updates one index, on birth_year</li>
+    </ol>
+    <figcaption><b>One update, four structures.</b> The number of writes grows with the number of indexes, whether or not their columns changed.</figcaption>
+  </figure>
+
+  <h2>Try it: what does one update write?</h2>
+  <p>One row is updated in a table with a primary key and some secondary indexes. Choose the number of indexes, what the update changes, and the storage engine, and see which structures are written.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Structures written by a single UPDATE</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="ub-row"><span>Secondary indexes</span><div class="seg" id="ubK"><button data-v="2">2</button><button class="active" data-v="6">6</button><button data-v="12">12</button></div></div>
+      <div class="ub-row"><span>The update changes</span><div class="seg" id="ubC"><button class="active" data-v="plain">a column with no index</button><button data-v="indexed">a column with an index</button></div></div>
+      <div class="ub-row"><span>Engine</span><div class="seg" id="ubE"><button data-v="hot">PostgreSQL, room on the page</button><button class="active" data-v="pg">PostgreSQL, page full</button><button data-v="inno">MySQL InnoDB</button></div></div>
+      <div class="ub-sql" id="ubSql"></div>
+      <div class="ub-h">Structures, and which were written</div>
+      <div class="ub-grid" id="ubGrid"></div>
+      <div class="ub-msg" id="ubMsg"></div>
+      <div class="stats" id="ubStats"></div>
+    </div>
+    <div class="panel-foot">Bytes are rough: a row of 120 bytes and index entries of about 60, with log overhead. PostgreSQL replicates its WAL, so every structure written adds to the stream. MySQL replicates the row change, here with the full row before and after. The last figure is the price of a read: how many B-trees a lookup through a secondary index has to descend.</div>
+  </div>
+
+  <p>Things to notice. Take six indexes and an update to a column with no index. With the page full, PostgreSQL writes eight structures and puts about 570 bytes into the replication stream, and at twelve indexes that is fourteen structures and over 900 bytes. InnoDB writes the row and its undo record, and its stream is the same 270 bytes however many indexes there are. That is Uber's complaint, and the panel confirms it. Now switch PostgreSQL to "room on the page". The new version stays on the same page, no index is touched, and it writes less than InnoDB does. That is the heap-only tuple update of <a href="11-pages-heap-files.html">Chapter 11</a>, and it was the first thing the replies pointed out: Uber's article described PostgreSQL's worst case and didn't mention the optimisation built to avoid it. It applies only when no indexed column changes and the page has free space, so on a table where the frequently updated columns are indexed, as on Uber's, it helps little. The last figure in the panel is the other side of the trade. Every read through a secondary index in InnoDB descends two trees, the index and then the primary key, where PostgreSQL goes from the index straight to the row.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>PostgreSQL heap</th><th>InnoDB clustered index</th></tr></thead>
+      <tbody>
+        <tr><td><b>Where rows live</b></td><td>In a heap, in no particular order</td><td>In the leaves of the primary-key B-tree</td></tr>
+        <tr><td><b>A secondary index entry points to</b></td><td>A physical location: page and slot</td><td>The row's primary key</td></tr>
+        <tr><td><b>An update writes</b></td><td>A new row version elsewhere, and every index, unless it qualifies as heap-only</td><td>The row in place, plus the indexes whose columns changed</td></tr>
+        <tr><td><b>Old versions go</b></td><td>Into the table itself, until VACUUM</td><td>Into the undo log, purged in the background</td></tr>
+        <tr><td><b>Read by secondary index</b></td><td>One descent, then the heap page</td><td>Two descents</td></tr>
+        <tr><td><b>Read by primary key, or a range of it</b></td><td>One descent, then scattered heap pages</td><td>One descent, and neighbouring keys share pages</td></tr>
+        <tr><td><b>A wide primary key</b></td><td>Costs nothing elsewhere</td><td>Is repeated in every secondary index entry</td></tr>
+        <tr><td><b>A long-running reader</b></td><td>Stops VACUUM, and the table bloats</td><td>Makes the undo log grow, and old versions slow to reach</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Replication differences</h2>
+  <p>Uber's second argument concerned what travels to the replicas. PostgreSQL's streaming replication is <b>physical</b>: it ships the WAL, a record of changes to pages, and the replica applies the same bytes to the same places (<a href="25-replication.html">Chapter 25</a>). MySQL's replication is <b>logical</b>: a second log, the binlog, records each change as "this row of this table went from these values to those", and the replica carries it out through its own storage engine.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Physical: ship the WAL</th><th>Logical: ship row changes</th></tr></thead>
+      <tbody>
+        <tr><td><b>Stream contains</b></td><td>Every page-level change, index entries and all</td><td>The rows that changed</td></tr>
+        <tr><td><b>Volume</b></td><td>Grows with write amplification</td><td>Independent of the number of indexes</td></tr>
+        <tr><td><b>The replica is</b></td><td>A byte-for-byte copy</td><td>The same data, perhaps laid out differently</td></tr>
+        <tr><td><b>Different major versions</b></td><td>Not possible: the page format may differ</td><td>Possible, which allows rolling upgrades</td></tr>
+        <tr><td><b>Different indexes or tables on the replica</b></td><td>No</td><td>Yes</td></tr>
+        <tr><td><b>A storage-level bug on the primary</b></td><td>Is copied to every replica exactly</td><td>Often doesn't carry over, since the replica redoes the change itself</td></tr>
+        <tr><td><b>Simplicity and exactness</b></td><td>High: nothing is reinterpreted</td><td>Lower: replicas can drift, and need checking</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Uber listed four practical consequences it had met. The WAL stream between data centres was large, and expensive. A bug in PostgreSQL 9.2 had caused replicas to miss some WAL records during a failover, leaving rows on replicas in a contradictory state that physical replication then preserved faithfully. Queries on replicas conflicted with the WAL being applied: a long read transaction on a replica either delayed replication or was cancelled, and application code that held transactions open while doing unrelated work made that common. And upgrades were painful: with no replication between major versions, moving a large database to a new release meant hours of careful work, so Uber had stayed on an old version.</p>
+
+  <h2>The rebuttals</h2>
+  <p>The replies came from people who had written the code in question, and their tone was mostly respectful. Robert Haas and Simon Riggs, both long-standing PostgreSQL committers, answered on their companies' blogs. Markus Winand, who writes on SQL performance, published a widely read critique, and Christophe Pettus gave a conference talk in reply. Taken together they sorted Uber's points into three groups.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Uber's claim</th><th>The response</th><th>Since then</th></tr></thead>
+      <tbody>
+        <tr><td><b>Every update writes every index</b></td><td>True when the update isn't heap-only, and the article never mentions heap-only updates. For a table whose updated columns are indexed, the complaint stands, and the developers said so</td><td>A proposed fix, WARM, was never merged. PostgreSQL 13 and 14 reduced the bloat that such updates leave in indexes</td></tr>
+        <tr><td><b>InnoDB's design is better for this</b></td><td>It is better for updates and worse for reads through secondary indexes, and it has its own costs with wide keys and long transactions. The article gave only one side of the trade</td><td>Unchanged: it is a design choice</td></tr>
+        <tr><td><b>Physical replication is bulky and can't cross versions</b></td><td>True for the built-in replication of the time. A logical replication extension already existed for newer releases than Uber was running</td><td>Logical replication has been built in since PostgreSQL 10, in 2017</td></tr>
+        <tr><td><b>Replicas became corrupt</b></td><td>That was a bug, since fixed, and every database has had its share. It isn't an argument about architecture</td><td></td></tr>
+        <tr><td><b>Replica queries conflict with replay</b></td><td>True, and configurable. The trouble was largely transactions held open by application code</td><td>Feedback from standby to primary reduces it, at the price of bloat on the primary</td></tr>
+        <tr><td><b>Upgrades are hard</b></td><td>Fair. Being several releases behind made everything else on the list worse</td><td>Logical replication now allows upgrades with little downtime</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Winand made the observation that puts the whole episode in a different light. Schemaless, the system Uber was moving to, stores rows that are written once and seldom changed, as blobs of JSON addressed by a key, with a few secondary indexes maintained by Uber's own code. It uses MySQL as a durable, replicated key-value store. Uber's problem had been that its workload looked less and less like the one a general-purpose relational database is built for, and its solution was to build a specialised store. That MySQL sat underneath it was close to incidental.</p>
+
+  <h2>Lessons</h2>
+  <p>The first lesson is that the workload chooses the engine. For a table with a dozen indexes and constant updates to indexed columns, replicated across a continent, PostgreSQL's heap is the more expensive design. For a table read mostly through secondary indexes, or one whose updates are heap-only, it is the cheaper one. Neither layout is better in general, and anyone who says one is has a particular workload in mind.</p>
+  <p>The second is that internals start to matter at scale. For most of this course the storage layout could be treated as a detail. At Uber's size, the difference between an index entry that holds an address and one that holds a key was a line in the bandwidth bill.</p>
+  <p>The third is about reading. An engineering post like Uber's is a truthful account of one company's experience, written by people explaining a decision already made. Useful questions to ask of any such post: what was the workload, which version were they on, which alternatives go unmentioned, and what did the people who build the system say in reply?</p>
+
+  <div class="callout usecase">
+    <div class="ico">🐘</div>
+    <div class="body"><div class="title">What PostgreSQL did next</div><p>The Uber article had an effect on PostgreSQL itself that can be traced through its releases. The complaint about replication was already being addressed when the article appeared: logical decoding of the WAL had arrived in version 9.4, an extension built on it could replicate between versions, and in version 10, released in 2017, logical replication with publications and subscriptions became part of the core system. A major-version upgrade can now be done by replicating logically to a new server and switching over, which was exactly what Uber had lacked. The complaint about index writes proved much harder. Developers proposed a scheme called WARM, which would have let an update skip the indexes whose columns hadn't changed even when another index did need a new entry. It went through many rounds of review over more than a year and was never committed: it complicated index scans and VACUUM, and the reviewers weren't satisfied that it was safe. A more radical project, zheap, set out to give PostgreSQL an alternative table format with updates in place and an undo log, as InnoDB has. To make that possible, version 12 added an interface that lets a table use a different storage engine, but zheap itself wasn't finished. What did ship attacked the consequences. Version 13 made B-tree indexes store duplicate values compactly, and version 14 added a mechanism that, when a page in an index is about to split, first looks for entries pointing at dead versions of the same rows and removes them. Between them these sharply reduce the index bloat that repeated updates used to cause, though each update still writes the entries. The heap that Uber criticised in 2016 is still the only table format PostgreSQL ships, and the trade-off it makes is the same one.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>"Uber proved MySQL is better than Postgres."</b> It showed that one design cost more for one workload.</li>
+      <li><b>Forgetting heap-only updates.</b> An update that changes no indexed column, on a page with room, writes no index entries.</li>
+      <li><b>Indexing a column that is updated constantly</b> in PostgreSQL. It disables the heap-only path for every update that touches it.</li>
+      <li><b>Ignoring InnoDB's side of the bill:</b> two descents for each secondary-index read, and the primary key copied into every secondary index.</li>
+      <li><b>Treating a bug as an architectural flaw.</b> The replica corruption was a defect in one release.</li>
+      <li><b>Falling several major versions behind,</b> and then judging the database by the old one.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do PostgreSQL and MySQL's InnoDB differ in how they store a table and its indexes?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>In PostgreSQL the table is a heap: rows are stored in pages in no particular order, and every index, the primary key included, is a separate B-tree whose entries point to a row's physical location. In InnoDB the table is the primary-key B-tree: rows live in its leaves, in key order, and secondary indexes store the indexed columns plus the primary key value, with no physical pointer. The consequences run in both directions. A lookup by secondary index in PostgreSQL goes index, then heap; in InnoDB it goes secondary index, then primary-key index, two tree descents. Range scans by primary key are very efficient in InnoDB, since the rows are physically adjacent. On update, PostgreSQL writes a new row version at a new location, so unless the update qualifies as heap-only, with no indexed column changed and space on the page, every index needs a new entry; InnoDB updates the row in place, keeps the old version in the undo log, and touches only the indexes whose columns changed. Old versions are cleaned by VACUUM in PostgreSQL and by purge of the undo log in InnoDB. So PostgreSQL tends to pay more on heavily indexed, update-heavy tables, and InnoDB pays more on secondary-index reads and with wide primary keys.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Uber said PostgreSQL's replication was a problem for them. What is the difference between physical and logical replication, and what does each cost?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Physical replication ships the write-ahead log: low-level records of changes to pages, which the replica applies to produce a byte-identical copy. Its strengths are simplicity and exactness: nothing is reinterpreted, everything is replicated including DDL, and applying it is cheap. Its costs are that the replica must be the same major version and architecture, must have the same tables and indexes, and can't take writes of its own; that the stream includes every index and page-level change, so its volume scales with write amplification; that corruption or a storage bug on the primary is copied faithfully; and that read queries on the replica can conflict with replay, since replay may remove row versions a query still needs, so either the query is cancelled or replay waits. Logical replication ships row-level changes, insert, update and delete with the values, decoded from the log, and the replica applies them as ordinary writes. That allows different versions, which gives low-downtime upgrades, as well as different indexes, a subset of tables, and several sources feeding one target; the stream is usually smaller. Its costs are more work on the replica to apply, the possibility that the two sides drift apart if something writes to the replica or a change fails to apply, and, in PostgreSQL, that schema changes and sequences need separate handling. MySQL's binlog replication is logical; PostgreSQL has had built-in logical replication since version 10, and most installations use physical replication for high availability and logical for upgrades and data movement.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>PostgreSQL index entries point at a row version's physical location. A new version elsewhere means a new entry in every index.</li>
+      <li>A heap-only update avoids that, when no indexed column changes and the page has room.</li>
+      <li>InnoDB stores rows in the primary-key tree and puts the primary key in secondary indexes: cheaper updates, dearer secondary reads.</li>
+      <li>Physical replication copies page changes exactly. Logical replication copies row changes, and works across versions.</li>
+      <li>Uber's complaints were accurate for its workload and its version, and incomplete as a general comparison.</li>
+      <li>Judge a storage engine by the workload, and read migration stories as one side of an account.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A PostgreSQL table has 8 indexes. An update changes one column that has no index, and the new row version doesn't fit on the same page. How many indexes get a new entry?</p>
+      <div class="opts">
+        <button class="opt">None</button>
+        <button class="opt">All 8</button>
+        <button class="opt">One</button>
+        <button class="opt">Only the primary key's</button>
+      </div>
+      <div class="explain">The new version is at a new location, and every index entry points at a location.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does a secondary index entry in InnoDB contain?</p>
+      <div class="opts">
+        <button class="opt">The indexed columns and a page-and-slot address</button>
+        <button class="opt">A copy of the whole row</button>
+        <button class="opt">The indexed columns and a transaction ID</button>
+        <button class="opt">The indexed columns and the row's primary key</button>
+      </div>
+      <div class="explain">That is why moving or updating a row needn't touch it, and why a read through it needs a second lookup.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Which condition must hold for a PostgreSQL update to be heap-only, writing no index entries?</p>
+      <div class="opts">
+        <button class="opt">No indexed column changes, and the new version fits on the same page</button>
+        <button class="opt">The table has no secondary indexes</button>
+        <button class="opt">The update runs at serialisable isolation</button>
+        <button class="opt">The row was inserted in the same transaction</button>
+      </div>
+      <div class="explain">The old version's index entries then lead to the new one through a pointer within the page.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why can't PostgreSQL's physical replication run between two different major versions?</p>
+      <div class="opts">
+        <button class="opt">The network protocol changes</button>
+        <button class="opt">Licences forbid it</button>
+        <button class="opt">It ships page-level changes, and the on-disk format may differ between versions</button>
+        <button class="opt">It can, with a setting</button>
+      </div>
+      <div class="explain">Logical replication ships row changes, which don't depend on the page format.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What is the fairest summary of the Uber episode?</p>
+      <div class="opts">
+        <button class="opt">MySQL is the better database</button>
+        <button class="opt">Uber's engineers misunderstood PostgreSQL</button>
+        <button class="opt">For an update-heavy, heavily indexed, widely replicated workload on an old release, PostgreSQL's design cost more, and the article left out the cases where it costs less</button>
+        <button class="opt">Relational databases don't scale</button>
+      </div>
+      <div class="explain">Each engine's layout trades something. The workload decides which trade is cheaper.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const ROW = 150, ENTRY = 60, BINLOG = 270;          // rough bytes in the replication stream
+  const NAMES = ['status', 'email', 'phone', 'city', 'created_at', 'updated_at', 'rating', 'vehicle', 'region', 'last_trip', 'tier', 'referrer'];
+  function plan(K, change, eng) {
+    const idx = NAMES.slice(0, K), target = 'status';        // the indexed column that changes, when one does
+    const s = [];
+    if (eng === 'inno') {
+      s.push({ name: 'Clustered index', sub: 'the table, in primary-key order', w: true, main: true, note: 'row changed in place' });
+      s.push({ name: 'Undo log', sub: 'old versions', w: true, note: 'old version saved' });
+      idx.forEach((n) => { const hit = change === 'indexed' && n === target; s.push({ name: `idx_${n}`, sub: hit ? 'old entry marked, new one added' : 'holds the primary key: still correct', w: hit, index: true }); });
+      const entries = s.filter((x) => x.index && x.w).length;
+      return { s, entries, bytes: BINLOG, hot: false, descents: 2, eng };
+    }
+    const hot = eng === 'hot' && change === 'plain';
+    s.push({ name: 'Heap', sub: hot ? 'new version on the same page' : 'new version at a new location', w: true, main: true });
+    s.push({ name: 'users_pkey', sub: hot ? 'still leads to the row' : 'needs the new location', w: !hot, index: true });
+    idx.forEach((n) => s.push({ name: `idx_${n}`, sub: hot ? 'still leads to the row' : change === 'indexed' && n === target ? 'new value, new location' : 'unchanged value, new location', w: !hot, index: true }));
+    const entries = s.filter((x) => x.index && x.w).length;
+    return { s, entries, bytes: ROW + entries * ENTRY, hot, descents: 1, eng, blocked: eng === 'hot' && change === 'indexed' };
+  }
+  function draw() {
+    const K = +$('#ubK').dataset.value, change = $('#ubC').dataset.value, eng = $('#ubE').dataset.value, p = plan(K, change, eng);
+    $('#ubSql').textContent = change === 'plain' ? 'UPDATE users SET notes = \'prefers a quiet ride\' WHERE user_id = 4;      -- notes has no index' : 'UPDATE users SET status = \'on_trip\' WHERE user_id = 4;      -- status is indexed';
+    $('#ubGrid').innerHTML = p.s.map((x) => `<div class="ub-s ${x.w ? 'ub-w' : ''} ${x.main ? 'ub-main' : ''}"><b>${x.name}${x.w ? ' ✎' : ''}</b><small>${x.sub}</small></div>`).join('');
+    const written = p.s.filter((x) => x.w).length, m = $('#ubMsg'); let kind = '', html;
+    if (eng === 'inno') html = `<b>${written} structures written, ${p.entries ? 'one of them an index' : 'and no index among them'}.</b> The row is changed where it lies, and the old version goes to the undo log. ${change === 'indexed' ? 'Only the index on the changed column is updated.' : 'No secondary index is touched: each holds the primary key, which is unchanged.'} The count would be the same with fifty indexes on the table. The price is on reads: a lookup through any of them descends two trees.`;
+    else if (p.hot) html = `<b>One structure written: a heap-only update.</b> No indexed column changed and the page had room, so the new version sits beside the old and the existing index entries reach it through a pointer within the page. This is the case Uber's article left out. It depends on free space in the page, which a lower fillfactor provides.`;
+    else if (p.blocked) { kind = 'ub-bad'; html = `<b>${written} structures written.</b> The page has room, and it doesn't help: an indexed column changed, so the update can't be heap-only. Once one index needs a new entry, all ${K + 1} get one, since they all point at the row's location. An index on a column that changes often has this effect on every such update.`; }
+    else { kind = 'ub-bad'; html = `<b>${written} structures written, for one ${change === 'plain' ? 'unindexed ' : ''}column.</b> The new version is at a new location, so the primary key's index and all ${K} secondary indexes need a new entry${change === 'plain' ? ', though none of their columns changed' : ''}. Every one of those writes goes into the WAL and across the network to each replica. This is the write amplification Uber described.`; }
+    m.className = 'ub-msg ' + kind; m.innerHTML = html;
+    $('#ubStats').innerHTML = `<div class="stat ${written > 3 ? 'bad' : 'good'}"><div class="k">Structures written</div><div class="v">${written} <small>of ${p.s.length}</small></div></div>
+      <div class="stat ${p.entries > 1 ? 'bad' : 'good'}"><div class="k">Indexes written</div><div class="v">${p.entries} <small>of ${p.s.filter((x) => x.index).length}</small></div></div>
+      <div class="stat acc"><div class="k">Replication stream</div><div class="v">≈ ${p.bytes} <small>bytes</small></div></div>
+      <div class="stat ${p.descents > 1 ? 'warn' : 'good'}"><div class="k">Read via a secondary index</div><div class="v">${p.descents} <small>${p.descents === 1 ? 'descent' : 'descents'}</small></div></div>`;
+  }
+  ['#ubK', '#ubC', '#ubE'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>

@@ -6,34 +6,328 @@
 <title>Indexes: A First Look</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ix-q { width:100%; }
+  .ix-idx { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+  .ix-idx label { display:flex; gap:7px; align-items:center; font-size:12.5px; padding:5px 10px; border:1px solid var(--border); border-radius:10px; background:var(--surface-2); cursor:pointer; font-family:var(--mono); }
+  .ix-idx label.ix-used { border-color:var(--green); background:var(--green-soft); }
+  .ix-idx input { accent-color:var(--accent); }
+  .ix-plan { font-family:var(--mono); font-size:12.5px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:10px 12px; white-space:pre-wrap; margin-top:12px; color:var(--text); }
+  .ix-bars { display:grid; gap:8px; margin-top:12px; }
+  .ix-bar { display:grid; grid-template-columns:190px 1fr 110px; gap:10px; align-items:center; font-size:12.5px; }
+  @media (max-width:640px) { .ix-bar { grid-template-columns:1fr; } }
+  .ix-tr { height:16px; border-radius:6px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; }
+  .ix-tr i { display:block; height:100%; background:var(--muted); }
+  .ix-bar.ix-win .ix-tr i { background:var(--green); }
+  .ix-bar span:last-child { font-family:var(--mono); text-align:right; }
+  .ix-res { margin-top:10px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); }
+</style>
 </head>
 <body data-chapter="9">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 9</span><span class="pill">Beginner</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Indexes: <span class="grad">A First Look</span></h1>
-    <p class="lead">Why an index makes a lookup fast, what it costs on writes, and which columns deserve one.</p>
+    <h1>Indexes: A First <span class="grad">Look</span></h1>
+    <p class="lead">An index is a second, sorted copy of some columns that points back to the rows, so the database can jump to the rows it needs instead of reading the whole table. It's the single most effective performance tool you have, and the most commonly misused: indexes that are never used, indexes in the wrong column order, and indexes added to fix one read that quietly slow down every write. This chapter is about using them well. How they work inside, page splits and all, is <a href="13-b-trees.html">Chapter 13</a>.</p>
+    <ul class="objectives">
+      <li>Explain what an index lookup does and when a full scan is cheaper</li>
+      <li>Estimate selectivity and predict whether the planner will use an index</li>
+      <li>Order the columns of a composite index for the queries it serves</li>
+      <li>Price an index's cost on writes, storage and memory</li>
+      <li>Use covering indexes and index-only scans, and find indexes you don't need</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Sequential vs random I/O</b>, and why a full scan can win. See <a href="p3-disks-and-files.html">P3</a>.</li>
+        <li><b>Index sizes</b>: about 22 MB per million rows for a bigint key. See <a href="p8-data-size-math.html">P8</a>.</li>
+        <li><b>Sargable filters</b>: bare columns, half-open ranges. See <a href="02-filtering-sorting.html">Chapter 2</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Full scan vs index lookup</li>
-    <li>Selectivity</li>
-    <li>Composite indexes and column order</li>
-    <li>The write cost</li>
-    <li>Covering indexes</li>
-  </ol>
+  <h2>Full scan vs index lookup</h2>
+  <p>Without an index on <code>customer_id</code>, <code>SELECT … FROM orders WHERE customer_id = 4242</code> reads every page of the table and checks every row: a <b>sequential scan</b>. With <code>CREATE INDEX ON orders (customer_id)</code>, PostgreSQL builds a B-tree: the <code>customer_id</code> values in sorted order, each with a pointer (the row's physical address, its <b>ctid</b>) to the row in the table. A lookup walks from the root of the tree to the right leaf, reads the matching entries, and fetches just those rows:</p>
+  <figure class="seq" data-actors="Executor|Index root|Index leaf|Table (heap)">
+    <ol>
+      <li data-m="0>1">find customer_id = 4242</li>
+      <li data-m="1>2">descend: 4242 is in this child <small>A B-tree over 10 M rows is 3–4 levels deep, so this is 3–4 page reads, and the top levels are almost always cached.</small></li>
+      <li data-m="2>0" data-k="reply">100 entries: (4242 → page 18210, slot 4), (4242 → page 931, slot 17), …</li>
+      <li data-m="0>3">fetch page 18210, slot 4</li>
+      <li data-m="0>3">fetch page 931, slot 17 … (100 fetches, scattered)</li>
+      <li data-m="3>0" data-k="reply">100 rows</li>
+    </ol>
+    <figcaption><b>An index scan: a short walk down the tree, then one random heap fetch per matching row.</b> That last part is why indexes stop paying off when a query wants a large fraction of the table.</figcaption>
+  </figure>
+
+  <h2>Selectivity: when the planner ignores your index</h2>
+  <p><b>Selectivity</b> is the fraction of rows a condition matches. An index wins when it's small: 100 rows out of 10 million is 0.001%, and the index saves reading 125,000 pages. But each matching row costs a random page read, so as the fraction grows the index loses to a sequential scan. <a href="p3-disks-and-files.html">P3</a> showed the crossover is a few percent at most, and often far lower. PostgreSQL also has a middle option, the <b>bitmap scan</b>: collect all matching row addresses from the index first, sort them by page, then read each needed page once in physical order. You'll see all three in the panel.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Plan</th><th>How it reads</th><th>Best when</th></tr></thead>
+      <tbody>
+        <tr><td>Seq Scan</td><td>Every page, in order; filter each row</td><td>A large fraction of rows, or a small table</td></tr>
+        <tr><td>Index Scan</td><td>Walk the index; fetch each row from the heap as found</td><td class="best">Few rows; or rows needed in index order (ORDER BY … LIMIT)</td></tr>
+        <tr><td>Bitmap Index Scan + Bitmap Heap Scan</td><td>Collect matches, sort by page, read each page once</td><td>A moderate number of rows spread over many pages; combining two indexes with AND/OR</td></tr>
+        <tr><td>Index Only Scan</td><td>Answer from the index alone, skip the heap</td><td class="best">The index contains every column the query needs, and pages are all-visible</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>So an index on a low-selectivity column, such as <code>status</code> where 90% of orders are <code>'paid'</code>, is useless for <code>WHERE status = 'paid'</code> and excellent for <code>WHERE status = 'pending'</code>, which matches 1%. The planner knows the difference because it keeps statistics on the most common values of each column (<a href="19-cost-based-optimizer.html">Chapter 19</a>). If you mostly query the rare value, a <b>partial index</b> is smaller and better: <code>CREATE INDEX ON orders (created_at) WHERE status = 'pending'</code>.</p>
+
+  <h2>Composite indexes and column order</h2>
+  <p>A composite index on <code>(customer_id, created_at)</code> is sorted by <code>customer_id</code>, and within each customer by <code>created_at</code>, like a phone book sorted by surname then first name. That order decides which queries it can serve:</p>
+  <ul>
+    <li><code>WHERE customer_id = ?</code>: yes, using the leading column.</li>
+    <li><code>WHERE customer_id = ? AND created_at &gt;= ?</code>: yes, perfectly: jump to the customer, then to the date, read a contiguous range.</li>
+    <li><code>WHERE customer_id = ? ORDER BY created_at DESC LIMIT 10</code>: yes, and no sort: read 10 entries backwards and stop.</li>
+    <li><code>WHERE created_at &gt;= ?</code> alone: no, not usefully. Entries for one date range are scattered across every customer, like finding everyone called "Sam" in a phone book sorted by surname.</li>
+  </ul>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Equality columns first</b> Columns compared with <code>=</code> in the queries you're serving.</li>
+      <li><b>Then one range or sort column</b> The column in <code>&gt;</code>, <code>&lt;</code>, <code>BETWEEN</code> or <code>ORDER BY</code>. Columns after a range can't narrow the scan further.</li>
+      <li><b>Then INCLUDE extra columns</b> Values the query returns, to allow an index-only scan.</li>
+      <li data-k="decision"><b>Does an existing index already lead with these columns?</b> <code>(a)</code> is redundant if <code>(a, b)</code> exists.</li>
+      <li data-k="end"><b>Check the plan</b> <code>EXPLAIN</code> the real query with real data (<a href="17-explain.html">Chapter 17</a>).</li>
+    </ol>
+    <figcaption><b>Designing a composite index.</b> The common rule of thumb, "most selective column first", is wrong as stated: the query's equality and range structure matters more than selectivity.</figcaption>
+  </figure>
+
+  <h2>Try it: index lab</h2>
+  <p>A 10-million-row <code>orders</code> table (1 GB, 125,000 pages) with 100,000 customers, three years of orders, and status 90% paid, 9% refunded, 1% pending. Pick a query, tick indexes, and see what a cost-based planner would do.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Index lab: which plan, how many pages, at what write cost?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <select class="inp ix-q" id="ixQ" aria-label="Query"></select>
+      <div class="ix-idx" id="ixIdx"></div>
+      <div class="ix-plan" id="ixPlan"></div>
+      <div class="ix-bars" id="ixBars"></div>
+      <div class="stats" id="ixStats"></div>
+      <div class="ix-res" id="ixRes"></div>
+    </div>
+    <div class="panel-foot">Cost model: a sequential page read costs 1 unit, a random one 4 (PostgreSQL's defaults); about 300 index entries per leaf page; each extra index adds one B-tree insertion to every INSERT. Real plans also weigh CPU and caching, but choose the same way in these cases.</div>
+  </div>
+
+  <h2>The write cost</h2>
+  <p>Every index is maintained on every write. An <code>INSERT</code> into a table with five indexes does six insertions: the row plus one entry in each index, each possibly splitting a page, each logged to the WAL and shipped to replicas. An <code>UPDATE</code> that changes an indexed column must add new index entries too. (PostgreSQL can skip index work for updates that touch no indexed column and fit on the same page, a "HOT" update, but only if no index covers the changed column.) Indexes also take disk, memory in the buffer pool, and time in backups and restores. So an index should earn its place: it's used by a query that matters, and nothing else already serves that query.</p>
+<pre class="code"><span class="c">-- indexes that have never been used since statistics were last reset</span>
+<span class="k">SELECT</span> s.indexrelname, <span class="f">pg_size_pretty</span>(<span class="f">pg_relation_size</span>(s.indexrelid)) <span class="k">AS</span> size, s.idx_scan
+<span class="k">FROM</span>   pg_stat_user_indexes s
+<span class="k">JOIN</span>   pg_index i <span class="k">ON</span> i.indexrelid = s.indexrelid
+<span class="k">WHERE</span>  s.idx_scan = <span class="m">0</span> <span class="k">AND NOT</span> i.indisunique           <span class="c">-- unique indexes enforce rules even if never scanned</span>
+<span class="k">ORDER BY</span> <span class="f">pg_relation_size</span>(s.indexrelid) <span class="k">DESC</span>;</pre>
+
+  <h2>Covering indexes and index-only scans</h2>
+  <p>If an index contains every column a query reads, PostgreSQL can answer from the index without visiting the table at all: an <b>index-only scan</b>. Add returned columns as non-key payload with <code>INCLUDE</code>, so they don't affect the sort order:</p>
+<pre class="code"><span class="k">CREATE INDEX</span> orders_customer_created_idx
+    <span class="k">ON</span> orders (customer_id, created_at) <span class="k">INCLUDE</span> (total_cents, status);
+
+<span class="k">SELECT</span> created_at, total_cents, status          <span class="c">-- every column is in the index</span>
+<span class="k">FROM</span>   orders
+<span class="k">WHERE</span>  customer_id = <span class="m">4242</span>
+<span class="k">ORDER BY</span> created_at <span class="k">DESC</span>
+<span class="k">LIMIT</span>  <span class="m">20</span>;</pre>
+  <p>There's a catch specific to PostgreSQL's MVCC (<a href="23-mvcc.html">Chapter 23</a>): the index doesn't know whether a row version is visible to your transaction, so an index-only scan still checks the table's <b>visibility map</b>, and visits the heap for any page not marked all-visible. On a table with heavy recent updates, "index only" can still mean many heap fetches until VACUUM catches up; <code>EXPLAIN ANALYZE</code> reports them as <code>Heap Fetches</code>.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧹</div>
+    <div class="body"><div class="title">The index audit that sped up writes</div><p>A pattern seen in many production databases: a busy <code>events</code> table accumulates indexes over the years, each added by a different engineer for a different dashboard, until it has eleven, several of them prefixes of others (<code>(user_id)</code> next to <code>(user_id, created_at)</code>) and two unused since the feature they served was removed. Inserts write twelve structures, and the indexes are larger than the table. Querying <code>pg_stat_user_indexes</code> for <code>idx_scan = 0</code> and checking for redundant prefixes, then dropping them with <code>DROP INDEX CONCURRENTLY</code> after confirming on the replicas too (statistics are per server), routinely cuts write latency and WAL volume noticeably. It's one of the first things the tuning playbook does (<a href="37-tuning-playbook.html">Chapter 37</a>).</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>An index per column</b> instead of one composite index shaped like the query.</li>
+      <li><b>Wrong column order</b>: <code>(created_at, customer_id)</code> for "this customer's recent orders".</li>
+      <li><b>Indexing low-selectivity columns</b> (booleans, status) for their common values; use a partial index for the rare one.</li>
+      <li><b>Wrapping indexed columns in functions</b> (<code>lower(email)</code>, <code>created_at::date</code>) without a matching expression index.</li>
+      <li><b>Never removing indexes.</b> Unused and redundant indexes cost every write.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why doesn't the database use my index on <code>status</code> for <code>WHERE status = 'paid'</code>?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because 90% of rows are paid, so the condition isn't selective. Using the index would mean millions of random heap fetches, while a sequential scan reads every page once in order, which is far cheaper. The planner knows the value distribution from the column statistics. The index would help for <code>'pending'</code> at 1%, and if that's the main use I'd replace it with a partial index on the pending rows only, which is tiny and stays in cache.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Design the index for "a customer's 20 most recent orders, showing date, total and status", on a 500-million-row table.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div><code>CREATE INDEX CONCURRENTLY ON orders (customer_id, created_at DESC) INCLUDE (total_cents, status)</code>. Equality column first, then the sort column, so the scan jumps to the customer and reads 20 entries in order with no sort, and stops; <code>INCLUDE</code> makes it an index-only scan, subject to the visibility map. Building it concurrently avoids blocking writes. I'd check whether an existing <code>(customer_id)</code> index becomes redundant and can be dropped, and verify the plan with <code>EXPLAIN (ANALYZE, BUFFERS)</code>.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>An index lookup is a short tree descent plus one random heap fetch per matching row.</li>
+      <li>Indexes win for selective conditions; for a large fraction of rows a sequential or bitmap scan is cheaper.</li>
+      <li>Composite index order: equality columns, then one range or sort column, then INCLUDE columns.</li>
+      <li>Every index is paid for on every write, in storage and in memory; drop unused and redundant ones.</li>
+      <li>Covering indexes enable index-only scans, which still consult the visibility map.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Which query can use an index on <code>(customer_id, created_at)</code> efficiently?</p>
+      <div class="opts">
+        <button class="opt"><code>WHERE created_at &gt;= now() - interval '1 day'</code></button>
+        <button class="opt"><code>WHERE total_cents &gt; 10000</code></button>
+        <button class="opt"><code>WHERE created_at = $1 OR customer_id = $2</code></button>
+        <button class="opt"><code>WHERE customer_id = $1 AND created_at &gt;= $2</code></button>
+      </div>
+      <div class="explain">The index is sorted by customer_id first. Equality on it, then a range on created_at, reads one contiguous slice.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">90% of orders are 'paid'. The planner does a sequential scan for <code>WHERE status = 'paid'</code> despite an index on status. Is that a mistake?</p>
+      <div class="opts">
+        <button class="opt">Yes; the index should always be used</button>
+        <button class="opt">No; fetching 90% of rows through the index would mean far more random reads than one sequential pass</button>
+        <button class="opt">Yes; run ANALYZE and it will use the index</button>
+        <button class="opt">No; indexes can't be used for text columns</button>
+      </div>
+      <div class="explain">Low selectivity: nearly every page would be visited anyway, randomly and repeatedly. The sequential scan is the cheaper plan.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does an index-only scan avoid?</p>
+      <div class="opts">
+        <button class="opt">Fetching rows from the table, because every needed column is in the index (subject to the visibility map)</button>
+        <button class="opt">Reading the index</button>
+        <button class="opt">Sorting the result</button>
+        <button class="opt">Checking the WHERE clause</button>
+      </div>
+      <div class="explain">With INCLUDE or key columns covering the query, rows on all-visible pages are answered from the index alone.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A table has five secondary indexes. Roughly how many structures does one INSERT update?</p>
+      <div class="opts">
+        <button class="opt">1</button>
+        <button class="opt">2</button>
+        <button class="opt">6: the table plus each index</button>
+        <button class="opt">5</button>
+      </div>
+      <div class="explain">Every index needs an entry for the new row, each a separate B-tree insertion, logged to the WAL.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">You have indexes on (user_id) and (user_id, created_at). What can you usually do?</p>
+      <div class="opts">
+        <button class="opt">Nothing; both are needed</button>
+        <button class="opt">Drop (user_id, created_at)</button>
+        <button class="opt">Merge them with INCLUDE</button>
+        <button class="opt">Drop (user_id): the composite index serves the same lookups, since user_id is its leading column</button>
+      </div>
+      <div class="explain">A composite index can be used for its leading column alone. The single-column one is usually redundant, unless it's unique and enforcing a rule.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const N = 10e6, PAGES = 125000, PER_LEAF = 300, RPC = 4;
+  // query: equality columns, range column, order column, limit, rows matched, returned columns
+  const Q = [
+    // eqRows: rows matching the equality condition alone; rangeRows: rows matching the range alone; rows: final result
+    { t: "WHERE customer_id = 4242", eq: ['customer_id'], eqRows: 100, rows: 100, cols: ['*'] },
+    { t: "WHERE customer_id = 4242 ORDER BY created_at DESC LIMIT 10", eq: ['customer_id'], ord: 'created_at', limit: 10, eqRows: 100, rows: 100, cols: ['*'] },
+    { t: "WHERE created_at >= now() - interval '1 day'", range: 'created_at', rangeRows: 9100, rows: 9100, cols: ['*'] },
+    { t: "WHERE status = 'pending'", eq: ['status'], eqRows: 100000, rows: 100000, cols: ['*'] },
+    { t: "WHERE status = 'paid'", eq: ['status'], eqRows: 9000000, rows: 9000000, cols: ['*'] },
+    { t: "SELECT total_cents … WHERE customer_id = 4242", eq: ['customer_id'], eqRows: 100, rows: 100, cols: ['customer_id', 'total_cents'] },
+    { t: "WHERE customer_id = 4242 AND created_at >= now() - interval '30 days'", eq: ['customer_id'], range: 'created_at', eqRows: 100, rangeRows: 274000, rows: 3, cols: ['*'] },
+  ];
+  const IDX = [
+    { id: 'a', name: '(customer_id)', keys: ['customer_id'], inc: [] },
+    { id: 'b', name: '(status)', keys: ['status'], inc: [] },
+    { id: 'c', name: '(customer_id, created_at)', keys: ['customer_id', 'created_at'], inc: [] },
+    { id: 'd', name: '(created_at, customer_id)', keys: ['created_at', 'customer_id'], inc: [] },
+    { id: 'e', name: '(customer_id) INCLUDE (total_cents)', keys: ['customer_id'], inc: ['total_cents'] },
+  ];
+  $('#ixQ').innerHTML = Q.map((q, i) => `<option value="${i}">${q.t.startsWith('SELECT') ? q.t : 'SELECT * FROM orders ' + q.t}</option>`).join('');
+  $('#ixQ').value = 0;
+  $('#ixIdx').innerHTML = IDX.map((x) => `<label id="ixL${x.id}"><input type="checkbox" data-id="${x.id}"> ${x.name}</label>`).join('');
+  function options(q, chosen) {
+    const opts = [{ name: 'Seq Scan on orders', cost: PAGES + (q.ord ? 0.002 * q.rows : 0), pages: PAGES, idx: null }];
+    for (const x of chosen) {
+      // how far does the index match? equality on leading keys, then range/order on the next key
+      let k = 0; while (k < x.keys.length && (q.eq || []).includes(x.keys[k])) k++;
+      const nextKey = x.keys[k];
+      const rangeUsed = q.range && nextKey === q.range;
+      const orderUsed = q.ord && nextKey === q.ord;
+      if (k === 0 && !rangeUsed) continue;                      // leading column not usable
+      // index entries scanned, and rows fetched from the heap
+      let scanned, fetch;
+      if (k > 0 && rangeUsed) { scanned = q.rows; fetch = q.rows; }                      // equality, then range: both narrow the scan
+      else if (k > 0) { scanned = q.eqRows; fetch = q.eqRows; }                           // any range is checked on fetched rows
+      else {                                                                             // range on the leading column
+        scanned = q.rangeRows;
+        const eqInIndex = (q.eq || []).every((c) => x.keys.includes(c));
+        fetch = eqInIndex ? q.rows : q.rangeRows;                                        // later key columns filter inside the index
+      }
+      const filterAfter = q.range && !rangeUsed;
+      if (q.limit && orderUsed) { scanned = Math.min(q.limit, scanned); fetch = Math.min(q.limit, fetch); }
+      const covers = q.cols[0] !== '*' && q.cols.every((c) => x.keys.includes(c) || x.inc.includes(c));
+      const leaf = Math.ceil(scanned / PER_LEAF) + 3;
+      if (covers) { opts.push({ name: `Index Only Scan using ${x.name}`, cost: leaf, pages: leaf, idx: x.id, covers }); continue; }
+      const sortCost = q.ord && !orderUsed ? 0.002 * fetch : 0;
+      const heap = Math.min(fetch, PAGES);
+      opts.push({ name: `Index Scan using ${x.name}`, cost: leaf + heap * RPC + sortCost, pages: leaf + heap, idx: x.id, sort: q.ord && !orderUsed, filterAfter, early: q.limit && orderUsed, wide: k === 0 && q.rangeRows > 50000 });
+      if (!(q.limit && orderUsed) && fetch > 500) {
+        const pagesHit = Math.round(PAGES * (1 - Math.exp(-fetch / PAGES)));
+        opts.push({ name: `Bitmap Heap Scan via ${x.name}`, cost: leaf + pagesHit * (pagesHit > PAGES * 0.3 ? 1.2 : 2.2) + sortCost, pages: leaf + pagesHit, idx: x.id, bitmap: true, sort: q.ord && !orderUsed });
+      }
+    }
+    return opts.sort((a, b) => a.cost - b.cost);
+  }
+  function draw() {
+    const q = Q[+$('#ixQ').value];
+    const chosen = $$('#ixIdx input').filter((i) => i.checked).map((i) => IDX.find((x) => x.id === i.dataset.id));
+    const opts = options(q, chosen), best = opts[0];
+    $$('#ixIdx label').forEach((l) => l.classList.toggle('ix-used', best.idx && l.id === 'ixL' + best.idx));
+    const plan = [];
+    if (q.limit) plan.push(`Limit (rows=${q.limit})`);
+    if (best.sort) plan.push(`${q.limit ? '  ->  ' : ''}Sort  (Sort Key: created_at DESC)`);
+    const pad = (q.limit ? '  ' : '') + (best.sort ? '      ' : '');
+    const arrow = q.limit || best.sort ? '->  ' : '';
+    if (best.bitmap) { plan.push(`${pad}${arrow}${best.name.replace(/ via .*/, '')} on orders`); plan.push(`${pad}      ->  Bitmap Index Scan on ${best.name.replace(/.* via /, '')}`); }
+    else plan.push(`${pad}${arrow}${best.name}${best.idx ? ' on orders' : ''}`);
+    if (!best.idx) plan.push(`${pad}      Filter: (${q.t.replace(/^SELECT .* WHERE |^WHERE /, '').replace(/ ORDER BY.*/, '')})`);
+    if (best.filterAfter) plan.push(`${pad}      Filter: (created_at >= …)`);
+    $('#ixPlan').textContent = plan.join('\n');
+    const max = Math.max(...opts.map((o) => o.cost));
+    $('#ixBars').innerHTML = opts.slice(0, 5).map((o, i) => `<div class="ix-bar ${i === 0 ? 'ix-win' : ''}"><span>${o.name.replace('using ', '').replace(' on orders', '')}</span><div class="ix-tr"><i style="width:${Math.max(0.5, o.cost / max * 100)}%"></i></div><span>cost ${DB.fmt(o.cost, 1)}</span></div>`).join('');
+    const sizeMB = chosen.reduce((s, x) => s + (x.keys.length + x.inc.length > 1 ? 300 : 220), 0);
+    $('#ixStats').innerHTML =
+      `<div class="stat ${best.idx ? 'good' : ''}"><div class="k">Pages read</div><div class="v">${DB.fmt(best.pages)}</div></div>` +
+      `<div class="stat"><div class="k">Rows matched</div><div class="v">${DB.fmt(q.rows)}</div></div>` +
+      `<div class="stat ${chosen.length > 3 ? 'warn' : ''}"><div class="k">Structures per INSERT</div><div class="v">${1 + chosen.length}</div></div>` +
+      `<div class="stat"><div class="k">Index storage</div><div class="v">${sizeMB ? DB.bytes(sizeMB * 1e6) : '0'}</div></div>`;
+    let msg;
+    if (!chosen.length) msg = 'No indexes: every query reads all 125,000 pages. Tick an index that matches the query.';
+    else if (!best.idx && opts.length > 1) msg = `An index is available, but <b>${q.rows >= 1e6 ? 'the condition matches ' + DB.fmt(q.rows) + ' rows (90% of the table)' : 'it doesn\'t match well enough'}</b>: following it would cost more than reading the table once, so the planner scans.`;
+    else if (!best.idx) msg = 'None of the ticked indexes can serve this query: its leading column isn\'t constrained. Column order matters.';
+    else if (best.name.startsWith('Index Only')) msg = 'Every column the query reads is in the index, so the table isn\'t touched (as long as the visibility map marks those pages all-visible).';
+    else if (best.early) msg = 'The index is already sorted by created_at within the customer, so the scan reads 10 entries in order and stops: no sort, no reading the customer\'s other 90 orders.';
+    else if (best.sort) msg = 'The index finds the customer\'s rows, but they come out in no useful order, so all of them are fetched and sorted before LIMIT applies. An index on (customer_id, created_at) removes the sort.';
+    else if (best.bitmap) msg = `${DB.fmt(q.rows)} matching rows are spread over many pages, so the planner collects their addresses first and reads each page once in physical order: a bitmap scan.`;
+    else if (best.wide) msg = 'This index leads with created_at, so it reads every order from the last 30 days, about 274,000 entries, and checks customer_id on each one inside the index. Correct, but far more work than (customer_id, created_at), which jumps straight to the 3 rows.';
+    else if (best.filterAfter) msg = 'The index narrows to the customer\'s 100 rows; the date condition is then checked on each fetched row. A (customer_id, created_at) index would narrow to the 3 matching rows directly.';
+    else msg = `A selective lookup: ${DB.fmt(best.pages)} page reads instead of 125,000.`;
+    if (chosen.length > 3) msg += ` <i>But every INSERT now updates ${1 + chosen.length} structures.</i>`;
+    $('#ixRes').innerHTML = msg;
+  }
+  $('#ixQ').addEventListener('change', draw);
+  $$('#ixIdx input').forEach((i) => i.addEventListener('change', draw));
+  draw();
+})();
+</script>
 </body>
 </html>

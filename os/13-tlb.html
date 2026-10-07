@@ -6,34 +6,402 @@
 <title>The TLB</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .tl-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-top:14px; }
+  @media (max-width:760px) { .tl-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .tl-e { border:1.5px solid var(--border); border-radius:10px; padding:7px 9px; background:var(--surface); font-family:var(--mono); font-size:11.5px; min-height:80px; transition:.2s; overflow:hidden; }
+  .tl-e h6 { margin:0 0 4px; font-family:var(--font); font-size:11.5px; color:var(--text); }
+  .tl-e.tl-hit { border-color:var(--green); background:var(--green-soft); }
+  .tl-e.tl-new { border-color:var(--red); background:var(--red-soft); }
+  .tl-e.tl-other { opacity:.5; border-style:dashed; }
+  .tl-e.tl-empty { border-style:dashed; }
+  .tl-dim { color:var(--muted); }
+  .tl-tape { display:flex; flex-wrap:wrap; gap:3px; margin-top:12px; min-height:14px; }
+  .tl-tape i { display:block; width:10px; height:14px; border-radius:3px; }
+  .tl-tape .tl-h { background:var(--green); }
+  .tl-tape .tl-m { background:var(--red); }
+  .tl-tape .tl-s { width:3px; background:var(--text); }
+  .tl-key { margin-top:6px; font-size:12.5px; color:var(--muted); }
+  .tl-key i { display:inline-block; width:10px; height:10px; border-radius:3px; margin:0 4px 0 10px; vertical-align:-1px; }
+  .tl-key i:first-child { margin-left:0; }
+  .tl-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:46px; }
+  .tl-desc.tl-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .tl-desc.tl-ok { background:var(--green-soft); border-left-color:var(--green); }
+</style>
 </head>
 <body data-chapter="13">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 13</span><span class="pill">Intermediate</span><span class="pill">⏱ 40 min</span></div>
     <h1>The <span class="grad">TLB</span></h1>
-    <p class="lead">The cache that makes paging fast: hits and misses, TLB reach, flushes on context switch, and PCIDs.</p>
+    <p class="lead">Chapter 12 ended with a problem: one load from memory needs four more memory reads just to find out where the memory is. The <b>translation lookaside buffer</b> (TLB) is the cache that makes paging affordable: a few dozen to a few thousand recent page-to-frame translations kept inside the CPU and checked on every access. When it hits, translation costs nothing. When it misses, you pay for the page walk. How big it is, what empties it, and what it costs to keep correct across cores explain why huge pages exist, why switching processes costs more than switching threads, and why a busy <code>munmap</code> can slow down a 64-core server.</p>
+    <ul class="objectives">
+      <li>Say what a TLB entry holds and what happens on a hit, a miss and a fault</li>
+      <li>Calculate effective access time from a hit rate</li>
+      <li>Calculate TLB reach and explain why huge pages raise it</li>
+      <li>Explain when a context switch flushes the TLB, and how ASIDs and PCIDs avoid it</li>
+      <li>Explain what a TLB shootdown is and when it becomes a bottleneck</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Cache hits, misses and locality.</b> See <a href="p4-memory-hierarchy.html">P4</a>.</li>
+        <li><b>The four-level page walk, page-table entry flags and huge pages.</b> See <a href="12-paging-page-tables.html">Chapter 12</a>.</li>
+        <li><b>What a context switch saves and restores.</b> See <a href="06-context-switches-interrupts.html">Chapter 6</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why translation needs a cache</li>
-    <li>Hit rate and effective access time</li>
-    <li>TLB reach and huge pages</li>
-    <li>Flushes, ASIDs and PCIDs</li>
-    <li>TLB shootdowns</li>
-  </ol>
+  <h2>Why translation needs a cache</h2>
+  <p>Every instruction fetch, every load and every store uses a virtual address, and each one has to be translated. A four-level walk turns one memory access into five. Programs would run several times slower if the MMU really did that each time.</p>
+  <p>It doesn't have to, because programs have locality. A loop runs the same few pages of code, pushes and pops on the same stack page, and works through an array one page at a time. So the MMU keeps the translations it used most recently in a small, very fast lookup table: the TLB. Each entry holds a <b>virtual page number</b>, the <b>frame number</b> it maps to, the <b>permission bits</b> copied from the page-table entry, and a tag saying which address space it belongs to. The lookup compares the page number against many entries at once, in hardware, in well under a nanosecond.</p>
+  <p>Here is what the MMU does on every access, written as C. On x86, ARM and RISC-V this is a circuit, not code:</p>
+<pre class="code"><span class="c">/* One memory access, as the MMU sees it. PTE_* and pte_frame() are from Chapter 12. */</span>
+<span class="t">uint64_t</span> <span class="f">translate</span>(<span class="t">uint64_t</span> va, <span class="t">int</span> access)
+{
+    <span class="t">uint64_t</span> vpn = va &gt;&gt; <span class="m">12</span>;
+    <span class="k">struct</span> <span class="t">tlb_entry</span> *e = <span class="f">tlb_lookup</span>(vpn, current_asid);   <span class="c">/* compared against all candidates in parallel */</span>
+
+    <span class="k">if</span> (e) {                                             <span class="c">/* TLB hit: no memory reads at all */</span>
+        <span class="k">if</span> (!<span class="f">allowed</span>(e-&gt;flags, access))
+            <span class="f">page_fault</span>(va);                              <span class="c">/* e.g. a write to a read-only page */</span>
+        <span class="k">return</span> (e-&gt;pfn &lt;&lt; <span class="m">12</span>) | (va &amp; <span class="m">0xfff</span>);
+    }
+
+    <span class="t">uint64_t</span> pte = <span class="f">page_walk</span>(cr3, va);                   <span class="c">/* TLB miss: up to four reads */</span>
+    <span class="k">if</span> (!(pte &amp; <span class="m">PTE_PRESENT</span>) || !<span class="f">allowed</span>(pte, access))
+        <span class="f">page_fault</span>(va);                                  <span class="c">/* trap to the kernel; nothing is cached */</span>
+
+    <span class="f">tlb_insert</span>(vpn, current_asid, pte);                  <span class="c">/* may evict an older entry */</span>
+    <span class="k">return</span> <span class="f">pte_frame</span>(pte) | (va &amp; <span class="m">0xfff</span>);
+}</pre>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Access</b> The CPU issues a virtual address: page number plus offset.</li>
+      <li data-k="decision"><b>Page number in the TLB?</b> Yes: check the cached permission bits and use the cached frame. Done, with no memory reads.</li>
+      <li><b>Miss: walk the page tables</b> The MMU reads up to four entries, starting from CR3. The program doesn't notice, apart from the time.</li>
+      <li data-k="decision"><b>Present and allowed?</b> No: raise a page fault and let the kernel decide (<a href="14-page-faults-demand-paging.html">Chapter 14</a>).</li>
+      <li data-k="end"><b>Cache and continue</b> The translation goes into the TLB, replacing an older entry if needed, and the access completes.</li>
+    </ol>
+    <figcaption><b>Hit, miss, fault.</b> A TLB miss is handled by hardware in nanoseconds. A page fault is a trap into the kernel that costs microseconds or more. They are different events.</figcaption>
+  </figure>
+  <p>Some older architectures, such as MIPS and early SPARC, had a <b>software-managed</b> TLB: a miss trapped to the kernel, which did the lookup itself and loaded the entry. That let the OS use any page-table format it liked, but every miss cost a trap. Modern x86, ARM and RISC-V CPUs walk the tables in hardware.</p>
+
+  <h2>Hit rate and effective access time</h2>
+  <p>The standard way to measure a TLB is the <b>effective access time</b> (EAT): the average cost of one memory access once translation is included. If <code>h</code> is the hit rate:</p>
+<pre class="code">EAT = t_tlb + t_mem + (1 − h) × t_walk
+
+Textbook numbers: t_tlb = 1 ns, t_mem = 100 ns, t_walk = 4 × 100 ns (four levels, nothing cached)
+
+h = 0      (no TLB)    1 + 100 + 1.000 × 400 = 501 ns
+h = 0.90               1 + 100 + 0.100 × 400 = 141 ns
+h = 0.99               1 + 100 + 0.010 × 400 = 105 ns
+h = 0.999              1 + 100 + 0.001 × 400 = 101.4 ns</pre>
+  <p>Two things to take from the arithmetic. A TLB turns a 5× slowdown into a few per cent. And the last per cent of hit rate matters: going from 99% to 90% costs a third more time per access.</p>
+  <p>Those numbers are for exams and interviews. Real CPUs do better in three ways, and you should know them:</p>
+  <ul>
+    <li><b>The lookup is free on a hit.</b> The first-level TLB is searched at the same time as the L1 data cache, so a hit adds no delay.</li>
+    <li><b>Page-table entries are ordinary memory.</b> They sit in the same L1, L2 and L3 caches as your data, so a walk's reads usually cost a few nanoseconds each, not 100.</li>
+    <li><b>Paging-structure caches.</b> The MMU also remembers recent upper-level entries (PML4, PDPT and PD), so most walks skip straight to the last level: one read instead of four.</li>
+  </ul>
+  <p>A typical walk therefore costs tens of CPU cycles. It becomes expensive when the page-table entries themselves have fallen out of the caches, which is exactly what happens to programs that touch a lot of memory at random. A study of database, key-value cache and graph workloads (Basu et al., ISCA 2013) found they spent as much as 10% of their execution cycles on TLB misses, even with large pages.</p>
+
+  <h2>TLB reach and huge pages</h2>
+  <p><b>TLB reach</b> is how much memory the TLB can cover at once: the number of entries times the page size. If your program's working set fits inside the reach, almost every access hits. If it doesn't, misses are guaranteed however much RAM the machine has.</p>
+  <p>Real TLBs are split and layered like the data caches: a first level for instructions (iTLB), a first level for data (dTLB), and a larger, slower second level shared by both (often called the STLB). Entries for different page sizes are kept separately. These are the sizes for an Intel Skylake core; newer Intel and AMD cores have 2,000 to 3,000 second-level entries.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Page size</th><th>L1 data TLB</th><th>L1 reach</th><th>L2 TLB</th><th>L2 reach</th></tr></thead>
+      <tbody>
+        <tr><td>4 KiB</td><td>64 entries</td><td>256 KiB</td><td>1,536 entries</td><td>6 MiB</td></tr>
+        <tr><td>2 MiB</td><td>32 entries</td><td>64 MiB</td><td>1,536 entries (the same ones)</td><td>3 GiB</td></tr>
+        <tr><td>1 GiB</td><td>4 entries</td><td>4 GiB</td><td>16 entries</td><td>16 GiB</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Read the first row again. With 4 KiB pages, the whole second-level TLB covers 6 MiB. A PostgreSQL server with a 32 GiB buffer pool, a JVM with a 16 GiB heap or a Redis instance holding 50 GiB of keys can keep only a tiny fraction of its memory translated at any moment. That is the real case for huge pages, and the reason Chapter 12 called the TLB their most important benefit: the same 1,536 entries cover 3 GiB when each one maps 2 MiB.</p>
+  <p>Access pattern matters as much as size. Each row of this grid is exactly one page, so reading along a row stays on one page for 4,096 accesses, and reading down a column lands on a new page every time:</p>
+<pre class="code"><span class="k">#define</span> <span class="m">ROWS</span> <span class="m">4096</span>
+<span class="k">#define</span> <span class="m">COLS</span> <span class="m">4096</span>                     <span class="c">/* one row = 4096 bytes = one 4 KiB page */</span>
+<span class="k">static</span> <span class="t">char</span> grid[<span class="m">ROWS</span>][<span class="m">COLS</span>];        <span class="c">/* 16 MiB, filled by main() before timing */</span>
+
+<span class="t">long</span> <span class="f">by_row</span>(<span class="t">void</span>) {                   <span class="c">/* 4,096 pages touched, one after another */</span>
+    <span class="t">long</span> sum = <span class="m">0</span>;
+    <span class="k">for</span> (<span class="t">int</span> r = <span class="m">0</span>; r &lt; <span class="m">ROWS</span>; r++)
+        <span class="k">for</span> (<span class="t">int</span> c = <span class="m">0</span>; c &lt; <span class="m">COLS</span>; c++)
+            sum += grid[r][c];
+    <span class="k">return</span> sum;
+}
+
+<span class="t">long</span> <span class="f">by_col</span>(<span class="t">void</span>) {                   <span class="c">/* same bytes, but a different page on every access */</span>
+    <span class="t">long</span> sum = <span class="m">0</span>;
+    <span class="k">for</span> (<span class="t">int</span> c = <span class="m">0</span>; c &lt; <span class="m">COLS</span>; c++)
+        <span class="k">for</span> (<span class="t">int</span> r = <span class="m">0</span>; r &lt; <span class="m">ROWS</span>; r++)
+            sum += grid[r][c];
+    <span class="k">return</span> sum;
+}</pre>
+<pre class="code"><span class="c">$</span> gcc -O1 grid.c -o grid               <span class="c"># -O1: higher levels may swap the loops for you</span>
+<span class="c">$</span> perf stat -e dTLB-loads,dTLB-load-misses ./grid row
+        <span class="m">16,912,347</span>      dTLB-loads
+             <span class="m">5,216</span>      dTLB-load-misses          <span class="c">#  0.03% of all dTLB cache accesses</span>
+<span class="c">$</span> perf stat -e dTLB-loads,dTLB-load-misses ./grid col
+        <span class="m">16,931,102</span>      dTLB-loads
+        <span class="m">16,204,881</span>      dTLB-load-misses          <span class="c"># 95.71% of all dTLB cache accesses</span></pre>
+  <p>The counts above are illustrative, for a core like the one in the table with 4 KiB pages; yours will differ. The shape won't: <code>by_col</code> cycles through 4,096 pages, more than the 1,536 second-level entries, so nearly every access needs a page walk. It also runs many times slower, though most of that is data-cache misses, with the page walks adding to it. Now back the array with 2 MiB pages (set transparent huge pages to <code>always</code>, or ask with <code>madvise(MADV_HUGEPAGE)</code>): the 16 MiB grid needs eight TLB entries and the misses nearly vanish.</p>
+
+  <h2>Drive a TLB</h2>
+  <p>This TLB has eight entries, so you can watch every one. Run each workload with 4 KiB pages, then with 2 MiB pages. Then pick the hot loop, warm it up and switch processes a few times with PCIDs off and on.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">An 8-entry TLB: workloads, page sizes and context switches</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="tlWork"><button class="active" data-v="scan">array scan</button><button data-v="col">column walk</button><button data-v="rand">random lookups</button><button data-v="hot">hot loop</button></div>
+        <div class="seg" id="tlPage"><button class="active" data-v="4k">4 KiB pages</button><button data-v="2m">2 MiB pages</button></div>
+        <div class="seg" id="tlPcid"><button class="active" data-v="off">PCIDs off</button><button data-v="on">PCIDs on</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="tlStep">Next access →</button>
+        <button class="btn sm" id="tlRun">Run 48 accesses</button>
+        <button class="btn sm" id="tlSwitch">⇄ Switch process</button>
+        <button class="btn sm" id="tlReset">↺ Reset</button>
+        <span class="small muted" id="tlWho" style="font-family:var(--mono)"></span>
+      </div>
+      <div class="tl-grid" id="tlGrid"></div>
+      <div class="tl-tape" id="tlTape"></div>
+      <div class="tl-key"><i style="background:var(--green)"></i>hit<i style="background:var(--red)"></i>miss (page walk)<i style="background:var(--text);width:3px"></i>context switch · the last 64 events</div>
+      <div class="tl-desc" id="tlDesc"></div>
+      <div class="stats" id="tlStats"></div>
+    </div>
+    <div class="panel-foot">A model, not a real CPU: eight fully associative entries with least-recently-used replacement, and frame numbers that are invented. The array scan reads every 1,024 bytes; the column walk reads down a grid of 12 rows of 4,096 bytes; random lookups probe a 64 MiB hash table; the hot loop touches four pages. Both processes run the same program, so they use the same virtual addresses with different frames.</div>
+  </div>
+
+  <p>Things to notice. The column walk gets a 0% hit rate with 4 KiB pages, because 12 pages rotate through 8 slots and each one is evicted just before it is needed again. With 2 MiB pages all 12 rows share one entry. Random lookups over 64 MiB improve with 2 MiB pages but only to about one hit in four, because the reach is 16 MiB: huge pages raise the reach, they don't remove the limit.</p>
+
+  <h2>Context switches: flushes, ASIDs and PCIDs</h2>
+  <p>A TLB entry says "page <code>0x7f3a00003</code> is in frame <code>0x1a2f4</code>". That is true in one address space only. Another process has its own page <code>0x7f3a00003</code> in a different frame. So when the kernel loads another process's page tables into CR3, the old entries must not be used. There are three ways to make sure of that.</p>
+  <ul>
+    <li><b>Flush.</b> This was x86's only behaviour for decades: writing CR3 discards every entry except those marked <b>global</b> (a page-table entry bit for kernel mappings that are identical in every address space). It is simple and safe, but the incoming process starts with an empty TLB and misses on everything it touches, and so does the outgoing one when it returns. This is a large part of the "indirect cost" of a process switch in <a href="06-context-switches-interrupts.html">Chapter 6</a>.</li>
+    <li><b>Tag.</b> Each entry also stores an address-space number, and a lookup must match both the page number and the current number. ARM calls it an <b>ASID</b> (8 or 16 bits); x86 calls it a <b>PCID</b>, process-context identifier (12 bits, stored in the low bits of CR3). With tags, nothing is flushed on a switch. The old process's entries stay, can't match the new process's lookups, and are still valid when the old process runs again, unless they were evicted in the meantime.</li>
+    <li><b>Don't switch at all.</b> Threads of one process share their page tables (<a href="05-threads.html">Chapter 5</a>). Switching between them leaves CR3 alone and the TLB untouched. Kernel threads have no user address space, so Linux lets them borrow the previous task's page tables instead of switching ("lazy TLB").</li>
+  </ul>
+<pre class="code"><span class="c">$</span> grep -o -w -E <span class="s">'pcid|invpcid|pge'</span> /proc/cpuinfo | sort -u    <span class="c"># what this CPU supports</span>
+invpcid          <span class="c"># an instruction to invalidate entries of one PCID</span>
+pcid             <span class="c"># tagged TLB entries</span>
+pge              <span class="c"># global pages</span></pre>
+  <p>PCIDs arrived in Intel CPUs in 2010, but Linux only began using them for user processes in version 4.14 (2017). It keeps things cheap: each core remembers just six recently used address spaces and recycles their PCIDs, because the kernel has to track which cores may still hold entries for which address space.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Event</th><th>What happens to the TLB</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>Switch between threads of one process</td><td>Nothing: same page tables</td><td>None</td></tr>
+        <tr><td>Switch to another process, no PCIDs</td><td>All non-global entries on that core are flushed</td><td>Misses on every page the process touches until the TLB refills</td></tr>
+        <tr><td>Switch to another process, with PCIDs or ASIDs</td><td>Nothing flushed; entries of both processes compete for the same slots</td><td>Small: only evictions</td></tr>
+        <tr><td><code>munmap</code> or <code>mprotect</code>, single-threaded process</td><td>The affected pages are invalidated on this core (<code>invlpg</code>)</td><td>Tens to hundreds of nanoseconds</td></tr>
+        <tr><td><code>munmap</code> or <code>mprotect</code>, threads running on other cores</td><td>Every one of those cores must invalidate too: a shootdown</td><td>Microseconds, and an interrupt on each core</td></tr>
+        <tr><td>System call with kernel page-table isolation</td><td>Page tables switch on entry and exit; flushed each time unless PCIDs are in use</td><td>See below</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🫠</div>
+    <div class="body"><div class="title">Meltdown, KPTI, and the week PCIDs started to matter</div><p>Until 2018 the kernel was mapped into every process's page tables, protected only by the User bit (<a href="02-kernel-user-mode-syscalls.html">Chapter 2</a>). That made system calls cheap: entering the kernel changed the privilege level, not the page tables, and the kernel's global TLB entries stayed warm. The <b>Meltdown</b> attack, made public in January 2018, showed that speculative execution on many Intel CPUs let user code read that kernel memory anyway. The fix, <b>kernel page-table isolation</b> (KPTI, merged in Linux 4.15), gives each process two sets of page tables: a full one used in kernel mode, and one for user mode with almost none of the kernel mapped. Now every system call and interrupt switches page tables twice. Without PCIDs that means two TLB flushes per system call. With PCIDs, the kernel gives the two views separate tags and nothing is flushed. Brendan Gregg at Netflix measured the result: between 0.1% and 6% overhead on their cloud workloads, depending mostly on the system-call rate, and noticeably more on kernels or CPUs without PCID support. A hardware feature that had sat almost unused for seven years became essential in a week. <a href="36-os-security.html">Chapter 36</a> returns to the attack itself.</p></div>
+  </div>
+
+  <h2>TLB shootdowns</h2>
+  <p>Every core has its own TLB, and the hardware does not keep them in step with the page tables. If a process has threads running on eight cores, a translation for one of its pages may be cached in eight places. When the kernel changes or removes that mapping, clearing the page-table entry isn't enough: the other cores would go on using their cached copies.</p>
+  <p>So the kernel does a <b>TLB shootdown</b>. It updates the page tables, invalidates the entries on its own core, then sends an <b>inter-processor interrupt</b> (IPI) to every other core that might be running that address space and waits for each to invalidate its entries too. Only then is it safe to reuse the frames.</p>
+  <figure class="seq" data-actors="Thread on CPU 0|Kernel on CPU 0|CPU 1|CPU 2">
+    <ol>
+      <li data-m="0>1">munmap(buf, 64 KiB)</li>
+      <li data-m="1>2">IPI: flush these 16 pages (CPU 0 has already cleared the PTEs and its own TLB)</li>
+      <li data-m="1>3">IPI: flush these 16 pages</li>
+      <li data-m="2>1" data-k="reply">interrupted, ran invlpg × 16, done</li>
+      <li data-m="3>1" data-k="reply">interrupted, ran invlpg × 16, done</li>
+      <li data-m="1>0" data-k="reply">return 0; the frames can now be given to someone else</li>
+    </ol>
+    <figcaption><b>A TLB shootdown.</b> CPU 0 waits for every reply. If it freed the frames first, a thread on CPU 2 could still write through its stale entry into memory that now belongs to another process.</figcaption>
+  </figure>
+  <p>One shootdown costs a few microseconds and interrupts whatever each target core was doing. That is nothing once, and a real bottleneck at thousands per second on a machine with dozens of cores, because each call disturbs every core the process is using. The usual causes are frequent <code>munmap</code>, <code>mprotect</code> or <code>madvise(MADV_DONTNEED)</code> calls in a multithreaded program: a memory allocator returning memory to the kernel too eagerly (<a href="16-heap-malloc.html">Chapter 16</a>), a garbage collector changing page protections, or the kernel itself migrating and reclaiming pages. Linux softens it by batching the pages of one operation into a single IPI, and by flushing the whole TLB instead when more than 33 pages are involved. arm64 CPUs can broadcast an invalidation to all cores in hardware, with no interrupt, and AMD's Zen 3 and later add a similar instruction.</p>
+<pre class="code"><span class="c">$</span> grep TLB /proc/interrupts                       <span class="c"># shootdown interrupts per core since boot</span>
+ TLB:     <span class="m">184211</span>     <span class="m">179902</span>     <span class="m">201338</span>     <span class="m">176455</span>   TLB shootdowns
+<span class="c">$</span> perf stat -e tlb:tlb_flush -a sleep <span class="m">5</span>           <span class="c"># TLB flushes on the whole machine for 5 s</span>
+<span class="c">$</span> perf stat -e dTLB-load-misses,iTLB-load-misses -p <span class="m">4120</span> sleep <span class="m">5</span>    <span class="c"># misses in one process</span></pre>
+  <p>If <code>perf</code> shows a service spending its time in <code>flush_tlb_mm_range</code> and <code>smp_call_function_many_cond</code>, it is paying for shootdowns. The fixes are on the program's side: reuse memory instead of unmapping it, make the allocator hold on to freed memory for longer, or change protections less often. <a href="38-tail-latency.html">Chapter 38</a> shows what this does to tail latency.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Thinking the TLB caches data.</b> It caches translations: page number to frame number plus permissions. The data caches (L1, L2, L3) are separate.</li>
+      <li><b>Calling a TLB miss a page fault.</b> A miss is resolved by the hardware walk in nanoseconds and the kernel never hears of it. A fault traps to the kernel.</li>
+      <li><b>Saying every context switch flushes the TLB.</b> Thread switches within a process never do, and with PCIDs or ASIDs process switches don't either.</li>
+      <li><b>Expecting more RAM to fix TLB misses.</b> Reach is entries times page size. Only bigger pages or a smaller, more local working set help.</li>
+      <li><b>Forgetting the TLB is per core.</b> Changing a mapping in a multithreaded process costs an interrupt on every core running it.</li>
+      <li><b>Quoting the textbook 100 ns walk as a real number.</b> Use it for the formula; say that cached page-table entries make real walks much cheaper.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the TLB, and what happens on a miss?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The TLB is a small cache inside the CPU that maps virtual page numbers to physical frame numbers, together with the permission bits. It exists because translating an address through four levels of page tables would add four memory reads to every access. On a hit the frame comes straight from the TLB. On a miss the MMU walks the page tables itself, starting at CR3, and if it finds a valid entry it caches the translation and the access continues; the program only notices the delay. If the walk finds the page isn't present or the access isn't allowed, that is a page fault and the kernel takes over. A TLB has tens of first-level entries and a couple of thousand second-level ones, so with 4 KiB pages it covers only a few megabytes; huge pages are the main way to cover more.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A 64-core service got slower after a change that frees memory more aggressively. The profile shows time in <code>flush_tlb_mm_range</code>. What is happening?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>TLB shootdowns. Each core has its own TLB, so when one thread unmaps memory the kernel has to make every other core running that process drop its cached translations before the frames can be reused. It does that with inter-processor interrupts and waits for them to be acknowledged. One is a few microseconds; thousands per second across 64 cores interrupt every thread constantly, and the cost grows with core count. I'd confirm it with the TLB line in <code>/proc/interrupts</code> and the rate of <code>munmap</code> or <code>madvise</code> calls from <code>strace -c</code> or <code>perf</code>. The fix is to free less often: make the allocator retain and reuse memory, batch the frees, or pool the buffers so the mappings never change.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>The TLB caches page-to-frame translations and permissions; a hit avoids the page walk entirely.</li>
+      <li>EAT = TLB time + memory time + miss rate × walk time. A miss is not a page fault.</li>
+      <li>Reach = entries × page size: about 6 MiB with 4 KiB pages, about 3 GiB with 2 MiB pages on a typical core.</li>
+      <li>Entries belong to one address space. A process switch flushes them unless they are tagged with a PCID or ASID; a thread switch never does.</li>
+      <li>TLBs are per core, so changing a mapping in a multithreaded process needs a shootdown: an interrupt to every core running it.</li>
+      <li>KPTI switches page tables on every system call; PCIDs are what keep that affordable.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A memory access takes 100 ns, a page walk adds 400 ns, and the TLB lookup time is negligible. With a 98% hit rate, what is the effective access time?</p>
+      <div class="opts">
+        <button class="opt">100 ns</button>
+        <button class="opt">102 ns</button>
+        <button class="opt">108 ns</button>
+        <button class="opt">500 ns</button>
+      </div>
+      <div class="explain">100 + (1 − 0.98) × 400 = 100 + 8 = 108 ns. Only the 2% of accesses that miss pay for the walk.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A TLB has 1,536 entries. What is its reach with 4 KiB pages, and with 2 MiB pages?</p>
+      <div class="opts">
+        <button class="opt">6 MiB and 3 GiB</button>
+        <button class="opt">1.5 MiB and 1.5 GiB</button>
+        <button class="opt">6 GiB and 3 TiB</button>
+        <button class="opt">It depends on how much RAM is installed</button>
+      </div>
+      <div class="explain">Reach = entries × page size. 1,536 × 4 KiB = 6 MiB; 1,536 × 2 MiB = 3,072 MiB = 3 GiB. RAM size doesn't come into it.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Which of these needs no TLB flush at all, even on a CPU without PCIDs?</p>
+      <div class="opts">
+        <button class="opt">Switching from one process to another</button>
+        <button class="opt">A process calling <code>munmap</code> on a region it has used</button>
+        <button class="opt">Making a writable page read-only with <code>mprotect</code></button>
+        <button class="opt">Switching between two threads of the same process</button>
+      </div>
+      <div class="explain">Threads share one set of page tables, so every cached translation is still correct. The other three change which translations are valid.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does a PCID (or an ASID on ARM) do?</p>
+      <div class="opts">
+        <button class="opt">It makes the TLB larger</button>
+        <button class="opt">It tags each TLB entry with an address space, so entries from several processes can stay in the TLB across context switches</button>
+        <button class="opt">It lets two processes share the same physical frame</button>
+        <button class="opt">It stops other cores from needing shootdowns</button>
+      </div>
+      <div class="explain">A lookup matches the page number and the current tag, so stale entries can't be used and nothing needs flushing on a switch.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why does unmapping memory in a process with threads on several cores require inter-processor interrupts?</p>
+      <div class="opts">
+        <button class="opt">The page tables are stored separately on each core</button>
+        <button class="opt">The other threads must be killed first</button>
+        <button class="opt">Each core has its own TLB, and the hardware doesn't remove stale entries from other cores by itself</button>
+        <button class="opt">Interrupts are how memory is returned to the free list</button>
+      </div>
+      <div class="explain">Page tables are shared, but cached translations are per core. The kernel must tell each core to invalidate them before the frames are reused.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const SLOTS = 8, BASE = 0x7f3a00000000, KB = 1024, MB = 1048576;
+  function rnd(i, seed) { let t = Math.imul(i + 1 + seed * 7919, 0x6D2B79F5); t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return (t ^ (t >>> 14)) >>> 0; }
+  const HOT = [0x0a40, 3 * MB + 0x1f8, 6 * MB + 0x2c00, 9 * MB + 0x640];
+  // Each workload maps the i-th access of a process to a byte offset in its data region.
+  const W = {
+    scan: { off: (i) => (i * KB) % (64 * MB), note: { '4k': 'a new page every 4 accesses', '2m': 'a new page every 2,048 accesses' } },
+    col: { off: (i) => (i % 12) * 4096 + Math.floor(i / 12) % 4096, note: { '4k': '12 pages in rotation, 8 slots', '2m': 'all 12 rows inside one 2 MiB page' } },
+    rand: { off: (i, seed) => { const x = rnd(i, seed) % (64 * MB); return x - x % 8; }, note: { '4k': '16,384 pages in a 64 MiB table', '2m': '32 huge pages in a 64 MiB table' } },
+    hot: { off: (i) => HOT[i % 4] + (i % 16) * 8, note: { '4k': '4 hot pages', '2m': '4 hot pages' } },
+  };
+  let work = 'scan', page = '4k', pcid = 'off';
+  let tlb, cur, pos, tick, st, tape, last;
+  const hx = (n) => '0x' + n.toString(16);
+  const tag = (p) => pcid === 'on' ? (p === 'A' ? 1 : 2) : 0;
+  function frameOf(p, vpn) { const h = rnd(vpn % 1000003, p === 'A' ? 11 : 23); return page === '2m' ? 0x40000 + (h % 0x1ff) * 512 : 0x10000 + h % 0x3fff0; }
+  function reset() { tlb = new Array(SLOTS).fill(null); cur = 'A'; pos = { A: 0, B: 0 }; tick = 0; st = { acc: 0, hit: 0, reads: 0, flushed: 0, sw: 0 }; tape = []; last = null; }
+  function access() {
+    const size = page === '2m' ? 2 * MB : 4096, levels = page === '2m' ? 3 : 4;
+    const va = BASE + W[work].off(pos[cur]++, cur === 'A' ? 1 : 2), vpn = Math.floor(va / size), t = tag(cur);
+    tick++; st.acc++;
+    let k = tlb.findIndex((e) => e && e.vpn === vpn && e.tag === t);
+    if (k >= 0) { tlb[k].last = tick; st.hit++; tape.push('h'); last = { kind: 'hit', k, va, vpn }; return; }
+    k = tlb.indexOf(null);
+    let old = null;
+    if (k < 0) { k = 0; tlb.forEach((e, j) => { if (e.last < tlb[k].last) k = j; }); old = tlb[k]; }
+    tlb[k] = { vpn, tag: t, owner: cur, pfn: frameOf(cur, vpn), last: tick };
+    st.reads += levels; tape.push('m'); last = { kind: 'miss', k, va, vpn, old, levels };
+  }
+  function switchProc() {
+    const from = cur; cur = cur === 'A' ? 'B' : 'A'; st.sw++; tape.push('s');
+    let n = 0;
+    if (pcid === 'off') { n = tlb.filter(Boolean).length; tlb.fill(null); st.flushed += n; }
+    last = { kind: 'switch', from, n };
+  }
+  function render() {
+    const big = page === '2m';
+    $('#tlWho').textContent = `running: process ${cur}${pcid === 'on' ? ' (PCID ' + tag(cur) + ')' : ''} · ${W[work].note[page]}`;
+    $('#tlGrid').innerHTML = tlb.map((e, k) => {
+      if (!e) return `<div class="tl-e tl-empty"><h6>slot ${k}</h6><span class="tl-dim">empty</span></div>`;
+      const mine = e.owner === cur;
+      const cls = last && last.k === k ? (last.kind === 'hit' ? 'tl-hit' : 'tl-new') : mine ? '' : 'tl-other';
+      return `<div class="tl-e ${cls}"><h6>slot ${k}${pcid === 'on' ? ' · PCID ' + e.tag : ''}</h6>page ${hx(e.vpn)}<br>→ frame ${hx(e.pfn)}<br><span class="tl-dim">${mine ? 'used ' + (tick - e.last) + ' ago' : 'process ' + e.owner + ': no match'}</span></div>`;
+    }).join('');
+    $('#tlTape').innerHTML = tape.slice(-64).map((x) => `<i class="tl-${x}"></i>`).join('');
+    const d = $('#tlDesc');
+    if (!last) { d.className = 'tl-desc'; d.innerHTML = 'Press <b>Next access</b> to send the first address through the TLB.'; }
+    else if (last.kind === 'hit') { d.className = 'tl-desc tl-ok'; d.innerHTML = `Process ${cur} reads <code>${hx(last.va)}</code>. Page ${hx(last.vpn)} is in slot ${last.k}: <b>TLB hit</b>. The frame comes straight from the entry, with no page-table reads.`; }
+    else if (last.kind === 'miss') {
+      const ev = last.old ? `, evicting page ${hx(last.old.vpn)}${last.old.owner !== cur ? ' of process ' + last.old.owner : ''} (least recently used)` : '';
+      d.className = 'tl-desc tl-bad';
+      d.innerHTML = `Process ${cur} reads <code>${hx(last.va)}</code>. Page ${hx(last.vpn)} is not in the TLB${pcid === 'on' ? ' under PCID ' + tag(cur) : ''}: <b>TLB miss</b>. The MMU walks the page tables (${last.levels} reads) and caches the result in slot ${last.k}${ev}.`;
+    } else if (pcid === 'off') {
+      d.className = 'tl-desc tl-bad';
+      d.innerHTML = `Context switch: CR3 now points at process ${cur}'s page tables. Without PCIDs that write flushes every non-global entry: <b>${last.n} translation${last.n === 1 ? '' : 's'} thrown away</b>. Process ${cur} starts cold, and so will ${last.from} when it comes back.`;
+    } else {
+      d.className = 'tl-desc';
+      d.innerHTML = `Context switch: CR3 now holds process ${cur}'s page tables and PCID ${tag(cur)}, with the no-flush bit set. <b>Nothing is flushed.</b> Process ${last.from}'s entries stay but can't match ${cur}'s lookups, and are still valid when ${last.from} returns unless they are evicted first.`;
+    }
+    const hr = st.acc ? st.hit / st.acc * 100 : null;
+    $('#tlStats').innerHTML = `<div class="stat"><div class="k">Accesses</div><div class="v">${st.acc}</div></div>
+      <div class="stat ${hr === null ? '' : hr >= 90 ? 'good' : hr >= 50 ? 'warn' : 'bad'}"><div class="k">Hit rate</div><div class="v">${hr === null ? '–' : hr.toFixed(0) + '%'}</div></div>
+      <div class="stat"><div class="k">Page-table reads</div><div class="v">${st.reads}</div></div>
+      <div class="stat acc"><div class="k">TLB reach</div><div class="v">${big ? '16 MiB' : '32 KiB'}</div></div>
+      <div class="stat ${st.flushed ? 'bad' : ''}"><div class="k">Flushed by switches</div><div class="v">${st.flushed}</div></div>`;
+  }
+  $('#tlWork').addEventListener('segchange', (e) => { work = e.detail; reset(); render(); });
+  $('#tlPage').addEventListener('segchange', (e) => { page = e.detail; reset(); render(); });
+  $('#tlPcid').addEventListener('segchange', (e) => { pcid = e.detail; reset(); render(); });
+  $('#tlStep').onclick = () => { access(); render(); };
+  $('#tlRun').onclick = () => { for (let i = 0; i < 48; i++) access(); render(); };
+  $('#tlSwitch').onclick = () => { switchProc(); render(); };
+  $('#tlReset').onclick = () => { reset(); render(); };
+  reset(); render();
+})();
+</script>
 </body>
 </html>

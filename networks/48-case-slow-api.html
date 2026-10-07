@@ -6,34 +6,339 @@
 <title>Case Study: Debugging a Slow API from a Capture</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('net-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sa-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .sa-row > span { font-size:12.5px; color:var(--muted); min-width:170px; }
+  .sa-bars { margin-top:14px; }
+  .sa-bars h6 { margin:10px 0 4px; font-size:12px; font-weight:600; color:var(--muted); display:flex; justify-content:space-between; gap:10px; }
+  .sa-bars h6 b { color:var(--text); font-variant-numeric:tabular-nums; }
+  .sa-bar { display:flex; height:26px; border-radius:8px; border:1.5px solid var(--border); background:var(--surface-2); overflow:hidden; }
+  .sa-bar i { display:block; height:100%; min-width:0; transition:width .25s; }
+  .sa-hs { background:var(--accent-2); } .sa-ack { background:var(--red); } .sa-req { background:var(--green); } .sa-srv { background:var(--muted); } .sa-win { background:var(--amber); }
+  .sa-key { display:flex; flex-wrap:wrap; gap:6px 16px; margin-top:10px; font-size:12.5px; color:var(--muted); }
+  .sa-key span { display:inline-flex; align-items:center; gap:6px; }
+  .sa-key span i { width:11px; height:11px; border-radius:3px; display:inline-block; }
+  .sa-key span b { color:var(--text); font-variant-numeric:tabular-nums; }
+  .sa-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .sa-desc.sa-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .sa-desc.sa-mid { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
 </head>
 <body data-chapter="48">
-<!-- net:placeholder -->
 <main class="content">
 
   <section class="hero">
-    <div class="eyebrow"><span class="pill accent">Chapter 48</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Case Study: <span class="grad">Debugging a Slow API from a Capture</span></h1>
-    <p class="lead">A p99 of 2 seconds traced to a delayed-ACK interaction, a small window and a missing keep-alive.</p>
+    <div class="eyebrow"><span class="pill accent">Chapter 48</span><span class="pill">Case Study</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Debugging a Slow API <span class="grad">from a Capture</span></h1>
+    <p class="lead">A checkout service calls a pricing service. The checkout team's dashboard says that the call takes half a second at the median and over two seconds for the slowest 1%. The pricing team's dashboard says that their service answers in 20 ms. Both dashboards are correct, and the two teams have been arguing for a month. This last case study settles it with a packet capture, using the method of <a href="37-packet-level-debugging.html">Chapter 37</a>. The capture shows three separate faults, none of them in either team's request handler: a 200 ms timer that fires on every request, a receive window that is too small, and a connection that is opened again for every call.</p>
+    <ul class="objectives">
+      <li><span>Explain how a client and a server can truthfully report very different latencies for the same call</span></li>
+      <li><span>Find fixed-length gaps in a capture, and work out which side was waiting for what</span></li>
+      <li><span>Recognise a transfer limited by the receive window</span></li>
+      <li><span>Recognise a connection being opened for each request, and count what that costs</span></li>
+      <li><span>Apply the fixes one at a time, and verify each from the same point of measurement</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + CLI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Reading tcpdump output, and measuring from a capture:</b> <a href="37-packet-level-debugging.html">Chapter 37</a>.</li>
+        <li><b>Nagle's algorithm and delayed acknowledgements:</b> <a href="33-tcp-performance.html">Chapter 33</a>. This chapter finds that interaction in a real trace.</li>
+        <li><b>The receive window and window scaling:</b> <a href="12-flow-control.html">Chapter 12</a>.</li>
+        <li><b>Round trips and connection reuse:</b> <a href="38-latency-budgets.html">Chapter 38</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The symptom</li>
-    <li>The capture</li>
-    <li>Finding the 200 ms gaps</li>
-    <li>The fixes</li>
-    <li>Verifying</li>
-  </ol>
+  <h2>The symptom</h2>
+  <p>The checkout service runs in Frankfurt on Linux. For each order it sends the basket to the pricing service, an older system that runs in Virginia on Windows Server, and gets back a price for every line. The round trip between the two sites is 90 ms. Most baskets are small. About three in a hundred are large trade orders, for which the response runs to 300 kB.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Checkout's dashboard</th><th>Pricing's dashboard</th></tr></thead>
+      <tbody>
+        <tr><td><b>Measures</b></td><td>From calling the client library until it returns</td><td>From the handler being given the request until it has written the response</td></tr>
+        <tr><td><b>Median</b></td><td>490 ms</td><td>20 ms</td></tr>
+        <tr><td><b>99th percentile</b></td><td>2,110 ms</td><td>35 ms</td></tr>
+        <tr><td><b>Conclusion drawn</b></td><td>"Pricing is slow"</td><td>"Pricing is fast, so it must be the network"</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>A single round trip and 20 ms of work should take 110 ms, and the checkout service is seeing more than four times that for the easy requests. The server's timer starts when the whole request has arrived and stops when the response has been handed to the kernel. Opening the connection, getting the request there and getting the response back all happen outside it. The network team, for their part, report no loss and an idle link. So the time is being spent somewhere that none of the three teams measures, and a capture is the way to find it.</p>
+
+  <h2>The capture</h2>
+<pre class="code"><span class="c"># On the checkout host: headers only, the conversation with pricing, kept in a ring of files</span>
+$ sudo tcpdump -i eth0 -n -s 128 -C 100 -W 10 -w pricing.pcap 'host 10.9.1.20 and port 8080'</pre>
+  <p>From an hour of traffic, here is one request for a large basket, the kind that takes two seconds. The first column is the time since the previous line (<code>-ttt</code>), which puts the gaps in plain view.</p>
+<pre class="code">$ tcpdump -n -ttt -r pricing.pcap 'port 41822'
+ 0.000000 IP 10.4.2.15.41822 &gt; 10.9.1.20.8080: Flags [<span class="k">S</span>], seq 0, <span class="k">win 16384</span>, options [mss 1460,sackOK,TS,<span class="k">wscale 0</span>]
+ 0.090212 IP 10.9.1.20.8080 &gt; 10.4.2.15.41822: Flags [S.], seq 0, ack 1, win 65535, options [mss 1460,sackOK,TS,wscale 8]
+ 0.000048 IP 10.4.2.15.41822 &gt; 10.9.1.20.8080: Flags [.], ack 1, win 16384
+ 0.000195 IP 10.4.2.15.41822 &gt; 10.9.1.20.8080: Flags [P.], seq 1:221, ack 1, length 220: HTTP: POST /price HTTP/1.1
+ <span class="m">0.290377</span> IP 10.9.1.20.8080 &gt; 10.4.2.15.41822: Flags [.], ack 221, win 65535, length 0          <span class="c"># ← 290 ms of nothing</span>
+ <span class="m">0.000061</span> IP 10.4.2.15.41822 &gt; 10.9.1.20.8080: Flags [P.], seq 221:3031, ack 1, length 2810     <span class="c"># ← the body, 61 µs later</span>
+ 0.110480 IP 10.9.1.20.8080 &gt; 10.4.2.15.41822: Flags [.], seq 1:1461, ack 3031, length 1460: HTTP: HTTP/1.1 200 OK
+ <span class="c">          … 10 more segments in the same millisecond: 16,060 bytes in all …</span>
+ 0.000310 IP 10.4.2.15.41822 &gt; 10.9.1.20.8080: Flags [.], ack 16061, <span class="k">win 16384</span>
+ <span class="m">0.089870</span> IP 10.9.1.20.8080 &gt; 10.4.2.15.41822: Flags [.], seq 16061:17521, ack 3031, length 1460   <span class="c"># ← one round trip later</span>
+ <span class="c">          … 10 more segments, an ACK, a 90 ms wait: this repeats 17 more times …</span>
+ 0.000402 IP 10.9.1.20.8080 &gt; 10.4.2.15.41822: Flags [<span class="k">F.</span>], seq 300001, ack 3031
+ 0.000055 IP 10.4.2.15.41822 &gt; 10.9.1.20.8080: Flags [F.], seq 3031, ack 300002</pre>
+  <p>Added up, the deltas come to 2.11 seconds, which is the dashboard's figure. There are no retransmissions and no resets. Everything was delivered at the first attempt, and most of the 2.11 seconds was spent with one side or the other waiting.</p>
+
+  <h2>Finding the 200 ms gaps</h2>
+  <p>Looking at one connection finds a problem. To learn whether it is the usual one, ask the same question of every connection in the file:</p>
+<pre class="code"><span class="c"># Every packet that arrived more than 150 ms after the one before it on the same connection</span>
+$ tshark -r pricing.pcap -o tcp.calculate_timestamps:TRUE -Y 'tcp.time_delta &gt; 0.15' \
+         -T fields -e tcp.stream -e tcp.time_delta -e ip.src -e tcp.len | head -5
+0    <span class="m">0.290377</span>   10.9.1.20   0
+1    <span class="m">0.290102</span>   10.9.1.20   0
+2    <span class="m">0.291044</span>   10.9.1.20   0
+3    <span class="m">0.290230</span>   10.9.1.20   0
+4    <span class="m">0.290519</span>   10.9.1.20   0
+
+$ tshark -r pricing.pcap -Y 'tcp.flags.syn == 1 &amp;&amp; tcp.flags.ack == 0' | wc -l
+<span class="m">41872</span>                                              <span class="c"># SYNs in the file</span>
+$ tshark -r pricing.pcap -Y 'http.request' | wc -l
+<span class="m">41650</span>                                              <span class="c"># requests in the file</span></pre>
+  <p>Every connection has exactly one long gap. It is always 290 ms, and the packet that ends it is always an empty ACK from the server. A delay that regular is a timer (<a href="37-packet-level-debugging.html">Chapter 37</a>). Since 290 is 200 plus the 90 ms round trip, the timer is 200 ms and it is at the far end.</p>
+  <p><b>The first fault</b> is the one from <a href="33-tcp-performance.html">Chapter 33</a>, and three lines of the capture show both halves of it. The client sent 220 bytes, the request's headers, and then stopped, although the body was ready. That is Nagle's algorithm: the headers hadn't been acknowledged and the next piece wasn't a full segment, so the kernel held it. The server received the headers, had nothing to say in reply to half a request, and held back its ACK in the hope of sending it along with some data. Its delayed-ACK timer is 200 ms. Each side was waiting for the other, and only the timer ended the wait. The evidence that the client was the one being held is the 61 microseconds between the ACK arriving and the body leaving: the body had been sitting in the kernel, ready, the whole time.</p>
+  <p><b>The second fault</b> is in the response. The server sends eleven segments, 16,060 bytes, and stops until an ACK comes back a round trip later, then sends eleven more, nineteen times over. The limit is announced in the client's first packet: <code>win 16384</code>, with <code>wscale 0</code>. The client is offering a receive window of 16 kB and has promised never to offer more, so the server may never have more than 16 kB in flight (<a href="12-flow-control.html">Chapter 12</a>). With a 90 ms round trip that is a ceiling of about 1.4 Mbit/s, on a link that can carry a thousand times as much. A 300 kB response takes nineteen round trips where two or three would do.</p>
+  <p><b>The third fault</b> is in the two counts. There are 41,872 SYNs for 41,650 requests: a new connection for every request, and a couple of hundred SYNs that had to be sent twice. Every call pays a 90 ms handshake before it starts. Every response starts from a cold congestion window. And each of those handshakes is a chance for a SYN to be lost, which costs a full second (<a href="08-tcp-handshake.html">Chapter 8</a>). The retried SYNs are 0.5% of the total, too few to show at the 99th percentile, and they are the 99.9th.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Two measurements disagree</b> so the time is being spent somewhere neither of them covers</li>
+      <li data-k="step"><b>Capture at the client</b> where the larger number is measured</li>
+      <li data-k="step"><b>Follow one slow request</b> and add up the gaps until they account for the whole time</li>
+      <li data-k="decision"><b>For each gap: who had something to send, and what were they waiting for?</b> the packet that ends the gap tells you</li>
+      <li data-k="step"><b>Check the whole file</b> to learn whether the pattern is on every connection or only the one you looked at</li>
+      <li data-k="step"><b>Fix one thing</b></li>
+      <li data-k="end"><b>Capture again at the same place</b> and compare the same percentiles</li>
+    </ol>
+    <figcaption><b>The method.</b> The fourth step is where the diagnosis is made.</figcaption>
+  </figure>
+
+  <h2>Try it: apply the fixes</h2>
+  <p>Turn each fix on and off, for a small basket and a large one, and see which part of the time it removes.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Where the two seconds go</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="sa-row"><span>The request</span><div class="seg" id="saSize"><button data-v="small">a small basket: 2 kB back</button><button class="active" data-v="large">a large basket: 300 kB back</button></div></div>
+      <div class="sa-row"><span>Headers and body are sent</span><div class="seg" id="saNagle"><button class="active" data-v="0">in two writes, with Nagle on</button><button data-v="1">in one write, or with TCP_NODELAY</button></div></div>
+      <div class="sa-row"><span>The client's receive buffer</span><div class="seg" id="saWin"><button class="active" data-v="0">fixed at 16 kB</button><button data-v="1">left to the kernel to size</button></div></div>
+      <div class="sa-row"><span>Connections</span><div class="seg" id="saKeep"><button class="active" data-v="0">a new one for each request</button><button data-v="1">kept open and reused</button></div></div>
+      <div class="sa-bars">
+        <h6><span>This request</span><b id="saT1"></b></h6>
+        <div class="sa-bar" id="saBar1"></div>
+        <h6><span>As first captured</span><b id="saT2"></b></h6>
+        <div class="sa-bar" id="saBar2"></div>
+      </div>
+      <div class="sa-key" id="saKey"></div>
+      <div class="sa-desc" id="saDesc"></div>
+      <div class="stats" id="saStats"></div>
+    </div>
+    <div class="panel-foot">The round trip is 90 ms and the server takes 20 ms. Three requests in a hundred are large, so the median is the small basket's time and the 99th percentile is the large one's. With a window sized by the kernel, a new connection still has to grow its congestion window from ten segments, which takes four extra round trips for 300 kB. A connection that has been in use has no such wait.</div>
+  </div>
+
+  <p>Things to notice. As captured, a small basket takes 490 ms, of which 290 ms is the delayed acknowledgement and 90 ms the handshake. A large one takes 2,110 ms, and 1,620 ms of that is eighteen round trips spent waiting for a window that was never allowed to grow. Sending the request in one write removes 290 ms from every call. Freeing the receive buffer removes most of the large basket's delay but not all of it: on a new connection the response is now limited by slow start, and still needs four extra round trips. Only with the connection kept open as well does the large basket come down to the same 110 ms as the small one. With all three applied, the median improves by a factor of four and the 99th percentile by a factor of nineteen, and no line of the pricing service or the network has been touched.</p>
+
+  <h2>The fixes</h2>
+  <p>All three faults were in a small HTTP client written inside the company years earlier, which the checkout service had inherited. Each of its choices had seemed reasonable when it was made.</p>
+<pre class="code"><span class="c"># Before: the inherited client</span>
+<span class="k">def</span> <span class="f">price</span>(basket):
+    s = socket.<span class="f">socket</span>()
+    s.<span class="f">setsockopt</span>(socket.SOL_SOCKET, socket.SO_RCVBUF, <span class="m">16384</span>)   <span class="c"># "saves memory": fixes the window at 16 kB</span>
+    s.<span class="f">connect</span>((<span class="s">"pricing.internal"</span>, <span class="m">8080</span>))                     <span class="c"># a new connection for every call</span>
+    body = json.<span class="f">dumps</span>(basket).<span class="f">encode</span>()
+    s.<span class="f">sendall</span>(<span class="f">headers_for</span>(body))                               <span class="c"># write 1: the headers</span>
+    s.<span class="f">sendall</span>(body)                                            <span class="c"># write 2: the body, which Nagle holds</span>
+    reply = <span class="f">read_response</span>(s)
+    s.<span class="f">close</span>()
+    <span class="k">return</span> reply
+
+<span class="c"># After: a maintained library, and one pool for the life of the process</span>
+session = requests.<span class="f">Session</span>()                                   <span class="c"># keeps connections open, and sets TCP_NODELAY</span>
+session.<span class="f">mount</span>(<span class="s">"http://"</span>, requests.adapters.<span class="f">HTTPAdapter</span>(pool_maxsize=<span class="m">50</span>))
+
+<span class="k">def</span> <span class="f">price</span>(basket):
+    r = session.<span class="f">post</span>(<span class="s">"http://pricing.internal:8080/price"</span>, json=basket, timeout=<span class="m">3</span>)
+    r.<span class="f">raise_for_status</span>()
+    <span class="k">return</span> r.<span class="f">json</span>()                                            <span class="c"># no SO_RCVBUF: the kernel sizes the window itself</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Fault</th><th>Seen in the capture as</th><th>Fix</th><th>Caution</th></tr></thead>
+      <tbody>
+        <tr><td><b>Nagle meets delayed ACK</b></td><td>A gap of 200 ms plus a round trip after the headers, ended by an empty ACK</td><td>Send the request in one write, or set <code>TCP_NODELAY</code></td><td>With <code>TCP_NODELAY</code>, a program that makes many tiny writes sends many tiny packets. Buffer in the application</td></tr>
+        <tr><td><b>A fixed, small receive buffer</b></td><td><code>win 16384</code> and <code>wscale 0</code> in the SYN, and data arriving in equal bursts one round trip apart</td><td>Don't set <code>SO_RCVBUF</code>. The kernel then scales the window up to megabytes</td><td>If a limit really is needed, set it system-wide and above the bandwidth-delay product</td></tr>
+        <tr><td><b>A connection for each request</b></td><td>As many SYNs as requests</td><td>Keep connections open and take them from a pool</td><td>Check that the pool's idle timeout is shorter than the server's and any load balancer's (<a href="15-http-1-1.html">Chapter 15</a>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The fixes were deployed one at a time, a day apart. That took longer, and it meant each change could be seen in the numbers by itself. If the three had gone out together and the result had been disappointing, nobody would have known which one hadn't worked.</p>
+
+  <h2>Verifying</h2>
+  <p>A fix isn't finished until the measurement that showed the problem shows that it has gone. That means the same capture point, the same filter, and the same percentiles.</p>
+<pre class="code">$ tshark -r after.pcap -o tcp.calculate_timestamps:TRUE -Y 'tcp.time_delta &gt; 0.15 &amp;&amp; tcp.len == 0' | wc -l
+<span class="m">0</span>                                                  <span class="c"># no delayed-ACK gaps</span>
+$ tshark -r after.pcap -Y 'tcp.flags.syn == 1 &amp;&amp; tcp.flags.ack == 0' | wc -l
+<span class="m">50</span>                                                 <span class="c"># 50 connections for the hour, for 42,000 requests</span>
+
+$ ss -ti dst 10.9.1.20 | grep -o 'wscale:[0-9,]*\|rcv_space:[0-9]*' | head -2
+wscale:<span class="m">8,7</span>                                         <span class="c"># window scaling is now in use in both directions</span>
+rcv_space:<span class="m">482816</span>                                   <span class="c"># and the kernel has grown the receive window to 480 kB</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Checkout's dashboard</th><th>Before</th><th>After one write</th><th>and a free receive buffer</th><th>and a connection pool</th></tr></thead>
+      <tbody>
+        <tr><td><b>Median</b></td><td>490 ms</td><td>200 ms</td><td>200 ms</td><td>110 ms</td></tr>
+        <tr><td><b>99th percentile</b></td><td>2,110 ms</td><td>1,820 ms</td><td>560 ms</td><td>110 ms</td></tr>
+        <tr><td><b>99.9th percentile</b></td><td>about 3,100 ms</td><td>about 2,800 ms</td><td>about 1,560 ms</td><td>about 130 ms</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The last row is the retried SYNs. It went away with the pool, since a service that opens fifty connections an hour has almost no handshakes to lose. The pricing team's dashboard read 20 ms before and reads 20 ms now. Their service had been fast all along. The delay was in the calling client's use of TCP, which only a capture could see.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧠</div>
+    <div class="body"><div class="title">The one-second pause in every upload</div><p>A fixed delay with a similar cause has been found, by the same method, by a great many teams using the curl library. HTTP lets a client that is about to send a large body ask permission first, with the header <code>Expect: 100-continue</code>. The client sends the headers alone and waits. A server that would reject the request, for lack of authorisation perhaps, can say so before megabytes are uploaded for nothing, and a server that is content replies <code>100 Continue</code>, at which the client sends the body. For many years curl added this header by itself to any POST or PUT with a body of more than 1,024 bytes. Plenty of servers, proxies and application frameworks ignore the header altogether. They neither reject nor send the 100, and simply wait for a body. curl allows for this by waiting one second and then sending the body anyway. Nothing fails. Every request above a kilobyte takes exactly one second longer than it should, and requests below that size are quick, which makes the problem look as if it depended on the data. In a capture it can't be missed: the headers go out, there is silence for 1.000 seconds, and then the body follows without the server having sent a byte. The cure is one line that sends an empty <code>Expect:</code> header to switch the behaviour off, and later versions of curl raised the threshold considerably. The diagnosis follows the same steps as this chapter's: a delay of a round number, a silence in the capture, and the question of who was waiting for what.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Treating the server's latency figure as the caller's.</b> It leaves out connection setup, both transfers, and every wait in between.</li>
+      <li><b>Looking for loss when the delays are regular.</b> 200 ms and 1 s are timers, and retransmission counters will show nothing.</li>
+      <li><b>Setting socket buffer sizes by hand.</b> A fixed <code>SO_RCVBUF</code> turns off the kernel's automatic sizing, and is nearly always smaller than what the kernel would have chosen.</li>
+      <li><b>Setting <code>TCP_NODELAY</code> and then writing a byte at a time.</b> Each write becomes a packet. Assemble the message first.</li>
+      <li><b>Shipping several fixes at once.</b> If the result disappoints, you can't tell which fix didn't work.</li>
+      <li><b>Checking only the median afterwards.</b> Two of the three faults here hardly moved it.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> A client reports that a call takes two seconds. The server's metrics say it handled the request in 30 ms. How can both be right?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because they measure different intervals. The server's timer typically starts when its handler receives a complete request and stops when it has written the response to the socket. The client's timer starts when the application calls the client library and stops when the full response has been read. The difference is everything in between: DNS resolution; establishing a TCP connection, and a TLS session, if one isn't being reused; time the request spends getting there, including any stall such as Nagle's algorithm waiting on a delayed ACK; time the request waits in the server's accept queue or a thread-pool queue before the handler sees it; and the time to transfer the response back, which for a large body depends on the congestion window and the receive window, not on the server. Retransmissions and SYN retries add fixed delays on top. So I'd neither accuse the server nor the network; I'd take a packet capture on the client, find one slow request, and account for its time gap by gap.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Walk me through how you would use a packet capture to find where the time goes in a slow API call.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I'd capture on the client side, since that is where the slowness is observed, with a filter for the server's address and port, headers only, into a ring buffer, and correlate with application logs to pick out a slow request. Then I'd print that connection with inter-packet deltas and walk it in order. Does it start with a SYN? Then connections aren't being reused, and the SYN to SYN-ACK time gives me the RTT, or shows a 1-second SYN retry. After the handshake, when does the request leave, in how many segments, and is there a pause between them? A gap after a small first segment that ends with a bare ACK, of about 40 or 200 ms plus the RTT, is Nagle against delayed ACK. When is the last byte of the request acknowledged, and how long until the first byte of the response? That interval minus one RTT is the server's real time, queueing included. Then the response: does it arrive in one flight, or in bursts one RTT apart? Bursts that double are slow start; bursts of constant size equal to the advertised window mean the receiver's window is the limit, and I'd check the window and scale option in the SYN. Any retransmissions, duplicate ACKs or zero windows? How does it end? For every gap I ask who had data to send and what they were waiting for; the packet that ends the gap usually answers it. Then I'd check with tshark whether the pattern holds across all connections, fix one thing at a time, and re-capture from the same place to confirm, looking at p99 and not only the median.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A server's latency figure covers its handler. Connection setup, transfer and waiting are outside it, and only the client's side sees them.</li>
+      <li>For every gap in a capture, ask who had something to send and what they were waiting for. The packet that ends the gap gives the answer.</li>
+      <li>A gap of a timer's length plus a round trip, ended by an empty ACK, is Nagle's algorithm meeting a delayed acknowledgement.</li>
+      <li>Data arriving in equal bursts one round trip apart is a transfer limited by the receive window. Look at the window and scale in the SYN.</li>
+      <li>One SYN per request means no connection reuse, which costs a handshake, a cold congestion window and a chance of a one-second retry on every call.</li>
+      <li>Fix one thing at a time, and verify from the same place with the same percentiles.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">The caller measures 490 ms for a call. The server measures 20 ms for the same call. What is the most likely explanation?</p>
+      <div class="opts">
+        <button class="opt">One of the two clocks is wrong</button>
+        <button class="opt">The server times only its handler, and the rest was spent on connection setup, transfer and waiting, which only the caller sees</button>
+        <button class="opt">The server is hiding slow requests</button>
+        <button class="opt">The network is losing packets</button>
+      </div>
+      <div class="explain">Both figures are correct, for different intervals.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A capture shows: the request's headers sent, 290 ms of silence, an empty ACK from the server, and the body sent 61 µs after that. The round trip is 90 ms. What happened?</p>
+      <div class="opts">
+        <button class="opt">The headers were lost and retransmitted</button>
+        <button class="opt">The server application was slow</button>
+        <button class="opt">The client's kernel held the body until the headers were acknowledged, and the server delayed that acknowledgement for 200 ms</button>
+        <button class="opt">The client application was slow to produce the body</button>
+      </div>
+      <div class="explain">The body leaving within microseconds of the ACK shows it was ready and waiting in the kernel.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A response arrives in bursts of 16 kB, one round trip apart, and every packet from the client says <code>win 16384</code>. What limits the transfer?</p>
+      <div class="opts">
+        <button class="opt">The client's receive window: the server may not have more than 16 kB unacknowledged</button>
+        <button class="opt">The server's processor</button>
+        <button class="opt">Congestion on the path</button>
+        <button class="opt">The MTU</button>
+      </div>
+      <div class="explain">Slow start would make the bursts grow. Bursts of constant size, equal to the advertised window, are flow control.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">An hour's capture contains 41,872 SYNs and 41,650 HTTP requests. What does that tell you?</p>
+      <div class="opts">
+        <button class="opt">The server is under a SYN flood</button>
+        <button class="opt">Requests are being duplicated</button>
+        <button class="opt">Keep-alive is working well</button>
+        <button class="opt">A new connection is opened for every request, and about 200 SYNs had to be retransmitted</button>
+      </div>
+      <div class="explain">With reuse there would be a few dozen SYNs. Every extra one is a handshake, and some of them are one-second retries.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">After deploying a fix, how should you confirm that it worked?</p>
+      <div class="opts">
+        <button class="opt">Check that the average latency went down</button>
+        <button class="opt">Capture again at the same point, confirm that the pattern has gone, and compare the same percentiles as before</button>
+        <button class="opt">Ask the other team whether their numbers changed</button>
+        <button class="opt">Run a single request by hand</button>
+      </div>
+      <div class="explain">The measurement that showed the problem is the one that must show it gone, at the tail as well as the median.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = NET;
+  const cfg = { size: 'large', nagle: 0, win: 0, keep: 0 };
+  const RTT = 90, SRV = 20, DELACK = 200, BODY = 300, WINDOW = 16.06;   // ms, ms, ms, kB in a large response, kB the fixed window lets through per round trip
+  const NAMES = { hs: 'TCP handshake', ack: 'Waiting on a delayed ACK', req: 'Request and first of the response', srv: 'Server', win: 'More round trips for the response' };
+  function budget(size, nagle, win, keep) {
+    const b = { hs: keep ? 0 : RTT, ack: nagle ? 0 : DELACK + RTT, req: RTT, srv: SRV, win: 0, rounds: 0 };
+    if (size === 'large') {
+      if (!win) b.rounds = Math.ceil(BODY / WINDOW) - 1;       // every round after the first is an extra round trip
+      else if (!keep) b.rounds = 4;                             // slow start from ten segments: 14.6, 43.8, 102, 219, 453 kB
+      b.win = b.rounds * RTT;
+    }
+    b.total = b.hs + b.ack + b.req + b.srv + b.win; return b;
+  }
+  const bar = (b, scale) => ['hs', 'ack', 'req', 'srv', 'win'].map((k) => `<i class="sa-${k}" style="width:${b[k] / scale * 100}%" title="${NAMES[k]}: ${b[k]} ms"></i>`).join('');
+  const n = (x) => x.toLocaleString('en-GB');
+  function render() {
+    const b = budget(cfg.size, cfg.nagle, cfg.win, cfg.keep), w = budget(cfg.size, 0, 0, 0);
+    const p50 = budget('small', cfg.nagle, cfg.win, cfg.keep).total, p99 = budget('large', cfg.nagle, cfg.win, cfg.keep).total;
+    const scale = budget('large', 0, 0, 0).total;
+    $('#saBar1').innerHTML = bar(b, scale); $('#saBar2').innerHTML = bar(w, scale);
+    $('#saT1').textContent = n(b.total) + ' ms'; $('#saT2').textContent = n(w.total) + ' ms';
+    $('#saKey').innerHTML = ['hs', 'ack', 'req', 'srv', 'win'].map((k) => `<span><i class="sa-${k}"></i>${NAMES[k]} <b>${n(b[k])} ms</b></span>`).join('');
+    const left = [];
+    if (!cfg.keep) left.push('a 90 ms handshake on every call');
+    if (!cfg.nagle) left.push('290 ms waiting for a delayed ACK');
+    if (cfg.size === 'large' && b.rounds) left.push(cfg.win ? `${b.rounds} extra round trips while a new connection's congestion window grows` : `${b.rounds} extra round trips behind a 16 kB window`);
+    const d = $('#saDesc'); let text, cls;
+    if (!left.length) { cls = ''; text = `<b>${n(b.total)} ms: one round trip and the server's 20 ms.</b> Nothing is set up, nothing waits on a timer, and the ${cfg.size === 'large' ? '300 kB response arrives in a single flight on a connection whose windows are already open' : 'response fits in two packets'}. This is the least the call can cost at this distance.`; }
+    else { cls = b.total > 1000 ? 'sa-bad' : 'sa-mid'; text = `<b>${n(b.total)} ms, against 110 ms for the work itself.</b> Still being paid: ${left.join('; ')}.` + (cfg.size === 'small' && !cfg.win ? ' The small window makes no difference to a 2 kB response, which is why this fault never showed in the median.' : '') + (cfg.size === 'large' && cfg.win && !cfg.keep ? ' The window is no longer the limit. Slow start is, and only a connection that is already warm avoids it.' : ''); }
+    d.className = 'sa-desc ' + cls; d.innerHTML = text;
+    $('#saStats').innerHTML = `<div class="stat ${b.total <= 110 ? 'good' : b.total > 1000 ? 'bad' : 'warn'}"><div class="k">This request</div><div class="v">${n(b.total)} ms</div></div>
+      <div class="stat ${p50 <= 110 ? 'good' : 'warn'}"><div class="k">Median</div><div class="v">${n(p50)} ms</div></div>
+      <div class="stat ${p99 <= 110 ? 'good' : p99 > 1000 ? 'bad' : 'warn'}"><div class="k">99th percentile</div><div class="v">${n(p99)} ms</div></div>
+      <div class="stat acc"><div class="k">Round trips for this request</div><div class="v">${(cfg.keep ? 0 : 1) + (cfg.nagle ? 0 : 1) + 1 + b.rounds}</div></div>`;
+  }
+  $('#saSize').addEventListener('segchange', (e) => { cfg.size = e.detail; render(); });
+  $('#saNagle').addEventListener('segchange', (e) => { cfg.nagle = +e.detail; render(); });
+  $('#saWin').addEventListener('segchange', (e) => { cfg.win = +e.detail; render(); });
+  $('#saKeep').addEventListener('segchange', (e) => { cfg.keep = +e.detail; render(); });
+  render();
+})();
+</script>
 </body>
 </html>

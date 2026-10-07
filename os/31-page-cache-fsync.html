@@ -6,34 +6,325 @@
 <title>The Page Cache &amp; fsync</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pc-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:14px; }
+  @media (max-width:760px) { .pc-grid { grid-template-columns:1fr; } }
+  .pc-box { border:1.5px solid var(--border); border-radius:12px; padding:9px 11px; background:var(--surface); min-height:112px; }
+  .pc-box h6 { margin:0 0 2px; font-size:13px; }
+  .pc-box small { display:block; margin-bottom:8px; font-size:12px; color:var(--muted); }
+  .pc-box.pc-dead { opacity:.5; border-style:dashed; }
+  .pc-chips { display:flex; flex-wrap:wrap; gap:4px; }
+  .pc-chip { font-family:var(--mono); font-size:11.5px; font-weight:700; padding:3px 7px; border-radius:7px; border:1.5px solid var(--border-strong); background:var(--surface-2); }
+  .pc-chip.pc-dirty { border-color:var(--amber); background:var(--amber-soft); }
+  .pc-chip.pc-safe { border-color:var(--green); background:var(--green-soft); }
+  .pc-chip.pc-lost { border-color:var(--red); background:var(--red-soft); text-decoration:line-through; }
+  .pc-none { font-size:12.5px; color:var(--muted); }
+  .pc-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:66px; }
+  .pc-desc.pc-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .pc-desc.pc-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .pc-desc.pc-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="31">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 31</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>The Page Cache &amp; <span class="grad">fsync</span></h1>
-    <p class="lead">Why write() returns before the disk has the data, dirty pages and writeback, and fsync's real guarantees.</p>
+    <p class="lead">When <code>write()</code> returns successfully, where is your data? Not on the disk. It is in the kernel's memory, in the <b>page cache</b>, and it will reach the disk at some point in the next half a minute, unless the power fails first. This arrangement is what makes file I/O fast: reads are served from RAM and writes return in microseconds. It is also why "the program wrote it" and "it is saved" are different statements, and why a single call, <code>fsync</code>, carries the whole weight of durability in every database and every program that must not lose data.</p>
+    <ul class="objectives">
+      <li>Explain what the page cache holds and how reads and writes use it</li>
+      <li>Describe dirty pages, writeback and what triggers it</li>
+      <li>Say what fsync, fdatasync, O_SYNC and O_DIRECT each guarantee</li>
+      <li>Work out what survives a process crash, a kernel crash and a power cut</li>
+      <li>Explain how databases get durability without an fsync per write</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>File-backed pages, and how the kernel reclaims memory.</b> See <a href="15-page-replacement.html">Chapter 15</a>.</li>
+        <li><b>Journaling, and the write-then-rename pattern.</b> See <a href="24-journaling-crash-consistency.html">Chapter 24</a>.</li>
+        <li><b>How a file mapping shares the kernel's pages.</b> See <a href="30-mmap-copy-on-write.html">Chapter 30</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The page cache</li>
-    <li>Dirty pages and writeback</li>
-    <li>fsync, fdatasync and O_DIRECT</li>
-    <li>fsync failures (fsyncgate)</li>
-    <li>Durability in databases</li>
-  </ol>
+  <h2>The page cache</h2>
+  <p>Disks are thousands of times slower than memory (<a href="p4-memory-hierarchy.html">P4</a>), so the kernel keeps copies of file contents in RAM. Every ordinary <code>read</code> and <code>write</code> goes through this <b>page cache</b>, a collection of 4 KiB pages indexed by file and offset.</p>
+  <ul>
+    <li><b>Read, page in the cache:</b> copy from RAM to your buffer. Microseconds, and no disk involved.</li>
+    <li><b>Read, page not cached:</b> the kernel reads it from disk into the cache, then copies. When it sees you reading sequentially it reads <i>ahead</i>, fetching the next blocks before you ask.</li>
+    <li><b>Write:</b> copy from your buffer into the cached page and mark the page <b>dirty</b>. Return. The disk has not been touched.</li>
+  </ul>
+  <p>The cache has no fixed size. It grows to use whatever memory nothing else wants, and shrinks instantly when a program needs memory, because a clean page can simply be dropped (<a href="15-page-replacement.html">Chapter 15</a>). That is why a healthy Linux machine shows almost no "free" memory:</p>
+<pre class="code"><span class="c">$</span> free -h
+               total        used        free      shared  buff/cache   available
+Mem:            31Gi       6.2Gi       412Mi       310Mi        24Gi        24Gi
+<span class="c">#                                    ^ nearly nothing "free"     ^ the page cache      ^ but 24 GiB can be had at once</span>
+<span class="c">$</span> fincore access.log                   <span class="c"># how much of one file is in the cache right now</span>
+  RES PAGES  SIZE FILE
+ 1.2G <span class="m">314573</span>  4.8G access.log</pre>
+  <p>Read <code>available</code>, not <code>free</code>. Memory used for cache isn't wasted; unused memory is.</p>
+
+  <h2>Dirty pages and writeback</h2>
+  <p>A dirty page is one whose contents in memory are newer than on disk. Kernel flusher threads write dirty pages back in the background, a process called <b>writeback</b>. Three things set it off:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Trigger</th><th>Default on Linux</th><th>Setting</th></tr></thead>
+      <tbody>
+        <tr><td><b>Age</b>: a page has been dirty for too long</td><td>30 seconds, checked every 5</td><td><code>vm.dirty_expire_centisecs</code>, <code>vm.dirty_writeback_centisecs</code></td></tr>
+        <tr><td><b>Volume</b>: too much memory is dirty</td><td>Background writeback starts at 10% of available memory</td><td><code>vm.dirty_background_ratio</code></td></tr>
+        <tr><td><b>Too much</b>: writers are outrunning the disk</td><td>At 20%, a process calling <code>write()</code> is made to wait</td><td><code>vm.dirty_ratio</code></td></tr>
+        <tr><td><b>A request</b></td><td><code>fsync</code>, <code>sync</code>, unmounting</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <figure class="seq" data-actors="Program|Page cache (RAM)|Flusher thread|Disk">
+    <ol>
+      <li data-m="0>1">write(fd, buf, 4096): copied in, page marked dirty</li>
+      <li data-m="1>0" data-k="reply">returns 4096 after about a microsecond</li>
+      <li data-m="2>1">up to 30 s later: collect the dirty pages</li>
+      <li data-m="2>3">write the blocks</li>
+      <li data-m="3>2" data-k="reply">done: the pages are clean</li>
+    </ol>
+    <figcaption><b>An ordinary write.</b> The return value of <code>write()</code> says the kernel has accepted the data. It says nothing about the disk.</figcaption>
+  </figure>
+  <p>Delaying is good for speed: a file written and deleted within seconds never touches the disk at all, repeated writes to one page become a single disk write, and blocks can be written in an efficient order. The third row of the table is the catch. If a program writes faster than the disk can absorb for long enough, its <code>write()</code> calls suddenly block, sometimes for seconds, which looks from outside like the application freezing for no reason.</p>
+<pre class="code"><span class="c">$</span> grep -E <span class="s">'^(Dirty|Writeback):'</span> /proc/meminfo
+Dirty:            <span class="m">184320</span> kB        <span class="c"># waiting to be written</span>
+Writeback:          <span class="m">8192</span> kB        <span class="c"># being written at this moment</span></pre>
+
+  <h2>Making data durable</h2>
+  <p>A program that needs its data to survive must say so.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Call or flag</th><th>What it does</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td><code>fsync(fd)</code></td><td>Writes this file's dirty pages and metadata, tells the drive to empty its own write cache, and returns only when all of that is done</td><td>The standard way to make a file durable</td></tr>
+        <tr><td><code>fdatasync(fd)</code></td><td>The same, but skips metadata that isn't needed to read the data back, such as the modification time</td><td>Slightly cheaper; what databases usually call</td></tr>
+        <tr><td><code>O_SYNC</code> / <code>O_DSYNC</code> on <code>open</code></td><td>Every <code>write</code> behaves as if followed by fsync or fdatasync</td><td>Simple and slow</td></tr>
+        <tr><td><code>O_DIRECT</code> on <code>open</code></td><td>Bypasses the page cache: reads and writes go between your buffer and the device</td><td>Databases that keep their own cache. It is about caching, not durability: you still need to sync</td></tr>
+        <tr><td><code>sync()</code></td><td>Starts writeback of everything dirty on the system</td><td>Before unplugging a disk</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>An <code>fsync</code> costs what the disk costs: a fraction of a millisecond on a good SSD, around ten on a spinning disk, because it waits for a real device to confirm. It is the one call in ordinary file I/O that is as slow as hardware. Two things follow from the layers data passes through:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Where the data is</th><th>Process crashes</th><th>Kernel crashes</th><th>Power fails</th></tr></thead>
+      <tbody>
+        <tr><td>In a user-space buffer (<code>printf</code>, <code>fwrite</code> before <code>fflush</code>)</td><td><b>Lost</b></td><td>Lost</td><td>Lost</td></tr>
+        <tr><td>In the page cache (after <code>write</code>)</td><td>Safe: the kernel still has it</td><td><b>Lost</b></td><td>Lost</td></tr>
+        <tr><td>In the drive's write cache</td><td>Safe</td><td>Safe</td><td><b>Lost</b>, unless the drive has power-loss protection</td></tr>
+        <tr><td>On stable storage (after <code>fsync</code> returns)</td><td>Safe</td><td>Safe</td><td>Safe</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The first row catches people out: the C library has its own buffer in front of the kernel's. And the second explains a common surprise in the other direction. A program killed with <code>kill -9</code> loses nothing it had already handed to <code>write()</code>, because the page cache belongs to the kernel, not to the process.</p>
+
+  <h2>Lose some data</h2>
+  <p>A program appends records to a file. Choose when it calls <code>fsync</code>, append some records, and then end things in one of two ways. Compare the time each policy costs with what it loses.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">write(), fsync() and two kinds of crash</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="pcPol"><button class="active" data-v="never">never fsync</button><button data-v="batch">fsync every 4 records</button><button data-v="every">fsync every record</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm primary" id="pcAdd">Append a record</button>
+        <button class="btn sm" id="pcAdd10">Append 10</button>
+        <button class="btn sm" id="pcWait">30 seconds pass</button>
+        <button class="btn sm" id="pcKill">kill -9 the program</button>
+        <button class="btn sm" id="pcPower">⚡ Power cut</button>
+        <button class="btn sm" id="pcReset">↺ Reset</button>
+      </div>
+      <div class="pc-grid" id="pcGrid"></div>
+      <div class="pc-desc" id="pcDesc"></div>
+      <div class="stats" id="pcStats"></div>
+    </div>
+    <div class="panel-foot">A model: a <code>write()</code> costs 2 microseconds and an <code>fsync</code> 2 milliseconds, roughly an SSD. Each record's number is the order in which the program was told its write had succeeded. Amber records are in the page cache only; green ones are on the disk.</div>
+  </div>
+
+  <p>Things to notice. With no <code>fsync</code>, ten records take 20 microseconds and all of them are lost in a power cut, but none in a <code>kill -9</code>: the kernel writes them out a little later as if nothing had happened. Syncing every record makes each one safe the moment the program hears "ok", and costs a thousand times more time. Syncing every four sits in between: at most three acknowledged records are ever at risk, for a quarter of the cost. That middle position, deliberately chosen, is how most databases run.</p>
+
+  <h2>When fsync says no</h2>
+  <div class="callout usecase">
+    <div class="ico">🐘</div>
+    <div class="body"><div class="title">fsyncgate: twenty years of a wrong assumption</div><p>In 2018 a PostgreSQL user, Craig Ringer, investigated a case of silent data corruption on a storage system that had briefly returned errors. The cause shook every database team. PostgreSQL, like most software, assumed that if <code>fsync</code> failed it could try again later, and that a later success meant the data was now safe. Linux didn't work that way. When writeback of a dirty page failed, the kernel reported the error to one <code>fsync</code> call and then marked the page <i>clean</i>, since keeping unwritable pages for ever would exhaust memory. The data existed only in a page that could now be dropped at any time. The next <code>fsync</code> found nothing dirty and returned success. The database concluded a checkpoint was complete and discarded the log records that could have rebuilt the lost pages. On older kernels the single error report could even be delivered to a different process, or to nobody. PostgreSQL's fix was blunt and correct: since version 12, and in the older versions through updates, a failed <code>fsync</code> makes the server crash on purpose and recover from its write-ahead log, which it knows is good. MySQL, MongoDB and others made the same change, and Linux improved how reliably the error is reported. The rule to take away: <b>a failed fsync means that data is gone from the kernel's hands. Never retry it. Treat everything written since the last successful sync as lost.</b></p></div>
+  </div>
+
+  <h2>Durability in databases</h2>
+  <p>A database can't call <code>fsync</code> on its data files for every change: the changed pages are scattered and each sync costs milliseconds. It uses the journal idea of Chapter 24 instead. Every change is first appended to a sequential <b>write-ahead log</b>, and a transaction is acknowledged once the log record is synced. The data files are updated later, at leisure, through the page cache or the database's own. After a crash the log is replayed.</p>
+  <p>The remaining cost is one sync per commit, and <b>group commit</b> removes most of that: transactions that arrive while a sync is in progress wait together and share the next one, so a hundred commits may cost a single <code>fsync</code>. Databases expose the trade-off the panel showed as a setting:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>System</th><th>Setting</th><th>Safest value</th><th>Faster value, and what it risks</th></tr></thead>
+      <tbody>
+        <tr><td>PostgreSQL</td><td><code>synchronous_commit</code></td><td><code>on</code> (default): sync the log before acknowledging</td><td><code>off</code>: acknowledge first; the last fraction of a second of commits can be lost, without corruption</td></tr>
+        <tr><td>MySQL InnoDB</td><td><code>innodb_flush_log_at_trx_commit</code></td><td><code>1</code> (default): sync at every commit</td><td><code>2</code>: write at commit, sync once a second; <code>0</code>: both once a second</td></tr>
+        <tr><td>Redis</td><td><code>appendfsync</code></td><td><code>always</code></td><td><code>everysec</code> (default): up to a second of writes; <code>no</code>: leave it to the kernel, up to 30 seconds</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>None of these choices is wrong. What is wrong is not knowing which one you have.</p>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Treating a successful <code>write()</code> as "saved".</b> It means "in the kernel's memory". Only a successful <code>fsync</code> means "on the disk".</li>
+      <li><b>Ignoring the return value of <code>fsync</code> or <code>close</code>.</b> Errors from delayed writes are reported there and nowhere else.</li>
+      <li><b>Retrying a failed <code>fsync</code>.</b> The pages may already have been marked clean. A later success doesn't mean the data was written.</li>
+      <li><b>Forgetting the directory.</b> A new file's name lives in its directory. Sync the directory too, or the file can be durable and unreachable.</li>
+      <li><b>Benchmarking writes without syncing.</b> You are timing a copy into RAM. Include <code>fsync</code>, or the numbers describe nothing real.</li>
+      <li><b>Reading "used" memory as a shortage.</b> Page cache is counted there and is given up on demand. Look at <code>available</code>.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What happens when a program calls <code>write()</code>, and when is the data safe?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div><code>write()</code> copies the bytes from the program's buffer into the kernel's page cache and marks those pages dirty, then returns. No disk I/O has happened. Kernel flusher threads write dirty pages to the device later: by default within about 30 seconds, or sooner if a lot of memory is dirty. So after <code>write()</code> the data survives the process crashing, because the kernel holds it, but not a kernel panic or a power failure. To make it durable the program calls <code>fsync</code> or <code>fdatasync</code>, which write that file's dirty pages, ask the drive to flush its own cache, and return only when the device confirms. That costs milliseconds, so programs sync at the points where they promise durability, such as a database commit, not after every write. And for a new file you also sync its directory, so the name is durable as well as the contents.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How can a database be both durable and fast when fsync is so slow?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>By syncing less, and syncing something cheap. Changes go first to a write-ahead log, which is append-only, so making a transaction durable means syncing a small sequential write instead of many scattered data pages. The data pages are modified in memory and written back in the background; if the machine crashes, the log is replayed. Then group commit: many concurrent transactions share one <code>fsync</code>, because while one sync is in flight the commits that arrive queue up and are covered by the next, so throughput can be far higher than one over the sync time. Beyond that it is hardware and policy: drives with power-loss protection make sync cheap, and the database can be told to acknowledge before syncing, accepting the loss of the last few hundred milliseconds of commits in a crash in exchange for latency. What a database must not do is ignore sync errors: a failed <code>fsync</code> has to be treated as fatal for that data and recovered from the log.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>All ordinary file I/O goes through the page cache; reads are served from RAM and writes land in RAM.</li>
+      <li><code>write()</code> returns once the data is in the cache. Dirty pages reach the disk by background writeback, up to about 30 seconds later.</li>
+      <li><code>fsync</code> and <code>fdatasync</code> force a file to stable storage and wait; they cost what the device costs.</li>
+      <li>Data in the page cache survives a process crash but not a kernel crash or a power cut.</li>
+      <li>A failed <code>fsync</code> must be treated as data loss, never retried.</li>
+      <li>Databases get durability from a sequential write-ahead log and share each sync among many commits.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A program's <code>write()</code> call returns successfully. Where is the data guaranteed to be?</p>
+      <div class="opts">
+        <button class="opt">On the disk's platter or flash</button>
+        <button class="opt">In the kernel's page cache, marked dirty</button>
+        <button class="opt">In the drive's write cache</button>
+        <button class="opt">In the file system's journal</button>
+      </div>
+      <div class="explain">write copies into kernel memory and returns. Writeback to the device happens later, or when the program asks with fsync.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A program writes 100 records with <code>write()</code>, never calls <code>fsync</code>, and is then killed with <code>kill -9</code>. The machine keeps running. What happens to the records?</p>
+      <div class="opts">
+        <button class="opt">All are lost</button>
+        <button class="opt">Only those in the last 30 seconds are lost</button>
+        <button class="opt">None are lost: they are in the kernel's page cache and will be written back</button>
+        <button class="opt">They are lost unless the file was opened with <code>O_DIRECT</code></button>
+      </div>
+      <div class="explain">The page cache belongs to the kernel and outlives the process. A power cut or kernel crash would be a different story.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does <code>fsync(fd)</code> guarantee when it returns successfully?</p>
+      <div class="opts">
+        <button class="opt">That file's data and metadata have been written to the device and the device has been told to flush its cache</button>
+        <button class="opt">All dirty pages on the whole system are on disk</button>
+        <button class="opt">The data has been copied into the page cache</button>
+        <button class="opt">The file can no longer be modified</button>
+      </div>
+      <div class="explain">It covers one file and waits for the device. Syncing everything is <code>sync()</code>.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">An <code>fsync</code> call returns an error. What should a program that cares about its data do?</p>
+      <div class="opts">
+        <button class="opt">Call <code>fsync</code> again until it succeeds</button>
+        <button class="opt">Ignore it; the kernel will retry</button>
+        <button class="opt">Close and reopen the file, then continue</button>
+        <button class="opt">Treat the data written since the last successful sync as lost, and recover from a source it trusts</button>
+      </div>
+      <div class="explain">After a failed writeback the kernel may mark the pages clean, so a retry can report success with the data never written.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What is group commit?</p>
+      <div class="opts">
+        <button class="opt">Committing several tables in one transaction</button>
+        <button class="opt">Letting many transactions that are waiting to commit share a single <code>fsync</code> of the log</button>
+        <button class="opt">Writing data pages before the log</button>
+        <button class="opt">Replicating a commit to several servers</button>
+      </div>
+      <div class="explain">While one sync is in progress, later commits queue up and are all made durable by the next sync, dividing its cost among them.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const WRITE_US = 2, SYNC_US = 2000;
+  let policy = 'never', recs, alive, powered, sinceSync, time, syncs, last;
+  function reset() { recs = []; alive = true; powered = true; sinceSync = 0; time = 0; syncs = 0; last = null; }
+  const dirty = () => recs.filter((r) => r.at === 'cache');
+  function fsync() { recs.forEach((r) => { if (r.at === 'cache') r.at = 'disk'; }); time += SYNC_US; syncs++; sinceSync = 0; }
+  function add(n) {
+    let synced = 0;
+    for (let i = 0; i < n; i++) {
+      recs.push({ id: recs.length + 1, at: 'cache' }); time += WRITE_US; sinceSync++;
+      if (policy === 'every' || (policy === 'batch' && sinceSync >= 4)) { fsync(); synced++; }
+    }
+    const d = dirty().length;
+    last = { cls: d ? 'pc-warn' : 'pc-ok', text: `${n === 1 ? 'Record ' + recs.length + ' was' : n + ' records were'} written with <code>write()</code>, which returned at once. ` + (synced ? `<code>fsync</code> was called ${synced === 1 ? 'once' : synced + ' times'}, each waiting about 2 ms for the disk. ` : 'No <code>fsync</code> was called. ') + (d ? `<b>${d} acknowledged record${d > 1 ? 's are' : ' is'} in the page cache only.</b>` : '<b>Everything acknowledged is on the disk.</b>') };
+  }
+  function fmtTime(us) { return us >= 1000 ? (us / 1000).toFixed(us % 1000 ? 2 : 0) + '<small> ms</small>' : us + '<small> µs</small>'; }
+  function render() {
+    const chip = (r) => `<span class="pc-chip ${r.at === 'cache' ? 'pc-dirty' : r.at === 'disk' ? 'pc-safe' : 'pc-lost'}">${r.id}</span>`;
+    const list = (xs) => xs.length ? `<div class="pc-chips">${xs.map(chip).join('')}</div>` : '<span class="pc-none">nothing</span>';
+    const lost = recs.filter((r) => r.at === 'lost');
+    $('#pcGrid').innerHTML =
+      `<div class="pc-box ${alive ? '' : 'pc-dead'}"><h6>The program</h6><small>${!powered ? 'gone' : alive ? 'running' : 'killed'}</small><div class="pc-none">${recs.length} record${recs.length === 1 ? '' : 's'} written and acknowledged</div></div>` +
+      `<div class="pc-box ${powered ? '' : 'pc-dead'}"><h6>Page cache</h6><small>kernel memory: dirty pages${powered ? '' : ' (wiped)'}</small>${powered ? list(dirty()) : list(lost)}</div>` +
+      `<div class="pc-box"><h6>Disk</h6><small>survives everything</small>${list(recs.filter((r) => r.at === 'disk'))}</div>`;
+    const d = $('#pcDesc');
+    d.className = 'pc-desc ' + (last ? last.cls : '');
+    d.innerHTML = last ? last.text : 'The file is empty. Append some records.';
+    const safe = recs.filter((r) => r.at === 'disk').length;
+    $('#pcStats').innerHTML = `<div class="stat"><div class="k">Acknowledged</div><div class="v">${recs.length}</div></div>
+      <div class="stat good"><div class="k">On disk</div><div class="v">${safe}</div></div>
+      <div class="stat ${dirty().length ? 'warn' : ''}"><div class="k">At risk</div><div class="v">${dirty().length}</div></div>
+      <div class="stat ${lost.length ? 'bad' : ''}"><div class="k">Lost</div><div class="v">${lost.length}</div></div>
+      <div class="stat acc"><div class="k">Time in I/O calls</div><div class="v" style="font-size:18px">${fmtTime(time)}</div></div>
+      <div class="stat"><div class="k">fsync calls</div><div class="v">${syncs}</div></div>`;
+    $('#pcAdd').disabled = $('#pcAdd10').disabled = $('#pcKill').disabled = !alive || !powered;
+    $('#pcWait').disabled = $('#pcPower').disabled = !powered;
+  }
+  $('#pcAdd').onclick = () => { add(1); render(); };
+  $('#pcAdd10').onclick = () => { add(10); render(); };
+  $('#pcWait').onclick = () => {
+    const n = dirty().length; recs.forEach((r) => { if (r.at === 'cache') r.at = 'disk'; }); sinceSync = 0;
+    last = { cls: 'pc-ok', text: n ? `Thirty seconds go by. The kernel's flusher threads notice ${n} page${n > 1 ? 's' : ''} that ${n > 1 ? 'have' : 'has'} been dirty too long and write ${n > 1 ? 'them' : 'it'} to the disk. The program did nothing and waited for nothing.` + (alive ? '' : ' The program that wrote them is long dead; the kernel finished the job anyway.') : 'Thirty seconds go by. Nothing was dirty, so there is nothing to write.' };
+    render();
+  };
+  $('#pcKill').onclick = () => {
+    alive = false; const n = dirty().length;
+    last = { cls: n ? 'pc-warn' : 'pc-ok', text: '<b>The program is killed.</b> Its memory is gone, but the page cache is the kernel\'s, not the program\'s. ' + (n ? `The ${n} unsynced record${n > 1 ? 's are' : ' is'} still there, still dirty, and will be written back as usual. <b>Nothing has been lost.</b> Let 30 seconds pass.` : 'Everything was already on disk.') };
+    render();
+  };
+  $('#pcPower').onclick = () => {
+    powered = false; alive = false; let n = 0;
+    recs.forEach((r) => { if (r.at === 'cache') { r.at = 'lost'; n++; } });
+    last = n ? { cls: 'pc-bad', text: `<b>The power fails.</b> Memory is wiped, the page cache with it. <b>${n} record${n > 1 ? 's' : ''} that the program had been told ${n > 1 ? 'were' : 'was'} written ${n > 1 ? 'are' : 'is'} gone</b>: every <code>write()</code> returned success, and none of ${n > 1 ? 'them' : 'it'} reached the disk.` + (policy === 'batch' ? ' With a sync every 4 records, that can never be more than 3.' : '') }
+      : { cls: 'pc-ok', text: '<b>The power fails.</b> Memory is wiped, but there was nothing in the page cache that wasn\'t already on the disk. <b>Nothing is lost.</b>' };
+    render();
+  };
+  $('#pcReset').onclick = () => { reset(); render(); };
+  $('#pcPol').addEventListener('segchange', (e) => { policy = e.detail; reset(); render(); });
+  reset(); render();
+})();
+</script>
 </body>
 </html>

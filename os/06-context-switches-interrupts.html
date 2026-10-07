@@ -6,34 +6,285 @@
 <title>Context Switches &amp; Interrupts</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .cs-ctl { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:12px; }
+  @media (max-width:760px) { .cs-ctl { grid-template-columns:1fr; } }
+  .cs-ctl label { font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); display:block; }
+  .cs-ctl input { width:100%; accent-color:var(--accent); margin-top:6px; }
+  .cs-ctl .v { font-family:var(--mono); font-size:13px; color:var(--text); text-transform:none; letter-spacing:0; float:right; }
+  .cs-svg { width:100%; height:auto; display:block; margin-top:12px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; }
+  .cs-svg text { font-family:var(--mono); font-size:9px; fill:var(--muted); }
+  .cs-svg .cs-lbl { fill:var(--text-2); font-size:9.5px; }
+  .cs-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); }
+  .cs-res.cs-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .cs-res.cs-ok { background:var(--green-soft); border-left-color:var(--green); }
+</style>
 </head>
 <body data-chapter="6">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 6</span><span class="pill">Beginner</span><span class="pill">⏱ 40 min</span></div>
     <h1>Context Switches &amp; <span class="grad">Interrupts</span></h1>
-    <p class="lead">Timer interrupts, saving and restoring registers, and why a context switch costs microseconds.</p>
+    <p class="lead">A CPU core runs one thread at a time. To make 300 threads look like they run together, the kernel has to stop one, save everything about where it was, and start another, thousands of times a second. The trigger is usually an interrupt: a timer firing, a packet arriving, a disk finishing. This chapter shows how an interrupt takes the CPU away from whatever is running, what a context switch actually saves and restores, what it costs (the direct part is small; the cache damage often isn't), and how the kernel keeps interrupt handlers short.</p>
+    <ul class="objectives">
+      <li>Explain what happens in hardware and in the kernel when an interrupt arrives</li>
+      <li>Describe what a context switch saves and restores, and what changes between a thread switch and a process switch</li>
+      <li>Estimate the direct and indirect cost of switching, and when it starts to matter</li>
+      <li>Measure context switches with <code>vmstat</code>, <code>pidstat</code> and <code>/proc</code></li>
+      <li>Explain top halves, bottom halves and why NAPI polls the network card</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Registers, <code>rip</code>, <code>rsp</code> and the instruction cycle.</b> See <a href="p3-how-cpu-runs-code.html">P3</a>.</li>
+        <li><b>Caches and why a cold cache is slow.</b> See <a href="p4-memory-hierarchy.html">P4</a>.</li>
+        <li><b>Entering the kernel; the PCB; run queues.</b> See <a href="02-kernel-user-mode-syscalls.html">Chapter 2</a> and <a href="04-process-states-pcb.html">Chapter 4</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Hardware interrupts and the timer</li>
-    <li>Saving and restoring context</li>
-    <li>Process vs thread switch cost</li>
-    <li>Measuring switches with vmstat</li>
-    <li>Top halves and bottom halves</li>
-  </ol>
+  <h2>Interrupts: the hardware taps the CPU on the shoulder</h2>
+  <p>Devices don't wait to be asked. When a network card has received packets, a disk has finished a read or the local timer has counted down, it raises an <b>interrupt</b>. Between two instructions the CPU checks for pending interrupts (the last step of the cycle in <a href="p3-how-cpu-runs-code.html">P3</a>), and if one is pending and interrupts are enabled, it saves the current <code>rip</code>, <code>rsp</code> and flags on the kernel stack, switches to kernel mode if needed, and jumps to the handler for that interrupt's vector, looked up in the <b>interrupt descriptor table</b> the kernel set up at boot.</p>
+  <p>The <b>timer interrupt</b> is the one that makes multitasking work. Each core's local APIC timer fires periodically (Linux's <code>CONFIG_HZ</code> is commonly 250 or 1,000 times a second), and on each tick the kernel updates the running task's CPU time and asks the scheduler whether someone else should run. Idle cores turn the periodic tick off ("tickless", <code>NO_HZ</code>) to save power, and dedicated cores can even run with almost no ticks for latency-sensitive work.</p>
+<pre class="code"><span class="c">$</span> head -<span class="m">3</span> /proc/interrupts            <span class="c"># per-CPU counts of each interrupt since boot</span>
+            CPU0       CPU1       CPU2       CPU3
+ LOC:   <span class="m">81234567</span>   <span class="m">80119876</span>   <span class="m">79876543</span>   <span class="m">80555432</span>   Local timer interrupts
+ <span class="m">125</span>:    <span class="m">9123456</span>          <span class="m">0</span>    <span class="m">8811203</span>          <span class="m">0</span>   PCI-MSI  nvme0q1  (one queue per CPU)
+<span class="c">$</span> grep CONFIG_HZ= /boot/config-$(uname -r)
+CONFIG_HZ=<span class="m">250</span></pre>
+
+  <h2>What a context switch saves and restores</h2>
+  <p>A <b>context switch</b> is the kernel stopping one task and resuming another on the same CPU. It happens for two reasons: the running task <b>blocks</b> (a voluntary switch: it called <code>read()</code> and there was nothing to read) or it is <b>preempted</b> (an involuntary switch: the timer says its turn is over, or a higher-priority task woke up). Either way, by the time the switch happens the task is already in kernel mode with its user registers saved on its kernel stack, so the switch itself is surprisingly small:</p>
+<pre class="code"><span class="c">/* The shape of Linux's schedule() → context_switch(), heavily simplified. */</span>
+<span class="k">void</span> <span class="f">context_switch</span>(<span class="k">struct</span> task_struct *prev, <span class="k">struct</span> task_struct *next) {
+	<span class="k">if</span> (prev-&gt;mm != next-&gt;mm)
+		<span class="f">switch_mm</span>(prev-&gt;mm, next-&gt;mm);   <span class="c">/* different process: load next's page tables (write CR3) */</span>
+	<span class="f">switch_to</span>(prev, next);               <span class="c">/* save prev's callee-saved registers and stack pointer
+	                                        into prev-&gt;thread, load next's, jump into next */</span>
+	<span class="c">/* ... when prev is eventually switched back in, it resumes HERE */</span>
+}</pre>
+  <figure class="seq" data-actors="thread A (user)|CPU|kernel: schedule()|thread B">
+    <ol>
+      <li data-m="0>0">running user code</li>
+      <li data-m="1>2" data-k="async">timer interrupt: save A's user rip/rsp/regs on A's kernel stack</li>
+      <li data-m="2>2">update A's runtime; is someone else due? yes: B</li>
+      <li data-m="2>2">switch_mm: same process? skip. Different? load B's page tables</li>
+      <li data-m="2>2">switch_to: save A's kernel rsp in A's task_struct; load B's</li>
+      <li data-m="2>3" data-k="reply">return along B's kernel stack; restore B's user registers; iret/sysret</li>
+      <li data-m="3>3">B continues exactly where it was preempted earlier</li>
+    </ol>
+    <figcaption><b>A preemptive switch.</b> The trick is in <code>switch_to</code>: swapping the kernel stack pointer swaps "where we return to". A's state stays parked on A's kernel stack until it's chosen again.</figcaption>
+  </figure>
+  <p>The floating-point and vector registers (which can be hundreds of bytes with AVX-512) are also saved and restored, and switching to a task of a <i>different process</i> changes the page tables. Older CPUs had to flush the whole TLB on that page-table change; x86 PCIDs and ARM ASIDs tag TLB entries by address space so they can survive (<a href="13-tlb.html">Chapter 13</a>).</p>
+
+  <h2>What switching costs</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Operation</th><th>Rough cost</th><th>Where the time goes</th></tr></thead>
+      <tbody>
+        <tr><td>Function call</td><td>~1 ns</td><td>A <code>call</code> and a <code>ret</code></td></tr>
+        <tr><td>System call (no switch)</td><td>~0.1–0.3 µs</td><td>Mode change, mitigations (<a href="02-kernel-user-mode-syscalls.html">Chapter 2</a>)</td></tr>
+        <tr><td>Thread switch, same process</td><td>~1–2 µs direct</td><td>Scheduler decision, register save/restore, FPU state</td></tr>
+        <tr><td>Process switch</td><td>~2–4 µs direct</td><td>All of the above plus loading new page tables</td></tr>
+        <tr><td>Indirect cost afterwards</td><td>~0 to hundreds of µs</td><td>The new task finds L1/L2 and TLB full of the old task's data and refills them from L3 or DRAM</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The direct cost is small enough that a few thousand switches per second per core are noise. The <b>indirect</b> cost is the one that bites, and it depends on how much data each task touches: a task with a 1 MiB working set that gets switched out finds most of it gone from L2 when it comes back. Shorter time slices mean more switches and more refills; that's the trade-off between responsiveness and throughput every scheduler makes (<a href="07-scheduling-basics.html">Chapter 7</a>). Explore it:</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Switching overhead: 40 ms on one core</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="csKind"><button class="active" data-v="t">Threads of one process</button><button data-v="p">Separate processes</button></div>
+      </div>
+      <div class="cs-ctl">
+        <label>Time slice <span class="v" id="csSliceV"></span><input type="range" id="csSlice" min="0" max="7" value="4"></label>
+        <label>Runnable tasks on this core <span class="v" id="csNV"></span><input type="range" id="csN" min="2" max="8" value="3"></label>
+        <label>Working set per task <span class="v" id="csWsV"></span><input type="range" id="csWs" min="0" max="6" value="3"></label>
+      </div>
+      <svg class="cs-svg" id="csSvg" viewBox="0 0 640 170" role="img" aria-label="CPU timeline"></svg>
+      <div class="stats" id="csStats"></div>
+      <div class="cs-res" id="csRes"></div>
+    </div>
+    <div class="panel-foot">A simple model: direct cost 1.5 µs (thread) or 3 µs (process), plus a refill cost of the working set, capped at a 2 MiB L2, at about 5 ns per 64-byte line. Real numbers vary; the trends don't. Red slivers are switching time, drawn wider than scale so you can see them.</div>
+  </div>
+
+  <h2>Measuring switches</h2>
+<pre class="code"><span class="c">$</span> vmstat <span class="m">1</span>                       <span class="c"># cs = context switches per second, whole machine</span>
+procs -----------memory---------- ---system-- ------cpu-----
+ r  b   swpd   free   buff  cache   <span class="k">in</span>   cs us sy id wa st
+ <span class="m">6</span>  <span class="m">0</span>      <span class="m">0</span> <span class="m">812344</span>  <span class="m">94120</span> <span class="m">5122340</span> <span class="m">18210</span> <span class="m">42733</span> <span class="m">61</span> <span class="m">14</span> <span class="m">25</span>  <span class="m">0</span>  <span class="m">0</span>
+<span class="c">$</span> pidstat -w -p <span class="m">4120</span> <span class="m">1</span>           <span class="c"># per process: voluntary vs involuntary switches per second</span>
+  PID   cswch/s nvcswch/s  Command
+ <span class="m">4120</span>   <span class="m">9123</span>.<span class="m">00</span>    <span class="m">412</span>.<span class="m">00</span>  java
+<span class="c">$</span> grep ctxt /proc/<span class="m">4120</span>/status    <span class="c"># lifetime totals, as in Chapter 4</span></pre>
+  <p>Read the two kinds separately. Many <b>voluntary</b> switches (<code>cswch/s</code>) mean the task blocks a lot: normal for an I/O-heavy server, suspicious if it's lock contention. Many <b>involuntary</b> switches (<code>nvcswch/s</code>) mean it's being preempted while it still wants the CPU: too many runnable threads for the cores, or a CPU limit throttling it (<a href="38-tail-latency.html">Chapter 38</a>). <code>vmstat</code>'s <code>r</code> column, runnable tasks, consistently above the core count is the same story from the machine's side.</p>
+
+  <h2>Top halves and bottom halves</h2>
+  <p>While an interrupt handler runs, further interrupts on that core are usually held off, and whatever task was running is stuck. So Linux splits interrupt work in two. The <b>top half</b>, the handler itself, does the bare minimum: acknowledge the device, grab the data or note that it's ready, and schedule the rest. The <b>bottom half</b> does the real processing a little later with interrupts enabled: as a <b>softirq</b> (used by networking and block I/O), a <b>tasklet</b>, or a <b>workqueue</b> item or threaded handler running in a kernel thread, which is even allowed to sleep.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Packet arrives</b> The NIC copies it into RAM by DMA and raises an interrupt.</li>
+      <li><b>Top half (microseconds)</b> Acknowledge the NIC, disable its interrupt, schedule the NET_RX softirq.</li>
+      <li><b>Bottom half: softirq</b> Poll the NIC's receive ring, build packet buffers, run IP and TCP processing.</li>
+      <li data-k="decision"><b>Ring empty within budget?</b> Yes: re-enable the NIC's interrupt. No: keep polling (heavy load).</li>
+      <li data-k="end"><b>Wake the reader</b> Data is queued on the socket; the waiting thread is woken (<a href="04-process-states-pcb.html">Chapter 4</a>).</li>
+    </ol>
+    <figcaption><b>Receiving a packet on Linux (NAPI).</b> Under load the kernel stops taking an interrupt per packet and polls instead.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🌊</div>
+    <div class="body"><div class="title">Receive livelock, and why Linux polls the network card</div><p>In the 1990s, researchers (Mogul and Ramakrishnan, 1996) documented <b>receive livelock</b>: under a flood of packets, a machine spent all its time in interrupt handlers accepting packets and none processing them, so throughput collapsed to zero exactly when load was highest. Each interrupt was cheap; a hundred thousand a second was not. Linux's answer, NAPI, merged in the early 2000s, is the flow above: the first packet's interrupt switches the driver to polling mode, the softirq drains the receive ring in batches with a budget per round, and interrupts come back only when the ring is empty. Modern NICs add interrupt coalescing (one interrupt per batch or per few microseconds) and multiple queues with a separate interrupt per core. It's the same lesson as batching system calls: per-event overhead must not grow with load.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Equating a system call with a context switch.</b> A syscall changes mode on the same thread; a switch changes which thread runs. A non-blocking syscall involves no switch.</li>
+      <li><b>Ignoring the indirect cost.</b> Microbenchmarks of switching measure the direct microseconds; real services pay in cache and TLB misses afterwards.</li>
+      <li><b>Running thousands of busy threads on a few cores.</b> Involuntary switches and cache thrash grow; use a pool sized to the cores for CPU work (<a href="27-thread-pools.html">Chapter 27</a>).</li>
+      <li><b>Doing slow work in an interrupt handler</b> (in a driver): it delays everything on that core. Defer it to a bottom half.</li>
+      <li><b>Reading high <code>cs</code> alone as a problem.</b> 50,000 voluntary switches per second can be a healthy, busy I/O server; check involuntary switches and run-queue length too.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What happens during a context switch?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The current task is already in the kernel, either because it blocked in a system call or because a timer interrupt arrived, so its user registers are saved on its kernel stack. The scheduler picks the next task. If that task belongs to a different process, the kernel loads its page tables. Then <code>switch_to</code> saves the current task's callee-saved registers and kernel stack pointer into its <code>task_struct</code> and loads the next task's, so returning now unwinds the next task's kernel stack, restores its user registers and drops back to user mode where it left off. FPU and vector state are saved and restored too.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why is switching between threads of one process cheaper than between processes, and is it always?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Threads share an address space, so the kernel skips loading new page tables, and the TLB entries and much of the cache content (shared code and data) stay useful. A process switch loads new page tables, and without PCIDs that flushed the TLB; with PCIDs entries survive, but the new process still touches entirely different memory, so it misses more in caches and the TLB. It isn't always a big difference: if two threads of the same process work on completely different data, the cache refill dominates either way, and that indirect cost is usually larger than the direct microseconds of the switch.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Interrupts let devices and the timer take the CPU between any two instructions; the timer tick drives preemptive scheduling.</li>
+      <li>A switch saves the old task's registers and kernel stack pointer in its PCB and loads the next task's; a process switch also loads page tables.</li>
+      <li>Direct cost is a few microseconds; the indirect cost of cold caches and TLBs is often larger.</li>
+      <li>Voluntary switches mean blocking; involuntary ones mean preemption. <code>vmstat</code>, <code>pidstat -w</code> and <code>/proc</code> show both.</li>
+      <li>Interrupt handlers do the minimum (top half) and defer the rest (softirqs, workqueues); NAPI polls under load to avoid livelock.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What lets the kernel take the CPU away from a thread that never makes a system call?</p>
+      <div class="opts">
+        <button class="opt">The thread's stack overflows</button>
+        <button class="opt">The periodic timer interrupt, which enters the kernel and lets the scheduler preempt it</button>
+        <button class="opt">The MMU</button>
+        <button class="opt">Nothing: such threads run forever</button>
+      </div>
+      <div class="explain">The timer fires regardless of what the thread is doing, so the kernel always regains control.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What is the extra step when switching to a thread of a different process?</p>
+      <div class="opts">
+        <button class="opt">Copying the new process's memory</button>
+        <button class="opt">Reloading the program from disk</button>
+        <button class="opt">Restarting the scheduler</button>
+        <button class="opt">Loading the new process's page tables (on x86, writing CR3)</button>
+      </div>
+      <div class="explain">Threads of one process share an address space; a different process needs its own page tables, which also affects the TLB.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q"><code>pidstat -w</code> shows a CPU-heavy service with a high <code>nvcswch/s</code>. What does that suggest?</p>
+      <div class="opts">
+        <button class="opt">It's frequently preempted while still runnable: more runnable threads than cores, or CPU throttling</button>
+        <button class="opt">It blocks on I/O constantly</button>
+        <button class="opt">It is leaking memory</button>
+        <button class="opt">It has crashed</button>
+      </div>
+      <div class="explain">Non-voluntary switches happen when the task wanted to keep running. Voluntary ones (cswch) come from blocking.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why does Linux split interrupt handling into a top half and a bottom half?</p>
+      <div class="opts">
+        <button class="opt">To run interrupt handlers in user space</button>
+        <button class="opt">Because devices require two acknowledgements</button>
+        <button class="opt">To keep the part that runs with interrupts held off as short as possible, deferring the heavy work to run later with interrupts enabled</button>
+        <button class="opt">To handle each interrupt twice for reliability</button>
+      </div>
+      <div class="explain">Long top halves delay other interrupts and the interrupted task. Softirqs, tasklets and workqueues carry the rest.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Halving the time slice on a busy core with large working sets usually…</p>
+      <div class="opts">
+        <button class="opt">doubles throughput</button>
+        <button class="opt">improves responsiveness but increases switching and cache-refill overhead, lowering throughput</button>
+        <button class="opt">has no effect</button>
+        <button class="opt">eliminates context switches</button>
+      </div>
+      <div class="explain">More, shorter turns mean each task waits less for its next turn but pays the switch and refill cost more often.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const SLICES = [0.1, 0.25, 0.5, 1, 3, 6, 12, 24];        // ms
+  const WS = [16, 64, 256, 1024, 2048, 8192, 32768];        // KiB
+  let kind = 't';
+  const COL = ['var(--green)', 'var(--accent-2)', 'var(--pink)', 'var(--accent)', 'var(--text-2)', 'var(--amber)', 'var(--red)', 'var(--muted)'];
+  function draw() {
+    const slice = SLICES[+$('#csSlice').value] * 1000, n = +$('#csN').value, ws = WS[+$('#csWs').value];
+    $('#csSliceV').textContent = SLICES[+$('#csSlice').value] + ' ms';
+    $('#csNV').textContent = n;
+    $('#csWsV').textContent = ws >= 1024 ? ws / 1024 + ' MiB' : ws + ' KiB';
+    const direct = kind === 't' ? 1.5 : 3;                           // µs
+    const refill = Math.min(ws, 2048) * 1024 / 64 * 0.005;           // µs: lines × 5 ns
+    const sw = direct + refill, period = slice + sw;
+    const overhead = sw / period;
+    const switchesPerSec = 1e6 / period;
+    const waitMs = (n - 1) * period / 1000;                          // how long each task waits for its next turn
+    // timeline: 40 ms
+    const W = 560, X0 = 70, T = 40000, sx = (us) => X0 + us / T * W;
+    let s = '', t = 0, k = 0;
+    const rowY = (i) => 18 + i * (120 / n);
+    const rh = Math.max(8, 120 / n - 4);
+    for (let i = 0; i < n; i++) s += `<text class="cs-lbl" x="6" y="${rowY(i) + rh / 2 + 4}">${kind === 't' ? 'thread' : 'proc'} ${i + 1}</text>`;
+    let count = 0;
+    while (t < T && count < 4000) {
+      const i = k % n;
+      const w = Math.max(0.6, sx(Math.min(T, t + slice)) - sx(t));
+      s += `<rect x="${sx(t).toFixed(2)}" y="${rowY(i)}" width="${w.toFixed(2)}" height="${rh}" rx="2" fill="${COL[i]}" opacity="0.75"/>`;
+      t += slice;
+      if (t < T) {
+        const sw0 = sx(t), sww = Math.max(1.4, sx(t + sw) - sx(t));
+        s += `<rect x="${sw0.toFixed(2)}" y="10" width="${sww.toFixed(2)}" height="${128}" fill="var(--red)" opacity="0.55"/>`;
+      }
+      t += sw; k++; count++;
+    }
+    s += `<line x1="${X0}" y1="148" x2="${X0 + W}" y2="148" stroke="var(--border-strong)"/>`;
+    [0, 10, 20, 30, 40].forEach((m) => (s += `<text x="${sx(m * 1000) - (m === 40 ? 30 : 6)}" y="162">${m} ms</text>`));
+    $('#csSvg').innerHTML = s;
+    $('#csStats').innerHTML = `
+      <div class="stat"><div class="k">Switches / second</div><div class="v">${OS.fmt(switchesPerSec, 1)}</div></div>
+      <div class="stat"><div class="k">Cost per switch</div><div class="v">${sw.toFixed(1)}<small> µs (${direct} direct)</small></div></div>
+      <div class="stat ${overhead > .1 ? 'bad' : overhead > .02 ? 'warn' : 'good'}"><div class="k">CPU lost to switching</div><div class="v">${(overhead * 100).toFixed(1)}%</div></div>
+      <div class="stat ${waitMs > 50 ? 'bad' : waitMs > 15 ? 'warn' : 'good'}"><div class="k">Wait for next turn</div><div class="v">${waitMs.toFixed(1)}<small> ms</small></div></div>`;
+    const res = $('#csRes');
+    if (overhead > .1) { res.className = 'cs-res cs-bad'; res.innerHTML = `<b>${(overhead * 100).toFixed(0)}% of the core goes on switching.</b> Slices of ${SLICES[+$('#csSlice').value]} ms are too short for ${$('#csWsV').textContent} working sets: each task spends ~${refill.toFixed(0)} µs refilling its caches before doing useful work. Lengthen the slice or run fewer tasks per core.`; }
+    else if (waitMs > 50) { res.className = 'cs-res cs-bad'; res.innerHTML = `Overhead is low (${(overhead * 100).toFixed(1)}%), but each task waits <b>${waitMs.toFixed(0)} ms</b> between turns. Fine for batch jobs; an interactive request would feel sluggish. This tension is the scheduling problem of <a href="07-scheduling-basics.html">Chapter 7</a>.`; }
+    else { res.className = 'cs-res cs-ok'; res.innerHTML = `A balanced setting: ${(overhead * 100).toFixed(1)}% overhead and ${waitMs.toFixed(1)} ms between turns. Linux's fair scheduler aims for a similar balance, with slices of a few milliseconds that shrink as more tasks compete. Now try 0.1 ms slices with an 8 MiB working set.`; }
+  }
+  $('#csKind').addEventListener('segchange', (e) => { kind = e.detail; draw(); });
+  ['#csSlice', '#csN', '#csWs'].forEach((id) => $(id).addEventListener('input', draw));
+  draw();
+})();
+</script>
 </body>
 </html>

@@ -2,7 +2,7 @@
 
 **[captainblue793.github.io/palak-engineering-atlas](https://captainblue793.github.io/palak-engineering-atlas/)**
 
-Every interactive engineering course I've written, in one place — **228 chapters (196 main chapters plus a 32-chapter Prerequisites level), ~168 hours,
+Every interactive engineering course I've written, in one place — **396 chapters (340 main chapters plus a 56-chapter Prerequisites level), ~290 hours,
 zero dependencies**. No walls of text: every chapter has animated diagrams, simulators you can
 break, an interview drill and a quiz. It all runs in your browser, offline, with no account and
 no build step.
@@ -13,8 +13,11 @@ no build step.
 | **[ML & AI Systems](ml-ai-systems/)** | 8 prerequisites + 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
 | **[DSA](dsa/)** | 8 prerequisites + 56 | Every structure and algorithm, in one consistent C++ house style |
 | **[Low-Level Design](lld/)** | 8 prerequisites + 46 | SOLID, design patterns, concurrency and 16 case studies in Java |
+| **[OS & Concurrency](os/)** | 8 prerequisites + 48 | Processes, virtual memory, file systems, locks, epoll and containers in C — plus 8 case studies |
+| **[Computer Networks](networks/)** | 8 prerequisites + 48 | TCP/IP layer by layer, DNS, TLS, HTTP/2 and 3, BGP, CDNs and packet-level debugging in Python and the CLI — plus 8 case studies |
+| **[Database Internals & SQL](databases/)** | 8 prerequisites + 48 | SQL from the first SELECT, then pages, B-trees and LSM trees, query plans, WAL, MVCC, replication and sharding in PostgreSQL and Python — plus 8 case studies |
 
-**On the way:** OS & Concurrency · Computer Networks · Database Internals & SQL · Distributed Systems ·
+**On the way:** Distributed Systems ·
 Cloud & DevOps — see [the plan](docs/superpowers/specs/2026-09-30-atlas-expansion-design.md). The Atlas home
 page also suggests an order through the courses for each kind of role.
 
@@ -32,7 +35,10 @@ palak-engineering-atlas/
 ├── system-design/      ← each course is a self-contained site
 ├── ml-ai-systems/
 ├── dsa/
-└── lld/
+├── lld/
+├── os/
+├── networks/
+└── databases/
 ```
 
 ## What the Atlas adds

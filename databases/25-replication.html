@@ -6,34 +6,343 @@
 <title>Replication</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rp-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .rp-row > span { font-size:12.5px; color:var(--muted); min-width:130px; }
+  .rp-nodes { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:14px; }
+  @media (max-width:640px) { .rp-nodes { grid-template-columns:1fr; } }
+  .rp-node { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; min-width:0; }
+  .rp-node h6 { margin:0 0 6px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); display:flex; justify-content:space-between; gap:8px; }
+  .rp-node h6 b { color:var(--text); text-transform:none; letter-spacing:0; }
+  .rp-tx { display:flex; flex-wrap:wrap; gap:3px; min-height:26px; }
+  .rp-tx i { font-style:normal; font-family:var(--mono); font-size:11px; min-width:24px; text-align:center; padding:2px 4px; border-radius:5px; background:var(--green-soft); border:1px solid var(--green); }
+  .rp-tx i.rp-wait { background:var(--amber-soft); border-color:var(--amber); border-style:dashed; }
+  .rp-tx i.rp-lost { background:var(--red-soft); border-color:var(--red); text-decoration:line-through; }
+  .rp-tx span { font-size:12.5px; color:var(--muted); }
+  .rp-node small { display:block; margin-top:6px; font-size:12px; color:var(--muted); }
+  .rp-node.rp-down { opacity:.5; border-style:dashed; }
+  .rp-node.rp-primary { border-color:var(--accent); }
+  .rp-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--border); min-height:52px; }
+  .rp-msg.rp-good { background:var(--green-soft); border-left-color:var(--green); }
+  .rp-msg.rp-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .rp-msg.rp-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="25">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 25</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
     <h1><span class="grad">Replication</span></h1>
-    <p class="lead">Physical vs logical, synchronous vs asynchronous, replication lag and failover.</p>
+    <p class="lead">A database on one machine is lost when that machine is, and can serve only as many reads as that machine can manage. Replication keeps complete copies of the database on other machines, continuously up to date, or very nearly. The words "very nearly" are where the difficulty lies. A copy that is a fraction of a second behind is good enough to take over after a failure, and it will then be missing the last fraction of a second of commits. A copy that is guaranteed to have everything makes every commit wait for it. This chapter covers how the copies are kept, the choice between waiting and not waiting, what happens to reads from a copy that is behind, and what has to go right when a copy takes over.</p>
+    <ul class="objectives">
+      <li><span>Explain how streaming replication keeps a standby up to date, using the WAL</span></li>
+      <li><span>Compare physical with logical replication, and say what each is used for</span></li>
+      <li><span>Weigh synchronous against asynchronous commit: what each guarantees and what each costs</span></li>
+      <li><span>Explain replication lag, measure it, and handle reads that must see a recent write</span></li>
+      <li><span>Describe a failover, and what split brain is</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The write-ahead log, LSNs and redo:</b> <a href="20-wal-recovery.html">Chapter 20</a>. Replication is recovery that never finishes.</li>
+        <li><b>What COMMIT waits for:</b> <a href="10-transactions-acid.html">Chapter 10</a>.</li>
+        <li><b>Snapshots and VACUUM:</b> <a href="23-mvcc.html">Chapter 23</a>, for the conflicts between a standby's queries and replay.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Streaming (physical) replication</li>
-    <li>Logical replication</li>
-    <li>Sync vs async</li>
-    <li>Replication lag</li>
-    <li>Failover and split brain</li>
-  </ol>
+  <h2>Why replicate</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Purpose</th><th>How a replica serves it</th><th>What it requires</th></tr></thead>
+      <tbody>
+        <tr><td><b>Availability</b></td><td>When the primary fails, a replica is promoted and takes its place</td><td>A way to decide that the primary is really gone, and to stop it coming back as a second primary</td></tr>
+        <tr><td><b>Read capacity</b></td><td>Reads are spread across replicas, and only writes go to the primary</td><td>Tolerance of slightly stale data, or a way to route the reads that can't tolerate it</td></tr>
+        <tr><td><b>Isolation of heavy work</b></td><td>Reports, exports and backups run on a replica</td><td>A replica that may fall behind while they run</td></tr>
+        <tr><td><b>Distance</b></td><td>A replica in another region serves local reads and survives the loss of a data centre</td><td>Acceptance of more lag, or slower commits</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Replication does not protect against mistakes. A <code>DROP TABLE</code> on the primary is faithfully dropped on every replica a few milliseconds later. That is what backups are for (<a href="35-backups-pitr.html">Chapter 35</a>).</p>
+
+  <h2>Streaming (physical) replication</h2>
+  <p><a href="20-wal-recovery.html">Chapter 20</a> showed that a database can rebuild its data files by replaying the log after a crash. <b>Streaming replication</b> uses that directly. A standby starts from a copy of the primary's data files and stays permanently in recovery: the primary sends it the WAL as it is written, over an ordinary connection, and the standby replays it. The standby is the same database, byte for byte, a little behind.</p>
+  <figure class="seq" data-actors="Client|Primary|Standby">
+    <ol>
+      <li data-m="0>1">COMMIT</li>
+      <li data-m="1>1">write the commit record to the WAL, and flush it</li>
+      <li data-m="1>2" data-k="async">stream the WAL<small>Continuously, a few kilobytes at a time.</small></li>
+      <li data-m="1>0" data-k="reply">COMMIT, if asynchronous<small>The client is told at once. The standby may not have the record yet.</small></li>
+      <li data-m="2>2">write the WAL to disk, and flush it</li>
+      <li data-m="2>1" data-k="reply">flushed up to LSN 0/3A4F2D20</li>
+      <li data-m="1>0" data-k="reply">COMMIT, if synchronous<small>The client is told only now.</small></li>
+      <li data-m="2>2" data-k="note">replay the record: the change becomes visible to queries on the standby</li>
+    </ol>
+    <figcaption><b>One commit, two possible moments of acknowledgement.</b> The difference between them is the whole of the next section but one.</figcaption>
+  </figure>
+<pre class="code"><span class="c">-- On the primary: one row for each standby</span>
+<span class="k">SELECT</span> application_name, state, sync_state, sent_lsn, flush_lsn, replay_lsn, replay_lag
+<span class="k">FROM</span> pg_stat_replication;
+<span class="c">--  standby_a | streaming | sync  | 0/3A4F2D20 | 0/3A4F2D20 | 0/3A4F2D20 | 00:00:00.0021</span>
+<span class="c">--  standby_b | streaming | async | 0/3A4F2D20 | 0/3A4E1108 | 0/3A4E1108 | 00:00:00.4130</span></pre>
+  <p>A standby can answer read-only queries while it replays. It can't accept writes of any kind, and it can't have different indexes or tables from the primary, since it is a physical copy.</p>
+
+  <h2>Logical replication</h2>
+  <p><b>Logical replication</b> sends the same changes in a different form. The primary decodes its WAL back into row-level operations, "insert this row into <code>orders</code>, update the row with this key", and a subscriber applies them as ordinary writes to its own, independent database.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Physical (streaming)</th><th>Logical</th></tr></thead>
+      <tbody>
+        <tr><td><b>What is sent</b></td><td>WAL records: changes to bytes on pages</td><td>Row changes: inserts, updates and deletes, by table and key</td></tr>
+        <tr><td><b>The replica is</b></td><td>An identical copy of the whole cluster</td><td>A separate database that receives the tables you choose</td></tr>
+        <tr><td><b>The replica can</b></td><td>Serve reads only</td><td>Have its own tables, indexes and writes</td></tr>
+        <tr><td><b>Versions</b></td><td>Must match exactly</td><td>May differ, which allows an upgrade with almost no downtime</td></tr>
+        <tr><td><b>Schema changes</b></td><td>Replicated like everything else</td><td>Not replicated: you apply them on both sides yourself</td></tr>
+        <tr><td><b>Used for</b></td><td>High availability and read replicas</td><td>Upgrades, moving some tables elsewhere, feeding a warehouse or a search index, change data capture</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c">-- On the source</span>
+<span class="k">CREATE PUBLICATION</span> orders_pub <span class="k">FOR TABLE</span> orders, order_items;
+<span class="c">-- On the destination, which already has those tables</span>
+<span class="k">CREATE SUBSCRIPTION</span> orders_sub
+  <span class="k">CONNECTION</span> <span class="s">'host=primary dbname=shop user=repl'</span> <span class="k">PUBLICATION</span> orders_pub;</pre>
+  <p>MySQL's replication has always been of the logical kind: replicas apply a "binary log" of row changes, separate from the storage engine's own log. That is one reason MySQL has long allowed replicas of a different version, and one of the differences examined in <a href="43-case-uber-postgres-mysql.html">Chapter 43</a>.</p>
+
+  <h2>Sync vs async</h2>
+  <p>When the primary tells a client "committed", how many machines have that commit? The setting <code>synchronous_commit</code> decides, for each transaction if you wish.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th><code>synchronous_commit</code></th><th>COMMIT returns when</th><th>A committed transaction can be lost if</th></tr></thead>
+      <tbody>
+        <tr><td><code>off</code></td><td>The record is in the primary's memory</td><td>The primary crashes within the next fraction of a second</td></tr>
+        <tr><td><code>local</code>, or <code>on</code> with no synchronous standby</td><td>It is flushed to the primary's disk. Standbys receive it afterwards: <b>asynchronous</b> replication</td><td>The primary is lost before the standby has received it</td></tr>
+        <tr><td><code>on</code>, with a synchronous standby</td><td>It is flushed on the primary and on the standby</td><td>Both machines are lost together</td></tr>
+        <tr><td><code>remote_apply</code></td><td>The standby has also replayed it, so a read there will see it</td><td>Both machines are lost together</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Synchronous replication has two costs. Every commit takes at least one round trip to the standby longer, which is under a millisecond in the same data centre and tens of milliseconds between regions (<a href="../networks/38-latency-budgets.html">Networks, Chapter 38</a>). And if the synchronous standby is unreachable, commits can't complete. A cluster with one synchronous standby is <i>less</i> available for writes than a single machine, since it now needs both to be up. The usual answer is to have two or more candidates and wait for any one:</p>
+<pre class="code">synchronous_standby_names = <span class="s">'ANY 1 (standby_a, standby_b)'</span>     <span class="c"># a quorum: either one will do</span></pre>
+
+  <h2>Try it: commit, lag and failover</h2>
+  <p>A primary and one standby. Commit some transactions, change the state of the standby, read from it, and then lose the primary and see what the standby has.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">One primary, one standby</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="rp-row"><span>COMMIT waits for</span><div class="seg" id="rpMode"><button class="active" data-v="async">the primary only: asynchronous</button><button data-v="sync">the standby as well: synchronous</button></div></div>
+      <div class="rp-row"><span>The standby is</span><div class="seg" id="rpLink"><button class="active" data-v="ok">keeping up</button><button data-v="lag">slow: lagging</button><button data-v="down">disconnected</button></div></div>
+      <div class="controls">
+        <button class="btn sm primary" id="rpCommit">Commit a transaction</button>
+        <button class="btn sm" id="rpRead">Read from the standby</button>
+        <button class="btn sm" id="rpFail" style="border-color:var(--red);color:var(--red)">💥 Lose the primary, promote the standby</button>
+        <button class="btn sm ghost" id="rpReset">↺ Reset</button>
+      </div>
+      <div class="rp-nodes">
+        <div class="rp-node" id="rpP"></div>
+        <div class="rp-node" id="rpS"></div>
+      </div>
+      <div class="rp-msg" id="rpMsg"></div>
+      <div class="stats" id="rpStats"></div>
+    </div>
+    <div class="panel-foot">Each numbered box is a transaction. On the primary, a solid box has been acknowledged to its client and a dashed one is still waiting for the standby. The standby is in the same data centre, 1 ms away, so a synchronous commit costs about 2 ms more when the standby is healthy.</div>
+  </div>
+
+  <p>Things to notice. Asynchronous, with the standby keeping up: commits take 1 ms, and losing the primary loses nothing. Asynchronous and lagging: commits are just as fast, a read from the standby is three transactions out of date, and a failover loses three transactions that their clients were told had committed. Asynchronous and disconnected: the primary carries on without complaint, and the standby falls further behind with every commit. Synchronous and healthy: 3 ms, and a failover loses nothing, by construction. Synchronous with a slow standby: nothing is lost and every commit takes 400 ms, because each one waits for the slow machine. Synchronous and disconnected: the commit doesn't return. Nothing is lost and nothing can be written either. Asynchronous replication can lose commits it has acknowledged, and synchronous replication stops acknowledging when the standby is unreachable. A second standby with a quorum is the usual way to have neither problem.</p>
+
+  <h2>Replication lag</h2>
+  <p>An asynchronous standby is always some distance behind, and the distance varies. It grows when the primary writes faster than the standby can replay: replay on a standby is largely done by one process, where the primary's writes came from hundreds of sessions at once. It grows when a query on the standby needs old row versions that replay wants to remove, and replay has to wait. And it grows after any single large transaction.</p>
+  <p>Lag causes a bug that every application with read replicas meets. A user saves a change, which goes to the primary. The page reloads, and that read goes to a replica which hasn't yet received the change. The user sees their old data and concludes that the save failed.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Remedy for "read your own writes"</th><th>How</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><b>Read from the primary after writing</b></td><td>For a few seconds after a user writes, send that user's reads to the primary</td><td>Simple. The primary gets more reads</td></tr>
+        <tr><td><b>Wait for the replica to catch up</b></td><td>Remember the LSN of the write, and have the replica wait until it has replayed that far before answering</td><td>Exact. Adds the lag to that request's latency</td></tr>
+        <tr><td><b><code>remote_apply</code> for chosen transactions</b></td><td>The commit itself waits until the replica has applied it</td><td>Slows the write, and needs the replica to be available</td></tr>
+        <tr><td><b>Don't use replicas for that data</b></td><td>Route by kind of query: account pages to the primary, catalogue browsing to replicas</td><td>Needs the application to know which is which</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Failover and split brain</h2>
+  <p>Promoting a standby is one command, and it takes a second or two. Everything round it is harder.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>The primary stops answering</b> health checks fail from a monitor</li>
+      <li data-k="decision"><b>Is it really dead?</b> or slow, or cut off from the monitor alone? Several observers must agree, and a timeout must pass</li>
+      <li data-k="fail"><b>Fence the old primary</b> make certain it can't accept writes: power it off, revoke its address, or let it lose a lease it must hold to stay primary</li>
+      <li data-k="step"><b>Choose the most advanced standby</b> the one with the highest replayed LSN</li>
+      <li data-k="step"><b>Promote it</b> it finishes replaying what it has and opens for writes</li>
+      <li data-k="step"><b>Redirect clients</b> through DNS, a virtual address or a proxy (<a href="../networks/46-case-lb-failover.html">Networks, Chapter 46</a>)</li>
+      <li data-k="end"><b>Rebuild the old primary as a standby</b> it can't simply rejoin if it has transactions the new primary never received</li>
+    </ol>
+    <figcaption><b>A failover.</b> The third step is the one most often skipped, and skipping it leads to the failure described next.</figcaption>
+  </figure>
+  <p><b>Split brain</b> is the state in which two machines both believe they are the primary and both accept writes. It happens when the old primary wasn't dead, only unreachable from wherever the decision was made. Each now has commits the other lacks, and there is no automatic way to merge two diverged histories: somebody has to decide which writes to keep. Preventing it requires that at most one machine can ever hold the right to be primary, which is a consensus problem, and tools such as Patroni solve it by keeping a lock in a consensus store like etcd. <a href="44-case-github-mysql-failover.html">Chapter 44</a> follows a real failover in which 43 seconds of network trouble led to a day of reconciling two sets of writes.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🪞</div>
+    <div class="body"><div class="title">Facebook's remote markers: knowing when not to trust a replica</div><p>Facebook ran its main database with one region holding the primaries and other regions holding replicas, with a cache in front of the databases in each region. A user in a replica region who changed something, a profile picture for instance, had the write sent across the country to the primary, and their next page view was served from the local cache and the local replica. Replication between regions took a noticeable time, so the local replica often hadn't received the change yet. The user saw the old picture, and worse, the old value was put back into the local cache, where it could stay. In a paper published in 2013 on how they scaled their cache, Facebook's engineers described the fix. When a web server in a replica region performs a write that affects some key, it first sets a small <b>remote marker</b> for that key in the local cache, then sends the write to the primary region, then deletes the key from the local cache. A later request for that key finds nothing cached, looks for a marker, and if one is there sends its read to the primary region and not to the local replica. When the change arrives through replication, the replication stream itself removes the marker. The scheme costs some cross-region reads, only for keys that were just written and only for the short time until the replica has caught up. It is the first row of the table above, done for each key separately. Most systems with replicas need some rule of this kind, since the application can only know that a replica is behind for a particular key by keeping track of what it has just written.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Treating a replica as a backup.</b> It reproduces mistakes and corruption within milliseconds.</li>
+      <li><b>One synchronous standby.</b> Its failure stops all writes. Use a quorum of two or more candidates.</li>
+      <li><b>Reading from replicas without thinking about lag.</b> Users will write, then read, and see the old value.</li>
+      <li><b>No alert on lag, or on unused replication slots.</b> A slot whose standby has gone keeps WAL for ever and fills the primary's disk.</li>
+      <li><b>Automatic failover without fencing.</b> A primary that was only slow comes back, and there are two.</li>
+      <li><b>Never rehearsing a failover.</b> The first one will then happen during an incident, with untested tooling.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the difference between synchronous and asynchronous replication?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is about when the primary acknowledges a commit to the client. With asynchronous replication it acknowledges as soon as the commit is durable on its own disk, and ships the change to replicas afterwards. Commits are as fast as on a single node and don't depend on replicas being up, but a replica is always slightly behind, so if the primary is lost, the most recent acknowledged commits can be lost with it, and reads from a replica can be stale. With synchronous replication the primary waits until at least one replica confirms that it has the commit on disk before acknowledging. A failover then loses no acknowledged commit, at the price of an extra network round trip on every commit and a dependency: if the synchronous replica is unreachable, commits block. So in practice people configure a quorum, any one of two or more replicas, to keep both durability and availability, and they often choose per transaction: synchronous for payments, asynchronous for less critical writes. Note that synchronous in this sense still doesn't make reads on the replica current unless you wait for apply as well as for flush.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> After adding read replicas, users report that they sometimes don't see changes they have just made. What is happening, and what are your options?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>That is replication lag breaking read-your-writes consistency. The write goes to the primary; the following read is routed to an asynchronous replica that hasn't yet replayed that write, so it returns the old state. Lag is normally milliseconds but grows under write bursts, large transactions, or when long queries on the replica delay replay. The options, roughly from cheapest: first, session stickiness to the primary after a write: for some seconds after a user writes, route that user's reads to the primary; simple and usually enough. Second, causal reads by position: capture the WAL position, the LSN, returned by the write, and have the read wait on the replica until it has replayed past that LSN, or fall back to the primary if it takes too long; precise, and it only delays reads that follow writes. Third, make specific commits wait for replica apply with synchronous_commit = remote_apply, which guarantees any replica read afterwards sees it, but slows those writes and ties them to replica health. Fourth, classify queries: anything where a user views their own recent data goes to the primary, and replicas serve content where staleness is harmless. I'd also monitor lag and take a replica out of rotation when it exceeds a threshold, and I'd watch for the nastier variant, monotonic reads, where consecutive reads hit replicas with different lag and data appears to go backwards.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A streaming standby is a copy that replays the primary's WAL continuously. It is identical, read-only and a little behind.</li>
+      <li>Logical replication sends row changes for chosen tables to an independent database, which allows upgrades, partial copies and feeds to other systems.</li>
+      <li>Asynchronous commits are fast and can be lost in a failover. Synchronous commits survive it, cost a round trip, and stall if the standby is unreachable.</li>
+      <li>A quorum of standbys gives durability without depending on any single one.</li>
+      <li>Replicas lag, so a read straight after a write may not see it. Route such reads to the primary, or wait for the replica to reach the write's LSN.</li>
+      <li>Failover needs certainty that the old primary is out. Two primaries accepting writes is split brain, and has no automatic repair.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How does a PostgreSQL streaming standby stay up to date?</p>
+      <div class="opts">
+        <button class="opt">It re-runs every SQL statement the primary ran</button>
+        <button class="opt">It receives the primary's WAL and replays it, as crash recovery would</button>
+        <button class="opt">It copies the data files every few seconds</button>
+        <button class="opt">It queries the primary for changed rows</button>
+      </div>
+      <div class="explain">A standby is a database that stays in recovery, applying log records as they arrive.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">With asynchronous replication, the primary fails and a standby that was 200 ms behind is promoted. What has happened to the last 200 ms of commits?</p>
+      <div class="opts">
+        <button class="opt">They are replayed from the standby's own log</button>
+        <button class="opt">The clients are told to resend them</button>
+        <button class="opt">They were never acknowledged, so nothing is lost</button>
+        <button class="opt">They are lost, although their clients were told they had committed</button>
+      </div>
+      <div class="explain">Asynchronous commit acknowledges before the standby has the record.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A cluster has one primary and one synchronous standby. The standby loses its network connection. What happens to writes on the primary?</p>
+      <div class="opts">
+        <button class="opt">Commits wait and don't return, until the standby is back or the configuration is changed</button>
+        <button class="opt">They continue as normal</button>
+        <button class="opt">They are queued and applied later</button>
+        <button class="opt">The standby is promoted</button>
+      </div>
+      <div class="explain">The primary promised not to acknowledge until the standby has the commit. A quorum of several standbys avoids depending on one.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A user updates their profile and the next page shows the old data. Reads go to replicas. What is the most direct fix?</p>
+      <div class="opts">
+        <button class="opt">Add more replicas</button>
+        <button class="opt">Increase the replicas' memory</button>
+        <button class="opt">For a short time after a user writes, send that user's reads to the primary</button>
+        <button class="opt">Disable caching in the browser</button>
+      </div>
+      <div class="explain">The replica hadn't yet replayed the write. More replicas wouldn't make any of them more current.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What is split brain?</p>
+      <div class="opts">
+        <button class="opt">A replica falling far behind the primary</button>
+        <button class="opt">Two nodes each acting as primary and accepting writes, so that their data diverges</button>
+        <button class="opt">A primary with two standbys</button>
+        <button class="opt">A table split across two servers</button>
+      </div>
+      <div class="explain">It follows a failover in which the old primary was unreachable but still running, and wasn't fenced off.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const LAG = 3;
+  let st;
+  const mode = () => $('#rpMode').dataset.value, link = () => $('#rpLink').dataset.value;
+  function reset() { st = { n: 0, acked: 0, standby: 0, pending: 0, failed: false, lost: 0, last: null, msg: null, cls: '' }; draw(); }
+  const say = (m, c) => { st.msg = m; st.cls = c; };
+  // Where the standby should be, given how many transactions exist and the state of its link.
+  function settle() {
+    // A slow standby under synchronous commit still gets every commit: the commit just waits longer for it.
+    if (link() === 'ok' || (link() === 'lag' && mode() === 'sync')) st.standby = st.n;
+    else if (link() === 'lag') st.standby = Math.max(st.standby, st.n - LAG);
+    // disconnected: stays where it is
+    if (mode() === 'sync') { st.acked = Math.max(st.acked, Math.min(st.n, st.standby)); }
+    else st.acked = st.n;
+    st.pending = st.n - st.acked;
+  }
+  function commit() {
+    if (st.failed) return say('The primary is gone. Reset to start again.', '');
+    if (st.pending) return say(`<b>Transaction ${st.acked + 1} is still waiting for the standby.</b> Its client hasn't had an answer, and with synchronous commit nothing behind it will get one either. Reconnect the standby, or switch to asynchronous.`, 'rp-bad');
+    st.n++; const before = st.acked; settle();
+    if (st.acked > before) {
+      const ms = mode() === 'sync' ? (link() === 'lag' ? 'about 400 ms, since the lagging standby took that long to flush it' : '3 ms: 1 for the primary\'s disk and 2 for the round trip to the standby') : '1 ms, the time to flush it on the primary';
+      st.last = mode() === 'sync' ? (link() === 'lag' ? 400 : 3) : 1;
+      say(`<b>Transaction ${st.n} committed, in ${ms}.</b> ` + (mode() === 'sync' ? 'The standby had it on disk before the client was told.' : st.standby >= st.n ? 'The standby received it a moment later.' : link() === 'down' ? 'The standby is disconnected and knows nothing of it. The primary doesn\'t mind.' : `The standby is ${st.n - st.standby} transactions behind.`), mode() === 'sync' && link() === 'lag' ? 'rp-warn' : 'rp-good');
+    } else { st.last = null; say(`<b>Transaction ${st.n} is written on the primary, and its COMMIT hasn't returned.</b> The primary is waiting for the standby to confirm, and the standby is disconnected. The client waits. No commit can be acknowledged until the standby is back.`, 'rp-bad'); }
+  }
+  function read() {
+    if (st.failed) return say(`<b>The standby is now the primary.</b> A read returns transaction ${st.standby}.`, '');
+    const behind = st.acked - st.standby;
+    say(behind > 0 ? `<b>The standby returns transaction ${st.standby}. The primary has acknowledged ${st.acked}.</b> A user who has just made change ${st.acked} and reads here doesn't see it, nor the ${behind > 1 ? (behind - 1) + ' before it' : 'one before'}. Their save appears to have failed.` : `<b>The standby returns transaction ${st.standby}, the same as the primary.</b> This read is current.`, behind > 0 ? 'rp-warn' : 'rp-good');
+  }
+  function fail() {
+    if (st.failed) return;
+    st.failed = true; st.lost = st.acked - st.standby; const unacked = st.pending;
+    say(st.lost > 0 ? `<b>${st.lost} acknowledged transaction${st.lost > 1 ? 's are' : ' is'} lost.</b> The standby is promoted with what it had, ${st.standby ? 'up to transaction ' + st.standby : 'which is nothing'}. Transactions ${st.standby + 1} to ${st.acked} were confirmed to their clients and exist nowhere now. This is the price of asynchronous replication.` : `<b>Nothing acknowledged is lost.</b> The standby is promoted, and it has every transaction that any client was told had committed.` + (unacked ? ` Transaction ${st.acked + 1} was never acknowledged, so its client knows to try again.` : ''), st.lost > 0 ? 'rp-bad' : 'rp-good');
+  }
+  function draw() {
+    const box = (from, to, cls) => { let s = ''; for (let i = from; i <= to; i++) s += `<i class="${cls}">${i}</i>`; return s; };
+    const P = $('#rpP'), S = $('#rpS');
+    P.className = 'rp-node' + (st.failed ? ' rp-down' : ' rp-primary');
+    P.innerHTML = `<h6><span>Primary</span><b>${st.failed ? 'lost' : 'accepting writes'}</b></h6><div class="rp-tx">${st.n ? box(1, st.failed ? st.standby : st.acked, '') + (st.failed ? box(st.standby + 1, st.acked, 'rp-lost') : '') + box(st.acked + 1, st.n, 'rp-wait') : '<span>no transactions yet</span>'}</div><small>${st.failed ? 'Whatever it had and the standby didn\'t went with it.' : mode() === 'sync' ? 'COMMIT returns when the standby has confirmed.' : 'COMMIT returns when its own disk has the record.'}</small>`;
+    S.className = 'rp-node' + (st.failed ? ' rp-primary' : link() === 'down' ? ' rp-down' : '');
+    S.innerHTML = `<h6><span>${st.failed ? 'Standby, promoted' : 'Standby'}</span><b>${st.failed ? 'the new primary' : link() === 'ok' ? 'keeping up' : link() === 'lag' ? 'lagging' : 'disconnected'}</b></h6><div class="rp-tx">${st.standby ? box(1, st.standby, '') : '<span>no transactions yet</span>'}</div><small>${st.failed ? 'It serves reads and writes from here on.' : 'Has ' + st.standby + ' of the primary\'s ' + st.n + '.'}</small>`;
+    const m = $('#rpMsg'); m.className = 'rp-msg ' + (st.cls || '');
+    m.innerHTML = st.msg || 'Commit a few transactions with the standby keeping up. Then make it lag, or disconnect it, and commit some more.';
+    const behind = st.failed ? 0 : st.n - st.standby;
+    $('#rpStats').innerHTML = `<div class="stat"><div class="k">Acknowledged commits</div><div class="v">${st.acked}</div></div>
+      <div class="stat ${behind > 0 ? 'warn' : 'good'}"><div class="k">Standby is behind by</div><div class="v">${behind}</div></div>
+      <div class="stat ${st.last > 100 ? 'warn' : ''}"><div class="k">Last commit took</div><div class="v">${st.pending ? 'waiting' : st.last ? st.last + ' ms' : '–'}</div></div>
+      <div class="stat ${st.pending ? 'bad' : 'good'}"><div class="k">Commits stalled</div><div class="v">${st.pending}</div></div>
+      <div class="stat ${st.failed ? (st.lost ? 'bad' : 'good') : ''}"><div class="k">Lost in failover</div><div class="v">${st.failed ? st.lost : '–'}</div></div>`;
+  }
+  const on = (id, fn) => { $(id).onclick = () => { fn(); draw(); }; };
+  on('#rpCommit', commit); on('#rpRead', read); on('#rpFail', fail);
+  $('#rpReset').onclick = reset;
+  $('#rpMode').addEventListener('segchange', () => { if (!st.failed) { settle(); say(mode() === 'sync' ? 'Commits now wait for the standby.' + (st.pending ? '' : '') : 'Commits now wait for the primary alone.' , ''); } draw(); });
+  $('#rpLink').addEventListener('segchange', () => { if (!st.failed) { const had = st.pending; settle(); say(link() === 'ok' ? `<b>The standby is connected and has caught up.</b>${had && !st.pending ? ' The commit that was waiting has returned.' : ''}` : link() === 'lag' ? (mode() === 'sync' ? '<b>The standby is now slow.</b> It still confirms every commit, about 400 ms late, and each commit waits for that.' : '<b>The standby is now lagging.</b> It will stay three transactions behind.') : '<b>The standby is disconnected.</b> It will receive nothing until it is back.', link() === 'ok' ? 'rp-good' : 'rp-warn'); } draw(); });
+  reset();
+})();
+</script>
 </body>
 </html>

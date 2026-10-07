@@ -6,34 +6,336 @@
 <title>CPU Scheduling II: Priorities, MLFQ &amp; Linux CFS</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sc-opts { display:flex; flex-wrap:wrap; gap:14px; margin-top:10px; font-size:13.5px; color:var(--text-2); }
+  .sc-opts label { display:flex; gap:6px; align-items:center; cursor:pointer; }
+  .sc-opts[hidden] { display:none; }
+  .sc-tl { display:grid; grid-template-columns:110px repeat(100,minmax(0,1fr)); gap:0; margin-top:12px; font-size:11px; }
+  .sc-tl .sc-nm { font-family:var(--mono); color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-right:6px; align-self:center; }
+  .sc-tl i { height:16px; display:block; }
+  .sc-tl i.sc-on { background:var(--c); }
+  .sc-tl i.sc-off { background:var(--surface-2); }
+  .sc-tl i.sc-slp { background:repeating-linear-gradient(90deg, var(--surface-2), var(--surface-2) 2px, var(--surface-3) 2px, var(--surface-3) 4px); }
+  .sc-qs { display:grid; gap:6px; margin-top:12px; }
+  .sc-qr { display:grid; grid-template-columns:150px 1fr; gap:8px; align-items:center; font-size:12.5px; }
+  .sc-qr b { font-family:var(--mono); color:var(--muted); font-weight:600; }
+  .sc-chips { display:flex; flex-wrap:wrap; gap:5px; min-height:24px; padding:3px; border:1px dashed var(--border); border-radius:8px; }
+  .sc-chip { font-family:var(--mono); font-size:11.5px; padding:2px 8px; border-radius:6px; color:#fff; font-weight:700; }
+  .sc-chip.sc-run { outline:2px solid var(--text); }
+  .sc-tab { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px; font-family:var(--mono); }
+  .sc-tab th { text-align:left; font-family:var(--font); font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; padding:4px 6px; }
+  .sc-tab td { padding:3px 6px; border-top:1px solid var(--border); }
+  .sc-tab select { font-family:var(--mono); font-size:12px; }
+  .sc-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); }
+</style>
 </head>
 <body data-chapter="8">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 8</span><span class="pill">Beginner</span><span class="pill">⏱ 50 min</span></div>
     <h1>CPU Scheduling II: <span class="grad">Priorities, MLFQ &amp; Linux CFS</span></h1>
-    <p class="lead">Priorities and starvation, the multi-level feedback queue, and how Linux's CFS shares the CPU fairly.</p>
+    <p class="lead">Chapter 7 left a puzzle: shortest-job-first gives the best response times, but the kernel can't know how long a job will run. Real schedulers solve it by watching. A task that keeps blocking after a millisecond of work behaves like a short, interactive job; a task that burns every slice behaves like a long batch job. This chapter covers the three ideas that turn that observation into a scheduler: <b>priorities</b> (and the starvation they cause), the <b>multi-level feedback queue</b>, and the approach Linux took instead from 2007, the <b>Completely Fair Scheduler</b>, with its successor EEVDF.</p>
+    <ul class="objectives">
+      <li>Explain priority scheduling, starvation and aging</li>
+      <li>State the MLFQ rules and why each one exists, including how it can be gamed</li>
+      <li>Explain CFS's virtual runtime, weights and red-black tree</li>
+      <li>Predict CPU shares from nice values</li>
+      <li>Say what EEVDF changed in Linux 6.6</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Turnaround, response time, SJF and round robin.</b> See <a href="07-scheduling-basics.html">Chapter 7</a>.</li>
+        <li><b>Run queues and blocking.</b> See <a href="04-process-states-pcb.html">Chapter 4</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
+  <h2>Priorities, starvation and aging</h2>
+  <p>The simplest improvement over round robin is to give each task a <b>priority</b> and always run the highest-priority ready task, round robin among equals. That lets an audio thread or a request handler beat a log compressor. The danger is <b>starvation</b>: if high-priority work never runs out, low-priority tasks never run at all. The classic fix is <b>aging</b>: the longer a task waits, the more its effective priority rises, until it's guaranteed a turn. Every scheduler below is, one way or another, a way of setting priorities automatically and preventing starvation.</p>
+
+  <h2>The multi-level feedback queue</h2>
+  <p>The MLFQ, first described by Corbató's team for MIT's CTSS in 1962 and still the basis of several schedulers (it shaped those of the BSDs, Solaris and Windows), keeps several round-robin queues of decreasing priority, with longer quanta lower down, and moves tasks between them based on how they behave. In the form used by the OSTEP textbook:</p>
   <ol>
-    <li>Priority scheduling and aging</li>
-    <li>MLFQ rules</li>
-    <li>CFS: virtual runtime and the red-black tree</li>
-    <li>nice values</li>
-    <li>EEVDF in newer kernels</li>
+    <li>If A's priority is higher than B's, A runs.</li>
+    <li>Equal priorities run round robin.</li>
+    <li>A new task starts in the top queue: assume it's short and interactive until it proves otherwise.</li>
+    <li>Once a task uses up its time allotment at a level, however many times it gave up the CPU along the way, it moves down one level.</li>
+    <li>Every period S, move all tasks back to the top queue (a <b>priority boost</b>).</li>
   </ol>
+  <p>Rule 3 approximates SJF without knowing lengths: short jobs finish while still at the top. Rule 5 is aging: CPU-bound tasks can't starve, and a task that turns interactive gets a fresh chance. Rule 4's wording matters. An earlier version said "if a task gives up the CPU before its quantum ends, it stays at its level", which a crafty program could game by sleeping for a moment just before each quantum expired, staying at top priority forever. Counting the total time used at a level closes that hole. Try both in the simulator below.</p>
+
+  <h2>Linux's Completely Fair Scheduler</h2>
+  <p>From 2007 (Linux 2.6.23) until 2023, Linux's default scheduler was CFS, written by Ingo Molnár. It drops queues and quanta altogether in favour of one idea: on an ideal multitasking CPU, <i>n</i> runnable tasks would each get exactly 1/<i>n</i> of the CPU at every instant. CFS tracks how far each task is from that ideal with its <b>virtual runtime</b>, <code>vruntime</code>, the CPU time it has received, scaled by its weight, and always runs the task with the <b>smallest</b> vruntime. Runnable tasks are kept in a red-black tree ordered by vruntime, so the next task is the leftmost node.</p>
+<pre class="code"><span class="c">/* The heart of CFS, simplified from kernel/sched/fair.c */</span>
+<span class="k">#define</span> <span class="m">NICE_0_LOAD</span> <span class="m">1024</span>
+
+<span class="k">static</span> <span class="k">void</span> <span class="f">update_curr</span>(<span class="k">struct</span> cfs_rq *rq, <span class="k">struct</span> sched_entity *curr, u64 delta_ns) {
+	curr-&gt;sum_exec_runtime += delta_ns;                               <span class="c">/* real CPU time */</span>
+	curr-&gt;vruntime += delta_ns * <span class="m">NICE_0_LOAD</span> / curr-&gt;load.weight;    <span class="c">/* weighted: heavy tasks age slowly */</span>
+	rq-&gt;min_vruntime = <span class="f">max</span>(rq-&gt;min_vruntime, <span class="f">leftmost_vruntime</span>(rq));
+}
+
+<span class="k">static</span> <span class="k">struct</span> sched_entity *<span class="f">pick_next_entity</span>(<span class="k">struct</span> cfs_rq *rq) {
+	<span class="k">return</span> <span class="f">rb_entry</span>(<span class="f">rb_first_cached</span>(&amp;rq-&gt;tasks_timeline), <span class="k">struct</span> sched_entity, run_node);  <span class="c">/* O(1): cached leftmost */</span>
+}
+
+<span class="c">/* A task waking from sleep is placed near min_vruntime, not where it left off,
+   so it can't bank hours of "credit" by sleeping, but does get to run soon. */</span>
+<span class="k">static</span> <span class="k">void</span> <span class="f">place_entity</span>(<span class="k">struct</span> cfs_rq *rq, <span class="k">struct</span> sched_entity *se) {
+	se-&gt;vruntime = <span class="f">max</span>(se-&gt;vruntime, rq-&gt;min_vruntime - sysctl_sched_latency / <span class="m">2</span>);
+}</pre>
+  <p>Interactive tasks get good latency for free: they sleep most of the time, so their vruntime stays low and they're at the left of the tree the moment they wake. <b>Nice values</b> (−20 to 19) set the weight: nice 0 is 1,024, and each step multiplies or divides it by about 1.25, so each nice level is worth roughly 10% of CPU relative to a competing task. A nice −5 task runs about three times as much as a nice 0 one; nice 19 gets a weight of just 15.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Tick or wake-up</b> The timer fires, or a task becomes runnable.</li>
+      <li><b>update_curr</b> Charge the running task: vruntime += elapsed × 1024 / weight.</li>
+      <li data-k="decision"><b>Should it be preempted?</b> Yes if it has had its slice (about 6 ms ÷ number of runnable tasks, never below 0.75 ms), or a woken task's vruntime is far enough to the left.</li>
+      <li><b>Re-insert and pick</b> Put the current task back in the tree by its new vruntime; take the leftmost.</li>
+      <li data-k="end"><b>Switch</b> Context-switch if the pick changed (<a href="06-context-switches-interrupts.html">Chapter 6</a>).</li>
+    </ol>
+    <figcaption><b>One CFS decision.</b> There are no fixed time slices; the slice shrinks as more tasks compete, which bounds how long anyone waits.</figcaption>
+  </figure>
+
+  <h2>EEVDF: Linux 6.6 and later</h2>
+  <p>In Linux 6.6 (October 2023), Peter Zijlstra replaced CFS's pick rule with <b>EEVDF</b>, Earliest Eligible Virtual Deadline First, an algorithm from a 1995 paper by Stoica and Abdel-Wahab. Weights and virtual time stay. What changes: a task is <i>eligible</i> only if it hasn't received more than its fair share (its "lag" is non-negative), and among eligible tasks the one with the earliest <b>virtual deadline</b> (roughly, vruntime plus its requested slice divided by its weight) runs. Tasks asking for shorter slices get earlier deadlines, so latency-sensitive work can be favoured explicitly instead of through CFS's pile of wake-up heuristics. For most workloads the behaviour is similar to CFS; the code is simpler and latency is more predictable.</p>
+
+  <h2>Simulate both</h2>
+  <p>Four tasks share one core: two CPU-bound jobs, an interactive one that works for 1 ms and then sleeps for 9 (an editor, a shell), and a fourth you can configure. Run 100 ms at a time and compare who gets the CPU, and how fast the interactive task gets it when it wakes.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">MLFQ vs CFS: one core, four tasks, 100 ms windows</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="scMode"><button class="active" data-v="mlfq">MLFQ</button><button data-v="cfs">CFS</button></div>
+        <button class="btn sm primary" id="scRun">▶ Run 100 ms</button>
+        <button class="btn sm" id="scStep">Step 10 ms</button>
+        <button class="btn sm" id="scReset">↺ Reset</button>
+      </div>
+      <div class="sc-opts" id="scOptsM">
+        <label><input type="checkbox" id="scBoost" checked> Priority boost every 50 ms (rule 5)</label>
+        <label><input type="checkbox" id="scAcct" checked> Count total time at a level (rule 4)</label>
+        <label><input type="checkbox" id="scGamer"> 4th task games the scheduler (sleeps just before each quantum ends)</label>
+      </div>
+      <div class="sc-opts" id="scOptsC" hidden><span>Set each task's nice value in the table. Lower nice = higher weight = more CPU.</span></div>
+      <div class="sc-qs" id="scQs"></div>
+      <div class="sc-tl" id="scTl"></div>
+      <div style="overflow-x:auto"><table class="sc-tab" id="scTab"></table></div>
+      <div class="sc-res" id="scRes"></div>
+    </div>
+    <div class="panel-foot">1 ms ticks. MLFQ: three queues with quanta of 2, 4 and 8 ms; a task is demoted after using 10 ms at Q0 or 20 ms at Q1. CFS: 6 ms latency target, 0.75 ms minimum slice, real nice-to-weight values from the kernel's table. The timeline shows the last 100 ms; hatching means sleeping.</div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Static priority</th><th>MLFQ</th><th>CFS</th><th>EEVDF</th></tr></thead>
+      <tbody>
+        <tr><td>Picks</td><td>Highest priority</td><td>Highest non-empty queue, RR within it</td><td>Smallest vruntime</td><td>Earliest virtual deadline among eligible tasks</td></tr>
+        <tr><td>Learns behaviour?</td><td>No</td><td>Yes: demotes CPU hogs</td><td>Implicitly: sleepers keep low vruntime</td><td>Implicitly, plus per-task slice requests</td></tr>
+        <tr><td>Starvation</td><td>Yes, without aging</td><td>Prevented by periodic boosts</td><td>No: everyone's vruntime advances</td><td>No</td></tr>
+        <tr><td>Tuning knobs</td><td>Priority per task</td><td>Number of queues, quanta, boost period</td><td>nice (weight), latency target</td><td>nice, requested slice</td></tr>
+        <tr><td>Data structure</td><td>Array of queues</td><td>Array of queues</td><td>Red-black tree, O(log n)</td><td>Augmented red-black tree</td></tr>
+        <tr><td>Used by</td><td>Real-time classes (<a href="39-priority-inversion-realtime.html">Chapter 39</a>)</td><td>FreeBSD's ULE (in spirit), Windows' dynamic priorities</td><td>Linux 2.6.23–6.5</td><td>Linux 6.6 onwards</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">☸️</div>
+    <div class="body"><div class="title">Kubernetes CPU requests are CFS weights</div><p>When you give a container <code>resources.requests.cpu: 500m</code>, Kubernetes doesn't reserve half a core anywhere. It sets the weight of the container's cgroup (<code>cpu.shares</code> = 512 under cgroup v1, the equivalent <code>cpu.weight</code> under v2), and Linux's fair scheduler does the rest: it schedules <i>groups</i> by weight the same way it schedules tasks by nice value. Under contention, a pod requesting 1000m gets twice the CPU of one requesting 500m; when the node is idle, either can use more. CPU <i>limits</i> are a different mechanism, a quota per period that pauses the group when used up, and they're a common hidden source of tail latency (<a href="38-tail-latency.html">Chapter 38</a>). On a single machine, <code>nice -n 19 ./backup.sh</code> uses the same machinery to keep a backup out of a web server's way.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Thinking a lower nice value makes a task faster.</b> It changes its share under contention only; on an idle machine nice does nothing.</li>
+      <li><b>Expecting nice 19 to mean "never runs while anything else wants the CPU".</b> It still gets about 1.5% against a nice 0 task; use <code>SCHED_IDLE</code> for truly background work.</li>
+      <li><b>Saying CFS has a fixed time slice.</b> The slice depends on how many tasks are runnable and their weights.</li>
+      <li><b>Saying MLFQ needs to know job lengths.</b> It infers them from how tasks use their quanta.</li>
+      <li><b>Forgetting the boost.</b> An MLFQ without it starves CPU-bound tasks whenever interactive load is high.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does Linux's CFS decide which task to run?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Each task has a virtual runtime: the CPU time it has used, scaled down for heavier (lower nice) tasks and up for lighter ones. Runnable tasks sit in a red-black tree ordered by vruntime, and CFS always runs the leftmost, the one that has had the least weighted CPU so far. The running task is charged as it runs and preempted when it has had its share of the target latency or when a woken task is sufficiently behind it. Tasks that sleep a lot keep low vruntimes and so run promptly when they wake, which gives interactive tasks good latency without special cases. Since Linux 6.6 the pick rule is EEVDF, which adds eligibility and virtual deadlines on top of the same weights.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How can a task game an MLFQ, and how do you stop it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>If the rule is "a task that gives up the CPU before its quantum expires keeps its priority", a CPU-hungry program can run for 99% of its quantum, do a tiny sleep or I/O, and repeat, staying in the top queue and taking far more than its share. The fix is to account for total CPU time used at a level, across yields: once its allotment is used up, it's demoted regardless of how it got there. Separately, periodic priority boosts prevent the opposite problem, CPU-bound tasks starving under a flood of interactive ones.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Priority scheduling needs aging, or low-priority work starves.</li>
+      <li>MLFQ: start at the top, demote tasks that use their allotment, boost everyone periodically; account total time at a level so it can't be gamed.</li>
+      <li>CFS runs the task with the smallest weighted virtual runtime, kept in a red-black tree.</li>
+      <li>Each nice step is about 1.25× weight, roughly 10% of CPU against a competitor; nice matters only under contention.</li>
+      <li>Linux 6.6 switched to EEVDF: same weights, plus eligibility and virtual deadlines for more predictable latency.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What is aging in a priority scheduler?</p>
+      <div class="opts">
+        <button class="opt">Killing tasks that have run too long</button>
+        <button class="opt">Gradually raising the priority of tasks that have waited a long time, so they can't starve</button>
+        <button class="opt">Lowering priority as a task's age in the system increases</button>
+        <button class="opt">Swapping old pages to disk</button>
+      </div>
+      <div class="explain">Waiting earns priority. MLFQ's periodic boost is a blunt form of the same idea.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">In an MLFQ, where does a brand-new task start, and why?</p>
+      <div class="opts">
+        <button class="opt">At the bottom, to protect existing tasks</button>
+        <button class="opt">In the middle queue</button>
+        <button class="opt">In a random queue</button>
+        <button class="opt">At the top, assuming it's short and interactive until it uses up its allotment</button>
+      </div>
+      <div class="explain">Starting high approximates SJF: short jobs finish before they're ever demoted, and long ones sink.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Two CPU-bound tasks compete on one core under CFS: one at nice 0 (weight 1024), one at nice 5 (weight 335). Roughly what share does the nice 0 task get?</p>
+      <div class="opts">
+        <button class="opt">About 75%</button>
+        <button class="opt">50%</button>
+        <button class="opt">100%</button>
+        <button class="opt">About 95%</button>
+      </div>
+      <div class="explain">1024 / (1024 + 335) ≈ 0.75. Shares are proportional to weights.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why do interactive tasks get the CPU quickly under CFS?</p>
+      <div class="opts">
+        <button class="opt">CFS detects keyboard input</button>
+        <button class="opt">They have a separate high-priority queue</button>
+        <button class="opt">They sleep most of the time, so their vruntime stays low and they sit at the left of the tree when they wake</button>
+        <button class="opt">They are given nice −20 automatically</button>
+      </div>
+      <div class="explain">Low vruntime means "owed CPU". On wake-up CFS places them near the minimum vruntime, so they're picked almost at once.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What did Linux 6.6 change about the default scheduler?</p>
+      <div class="opts">
+        <button class="opt">It replaced weights with fixed priorities</button>
+        <button class="opt">It replaced CFS's pick rule with EEVDF: earliest virtual deadline among eligible tasks</button>
+        <button class="opt">It removed nice values</button>
+        <button class="opt">It switched to round robin</button>
+      </div>
+      <div class="explain">EEVDF keeps virtual time and weights but uses lag-based eligibility and virtual deadlines, which makes latency more predictable.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const WEIGHT = { '-10': 9548, '-5': 3121, '0': 1024, '5': 335, '10': 110, '19': 15 };
+  const COLS = ['var(--accent)', 'var(--green)', 'var(--accent-2)', 'var(--pink)'];
+  const QUANTA = [2, 4, 8], ALLOT = [10, 20, 1e9];
+  let mode = 'mlfq', T, now, hist, nice = ['0', '0', '0', '0'];
+  function mkTasks() {
+    const gamer = mode === 'mlfq' && $('#scGamer').checked;
+    return [
+      { name: 'batch-A', kind: 'cpu' },
+      { name: 'batch-B', kind: 'cpu' },
+      { name: 'editor', kind: 'inter', burst: 1, sleep: 9 },
+      gamer ? { name: 'gamer', kind: 'gamer' } : { name: 'compile', kind: 'cpu' },
+    ].map((t, i) => Object.assign(t, { i, q: 0, used: 0, slice: 0, vr: 0, cpu: 0, sleepLeft: 0, runLeft: t.burst || 0, wakeAt: -1, lat: [], state: 'R' }));
+  }
+  function reset() { T = mkTasks(); now = 0; hist = T.map(() => []); cur = null; render(); }
+  let cur = null;
+  function runnable() { return T.filter((t) => t.state === 'R'); }
+  function tick() {
+    // wake sleepers
+    T.forEach((t) => { if (t.state === 'S' && --t.sleepLeft <= 0) { t.state = 'R'; t.wakeAt = now; if (mode === 'cfs') { const minv = Math.min(...runnable().filter((x) => x !== t).map((x) => x.vr), t.vr); t.vr = Math.max(t.vr, minv - 3); } } });
+    if (mode === 'mlfq') {
+      if ($('#scBoost').checked && now > 0 && now % 50 === 0) T.forEach((t) => { t.q = 0; t.used = 0; });
+      // preempt if a higher queue has work
+      const r = runnable();
+      if (cur && (cur.state !== 'R' || r.some((t) => t.q < cur.q))) cur = null;
+      if (!cur || cur.slice >= QUANTA[cur.q]) {
+        if (cur) { cur.slice = 0; T.push(T.splice(T.indexOf(cur), 1)[0]); }   /* round robin: quantum over, to the back */
+        const best = Math.min(...r.map((t) => t.q));
+        cur = r.length ? T.find((t) => t.state === 'R' && t.q === best) : null;   /* a preempted task resumes its quantum */
+      }
+    } else {
+      const r = runnable();
+      const W = r.reduce((s, t) => s + WEIGHT[nice[t.i]], 0);
+      if (cur && cur.state === 'R') {
+        const slice = Math.max(0.75, 6 * WEIGHT[nice[cur.i]] / W);
+        const woken = r.find((t) => t.wakeAt === now && t.vr + 1 < cur.vr);
+        if (cur.slice >= slice || woken) cur = null;
+      } else cur = null;
+      if (!cur && r.length) { cur = r.slice().sort((a, b) => a.vr - b.vr || a.i - b.i)[0]; cur.slice = 0; }
+    }
+    // run one ms
+    T.forEach((t) => hist[t.i].push(t === cur ? 'on' : t.state === 'S' ? 'slp' : 'off'));
+    if (cur) {
+      const c = cur;
+      if (c.wakeAt >= 0) { c.lat.push(now - c.wakeAt); c.wakeAt = -1; }
+      c.cpu++; c.slice++; c.used++;
+      if (mode === 'cfs') c.vr += 1024 / WEIGHT[nice[c.i]];
+      if (c.kind === 'inter') { if (--c.runLeft <= 0) { c.state = 'S'; c.sleepLeft = c.sleep; c.runLeft = c.burst; } }
+      if (mode === 'mlfq') {
+        const acct = $('#scAcct').checked;
+        if (c.kind === 'gamer' && c.slice === QUANTA[c.q] - 1) { c.state = 'S'; c.sleepLeft = 1; if (!acct) c.used = 0; }
+        if (c.kind === 'inter' && c.state === 'S' && !acct) c.used = 0;
+        if (c.used >= ALLOT[c.q] && c.q < 2) { c.q++; c.used = 0; c.slice = QUANTA[c.q]; }
+      }
+      if (c.state !== 'R') cur = null;
+    }
+    now++;
+  }
+  function run(ms) { for (let k = 0; k < ms; k++) tick(); render(); }
+  function render() {
+    $('#scOptsM').hidden = mode !== 'mlfq'; $('#scOptsC').hidden = mode !== 'cfs';
+    const order = T.slice().sort((a, b) => a.i - b.i);
+    if (mode === 'mlfq') {
+      $('#scQs').innerHTML = QUANTA.map((q, k) => `<div class="sc-qr"><b>Q${k} · quantum ${q} ms</b><div class="sc-chips">${T.filter((t) => t.q === k).map((t) => `<span class="sc-chip ${t === cur ? 'sc-run' : ''}" style="background:${COLS[t.i]};opacity:${t.state === 'S' ? .45 : 1}">${t.name}${t.state === 'S' ? ' 💤' : ''}</span>`).join('')}</div></div>`).join('');
+    } else {
+      const tree = order.filter((t) => t.state === 'R').sort((a, b) => a.vr - b.vr);
+      $('#scQs').innerHTML = `<div class="sc-qr"><b>red-black tree (by vruntime)</b><div class="sc-chips">${tree.map((t, k) => `<span class="sc-chip ${t === cur ? 'sc-run' : ''}" style="background:${COLS[t.i]}">${k === 0 ? '◀ ' : ''}${t.name} ${t.vr.toFixed(1)}</span>`).join('') || '<span class="small muted">empty</span>'}</div></div><div class="sc-qr"><b>sleeping</b><div class="sc-chips">${order.filter((t) => t.state === 'S').map((t) => `<span class="sc-chip" style="background:${COLS[t.i]};opacity:.5">${t.name} 💤</span>`).join('')}</div></div>`;
+    }
+    let tl = '';
+    order.forEach((t) => { const h = hist[t.i].slice(-100); while (h.length < 100) h.unshift('off'); tl += `<span class="sc-nm" style="color:${COLS[t.i]}">${t.name}</span>` + h.map((x) => `<i class="sc-${x}" style="--c:${COLS[t.i]}"></i>`).join(''); });
+    $('#scTl').innerHTML = tl;
+    const win = Math.min(100, Math.max(1, now)), share = (t) => hist[t.i].slice(-100).filter((x) => x === 'on').length / win;
+    $('#scTab').innerHTML = `<tr><th>Task</th><th>Behaviour</th>${mode === 'cfs' ? '<th>nice</th><th>weight</th><th>vruntime</th>' : '<th>queue</th>'}<th>CPU share (last 100 ms)</th><th>avg wake → run</th></tr>` +
+      order.map((t) => `<tr><td style="color:${COLS[t.i]};font-weight:700">${t.name}</td><td>${{ cpu: 'CPU-bound', inter: '1 ms work, 9 ms sleep', gamer: 'runs, naps 1 ms before quantum ends' }[t.kind]}</td>${mode === 'cfs' ? `<td><select class="inp" data-n="${t.i}">${Object.keys(WEIGHT).map((k) => `<option ${k === nice[t.i] ? 'selected' : ''}>${k}</option>`).join('')}</select></td><td>${WEIGHT[nice[t.i]]}</td><td>${t.vr.toFixed(1)}</td>` : `<td>Q${t.q}</td>`}<td>${(share(t) * 100).toFixed(1)}%</td><td>${t.lat.length ? (t.lat.reduce((a, b) => a + b, 0) / t.lat.length).toFixed(1) + ' ms' : '–'}</td></tr>`).join('');
+    const ed = T.find((t) => t.kind === 'inter'), gm = T.find((t) => t.kind === 'gamer');
+    const edLat = ed.lat.length ? ed.lat.reduce((a, b) => a + b, 0) / ed.lat.length : 0;
+    let msg;
+    if (!now) msg = 'Press <b>Run 100 ms</b>. Watch the editor (yellow) and how quickly it runs after each wake-up.';
+    else if (mode === 'mlfq') {
+      if (gm && !$('#scAcct').checked) msg = `<b>Gamed.</b> "gamer" naps 1 ms before each quantum ends, so without rule 4's accounting it never uses up its allotment and stays in Q0, taking <b>${(share(gm) * 100).toFixed(0)}%</b> of the CPU while the honest batch jobs sink. Turn rule 4 back on.`;
+      else if (!$('#scBoost').checked && now > 60) msg = `Without boosts, once the batch jobs reach Q2 they only run when Q0 and Q1 are empty. Here the editor leaves gaps, so they survive; with more interactive load they would <b>starve</b>. The boost every 50 ms guarantees them a turn.`;
+      else msg = `The editor stays in Q0 because it uses only about 5 ms of its 10 ms allotment between boosts; it waits on average <b>${edLat.toFixed(1)} ms</b> after waking. The batch jobs sink to Q2 and share what's left${$('#scBoost').checked ? ', bouncing back to Q0 at each 50 ms boost' : ''}. That's SJF behaviour without knowing job lengths.`;
+    } else {
+      const cpuT = order.filter((t) => t.kind === 'cpu');
+      msg = `CFS shares by weight: the CPU-bound tasks' shares follow their weights (${cpuT.map((t) => t.name + ' ' + WEIGHT[nice[t.i]]).join(', ')}). The editor's vruntime stays low because it sleeps, so it runs within <b>${edLat.toFixed(1)} ms</b> of waking. Set batch-A to nice −5 and compile to 19, then run again.`;
+    }
+    $('#scRes').innerHTML = msg;
+  }
+  $('#scMode').addEventListener('segchange', (e) => { mode = e.detail; reset(); });
+  $('#scRun').onclick = () => run(100);
+  $('#scStep').onclick = () => run(10);
+  $('#scReset').onclick = reset;
+  ['#scBoost', '#scAcct', '#scGamer'].forEach((id) => $(id).addEventListener('change', reset));
+  $('#scTab').addEventListener('change', (e) => { const s = e.target.closest('[data-n]'); if (s) { nice[+s.dataset.n] = s.value; render(); } });
+  reset();
+})();
+</script>
 </body>
 </html>

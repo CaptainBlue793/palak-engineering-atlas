@@ -6,34 +6,341 @@
 <title>Case Study: A Slow Query Made Fast</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sq-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .sq-row > span { font-size:12.5px; color:var(--muted); min-width:74px; }
+  .sq-h { margin:14px 0 6px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .sq-all { display:grid; gap:6px; }
+  .sq-a { display:grid; grid-template-columns:minmax(0,1.3fr) minmax(0,1.5fr) auto; gap:4px 12px; align-items:center; border:1.5px solid var(--border); border-radius:10px; background:var(--surface); padding:6px 11px; font-size:13px; }
+  .sq-a.sq-sel { border-color:var(--accent); background:var(--accent-soft); }
+  .sq-a small { color:var(--muted); font-size:11.5px; display:block; }
+  .sq-a b.sq-t { font-variant-numeric:tabular-nums; padding:1px 8px; border-radius:7px; background:var(--green-soft); border:1px solid var(--green); white-space:nowrap; }
+  .sq-a b.sq-t.sq-slow { background:var(--amber-soft, var(--surface-2)); border-color:var(--amber, var(--accent)); }
+  .sq-a b.sq-t.sq-bad { background:var(--red-soft); border-color:var(--red); }
+  @media (max-width:640px) { .sq-a { grid-template-columns:minmax(0,1fr) auto; } .sq-a > span:nth-child(2) { grid-column:1 / -1; grid-row:2; } }
+  .sq-plan { font-family:var(--mono); font-size:11.5px; line-height:1.55; padding:10px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); white-space:pre; overflow-x:auto; }
+  .sq-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .sq-msg.sq-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .sq-msg.sq-warn { background:var(--amber-soft, var(--surface-2)); border-left-color:var(--amber, var(--accent)); }
+</style>
 </head>
 <body data-chapter="42">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
-    <div class="eyebrow"><span class="pill accent">Chapter 42</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Case Study: <span class="grad">A Slow Query Made Fast</span></h1>
-    <p class="lead">From 12 seconds to 4 ms: reading the plan, fixing the estimate, and choosing the right index.</p>
+    <div class="eyebrow"><span class="pill accent">Chapter 42</span><span class="pill">Case Study</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Case Study: A Slow Query <span class="grad">Made Fast</span></h1>
+    <p class="lead">A support desk product has a dashboard that lists a team's open tickets, newest first. For nearly every customer it loads at once. For a few it takes twelve seconds, and then the request times out. The query is five lines long and has indexes on the columns it filters by, so nothing is obviously missing, and the engineers who look at it first conclude the server needs more memory. This case study follows the investigation from the symptom to the fix: finding the query, reading its plan, working out why the planner made a choice that looks absurd in hindsight, deciding between two kinds of fix, and proving the result. The end state is the same query answering in a fraction of a millisecond for every customer.</p>
+    <ul class="objectives">
+      <li><span>Recognise a plan problem from statistics alone: a small mean and an enormous maximum</span></li>
+      <li><span>Read a plan in which <code>LIMIT</code> stops a scan early, and see why its estimates mislead</span></li>
+      <li><span>Trace a wrong row estimate to correlated columns</span></li>
+      <li><span>Design an index that makes the good plan the only sensible one, whatever the estimate</span></li>
+      <li><span>Verify a fix with the worst-case parameters, typical ones, and production load</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Reading <code>EXPLAIN ANALYZE</code>:</b> <a href="17-explain.html">Chapter 17</a>.</li>
+        <li><b>Row estimates, independence and extended statistics:</b> <a href="19-cost-based-optimizer.html">Chapter 19</a>. This case is that chapter's theory causing an outage.</li>
+        <li><b>Composite and partial indexes:</b> <a href="09-indexes-first-look.html">Chapter 9</a>.</li>
+        <li><b>Finding costly queries:</b> <a href="37-tuning-playbook.html">Chapter 37</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The symptom</li>
-    <li>The plan</li>
-    <li>The bad estimate</li>
-    <li>The index</li>
-    <li>Verifying under load</li>
-  </ol>
+  <h2>The symptom</h2>
+  <p>The table is <code>tickets</code>: 60 million rows, about 4% of them open. It has a primary key, an index on <code>account_id</code>, and an index on <code>created_at</code>. The dashboard runs this for each team of each customer account.</p>
+<pre class="code"><span class="k">SELECT</span> ticket_id, subject, priority, created_at
+<span class="k">FROM</span>   tickets
+<span class="k">WHERE</span>  account_id = $1 <span class="k">AND</span> team_id = $2 <span class="k">AND</span> status = <span class="s">'open'</span>
+<span class="k">ORDER BY</span> created_at <span class="k">DESC</span>
+<span class="k">LIMIT</span>  <span class="m">25</span>;</pre>
+  <p>Complaints came from three customers, and nobody could reproduce the slowness with a test account. <code>pg_stat_statements</code> (<a href="37-tuning-playbook.html">Chapter 37</a>) showed why it had gone unnoticed, and where to look.</p>
+<pre class="code"> calls   | mean_ms | stddev_ms | max_ms   | rows
+---------+---------+-----------+----------+---------
+ <span class="m">2104880</span> |    <span class="m">31.4</span> |     <span class="m">412.7</span> | <span class="m">12406.4</span>  | <span class="m">48211306</span></pre>
+  <p>A mean of 31 ms is unremarkable, and it is the figure dashboards show. The other two columns tell the story: a maximum four hundred times the mean, and a standard deviation thirteen times it. A query that is uniformly slow has a large mean. One that is fast for most parameters and terrible for a few has a large spread, and that pattern nearly always means that <b>the plan is right for some parameter values and wrong for others</b>. So the next step is to run the query with the parameters of an account that complained.</p>
+
+  <h2>The plan</h2>
+<pre class="code"><span class="k">EXPLAIN</span> (<span class="k">ANALYZE</span>, <span class="k">BUFFERS</span>)
+<span class="k">SELECT</span> … <span class="k">WHERE</span> account_id = <span class="m">4117</span> <span class="k">AND</span> team_id = <span class="m">12</span> <span class="k">AND</span> status = <span class="s">'open'</span> <span class="k">ORDER BY</span> created_at <span class="k">DESC LIMIT</span> <span class="m">25</span>;
+
+ Limit  (cost=0.56..15016.10 rows=25 width=74) (actual time=3.412..12406.330 rows=25 loops=1)
+   Buffers: shared hit=1204551 read=2893310
+   -&gt;  Index Scan Backward using tickets_created_at_idx on tickets
+         (cost=0.56..4756924.10 rows=<span class="m">7920</span> width=74) (actual time=3.410..12406.301 rows=25 loops=1)
+         Filter: ((account_id = 4117) AND (team_id = 12) AND (status = 'open'::text))
+         Rows Removed by Filter: <span class="m">41237842</span>
+ Planning Time: 0.210 ms
+ Execution Time: <span class="m">12406.412</span> ms</pre>
+  <p>Read it from the inside (<a href="17-explain.html">Chapter 17</a>). The database isn't using the index on <code>account_id</code> at all. It is walking the index on <code>created_at</code> backwards, from the newest ticket in the whole table, fetching each row and testing the three conditions on it, and it stops when it has 25 that pass. To find them it read and threw away <b>41 million rows</b>, more than two-thirds of the table.</p>
+  <p>The plan isn't stupid. It avoids a sort: rows come out of that index already in the order wanted, so the scan can stop the moment the limit is satisfied. If matching rows are plentiful and recent, it reads a few thousand rows and finishes in milliseconds, which is exactly what happens for most accounts. The planner's arithmetic is on the first line. It expected 7,920 matching rows in the table, assumed they were spread evenly through time, and so expected to meet 25 of them after reading 25/7920 of the index: a cost of 15,016, against 4.76 million for the whole scan.</p>
+  <p>One thing in this plan is easy to misread. The scan's estimate says <code>rows=7920</code> and its actual figure says <code>rows=25</code>, which looks like an overestimate of three hundred times. It isn't a fair comparison. The estimate is for the scan run to completion, and the actual count was cut short by the limit. To learn how many rows really match, count them.</p>
+<pre class="code"><span class="k">SELECT</span> <span class="f">count</span>(*) <span class="k">FROM</span> tickets <span class="k">WHERE</span> account_id = <span class="m">4117</span> <span class="k">AND</span> team_id = <span class="m">12</span> <span class="k">AND</span> status = <span class="s">'open'</span>;
+ count
+-------
+    <span class="m">31</span></pre>
+  <p>The planner expected 7,920 matching rows and there are 31. And those 31 are old: this account's open tickets date from a year ago, so the backward walk through time passes 41 million newer tickets before it has collected 25.</p>
+
+  <h2>The bad estimate</h2>
+  <p>Where did 7,920 come from? The planner keeps statistics for each column separately, and combines conditions by multiplying their selectivities, which is correct only if the columns are independent (<a href="19-cost-based-optimizer.html">Chapter 19</a>).</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Condition</th><th>Share of the table, from <code>pg_stats</code></th><th>True for this account?</th></tr></thead>
+      <tbody>
+        <tr><td><code>account_id = 4117</code></td><td>3.3%: a very large account, 1.98 million tickets</td><td>Yes</td></tr>
+        <tr><td><code>status = 'open'</code></td><td>4% of all tickets</td><td>No. Of this account's tickets, 0.01% are open</td></tr>
+        <tr><td><code>team_id = 12</code></td><td>10%</td><td>Roughly</td></tr>
+        <tr><td><b>All three</b></td><td>60,000,000 × 0.033 × 0.04 × 0.10 = <b>7,920</b></td><td><b>31</b></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Account 4117 turned out to be an integration: a monitoring system that files tickets by API and closes each one automatically within the hour. It has two million tickets and almost none of them open. Status and account aren't independent, and for this account the general rate of 4% is wrong by a factor of several hundred. The three customers who complained were all of this kind.</p>
+  <p>The remedy from <a href="19-cost-based-optimizer.html">Chapter 19</a> is extended statistics, which record how often combinations of values occur.</p>
+<pre class="code"><span class="k">CREATE STATISTICS</span> tickets_account_status_team (mcv) <span class="k">ON</span> account_id, status, team_id <span class="k">FROM</span> tickets;
+<span class="k">ANALYZE</span> tickets;
+
+ Limit  (cost=1880412.80..1880412.86 rows=25 width=74) (actual time=1881.102..1881.110 rows=25 loops=1)
+   -&gt;  Sort  (cost=1880412.80..1880412.93 rows=<span class="m">52</span> width=74) (actual time=1881.100..1881.104 rows=25 loops=1)
+         Sort Key: created_at DESC
+         Sort Method: top-N heapsort  Memory: 31kB
+         -&gt;  Bitmap Heap Scan on tickets  (cost=21640.12..1880411.32 rows=<span class="m">52</span> width=74) (actual time=212.4..1881.0 rows=<span class="m">31</span> loops=1)
+               Recheck Cond: (account_id = 4117)
+               Filter: ((team_id = 12) AND (status = 'open'::text))
+               Rows Removed by Filter: <span class="m">1979969</span>
+               -&gt;  Bitmap Index Scan on tickets_account_id_idx  (cost=0.00..21640.10 rows=1980000 width=0)
+ Execution Time: <span class="m">1881.240</span> ms</pre>
+  <p>The estimate is now 52 against a true 31, which is close, and the planner has duly changed its mind: with so few matches expected, walking the time index looks hopeless, so it fetches the account's tickets through the index on <code>account_id</code> and sorts the survivors. That takes 1.9 seconds, six times better and still far too slow. The planner is now choosing the best plan available to it, and the best available is bad: it has to fetch two million rows to find 31. <b>A correct estimate lets the planner choose well among the plans that exist. It can't supply an index that isn't there.</b></p>
+
+  <h2>The index</h2>
+  <p>Neither existing index fits the query. One finds the account and none of the rest. The other supplies the order and none of the filtering. The query needs one index that does both, and the rule from <a href="09-indexes-first-look.html">Chapter 9</a> gives its shape: the columns tested for equality first, then the column that supplies the order.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Candidate</th><th>Finds the rows?</th><th>Supplies the order?</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><code>(account_id)</code>, existing</td><td>The account only</td><td>No</td><td>Two million rows fetched for a large account</td></tr>
+        <tr><td><code>(created_at)</code>, existing</td><td>No</td><td>Yes</td><td>Fast only when matches are dense and recent</td></tr>
+        <tr><td><code>(account_id, team_id, status)</code></td><td>Yes</td><td>No</td><td>Good for 31 rows. For a team with 96,000 open tickets it fetches them all and sorts</td></tr>
+        <tr><td><code>(account_id, team_id, status, created_at DESC)</code></td><td>Yes</td><td>Yes</td><td>Right, and it indexes all 60 million rows to serve a query about 4% of them</td></tr>
+        <tr><td><b><code>(account_id, team_id, created_at DESC) WHERE status = 'open'</code></b></td><td>Yes</td><td>Yes</td><td><b>Chosen.</b> The same result from an index a twenty-fifth of the size</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="k">CREATE INDEX CONCURRENTLY</span> tickets_open_idx
+  <span class="k">ON</span> tickets (account_id, team_id, created_at <span class="k">DESC</span>)
+  <span class="k">WHERE</span> status = <span class="s">'open'</span>;
+
+ Limit  (cost=0.43..38.12 rows=25 width=74) (actual time=0.031..0.068 rows=25 loops=1)
+   Buffers: shared hit=<span class="m">29</span>
+   -&gt;  Index Scan using tickets_open_idx on tickets  (cost=0.43..78.81 rows=52 width=74) (actual time=0.030..0.064 rows=25 loops=1)
+         Index Cond: ((account_id = 4117) AND (team_id = 12))
+ Planning Time: 0.180 ms
+ Execution Time: <span class="m">0.089</span> ms</pre>
+  <p>The scan goes straight to this account and team within the index, where the open tickets are already in order of time, reads 25 entries and stops. It touched 29 pages where the first plan touched four million. There is no filter line and no rows removed: every row the scan visited was a row the query wanted, which is what a well-fitted index looks like in a plan.</p>
+
+  <h2>Try it: three accounts, two fixes</h2>
+  <p>The same query for three accounts of different character. Switch the two fixes on and off, separately and together, and watch which plan the planner picks for each account and what it costs.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">The planner's choice, and what it cost</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="sq-row"><span>Statistics</span><div class="seg" id="sqS"><button class="active" data-v="0">each column alone</button><button data-v="1">+ extended statistics</button></div></div>
+      <div class="sq-row"><span>Indexes</span><div class="seg" id="sqI"><button class="active" data-v="0">account_id, created_at</button><button data-v="1">+ the partial composite index</button></div></div>
+      <div class="sq-row"><span>Account</span><div class="seg" id="sqA"><button data-v="small">a small customer</button><button data-v="busy">a large, busy customer</button><button class="active" data-v="quiet">the integration (4117)</button></div></div>
+      <div class="sq-h">All three accounts under these settings</div>
+      <div class="sq-all" id="sqAll"></div>
+      <div class="sq-h">The plan for the selected account</div>
+      <div class="sq-plan" id="sqPlan"></div>
+      <div class="sq-msg" id="sqMsg"></div>
+      <div class="stats" id="sqStats"></div>
+    </div>
+    <div class="panel-foot">The planner here does what PostgreSQL does: it prices each available plan from its estimate of matching rows and takes the cheapest. The time comes from the rows each plan really has to read. The small customer has 40,000 tickets, 140 of them open for this team. The busy one has 2.5 million tickets and 96,000 open. The integration has 1.98 million and 31.</div>
+  </div>
+
+  <p>Things to notice. With nothing fixed, the busy customer's dashboard takes under 5 ms using the very plan that takes the integration 12 seconds. The backward walk suits an account whose open tickets are many and recent, which is why the planner likes it and why testing with an ordinary account found nothing. Extended statistics alone correct the estimate for the integration, and the planner moves to the other bad plan, at 1.9 seconds. The index alone, with the statistics still wrong, brings all three accounts under a tenth of a millisecond. With an index that fits, the right plan is so much cheaper than the alternatives that the planner chooses it across the whole range of estimates. That is the stronger kind of fix: correcting the estimate helps the planner guess better, and the index makes the plan good whether the guess is right or not.</p>
+
+  <h2>Verifying under load</h2>
+  <p>A plan that looks right in one <code>EXPLAIN</code> isn't a finished fix. The checks below are what separates a change that worked from one that seemed to.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Reproduce on a copy of production</b> restored from backup, with real data sizes and real skew</li>
+      <li data-k="step"><b>Test the worst parameters and the typical ones</b> the integration, a busy account, a small one, an account with no open tickets</li>
+      <li data-k="step"><b>Test as the application runs it</b> as a prepared statement, executed more than five times, in case a generic plan differs</li>
+      <li data-k="step"><b>Build the index concurrently in production</b> and confirm that it is valid</li>
+      <li data-k="decision"><b>Did the statistics move?</b> mean, maximum and spread for this query, and no other query made worse</li>
+      <li data-k="store"><b>Check the cost on writes</b> insert and update latency on the table, and the index's size</li>
+      <li data-k="end"><b>Leave a guard</b> an alert on the query's maximum time, and a statement timeout for the dashboard</li>
+    </ol>
+    <figcaption><b>Verifying the fix.</b> The third step catches the case <a href="17-explain.html">Chapter 17</a> described: fast in psql, slow from the application.</figcaption>
+  </figure>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Measure, over 24 hours</th><th>Before</th><th>After</th></tr></thead>
+      <tbody>
+        <tr><td><b>Mean execution time</b></td><td>31.4 ms</td><td>0.07 ms</td></tr>
+        <tr><td><b>Maximum</b></td><td>12,406 ms</td><td>1.9 ms</td></tr>
+        <tr><td><b>Standard deviation</b></td><td>412.7 ms</td><td>0.05 ms</td></tr>
+        <tr><td><b>Dashboard endpoint, 99th percentile</b></td><td>Requests timing out</td><td>4 ms</td></tr>
+        <tr><td><b>Share of the database's total query time</b></td><td>22%</td><td>Under 0.1%</td></tr>
+        <tr><td><b>Insert into <code>tickets</code>, 99th percentile</b></td><td>1.1 ms</td><td>1.2 ms</td></tr>
+        <tr><td><b>Size of the new index</b></td><td></td><td>71 MB, against 1.9 GB had it covered every row</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Two results are worth a remark. The spread collapsed along with the maximum: the query now costs the same for every account, which is the real goal, since a query whose time doesn't depend on its parameters can't surprise anyone. And the query had been 22% of the database's total load without ever appearing slow on average, because each of the rare twelve-second executions cost as much as four hundred average ones. The extended statistics were kept, since they improve estimates for other queries on the table, and the index on <code>created_at</code> stayed, since other queries use it.</p>
+
+  <div class="callout usecase">
+    <div class="ico">📐</div>
+    <div class="body"><div class="title">PostgreSQL's planner: a straight line through an uneven table</div><p>The plan in this case study comes straight from a simplification in PostgreSQL's cost model, one its developers have explained on the project's mailing lists many times over the years. When a query has a <code>LIMIT</code>, the planner costs the plan beneath it as if it would run to completion, and then scales that cost by the fraction of rows the limit needs. Asking for 25 rows out of an expected 7,920 is priced at 25/7920 of the full scan, plus the cost of getting started. That is the calculation visible on the first line of the slow plan above: 4,756,924 scaled down to 15,016. The formula assumes that matching rows are spread evenly through whatever order the scan follows, so that a three-hundredth of the scan yields a three-hundredth of the matches. For a scan in time order, that holds only when the filter has no relationship to time. In practice it very often has one: open tickets are mostly recent, a departed customer's rows are all old, and a newly launched feature's rows are all new. When the matching rows are concentrated at the near end, the plan is even better than the planner thought. When they are at the far end, or there are fewer than the limit asks for, the scan runs most of the way through the table. The planner has no statistic that describes where in an index's order the rows matching some other condition fall, and collecting one for every pair of columns would be impractical, so the assumption has stayed. Experienced PostgreSQL users know its signature: a query with <code>ORDER BY</code> and <code>LIMIT</code>, an index scan on the ordering column, and a large "Rows Removed by Filter". They also know the dependable cure, which is the one used here: an index that covers the filter and the order together, so that the early-stopping plan no longer depends on where the matching rows happen to lie.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Judging a query by its mean.</b> Look at the maximum and the spread.</li>
+      <li><b>Testing with a typical account.</b> The plan was right for typical accounts. Use the parameters that failed.</li>
+      <li><b>Comparing estimated and actual rows under a <code>LIMIT</code></b> as if they measured the same thing.</li>
+      <li><b>Stopping when the estimate is fixed.</b> A good estimate can't choose a plan that no index supports.</li>
+      <li><b>Reaching for hints or planner settings</b> to force a plan for everyone, where an index would make the choice safe.</li>
+      <li><b>Declaring victory from one <code>EXPLAIN</code>,</b> without checking the prepared-statement path, the write cost or the production statistics.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> A query is fast for most users and takes ten seconds for a few. Where do you start?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>That pattern, fast usually and terrible sometimes, points to a plan that suits some parameter values and not others, more than to a query that is slow in general. I'd confirm it in pg_stat_statements: a small mean with a huge max and standard deviation. Then I'd get the actual parameters from a slow case, from logs with log_min_duration_statement or from the affected user's IDs, and run EXPLAIN (ANALYZE, BUFFERS) with those, and again with typical parameters, and compare the two plans. Usually either the plans differ, which means the estimates differ, or the plan is the same and does vastly more work for one input. I'd look for the node where the time goes, and for large "Rows Removed by Filter" figures and estimated rows far from actual. Common causes are skew, where one value covers a third of the table; correlated columns that the planner multiplies as if independent; and ORDER BY with LIMIT walking an index in sort order while filtering. The fix is usually an index that matches the query's filter and order together, sometimes with better statistics. I'd verify with the worst-case parameters, since the typical ones were never the problem.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why might PostgreSQL scan an index on the <code>ORDER BY</code> column and filter, when there is an index on the <code>WHERE</code> column? How do you stop it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because with a LIMIT, a plan that produces rows already sorted can stop early, and the planner prices that. It estimates how many rows match the filter, assumes they are evenly distributed along the ordering index, and costs the scan as the full scan's cost times limit over estimated matches. If it believes there are thousands of matches, reading the ordering index until it has found 25 looks far cheaper than using the filter index, fetching every matching row and sorting. It goes wrong in two ways. The estimate of matches may be too high, typically from multiplying the selectivities of correlated columns, so the matches are much rarer than assumed. Or the matches are not evenly spread: they sit at the far end of the scan order, or there are fewer than the limit, and the scan covers most of the index. To stop it, the best fix is a composite index with the equality columns first and the sort column last, partial if the filter includes a constant condition; then the early-stopping plan reads only matching rows and is cheapest under any estimate. Second, improve the estimates with extended statistics or a higher statistics target, which helps the planner but leaves it dependent on being right. Workarounds exist, such as changing the ORDER BY expression so that the ordering index can't be used, or wrapping the filter in a materialised CTE, but they pin one plan for all parameter values, including the ones for which the original plan was good, so I'd use them only as a stopgap.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A small mean with a huge maximum means the plan is wrong for some parameters. Test with those.</li>
+      <li>Under a <code>LIMIT</code>, a scan in sort order with a filter is fast when matches are dense and near, and reads most of the table when they are rare or far.</li>
+      <li>The planner multiplies selectivities as if columns were independent. Correlated columns give estimates wrong by orders of magnitude.</li>
+      <li>Fixing the estimate lets the planner choose the best plan available. It doesn't create a good one.</li>
+      <li>An index with the equality columns, then the sort column, and partial where a condition is constant, makes the good plan cheapest under any estimate.</li>
+      <li>Verify with the worst case, as a prepared statement, and in production statistics, and check what the index costs on writes.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A query's mean time is 30 ms, and its maximum is 12 seconds with a very large standard deviation. What does that suggest?</p>
+      <div class="opts">
+        <button class="opt">The server is short of memory</button>
+        <button class="opt">The query is slow for everyone</button>
+        <button class="opt">The plan suits most parameter values and is badly wrong for a few</button>
+        <button class="opt">The statistics view is broken</button>
+      </div>
+      <div class="explain">A uniformly slow query has a large mean. A large spread points at particular inputs.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why did the planner walk the <code>created_at</code> index backwards, and not use the index on <code>account_id</code>?</p>
+      <div class="opts">
+        <button class="opt">It expected thousands of matching rows spread evenly through time, so it expected to find 25 after reading a small part of the index, with no sort</button>
+        <button class="opt">The <code>account_id</code> index was corrupt</button>
+        <button class="opt">It always prefers the index on the ORDER BY column</button>
+        <button class="opt">The statistics had never been collected</button>
+      </div>
+      <div class="explain">The plan is a good one when its two assumptions hold. Here there were 31 matches, all of them old.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">In the slow plan, the scan node shows an estimate of <code>rows=7920</code> and an actual <code>rows=25</code>. What can you conclude about the estimate?</p>
+      <div class="opts">
+        <button class="opt">It was too high by a factor of 317</button>
+        <button class="opt">It was accurate</button>
+        <button class="opt">It was too low</button>
+        <button class="opt">Nothing yet: the actual count was cut short by the LIMIT. Run a <code>count(*)</code> to compare</button>
+      </div>
+      <div class="explain">The estimate is for the scan run to its end. The limit stopped it at 25.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">After extended statistics were added, the estimate was right and the query still took 1.9 seconds. Why?</p>
+      <div class="opts">
+        <button class="opt">The statistics hadn't taken effect</button>
+        <button class="opt">The planner chose the best plan available, and with no index fitting the query that plan had to fetch two million rows</button>
+        <button class="opt">Extended statistics slow queries down</button>
+        <button class="opt">The buffer pool was cold</button>
+      </div>
+      <div class="explain">Statistics inform the choice among existing plans. A better plan needed a new index.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why is the chosen index partial, with <code>WHERE status = 'open'</code>, and without <code>status</code> as a key column?</p>
+      <div class="opts">
+        <button class="opt">PostgreSQL can't index text columns</button>
+        <button class="opt">Partial indexes are always faster to scan</button>
+        <button class="opt">The query always asks for open tickets, which are 4% of the table, so the index can leave out the other 96%</button>
+        <button class="opt">To make writes to closed tickets slower</button>
+      </div>
+      <div class="explain">It is a twenty-fifth of the size, and rows that are never queried this way cost nothing to keep out.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const N = 60e6, FULL = 4756924, LIM = 25, PER_ROW_B = 12406.3 / 41237842, PER_ROW_A = 0.00095;
+  // rows: the account's tickets. matches: open for this team. est0/est1: planner's estimate without and with extended statistics.
+  // deep: rows the backward scan reads before it has 25 matches.
+  const ACC = {
+    small: { id: 9302, label: 'A small customer', rows: 40000, matches: 140, est0: 160, est1: 140, deep: 23600000, note: '40,000 tickets, 140 open for this team' },
+    busy: { id: 2290, label: 'A large, busy customer', rows: 2500000, matches: 96000, est0: 10000, est1: 96000, deep: 15625, note: '2.5 million tickets, 96,000 open' },
+    quiet: { id: 4117, label: 'The integration', rows: 1980000, matches: 31, est0: 7920, est1: 52, deep: 41237867, note: '1.98 million tickets, 31 open, all old' },
+  };
+  const num = (n) => Math.round(n).toLocaleString('en-GB');
+  const ms = (t) => t >= 1000 ? (t / 1000).toFixed(1) + ' s' : t >= 10 ? Math.round(t) + ' ms' : t >= 1 ? t.toFixed(1) + ' ms' : t.toFixed(2) + ' ms';
+  function choose(a, stats, index) {
+    const est = stats ? a.est1 : a.est0, take = Math.min(LIM, a.matches);
+    const plans = [
+      { k: 'B', name: 'backward scan of created_at, filtering', cost: FULL * Math.min(1, LIM / est), read: a.deep, time: a.deep * PER_ROW_B },
+      { k: 'A', name: 'account_id index, filter, sort', cost: a.rows * 0.95, read: a.rows, time: a.rows * PER_ROW_A },
+    ];
+    if (index) plans.push({ k: 'C', name: 'the partial composite index', cost: 0.43 + 1.5 * Math.min(LIM, est), read: take, time: 0.03 + 0.0024 * take });
+    const p = plans.slice().sort((x, y) => x.cost - y.cost)[0];
+    return { ...p, est, take, plans };
+  }
+  function planText(a, p) {
+    const e = num(p.est);
+    if (p.k === 'B') return ` Limit  (rows=25) (actual rows=${p.take})\n   ->  Index Scan Backward using tickets_created_at_idx on tickets\n         (rows=${e}) (actual rows=${p.take})\n         Filter: account_id = ${a.id} AND team_id = 12 AND status = 'open'\n         Rows Removed by Filter: ${num(p.read - p.take)}\n Execution Time: ${ms(p.time)}`;
+    if (p.k === 'A') return ` Limit  (rows=25) (actual rows=${p.take})\n   ->  Sort  (Sort Key: created_at DESC; top-N heapsort)\n         ->  Bitmap Heap Scan on tickets  (rows=${e}) (actual rows=${num(a.matches)})\n               Recheck Cond: account_id = ${a.id}\n               Filter: team_id = 12 AND status = 'open'\n               Rows Removed by Filter: ${num(a.rows - a.matches)}\n               ->  Bitmap Index Scan on tickets_account_id_idx  (actual rows=${num(a.rows)})\n Execution Time: ${ms(p.time)}`;
+    return ` Limit  (rows=25) (actual rows=${p.take})\n   ->  Index Scan using tickets_open_idx on tickets\n         (rows=${e}) (actual rows=${p.take})\n         Index Cond: account_id = ${a.id} AND team_id = 12\n Execution Time: ${ms(p.time)}`;
+  }
+  const grade = (t) => t >= 1000 ? 'sq-bad' : t >= 100 ? 'sq-slow' : '';
+  function draw() {
+    const stats = $('#sqS').dataset.value === '1', index = $('#sqI').dataset.value === '1', key = $('#sqA').dataset.value, a = ACC[key], p = choose(a, stats, index);
+    $('#sqAll').innerHTML = Object.entries(ACC).map(([k, x]) => { const q = choose(x, stats, index); return `<div class="sq-a ${k === key ? 'sq-sel' : ''}"><span><b>${x.label}</b><small>${x.note}</small></span><span>${q.name}<small>estimated ${num(q.est)} matches, read ${num(q.read)} rows</small></span><b class="sq-t ${grade(q.time)}">${ms(q.time)}</b></div>`; }).join('');
+    $('#sqPlan').textContent = planText(a, p);
+    const worst = Math.max(...Object.values(ACC).map((x) => choose(x, stats, index).time));
+    const m = $('#sqMsg'); let kind = '', html;
+    const off = p.est / a.matches, offTxt = off >= 1.5 ? `${off >= 10 ? Math.round(off) : off.toFixed(1)} times too high` : off <= 0.67 ? `${(1 / off).toFixed(1)} times too low` : 'about right';
+    if (p.k === 'C') html = `<b>${ms(p.time)}, reading ${p.take} index entries.</b> The index leads straight to this account and team, with open tickets already in time order. Every row read is a row wanted. The estimate is ${offTxt}, and it no longer matters: this plan costs ${num(p.cost)} against ${num(Math.min(...p.plans.filter((x) => x.k !== 'C').map((x) => x.cost)))} for the next best.`;
+    else if (p.k === 'B' && p.time >= 1000) { kind = 'sq-bad'; html = `<b>${ms(p.time)}: the plan from the incident.</b> The planner expected ${num(p.est)} matches and priced the walk at ${num(p.cost)}, a fraction of the full scan. There are ${a.matches}, all of them old, so the walk passed ${num(p.read - p.take)} newer tickets first. The estimate is ${offTxt}.`; }
+    else if (p.k === 'B') html = `<b>${ms(p.time)}: the same plan, working as intended.</b> This account's open tickets are many and recent, so walking back through time meets 25 of them after ${num(p.read)} rows, with no sort. This is the case the planner was pricing.`;
+    else if (p.time >= 1000) { kind = 'sq-warn'; html = `<b>${ms(p.time)}: the estimate is right, and the plan is still slow.</b> Expecting only ${num(p.est)} matches, the planner gave up the walk and used the index on <code>account_id</code>. That fetches all ${num(a.rows)} of the account's tickets to keep ${a.matches}. It is the best plan available, since no index fits the query.`; }
+    else html = `<b>${ms(p.time)}.</b> A small account: the index on <code>account_id</code> fetches its ${num(a.rows)} tickets, the filter keeps ${a.matches}, and a small sort picks the newest 25. Acceptable, and four hundred times what it needs to be.`;
+    m.className = 'sq-msg ' + kind; m.innerHTML = html;
+    $('#sqStats').innerHTML = `<div class="stat acc"><div class="k">Estimated matches</div><div class="v">${num(p.est)}</div></div>
+      <div class="stat"><div class="k">Actual matches</div><div class="v">${num(a.matches)}</div></div>
+      <div class="stat ${p.read > 1e6 ? 'bad' : p.read > 1e4 ? 'warn' : 'good'}"><div class="k">Rows read</div><div class="v">${num(p.read)}</div></div>
+      <div class="stat ${p.time >= 1000 ? 'bad' : p.time >= 100 ? 'warn' : 'good'}"><div class="k">Time, this account</div><div class="v">${ms(p.time)}</div></div>
+      <div class="stat ${worst >= 1000 ? 'bad' : worst >= 100 ? 'warn' : 'good'}"><div class="k">Slowest of the three</div><div class="v">${ms(worst)}</div></div>`;
+  }
+  ['#sqS', '#sqI', '#sqA'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>

@@ -6,34 +6,387 @@
 <title>Journaling &amp; Crash Consistency</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .jr-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-top:14px; }
+  @media (max-width:760px) { .jr-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .jr-box { border:1.5px solid var(--border); border-radius:12px; padding:9px 11px; background:var(--surface); min-height:104px; transition:.2s; }
+  .jr-box h6 { margin:0 0 6px; font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .jr-box div { font-family:var(--mono); font-size:12px; line-height:1.5; color:var(--text-2); }
+  .jr-box small { display:block; margin-top:5px; font-size:11.5px; color:var(--muted); }
+  .jr-box.jr-new { border-color:var(--green); background:var(--green-soft); }
+  .jr-box.jr-new div { color:var(--text); }
+  .jr-box.jr-log { border-color:var(--accent-2); background:var(--accent-2-soft); }
+  .jr-box.jr-off { opacity:.5; border-style:dashed; }
+  .jr-mem { margin-top:10px; font-size:13px; color:var(--muted); }
+  .jr-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:84px; }
+  .jr-desc.jr-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .jr-desc.jr-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .jr-desc.jr-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="24">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 24</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Journaling &amp; Crash <span class="grad">Consistency</span></h1>
-    <p class="lead">What a power cut does mid-write, fsck, write-ahead journaling, and copy-on-write file systems.</p>
+    <p class="lead">Adding one block to a file changes three separate places on the disk, and a disk writes them one at a time. Machines lose power, kernels panic and cables are pulled, at any moment, including between the second write and the third. What is on the disk then? A file system has to be able to answer "something sensible", after every possible interruption, and to get back to a usable state quickly. This chapter looks at the problem exactly, at the old answer (check the whole disk afterwards), at the answer nearly every file system uses now (write down what you are about to do first), and at a third design that avoids overwriting anything at all.</p>
+    <ul class="objectives">
+      <li>List the on-disk writes behind a simple append and what each partial combination leaves behind</li>
+      <li>Explain what fsck does and why it stopped being enough</li>
+      <li>Walk through a journaled transaction: log, commit, checkpoint, and recovery after a crash</li>
+      <li>Compare ext4's journal, ordered and writeback modes</li>
+      <li>Explain how copy-on-write file systems stay consistent without a journal</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Inodes, bitmaps, data blocks and directories.</b> See <a href="23-file-systems.html">Chapter 23</a>.</li>
+        <li><b>System calls, and that <code>write()</code> hands data to the kernel.</b> See <a href="10-file-descriptors.html">Chapter 10</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The crash consistency problem</li>
-    <li>fsck</li>
-    <li>Data vs metadata journaling</li>
-    <li>ext4 journal modes</li>
-    <li>Copy-on-write: btrfs, ZFS</li>
-  </ol>
+  <h2>The crash-consistency problem</h2>
+  <p>A program appends 4 KiB to a file that already has one block. To make that true on disk the file system must write three blocks:</p>
+  <ul>
+    <li>the <b>data block</b>: the new contents, in a block that was free (say block 5);</li>
+    <li>the <b>inode</b>: the size goes from 4,096 to 8,192, and block 5 is added to the file's block list;</li>
+    <li>the <b>block bitmap</b>: block 5 is marked as in use.</li>
+  </ul>
+  <p>These are in different places, and a disk can't write three scattered blocks as one indivisible operation. If the machine dies part-way, any subset may have reached the disk. Two of the eight combinations are clean: nothing written, or everything. The other six are these:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Reached the disk</th><th>What the disk now says</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Data only</td><td>Block 5 has the new bytes, but nothing refers to it and it is marked free</td><td>Harmless. It is as if the append never happened</td></tr>
+        <tr><td>Bitmap only</td><td>Block 5 is marked used, and no file owns it</td><td>A <b>leaked block</b>: space lost until something notices</td></tr>
+        <tr><td>Inode only</td><td>The file claims block 5, which holds old rubbish and is marked free</td><td>The file ends in <b>garbage</b>, possibly another user's old data. Worse, the allocator can give block 5 to a second file</td></tr>
+        <tr><td>Inode + bitmap</td><td>Metadata is perfectly consistent; block 5 was never written</td><td>The file ends in garbage, and <b>no check can tell</b></td></tr>
+        <tr><td>Inode + data</td><td>The file is right, but block 5 is marked free</td><td>The block will be handed to another file: <b>two files sharing one block</b></td></tr>
+        <tr><td>Bitmap + data</td><td>Block 5 is used and written, and no inode points to it</td><td>Leaked block; the append is lost</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The goal is modest: after a crash the file system should look as if each operation either happened completely or didn't happen at all. Losing the last second of work is acceptable. Structures that contradict each other are not.</p>
+
+  <h2>The old answer: fsck</h2>
+  <p>Early file systems let the inconsistencies happen and repaired them on the next boot. <code>fsck</code> (file system check) reads <i>all</i> the metadata and cross-checks it: every inode's block list against the bitmaps, every directory entry against the inode table, every link count against the number of names actually found.</p>
+<pre class="code"><span class="c">#</span> e2fsck -f /dev/sdb1
+Pass <span class="m">1</span>: Checking inodes, blocks, and sizes
+Pass <span class="m">2</span>: Checking directory structure
+Pass <span class="m">3</span>: Checking directory connectivity
+Pass <span class="m">4</span>: Checking reference counts
+Pass <span class="m">5</span>: Checking group summary information
+Block bitmap differences:  +<span class="m">524312</span>                  <span class="c"># an inode uses a block the bitmap calls free</span>
+Fix&lt;y&gt;? yes
+Free blocks count wrong for group #<span class="m">16</span> (<span class="m">1024</span>, counted=<span class="m">1023</span>).
+Fix&lt;y&gt;? yes
+/dev/sdb1: ***** FILE SYSTEM WAS MODIFIED *****</pre>
+  <p>It has two weaknesses that got worse every year. It has to scan the whole disk to find a problem that involves three blocks, so the time grows with the size of the disk, not the size of the damage: minutes in the 1990s, hours on a multi-terabyte volume, with the server down throughout. And it can only make the metadata agree with itself. In the "inode + bitmap" case there is nothing inconsistent to find, so the garbage stays. Orphaned files with no name are moved to <code>lost+found</code> for a human to sort out.</p>
+
+  <h2>Journaling: write it down first</h2>
+  <p>The idea that replaced it comes from databases, where it is called <b>write-ahead logging</b>. Before changing any structure in place, the file system first writes a note describing the whole change to a reserved area of the disk, the <b>journal</b>. Only once the note is safely stored does it make the real changes.</p>
+  <figure class="seq" data-actors="File system|Journal area|Final locations on disk">
+    <ol>
+      <li data-m="0>1">1. Journal write: "transaction 81 begins", plus copies of the blocks to change</li>
+      <li data-m="0>1">2. Commit: one small record, "transaction 81 is complete"</li>
+      <li data-m="0>2">3. Checkpoint: write the blocks to their real places</li>
+      <li data-m="0>1">4. Free: mark transaction 81 as no longer needed</li>
+    </ol>
+    <figcaption><b>One journaled transaction.</b> The commit record fits in a single sector, which a disk writes entirely or not at all, so there is one exact instant at which the transaction becomes durable.</figcaption>
+  </figure>
+  <p>After a crash, recovery reads the journal and nothing else:</p>
+  <ul>
+    <li><b>A transaction with no commit record</b> is ignored. Its real locations were never touched, so the file system is in its old, consistent state.</li>
+    <li><b>A committed transaction</b> is <b>replayed</b>: its logged blocks are copied to their real places. If some had already been written before the crash, they are simply written again with the same contents.</li>
+  </ul>
+  <p>Either way the operation is all or nothing, and recovery takes time proportional to the journal, a second or two, however large the disk is.</p>
+<pre class="code"><span class="c">$</span> dmesg | grep EXT4
+EXT4-fs (nvme0n1p2): recovery complete
+EXT4-fs (nvme0n1p2): mounted filesystem with ordered data mode</pre>
+
+  <h2>What goes in the journal: three modes</h2>
+  <p>Journaling everything means every block is written twice, once to the journal and once to its place. For file contents, which are most of the bytes, that halves write throughput. So file systems offer a cheaper arrangement: journal only the <b>metadata</b> and write data blocks directly. That raises a question of order. If the metadata transaction commits before the data block has been written, a crash leaves a committed inode pointing at garbage. <b>Ordered</b> mode closes that hole by always writing the data blocks to their final place <i>first</i>, and only then committing the metadata that refers to them.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>ext4 mount option</th><th>In the journal</th><th>After a crash</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><code>data=journal</code></td><td>Metadata and file data</td><td>Metadata consistent; file contents are old or new, never garbage</td><td>All data written twice</td></tr>
+        <tr><td><code>data=ordered</code> (default)</td><td>Metadata only; data is written to its place before the metadata commits</td><td>Metadata consistent; files never expose blocks that weren't written</td><td>Close to no journal</td></tr>
+        <tr><td><code>data=writeback</code></td><td>Metadata only; data is written whenever convenient</td><td>Metadata consistent, but a recently extended file can contain stale garbage</td><td>Fastest</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Two practical points. The journal protects the file system's <i>structure</i>, not your last few seconds of work: ext4 commits about every five seconds, and whatever hadn't been committed is simply gone after a crash. And a journal is no defence against a disk that returns wrong data or loses blocks it claimed to have written.</p>
+
+  <h2>Pull the plug</h2>
+  <p>The append from the start of the chapter. With no journal, perform the three writes in any order and cut the power wherever you like. Then switch to a journaled mode and try to find a moment at which a crash leaves the file system broken.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Appending one block, and a power cut</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="controls">
+        <div class="seg" id="jrMode"><button class="active" data-v="none">no journal</button><button data-v="ordered">metadata journal (ordered)</button><button data-v="journal">full data journal</button></div>
+      </div>
+      <div class="controls">
+        <button class="btn sm" id="jrD">Write data block</button>
+        <button class="btn sm" id="jrI">Write inode</button>
+        <button class="btn sm" id="jrB">Write bitmap</button>
+        <button class="btn sm primary" id="jrNext">Next write →</button>
+        <button class="btn sm" id="jrCrash">⚡ Cut the power</button>
+        <button class="btn sm" id="jrRec">Reboot and recover</button>
+        <button class="btn sm" id="jrReset">↺ Reset</button>
+      </div>
+      <div class="jr-grid" id="jrGrid"></div>
+      <div class="jr-mem" id="jrMem"></div>
+      <div class="jr-desc" id="jrDesc"></div>
+      <div class="stats" id="jrStats"></div>
+    </div>
+    <div class="panel-foot">The boxes show what is on the disk. The complete update exists in memory from the start and is lost when the power goes. Green means the new version has reached its final location. Real journals batch many operations into one transaction; this one holds a single append.</div>
+  </div>
+
+  <p>Things to notice. Without a journal, five of the eight places to stop leave something wrong, and the most dangerous are the ones where the inode gets ahead of the other two. Recovery by fsck repairs the bookkeeping but can't bring back the append or turn garbage into data. With either journal there is no bad moment: before the commit record the old state survives untouched, and after it the new state can always be rebuilt from the journal. In ordered mode, notice that the data block goes out first, so the commit never describes a file whose contents haven't been written.</p>
+
+  <h2>Copy-on-write file systems</h2>
+  <p>ZFS, btrfs and APFS take a different route: <b>never overwrite live data at all</b>. A change is written to free blocks. That changes the block that pointed to the old version, so a new copy of that block is written too, and so on up the tree of metadata to the root. Last of all, one write switches the file system's root pointer from the old tree to the new one.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Before</b> The root points at a tree of blocks describing every file. All of it is consistent.</li>
+      <li><b>Write the new data</b> Into free space. The old data block is untouched.</li>
+      <li><b>Write new copies of the metadata above it</b> The file's block map, then its parent, up to a new root. Still nothing live has changed.</li>
+      <li data-k="decision"><b>Crash now?</b> The old root is still the root. The new blocks are just unused space.</li>
+      <li data-k="end"><b>Switch the root pointer</b> One atomic write. The new tree is live, and the old blocks can be freed, or kept as a snapshot.</li>
+    </ol>
+    <figcaption><b>Copy-on-write update.</b> The disk always holds a complete, consistent tree. There is nothing to replay and nothing to check.</figcaption>
+  </figure>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>fsck only</th><th>Journaling</th><th>Copy-on-write</th></tr></thead>
+      <tbody>
+        <tr><td><b>Consistency after a crash</b></td><td>Restored by scanning everything</td><td>Restored by replaying the journal</td><td>Never lost</td></tr>
+        <tr><td><b>Recovery time</b></td><td>Grows with disk size: minutes to hours</td><td>Seconds</td><td>None</td></tr>
+        <tr><td><b>Extra writes</b></td><td>None</td><td>Metadata twice (data too, in full-journal mode)</td><td>Every change rewrites the path up to the root</td></tr>
+        <tr><td><b>Snapshots</b></td><td>No</td><td>No</td><td>Nearly free: keep an old root</td></tr>
+        <tr><td><b>Weak point</b></td><td>Downtime; can't fix data</td><td>Protects structure, not recent data</td><td>Files fragment over time; heavy on random-write workloads such as databases</td></tr>
+        <tr><td><b>Examples</b></td><td>ext2, FAT</td><td>ext3, ext4, XFS, NTFS</td><td>ZFS, btrfs, APFS</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Copy-on-write file systems usually add a checksum for every block, stored in the block above it. That lets them detect a disk silently returning the wrong contents, and repair it from a mirror copy if there is one, which neither fsck nor a journal can do.</p>
+
+  <h2>What the file system doesn't do for you</h2>
+  <p>A consistent file system is not the same as a safe file. All of the above keeps the <i>file system's</i> structures sane. Whether <i>your</i> data survives is up to you, because <code>write()</code> only copies bytes into the kernel's memory and returns. To make a file durable you must ask, with <code>fsync</code>, and to replace a file safely you combine it with the atomic rename from Chapter 23:</p>
+<pre class="code"><span class="t">int</span> fd = <span class="f">open</span>(<span class="s">"config.tmp"</span>, <span class="m">O_WRONLY</span> | <span class="m">O_CREAT</span> | <span class="m">O_TRUNC</span>, <span class="m">0644</span>);
+<span class="f">write</span>(fd, buf, len);
+<span class="f">fsync</span>(fd);                              <span class="c">/* 1. the new contents are on the disk */</span>
+<span class="f">close</span>(fd);
+<span class="f">rename</span>(<span class="s">"config.tmp"</span>, <span class="s">"config"</span>);         <span class="c">/* 2. switch the name, atomically */</span>
+<span class="t">int</span> dir = <span class="f">open</span>(<span class="s">"."</span>, <span class="m">O_RDONLY</span>);
+<span class="f">fsync</span>(dir);                             <span class="c">/* 3. the rename itself is on the disk */</span>
+<span class="f">close</span>(dir);</pre>
+  <p>After a crash at any point, <code>config</code> is the complete old file or the complete new one. Leave out step 1 and it can be an empty file. <a href="31-page-cache-fsync.html">Chapter 31</a> covers what <code>fsync</code> does and what it costs.</p>
+
+  <div class="callout usecase">
+    <div class="ico">📄</div>
+    <div class="body"><div class="title">The ext4 zero-length file bug of 2009</div><p>When ext4 became the default in Linux distributions in 2009, users began reporting that after a crash, configuration files they had just saved were present and <b>empty</b>. Desktop programs were saving settings the usual way: write a new file, then rename it over the old one, without an <code>fsync</code>. On ext3 that had been safe in practice, because ordered mode pushed the data out within five seconds, before the rename committed. ext4 had added <b>delayed allocation</b>: it didn't even choose blocks for new data until writeback, up to half a minute later, to lay files out better. Until then there were no data blocks for ordered mode to write first. So the journal could commit the rename, making the new name point at a file with no contents yet, and a crash in that window kept the committed, empty file and lost the old one. The file system was perfectly consistent; the users' data was gone. Both sides had a point: POSIX had never promised the old behaviour, and thousands of programs depended on it. ext4 changed, and now forces a file's data out when it is renamed over an existing file, and well-written programs call <code>fsync</code> before the rename, as above. It is the clearest demonstration that "crash-consistent" describes the file system, not the application.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Thinking a journal means no data loss.</b> It means no structural corruption. Recent writes that weren't committed or synced are lost.</li>
+      <li><b>Assuming <code>write()</code> returning means the data is on disk.</b> It is in memory. Only <code>fsync</code> asks for it to be made durable.</li>
+      <li><b>Replacing a file by truncating and rewriting it.</b> A crash in between leaves an empty or half-written file. Write a new one and rename.</li>
+      <li><b>Renaming without syncing the data first.</b> The name can become durable before the contents do.</li>
+      <li><b>Believing fsck makes data correct.</b> It makes metadata agree with itself. It can't know what your file should contain.</li>
+      <li><b>Mounting with <code>data=writeback</code> for speed without understanding it.</b> After a crash, files can contain stale blocks, including other users' deleted data.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is journaling in a file system and what problem does it solve?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A single file operation updates several on-disk structures, for an append the data block, the inode and the allocation bitmap, and the disk can't write them atomically. A crash in between leaves them contradicting each other: an inode pointing at an unwritten block, or a block that is in use but marked free. Journaling solves this with write-ahead logging. The file system first writes a description of the whole update to a journal area, then a commit record, and only then writes the blocks to their real locations. On reboot it scans the journal: transactions without a commit record are discarded, because nothing was changed in place, and committed ones are replayed. So every operation is all or nothing, and recovery takes seconds instead of the hours a full fsck needs. Most file systems journal only metadata for speed; ext4's default ordered mode also writes data blocks before committing the metadata that points to them, so files never expose garbage.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How would you update a configuration file so that a crash can never leave it corrupted or empty?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Never modify it in place. Write the complete new contents to a temporary file in the same directory, so it is on the same file system. Call <code>fsync</code> on that file, so its data and inode are on stable storage. Then <code>rename</code> it over the real name: rename is atomic, so any reader or any crash sees either the whole old file or the whole new one. Finally <code>fsync</code> the directory, because the rename is a change to the directory and isn't durable until that is flushed. I'd check the return value of every call, <code>fsync</code> especially, since a failed sync means the data may not be there. If I skipped the first <code>fsync</code>, a journaling file system could commit the rename before the data blocks were written, and a crash would leave a zero-length file, which is exactly what happened to many applications when ext4 introduced delayed allocation.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>One logical operation is several disk writes, and a crash can land between any two of them.</li>
+      <li>fsck repairs metadata by scanning the whole disk: slow, and unable to restore data.</li>
+      <li>A journal records the change, then a commit record, then checkpoints it; recovery replays committed transactions and ignores the rest.</li>
+      <li>Metadata journaling is the usual compromise; ordered mode writes data before committing the metadata that points to it.</li>
+      <li>Copy-on-write file systems write new blocks and switch a root pointer, so the disk is always consistent, and snapshots come nearly free.</li>
+      <li>None of this makes your own writes durable. That takes <code>fsync</code>, and write-then-rename for safe replacement.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A file is being extended by one block. The machine crashes after the inode has been written but before the data block or the bitmap. What is on the disk?</p>
+      <div class="opts">
+        <button class="opt">Nothing has changed; the append is simply lost</button>
+        <button class="opt">The file claims a block that holds old garbage and is still marked free</button>
+        <button class="opt">A block is marked used but belongs to no file</button>
+        <button class="opt">The file is correct but twice as large</button>
+      </div>
+      <div class="explain">The inode got ahead. Reading the file returns whatever was in that block before, and the allocator may hand the same block to another file.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why did journaling replace fsck as the normal way to recover from a crash?</p>
+      <div class="opts">
+        <button class="opt">fsck can't detect any inconsistencies</button>
+        <button class="opt">Journaling uses less disk space</button>
+        <button class="opt">Journaling prevents crashes</button>
+        <button class="opt">fsck must scan all the metadata on the disk, taking time that grows with its size; replaying a journal takes seconds</button>
+      </div>
+      <div class="explain">fsck's cost is proportional to the disk, not to the damage. Journal recovery reads only the journal.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">During recovery, the journal contains a transaction with its blocks logged but no commit record. What happens?</p>
+      <div class="opts">
+        <button class="opt">It is discarded; the final locations were never modified, so the old state is intact</button>
+        <button class="opt">It is replayed anyway</button>
+        <button class="opt">The file system refuses to mount</button>
+        <button class="opt">fsck is run on the whole disk</button>
+      </div>
+      <div class="explain">Nothing is written in place until after the commit. Without a commit record the transaction never happened.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does ext4's default <code>data=ordered</code> mode guarantee?</p>
+      <div class="opts">
+        <button class="opt">File data is written to the journal before its final place</button>
+        <button class="opt">Writes reach the disk in the order the program made them</button>
+        <button class="opt">A file's data blocks are written to their final place before the metadata that refers to them is committed</button>
+        <button class="opt">No data is ever lost in a crash</button>
+      </div>
+      <div class="explain">Only metadata is journaled, but data goes out first, so a committed inode never points at blocks that were not written.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How does a copy-on-write file system such as ZFS or btrfs stay consistent without a journal?</p>
+      <div class="opts">
+        <button class="opt">It runs fsck continuously in the background</button>
+        <button class="opt">It writes changed blocks to new locations and then switches a single root pointer atomically</button>
+        <button class="opt">It keeps all metadata in battery-backed memory</button>
+        <button class="opt">It writes every block twice in place</button>
+      </div>
+      <div class="explain">The old tree is valid until the root switches and the new one is valid after. There is no moment at which the disk holds a half-updated structure.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const STEPS = {
+    ordered: [
+      ['D', 'The <b>data block</b> is written straight to its final place, block 5. Nothing points at it yet and the bitmap still says it is free.'],
+      ['J', 'A transaction is written to the <b>journal</b>: a begin record and copies of the new inode and the new bitmap. The real inode and bitmap are untouched.'],
+      ['C', 'The <b>commit record</b> is written. From this instant the append counts as done: recovery will finish it if anything goes wrong.'],
+      ['I', '<b>Checkpoint:</b> the inode is copied from the journal to its real location.'],
+      ['B', '<b>Checkpoint:</b> the bitmap is copied to its real location.'],
+      ['F', 'The transaction is marked finished, and its space in the journal can be reused. The append is complete.'],
+    ],
+    journal: [
+      ['J', 'A transaction is written to the <b>journal</b>: a begin record and copies of the new inode, the new bitmap <i>and the data block</i>. Nothing has been changed in place.'],
+      ['C', 'The <b>commit record</b> is written. From this instant the append counts as done.'],
+      ['D', '<b>Checkpoint:</b> the data block is copied from the journal to block 5. This is its second trip to the disk.'],
+      ['I', '<b>Checkpoint:</b> the inode is copied to its real location.'],
+      ['B', '<b>Checkpoint:</b> the bitmap is copied to its real location.'],
+      ['F', 'The transaction is marked finished, and its space in the journal can be reused. The append is complete.'],
+    ],
+  };
+  // No journal: what each combination of completed writes means, and what fsck does about it. Key is inode, bitmap, data.
+  const RAW = {
+    '000': ['ok', 'Nothing reached the disk. The append is lost, and the file system is exactly as it was: <b>consistent</b>.', 'fsck finds nothing wrong.'],
+    '001': ['ok', 'Block 5 holds the new data, but no inode refers to it and the bitmap says it is free. It is as if the write never happened: <b>consistent</b>, append lost.', 'fsck finds nothing wrong.'],
+    '010': ['warn', 'The bitmap says block 5 is in use, but no file owns it. <b>Inconsistent: a leaked block.</b> Nothing breaks; the space is just gone.', 'fsck notices a block that is marked used and belongs to no inode, and frees it. The append is lost.'],
+    '011': ['warn', 'Block 5 is written and marked in use, but the inode was never updated, so no file owns it. <b>Inconsistent: a leaked block</b>, and the append is lost.', 'fsck frees the unowned block. The data in it is discarded.'],
+    '100': ['bad', 'The inode says the file is 8,192 bytes and owns block 5. But block 5 was never written, so it holds whatever was there before, perhaps part of someone\'s deleted file, and the bitmap says it is free, so the allocator may give it to another file as well. <b>Inconsistent, and dangerous.</b>', 'fsck sees an inode using a block marked free. It believes the inode and marks the block used. The structure is now consistent, and <b>the file ends in 4 KiB of garbage</b>: fsck can\'t know what the data should have been.'],
+    '101': ['bad', 'The inode and the data are right, but the bitmap says block 5 is free. The next file to grow can be given the same block, and <b>two files will overwrite each other</b>. Inconsistent.', 'fsck sees an inode using a block marked free and marks it used. Here that completes the append, by luck.'],
+    '110': ['bad', 'The inode and the bitmap agree: block 5 belongs to this file. The metadata is <b>consistent</b>. But the data block was never written, so the file ends in garbage, and nothing on the disk shows it.', 'fsck finds nothing wrong, because nothing is inconsistent. <b>The garbage stays</b>, and nobody is told.'],
+    '111': ['ok', 'All three writes reached the disk. The append is complete and the file system is <b>consistent</b>.', 'fsck finds nothing wrong.'],
+  };
+  let mode = 'none', d, crashed, recovered, last;
+  function reset() { d = { I: false, B: false, D: false, log: [], commit: false, done: false, step: 0, writes: 0 }; crashed = false; recovered = false; last = null; }
+  const key = () => (d.I ? '1' : '0') + (d.B ? '1' : '0') + (d.D ? '1' : '0');
+  function apply(op) {
+    d.writes++;
+    if (op === 'J') d.log = mode === 'journal' ? ['begin', 'inode copy', 'bitmap copy', 'data copy'] : ['begin', 'inode copy', 'bitmap copy'];
+    else if (op === 'C') { d.commit = true; d.log.push('COMMIT'); }
+    else if (op === 'F') { d.log = []; d.commit = false; d.done = true; }
+    else d[op] = true;
+  }
+  function crash() {
+    crashed = true;
+    if (mode === 'none') { const r = RAW[key()]; last = { cls: 'jr-' + r[0], text: '<b>Power lost.</b> ' + r[1] }; return; }
+    const where = d.done ? 'after the transaction finished' : d.commit ? 'after the commit record was written' : d.log.length ? 'after the journal write but before the commit record' : d.D ? 'after the data block was written but before anything reached the journal' : 'before anything was written';
+    last = { cls: 'jr-warn', text: `<b>Power lost</b> ${where}. Everything in memory is gone. What is on the disk is shown above; press <b>Reboot and recover</b> to see what the file system makes of it.` };
+  }
+  function recover() {
+    recovered = true;
+    if (mode === 'none') {
+      const k = key(), r = RAW[k];
+      if (k === '010' || k === '011') d.B = false;
+      if (k === '100' || k === '101') d.B = true;
+      const after = key();
+      last = { cls: after === '111' ? 'jr-ok' : (k === '100' || k === '110') ? 'jr-bad' : 'jr-warn', text: '<b>fsck</b> scans every inode and bitmap on the disk, which on a large volume takes from minutes to hours. ' + r[2] };
+      return;
+    }
+    if (d.commit) {
+      d.I = true; d.B = true; if (mode === 'journal') d.D = true;
+      d.log = []; d.commit = false; d.done = true;
+      last = { cls: 'jr-ok', text: `<b>Recovery reads only the journal</b> and finds a committed transaction. It <b>replays</b> it: the logged inode and bitmap${mode === 'journal' ? ' and data' : ''} are copied to their real places, including any that had already been written. The append is complete and the file system is consistent. This took milliseconds.` };
+    } else if (d.done) {
+      last = { cls: 'jr-ok', text: '<b>Recovery reads the journal</b> and finds nothing outstanding. The append had already finished. Consistent.' };
+    } else {
+      const hadLog = d.log.length > 0; d.log = [];
+      last = { cls: 'jr-ok', text: '<b>Recovery reads only the journal</b> and ' + (hadLog ? 'finds a transaction with <b>no commit record</b>, so it throws it away.' : 'finds it empty.') + ' The real inode and bitmap were never touched, so the file system is in its old state: <b>consistent</b>, with the append lost.' + (d.D ? ' Block 5 does hold the new data, but nothing refers to it and it is still marked free, which is harmless.' : '') };
+    }
+  }
+  function render() {
+    const j = mode !== 'none';
+    const box = (cls, title, body, note) => `<div class="jr-box ${cls}"><h6>${title}</h6><div>${body}</div>${note ? `<small>${note}</small>` : ''}</div>`;
+    $('#jrGrid').innerHTML =
+      box(j ? (d.log.length ? 'jr-log' : '') : 'jr-off', 'Journal', j ? (d.log.length ? d.log.join('<br>') : 'empty') : 'not used', j && d.commit ? 'committed' : '') +
+      box(d.I ? 'jr-new' : '', 'Inode 7', d.I ? 'size 8192<br>blocks 4, 5' : 'size 4096<br>blocks 4', d.I ? 'new' : 'old') +
+      box(d.B ? 'jr-new' : '', 'Block bitmap', d.B ? 'block 5: in use' : 'block 5: free', d.B ? 'new' : 'old') +
+      box(d.D ? 'jr-new' : '', 'Data block 5', d.D ? 'the new 4 KiB' : 'garbage from a deleted file', d.D ? 'new' : 'old');
+    $('#jrMem').innerHTML = crashed ? 'In memory: <b>nothing</b>. The power went, and the pending update with it.' : 'In memory: the complete update (new data, new inode, new bitmap), waiting to be written.';
+    const dd = $('#jrDesc');
+    dd.className = 'jr-desc ' + (last ? last.cls : '');
+    dd.innerHTML = last ? last.text : j ? 'Press <b>Next write</b> to send the first block to the disk, and <b>Cut the power</b> whenever you like.' : 'Three writes are needed. Do them in any order, and <b>Cut the power</b> after none, one, two or all three.';
+    const complete = d.I && d.B && d.D, k = key();
+    const cons = mode === 'none' ? ['000', '001', '110', '111'].includes(k) : recovered;
+    $('#jrStats').innerHTML = `<div class="stat"><div class="k">Disk writes so far</div><div class="v">${d.writes}</div></div>
+      <div class="stat ${!crashed ? '' : cons ? 'good' : j ? 'warn' : 'bad'}"><div class="k">Metadata</div><div class="v" style="font-size:16px">${!crashed ? '…' : cons ? 'consistent' : j ? 'not yet recovered' : 'inconsistent'}</div></div>
+      <div class="stat ${!crashed ? '' : complete ? 'good' : d.I && !d.D ? 'bad' : 'warn'}"><div class="k">The append</div><div class="v" style="font-size:16px">${!crashed ? 'in progress' : complete ? 'complete' : d.I && !d.D ? 'garbage in file' : j && d.commit ? 'will be replayed' : 'lost'}</div></div>`;
+    const show = (id, on) => { $(id).style.display = on ? '' : 'none'; };
+    show('#jrD', !j); show('#jrI', !j); show('#jrB', !j); show('#jrNext', j);
+    $('#jrD').disabled = crashed || d.D; $('#jrI').disabled = crashed || d.I; $('#jrB').disabled = crashed || d.B;
+    $('#jrNext').disabled = crashed || d.step >= 6;
+    $('#jrCrash').disabled = crashed; $('#jrRec').disabled = !crashed || recovered;
+  }
+  const raw = (op, what) => () => { apply(op); last = { cls: '', text: `The <b>${what}</b> is written to its place on the disk. ${3 - d.writes ? (3 - d.writes) + ' of the three writes still to go.' : 'All three writes are done: the append is complete.'}` }; if (d.writes === 3) last.cls = 'jr-ok'; render(); };
+  $('#jrD').onclick = raw('D', 'data block'); $('#jrI').onclick = raw('I', 'inode'); $('#jrB').onclick = raw('B', 'bitmap');
+  $('#jrNext').onclick = () => { const [op, text] = STEPS[mode][d.step++]; apply(op); last = { cls: op === 'F' ? 'jr-ok' : '', text: `Write ${d.step} of 6. ` + text }; render(); };
+  $('#jrCrash').onclick = () => { crash(); render(); };
+  $('#jrRec').onclick = () => { recover(); render(); };
+  $('#jrReset').onclick = () => { reset(); render(); };
+  $('#jrMode').addEventListener('segchange', (e) => { mode = e.detail; reset(); render(); });
+  reset(); render();
+})();
+</script>
 </body>
 </html>

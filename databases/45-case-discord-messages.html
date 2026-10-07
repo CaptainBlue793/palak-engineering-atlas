@@ -3,37 +3,302 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Case Study: Discord’s Messages on Cassandra and ScyllaDB</title>
+<title>Case Study: Discord’s Trillions of Messages</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .dc-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .dc-row > span { font-size:12.5px; color:var(--muted); min-width:92px; }
+  .dc-cql { margin-top:12px; font-family:var(--mono); font-size:12px; padding:8px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); white-space:pre-wrap; overflow-wrap:anywhere; }
+  .dc-list { margin-top:12px; display:grid; gap:6px; }
+  .dc-ch { display:grid; grid-template-columns:minmax(0,1.5fr) repeat(3,minmax(0,1fr)); gap:4px 12px; align-items:center; border:1.5px solid var(--border); border-radius:10px; background:var(--surface); padding:6px 11px; font-size:13px; }
+  .dc-ch.dc-head { border:0; background:none; padding:0 11px; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .dc-ch small { display:block; color:var(--muted); font-size:11.5px; }
+  .dc-ch span.dc-v { font-variant-numeric:tabular-nums; }
+  .dc-ch span.dc-bad { color:var(--red); font-weight:700; }
+  .dc-ch span.dc-warn { color:var(--amber, var(--accent)); font-weight:700; }
+  @media (max-width:640px) { .dc-ch { grid-template-columns:repeat(3,minmax(0,1fr)); } .dc-ch > :first-child { grid-column:1 / -1; } .dc-ch.dc-head > :first-child { display:none; } }
+  .dc-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .dc-msg.dc-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .dc-msg.dc-warn { background:var(--amber-soft, var(--surface-2)); border-left-color:var(--amber, var(--accent)); }
+</style>
 </head>
 <body data-chapter="45">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
-    <div class="eyebrow"><span class="pill accent">Chapter 45</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Case Study: <span class="grad">Discord’s Messages on Cassandra and ScyllaDB</span></h1>
-    <p class="lead">Trillions of messages, partition design, hot partitions and compaction pain.</p>
+    <div class="eyebrow"><span class="pill accent">Chapter 45</span><span class="pill">Case Study</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Case Study: Discord's <span class="grad">Trillions of Messages</span></h1>
+    <p class="lead">Discord is a chat service, and nearly everything in it is a message in a channel. In 2015 its messages were in a single MongoDB replica set. In 2017 the company wrote about moving them to Cassandra, by then holding billions of messages on twelve machines. In 2023 it wrote again: trillions of messages, 177 Cassandra machines that had become a constant operational burden, and a migration to ScyllaDB that left it with 72. The story covers eight years of one table, and the table's definition hardly changed in that time. It is worth studying for two reasons. It is the clearest published example of designing a wide-column table from its queries, as <a href="30-nosql-families.html">Chapter 30</a> described. And it shows what a good partition key can and can't do: the key kept partitions to a manageable size and did nothing about heat, and dealing with heat took an extra layer of software in front of the database.</p>
+    <ul class="objectives">
+      <li><span>Design a wide-column table for a chat workload, starting from its one dominant query</span></li>
+      <li><span>Explain why the partition key includes a time bucket, and what the bucket's length trades</span></li>
+      <li><span>Tell a large partition from a hot one, and say what each does to a cluster</span></li>
+      <li><span>Describe why Discord moved from Cassandra to ScyllaDB, and how it migrated</span></li>
+      <li><span>Explain request coalescing, and what a data service in front of a database buys</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Wide-column stores, partition keys and clustering keys:</b> <a href="30-nosql-families.html">Chapter 30</a>.</li>
+        <li><b>LSM trees, compaction and tombstones:</b> <a href="14-lsm-trees.html">Chapter 14</a>. Cassandra and ScyllaDB are both built on them.</li>
+        <li><b>Shard keys and hot spots:</b> <a href="26-partitioning-sharding.html">Chapter 26</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The data model</li>
-    <li>Partition keys by channel and bucket</li>
-    <li>Hot partitions</li>
-    <li>Moving to ScyllaDB</li>
-    <li>Data services</li>
-  </ol>
+  <h2>The data model</h2>
+  <p>Chat has one query that matters more than all the others together: <b>show the most recent messages in this channel</b>, and then the page before those as the user scrolls up. Writes are appends, nearly all of them to the present moment. Edits and deletions exist and are rare. Nothing joins messages to anything, and nobody asks for all messages by one author across the system.</p>
+  <p>That profile is what wide-column stores are built for (<a href="30-nosql-families.html">Chapter 30</a>). In Cassandra a table's primary key has two parts. The <b>partition key</b> decides which machines hold a row: all rows with the same partition key form one partition, stored together on one set of replicas. The <b>clustering key</b> decides the order of rows inside a partition. A query that names one partition and reads a run of rows in clustering order is a single sequential read on one machine, and that is the only kind of query such a database does really well. The design task is to choose the keys so that the important query has that form.</p>
+<pre class="code"><span class="k">CREATE TABLE</span> messages (
+  channel_id <span class="t">bigint</span>,
+  bucket     <span class="t">int</span>,
+  message_id <span class="t">bigint</span>,
+  author_id  <span class="t">bigint</span>,
+  content    <span class="t">text</span>,
+  <span class="k">PRIMARY KEY</span> ((channel_id, bucket), message_id)       <span class="c">-- partition key in the inner brackets, then the clustering key</span>
+) <span class="k">WITH CLUSTERING ORDER BY</span> (message_id <span class="k">DESC</span>);
+
+<span class="c">-- The query the table exists for</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> messages
+<span class="k">WHERE</span>  channel_id = <span class="m">81384788765712384</span> <span class="k">AND</span> bucket = <span class="m">412</span>
+<span class="k">LIMIT</span>  <span class="m">50</span>;                                             <span class="c">-- the newest 50: the first 50 rows of the partition</span></pre>
+  <p>The <code>message_id</code> is what Discord calls a snowflake: a 64-bit number whose high bits are a timestamp in milliseconds, so that sorting by ID sorts by time (<a href="46-case-instagram-ids.html">Chapter 46</a> takes such IDs apart). With messages clustered by ID in descending order, the newest messages in a partition are physically first, and "the latest 50" reads the start of the partition and stops.</p>
+
+  <h2>Partition keys by channel and bucket</h2>
+  <p>The obvious partition key is the channel alone, and it has a flaw that takes a year to show. A partition has no upper limit, and a busy channel never stops growing. Cassandra's own guidance is to keep partitions under about 100 MB, and it logs a warning above that: a very large partition makes compaction slow, strains memory when it is read, and can't be divided between machines, since a partition is the unit of placement.</p>
+  <p>Discord's answer was to add time to the partition key. Each message belongs to a <b>bucket</b>, a fixed window of ten days, computed from the timestamp inside its ID.</p>
+<pre class="code">DISCORD_EPOCH = <span class="m">1420070400000</span>                  <span class="c"># 1 January 2015, in milliseconds</span>
+BUCKET_SIZE   = <span class="m">1000</span> * <span class="m">60</span> * <span class="m">60</span> * <span class="m">24</span> * <span class="m">10</span>       <span class="c"># ten days, in milliseconds</span>
+
+<span class="k">def</span> <span class="f">make_bucket</span>(snowflake):
+    timestamp = snowflake &gt;&gt; <span class="m">22</span>                <span class="c"># the top 42 bits: milliseconds since the Discord epoch</span>
+    <span class="k">return</span> timestamp // BUCKET_SIZE
+
+<span class="k">def</span> <span class="f">recent_messages</span>(channel_id, limit=<span class="m">50</span>):
+    bucket, out = <span class="f">make_bucket</span>(<span class="f">now_as_snowflake</span>()), []
+    <span class="k">while</span> <span class="f">len</span>(out) &lt; limit <span class="k">and</span> bucket &gt;= <span class="f">first_bucket</span>(channel_id):
+        out += <span class="f">query</span>(channel_id, bucket, limit - <span class="f">len</span>(out))     <span class="c"># one partition for each step back</span>
+        bucket -= <span class="m">1</span>
+    <span class="k">return</span> out</pre>
+  <p>A channel is now a chain of partitions, one for each ten days, each of bounded size. The cost is in the read. A busy channel finds its 50 messages in the current bucket. A quiet one may have to step back through several buckets to collect 50, and each step is another query.</p>
+
+  <h2>Try it: choose the partition key</h2>
+  <p>Four channels of very different character, a year after the service launched. Choose a partition key and, where it applies, a bucket length, and see what each channel's partitions look like and what its main query costs.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Partition size against the cost of "the latest 50"</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="dc-row"><span>Partition key</span><div class="seg" id="dcK"><button data-v="channel">channel_id</button><button class="active" data-v="bucket">(channel_id, bucket)</button><button data-v="message">message_id</button></div></div>
+      <div class="dc-row"><span>Bucket length</span><div class="seg" id="dcB"><button data-v="1">1 day</button><button class="active" data-v="10">10 days</button><button data-v="100">100 days</button></div></div>
+      <div class="dc-cql" id="dcCql"></div>
+      <div class="dc-list" id="dcList"></div>
+      <div class="dc-msg" id="dcMsg"></div>
+      <div class="stats" id="dcStats"></div>
+    </div>
+    <div class="panel-foot">A message is taken as 250 bytes on disk. The dormant channel had 50 messages a day for some months and has been silent for 400 days. A partition over 100 MB is where Cassandra starts to warn, and one over a gigabyte is trouble. The bucket length matters only when the key includes a bucket.</div>
+  </div>
+
+  <p>Things to notice. With the channel alone as the key, every read is one partition, and the busiest channel's partition is 3.6 GB after a year and growing by 10 MB a day. With the message ID alone, the data is spread perfectly evenly and the one query that matters can't be answered without asking every machine. Channel and bucket lies between them, and the bucket length is a second trade-off. Ten days gives the busiest channel partitions of 100 MB. One day gives it 10 MB, and makes the dormant channel's reader step back through 400 empty partitions to find anything. A hundred days makes that walk short and the largest partition a gigabyte. No bucket length suits both the busiest channel and the quietest, and Discord later added a record of each channel's last message so that a reader could go straight to the right bucket.</p>
+
+  <h2>Hot partitions</h2>
+  <p>Bucketing bounds a partition's <i>size</i>. It does nothing about how often a partition is <i>read</i>. Every read of a busy channel's recent messages goes to the same partition, the current bucket, and so to the same three replicas. When a server with hundreds of thousands of members posts an announcement that notifies everyone, a large share of them open the channel within seconds, and all of those reads land on three machines.</p>
+  <p>On Cassandra that turned out to hurt much more than the busy channel. A machine under heavy read load slowed down for every partition it held. Reads in an LSM tree have to consult several files (<a href="14-lsm-trees.html">Chapter 14</a>), and a machine too busy serving reads to finish its compactions accumulated more files, which made each read more expensive still. Cassandra runs on the Java virtual machine, and under memory pressure its garbage collector paused the whole process, sometimes for seconds. A slow machine made the queries waiting on it queue up at their coordinators, and the latency spread through the cluster. Discord's engineers described nursing machines through this by hand, taking a struggling one out of rotation to let it compact in peace and then bringing it back, and spending a great deal of effort tuning the collector.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>A large partition</th><th>A hot partition</th></tr></thead>
+      <tbody>
+        <tr><td><b>The problem is</b></td><td>How much data shares one partition key</td><td>How many requests arrive for one partition key</td></tr>
+        <tr><td><b>Typical cause</b></td><td>An unbounded key: a channel, a user, a device, with no time component</td><td>Skewed popularity: a few keys get most of the traffic</td></tr>
+        <tr><td><b>Symptom</b></td><td>Slow compaction and repair, memory pressure on reads, growth that can't be spread</td><td>Three replicas saturated while the rest idle, and latency rising for everything on those machines</td></tr>
+        <tr><td><b>Fixed by the data model?</b></td><td>Yes: add a bucket to the key</td><td>Only partly. The newest bucket of a popular channel is still one partition</td></tr>
+        <tr><td><b>Other remedies</b></td><td>Shorter buckets, expiry, archiving</td><td>Caching, coalescing identical requests, rate limits, a faster engine</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Deletes brought a problem of their own. In an LSM store a delete writes a marker, a tombstone, and the data is removed later at compaction (<a href="14-lsm-trees.html">Chapter 14</a>). Discord's 2017 article described a public channel whose owner had deleted millions of messages, leaving one. Loading it meant scanning past millions of tombstones to find a single live row, which took around twenty seconds and long enough in garbage collection to make the machine appear down. The fix was to expire tombstones sooner and to keep track of empty buckets so that readers could skip them.</p>
+
+  <h2>Moving to ScyllaDB</h2>
+  <p>ScyllaDB is a reimplementation of Cassandra: the same data model, the same query language and the same file formats, written in C++ with a different internal design. It has no garbage collector, so there are no collection pauses. It divides each machine's cores, memory and data into independent shards, one for each core, which share nothing, so that a hot shard is isolated from its neighbours and no locks are contended between cores. Its scheduler gives compaction a budget alongside queries, so that neither starves the other. For Discord the data model didn't need to change at all. What changed was how the engine behaved under the load that model produced.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Cassandra, early 2022</th><th>ScyllaDB, after the migration</th></tr></thead>
+      <tbody>
+        <tr><td><b>Machines</b></td><td>177</td><td>72</td></tr>
+        <tr><td><b>Disk used on each</b></td><td>About 4 TB</td><td>About 9 TB</td></tr>
+        <tr><td><b>Read latency, 99th percentile</b></td><td>40 to 125 ms</td><td>15 ms</td></tr>
+        <tr><td><b>Write latency, 99th percentile</b></td><td>5 to 70 ms</td><td>A steady 5 ms</td></tr>
+        <tr><td><b>Runtime</b></td><td>Java, with a garbage collector to tune</td><td>C++, one shard for each core</td></tr>
+        <tr><td><b>Operational load</b></td><td>Constant attention from the on-call engineers</td><td>Quiet</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The figures are Discord's own. The smaller machine count comes partly from each machine holding more than twice the data, which Cassandra's machines couldn't have done without their compactions falling further behind.</p>
+
+  <h2>Data services</h2>
+  <p>Before migrating, Discord changed what talks to the database. Until then the main application queried Cassandra directly. The team put a layer of small services between them, written in Rust, each offering about one operation for each kind of query, and gave that layer two jobs that the database couldn't do for itself.</p>
+  <figure class="seq" data-actors="User A|User B|Data service|ScyllaDB">
+    <ol>
+      <li data-m="0>2">latest 50 in channel 813…</li>
+      <li data-m="2>3">SELECT … WHERE channel_id = 813… AND bucket = 412 LIMIT 50<small>the service starts a task for this query</small></li>
+      <li data-m="1>2">latest 50 in channel 813…<small>the same request, while the first is still in flight</small></li>
+      <li data-m="2>2">a task for that query is already running: subscribe to it<small>no second query is sent</small></li>
+      <li data-m="3>2" data-k="reply">50 rows</li>
+      <li data-m="2>0" data-k="reply">50 rows</li>
+      <li data-m="2>1" data-k="reply">the same 50 rows</li>
+      <li data-m="0-3" data-k="note">Ten thousand users opening one channel in the same second become a handful of queries</li>
+    </ol>
+    <figcaption><b>Request coalescing.</b> Identical requests that overlap in time share one query.</figcaption>
+  </figure>
+  <p>The first job is <b>request coalescing</b>, shown above. It differs from caching in that nothing is stored after the reply and nothing can be stale: it only merges requests that are in flight together. That is exactly the shape of a hot partition's load, where the traffic is thousands of identical reads at once. The second job is <b>routing</b>. Requests for a channel are sent to a particular instance of the service, chosen by consistent hashing on the channel ID, so that all the requests for one channel meet at one instance and can be coalesced there, where otherwise they would be scattered over all of them. The layer also gave the team a single place to limit how many queries run at once, and to change the database behind it, which they were about to do.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🚚</div>
+    <div class="body"><div class="title">The migration that stopped at 99.9999%</div><p>Moving trillions of messages between live clusters has two parts, as <a href="34-schema-migrations.html">Chapter 34</a> described for a single table. New data was handled by writing every new message to both Cassandra and ScyllaDB from a chosen moment onwards. Old data needed a backfill, and the first estimate, using ScyllaDB's standard migration tool, was three months. The team thought that too long to run two clusters side by side, and wrote a migrator of its own in Rust. It read the Cassandra cluster one range of the token ring at a time, wrote each range to ScyllaDB, and recorded its progress in a local SQLite file so that it could be stopped and resumed. By Discord's account it moved up to 3.2 million messages a second, and the new estimate was nine days. It ran for those days and then stopped with 99.9999% done. The final ranges of the token ring wouldn't finish reading: they timed out again and again. The cause was the problem from 2017 in a larger form. Those ranges held enormous runs of tombstones left by old deletions, which Cassandra's compaction had never reached, and reading through them took longer than any timeout allowed. The team forced a compaction of that range on the Cassandra side, the tombstones were cleared, and the last fraction of a per cent went through in seconds. They then checked a sample of reads against both clusters, switched reads over, and turned Cassandra off. Some months later the new cluster met its first real test, the final of the 2022 football World Cup, during which message volume leapt at each goal clearly enough that the goals could be read off the traffic graph. Discord reported that the database took it without difficulty.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>A partition key with no bound on its size.</b> A channel, user or device alone, for data that grows for ever.</li>
+      <li><b>Thinking a good partition key prevents hot spots.</b> It bounds size. Popularity is a property of the traffic.</li>
+      <li><b>Buckets chosen for the busiest key only.</b> Quiet keys then pay with many empty reads.</li>
+      <li><b>Designing the table before listing the queries.</b> In a wide-column store the query decides the key.</li>
+      <li><b>Heavy deletion in an LSM store without a plan for tombstones.</b> Reads have to step over them until compaction removes them.</li>
+      <li><b>Letting every application query the database directly,</b> with nowhere to coalesce, limit or redirect requests.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How would you choose the partition key for a table of chat messages in Cassandra?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I'd start from the main query, which is the most recent N messages in a channel, paged backwards. In Cassandra, an efficient query reads one partition in clustering order, so the channel has to be in the partition key and the clustering key should be a time-ordered message ID, descending, so that the newest rows come first. But channel alone is unbounded: a busy channel's partition would grow for ever, and large partitions cause slow compactions and memory pressure and can't be split across nodes. So I'd add a time bucket to the partition key, say ten days derived from the message ID's timestamp, which caps each partition's size. The trade-off is that reading recent messages in a quiet channel may need several buckets, so I'd size the bucket for the largest channels and mitigate the walk for quiet ones, for instance by storing each channel's latest message ID so that the reader starts at the right bucket. I'd also say what the key doesn't solve: a very popular channel's current bucket is still one partition on three replicas, so read heat needs caching or request coalescing in front.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> One channel in your chat system suddenly gets a hundred times the usual read traffic. What happens, and how do you protect the rest of the system?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>All of those reads hash to the same partition, so they land on the same replica set, three nodes if the replication factor is three. Those nodes' CPU and I/O saturate. The danger is the blast radius: each node holds many partitions, so every other channel with data there slows too, coordinators queue requests waiting on them, and timeouts and retries add load. In an LSM engine it can spiral, since a node busy with reads falls behind on compaction and reads then touch more files. Protections, from the outside in. Coalesce identical in-flight requests in a service layer: a thundering herd for the same 50 messages becomes a few queries, with no staleness. Route requests for a key to the same service instance with consistent hashing so that coalescing is effective. Add a short-lived cache for the hottest reads if a second or two of staleness is acceptable. Limit concurrency per partition or per node at that layer, shedding load before the database queues it. Use timeouts and hedging carefully so that retries don't multiply the load. On the database side, an engine that isolates load for each core and schedules compaction against queries degrades more gracefully, and reading at a lower consistency level spreads reads across replicas. Structurally, if a single key is hot all the time, I'd split it further, with sub-buckets, but for bursts on the newest data coalescing and caching are the right tools.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>In a wide-column store the table is designed for one query: the partition key locates it, and the clustering key orders it.</li>
+      <li>Chat messages: partition by channel and a time bucket, cluster by a time-ordered ID, newest first.</li>
+      <li>The bucket bounds partition size. Its length trades the largest partition against the reads a quiet key needs.</li>
+      <li>A hot partition is a traffic problem, and it slows every other partition on the same machines.</li>
+      <li>Discord kept its data model and changed its engine: no garbage collector, a shard for each core, compaction scheduled against queries.</li>
+      <li>A data service in front of the database can coalesce identical requests, route them by key and cap concurrency.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is <code>channel_id</code> alone a poor partition key for messages?</p>
+      <div class="opts">
+        <button class="opt">Reads would have to touch every machine</button>
+        <button class="opt">A busy channel's partition grows without limit, and a partition can't be split between machines</button>
+        <button class="opt">Channel IDs aren't unique</button>
+        <button class="opt">Cassandra doesn't allow a single-column partition key</button>
+      </div>
+      <div class="explain">Reads would be ideal. The trouble is size: compaction, memory and placement all suffer with very large partitions.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does lengthening the bucket from 10 days to 100 change?</p>
+      <div class="opts">
+        <button class="opt">Nothing: the bucket only affects writes</button>
+        <button class="opt">Partitions get smaller and reads get slower</button>
+        <button class="opt">Hot partitions disappear</button>
+        <button class="opt">Partitions get ten times larger, and a quiet channel needs fewer steps back to find its recent messages</button>
+      </div>
+      <div class="explain">The bucket length trades the size of the busiest partitions against the walk for the quietest keys.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A huge server posts an announcement, and its channel is opened by 200,000 people in a minute. The table is partitioned by channel and bucket. What is the problem?</p>
+      <div class="opts">
+        <button class="opt">All those reads go to one partition on three replicas, which saturate and slow everything else they hold</button>
+        <button class="opt">The partition becomes too large</button>
+        <button class="opt">The reads are spread over every machine</button>
+        <button class="opt">There is none: bucketing prevents it</button>
+      </div>
+      <div class="explain">Bucketing bounds size, and does nothing about popularity.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How does request coalescing differ from caching?</p>
+      <div class="opts">
+        <button class="opt">It stores results for longer</button>
+        <button class="opt">It works only for writes</button>
+        <button class="opt">It merges identical requests that are in flight at the same moment, and keeps nothing afterwards, so it can't serve stale data</button>
+        <button class="opt">There is no difference</button>
+      </div>
+      <div class="explain">A burst of identical reads becomes one query. The next request after the reply starts a new one.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why did reads of a channel with millions of deleted messages take many seconds?</p>
+      <div class="opts">
+        <button class="opt">Deleted rows are kept in a separate, slower table</button>
+        <button class="opt">Each delete left a tombstone, and the read had to scan past all of them to find a live row</button>
+        <button class="opt">The partition key had changed</button>
+        <button class="opt">Cassandra rebuilds the partition on every read</button>
+      </div>
+      <div class="explain">In an LSM store a delete is a write. The data and its marker go only when compaction removes them.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const ROW = 250, YEAR = 365, WANT = 50;
+  // rate: messages a day while active. silent: days since the last message. total: messages in all.
+  const CH = [
+    { name: 'A huge public channel', note: '40,000 messages a day', rate: 40000, silent: 0, total: 40000 * YEAR },
+    { name: 'A busy server\'s channel', note: '2,000 a day', rate: 2000, silent: 0, total: 2000 * YEAR },
+    { name: 'A group of friends', note: '20 a day', rate: 20, silent: 0, total: 20 * YEAR },
+    { name: 'A dormant channel', note: 'silent for 400 days', rate: 50, silent: 400, total: 5000 },
+  ];
+  const size = (b) => b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b >= 1e6 ? Math.round(b / 1e6) + ' MB' : b >= 1e3 ? Math.round(b / 1e3) + ' kB' : b + ' B';
+  const num = (n) => Math.round(n).toLocaleString('en-GB');
+  function calc(c, key, B) {
+    if (key === 'channel') return { big: c.total * ROW, parts: 1, reads: 1 };
+    if (key === 'message') return { big: ROW, parts: c.total, reads: Infinity };
+    const per = c.rate * B;                                        // messages in a full bucket
+    const big = Math.min(per, c.total) * ROW, parts = Math.ceil(Math.min(c.total / c.rate, YEAR) / B);
+    let reads;
+    if (c.silent) reads = Math.ceil(c.silent / B) + Math.ceil(WANT / per);            // empty buckets first, then enough to fill the page
+    else { const have = per / 2; reads = have >= WANT ? 1 : 1 + Math.ceil((WANT - have) / per); }   // the current bucket is half full on average
+    return { big, parts, reads };
+  }
+  function draw() {
+    const key = $('#dcK').dataset.value, B = +$('#dcB').dataset.value;
+    $$('#dcB button').forEach((b) => { b.disabled = key !== 'bucket'; });
+    $('#dcCql').textContent = key === 'channel' ? 'PRIMARY KEY ((channel_id), message_id)\n-- latest 50:  WHERE channel_id = ? LIMIT 50'
+      : key === 'message' ? 'PRIMARY KEY ((message_id))\n-- latest 50 in a channel:  no partition to name. Every machine must be asked, or a second table kept'
+      : `PRIMARY KEY ((channel_id, bucket), message_id)        -- bucket = ${B} ${B === 1 ? 'day' : 'days'}\n-- latest 50:  WHERE channel_id = ? AND bucket = ? LIMIT 50, stepping back a bucket at a time`;
+    const rows = CH.map((c) => ({ c, r: calc(c, key, B) }));
+    const sizeCls = (b) => b > 1e9 ? 'dc-bad' : b > 100e6 ? 'dc-warn' : '', readCls = (n) => n === Infinity || n > 50 ? 'dc-bad' : n > 5 ? 'dc-warn' : '';
+    $('#dcList').innerHTML = '<div class="dc-ch dc-head"><span>Channel</span><span>Largest partition</span><span>Partitions</span><span>Read for the latest 50</span></div>' + rows.map(({ c, r }) => `<div class="dc-ch"><span><b>${c.name}</b><small>${c.note}</small></span><span class="dc-v ${sizeCls(r.big)}">${size(r.big)}<small>largest partition</small></span><span class="dc-v">${num(r.parts)}<small>${r.parts === 1 ? 'partition' : 'partitions'}</small></span><span class="dc-v ${readCls(r.reads)}">${r.reads === Infinity ? 'every machine' : num(r.reads)}<small>${r.reads === Infinity ? 'no single partition' : r.reads === 1 ? 'partition read' : 'partitions read'}</small></span></div>`).join('');
+    const big = Math.max(...rows.map((x) => x.r.big)), worst = Math.max(...rows.map((x) => x.r.reads));
+    const m = $('#dcMsg'); let kind = '', html;
+    if (key === 'channel') { kind = 'dc-bad'; html = `<b>Every read is one partition, and one partition is ${size(big)}.</b> The huge channel's whole history is a single partition on three machines, growing by ${size(CH[0].rate * ROW)} a day for ever. Compacting or repairing it means handling all of it at once, and it can never be spread over more machines.`; }
+    else if (key === 'message') { kind = 'dc-bad'; html = '<b>Perfectly even, and useless for the query.</b> Each message is its own tiny partition, placed by the hash of its ID, so a channel\'s messages are scattered over the whole cluster. "The latest 50 in this channel" names no partition. Even distribution is a means to an end, and the end is the query.'; }
+    else if (B === 1) { kind = 'dc-warn'; html = `<b>Small partitions, long walks.</b> The busiest channel's partitions are only ${size(big)}. The friends' channel needs ${rows[2].r.reads} reads to gather 50 messages, and opening the dormant channel steps back through ${num(rows[3].r.reads - 1)} empty partitions before it finds one with anything in it.`; }
+    else if (B === 100) { kind = 'dc-warn'; html = `<b>Short walks, large partitions.</b> The dormant channel is found in ${rows[3].r.reads} reads. The busiest channel's partitions are ${size(big)} each, ten times what Cassandra is comfortable with, and its compactions will show it.`; }
+    else html = `<b>Discord's choice.</b> The busiest channel's partitions are ${size(big)}, at the edge of what is comfortable, and every active channel finds its latest 50 in one read. The dormant channel still costs ${rows[3].r.reads} reads, nearly all of them of empty partitions. Discord dealt with that separately, by recording where each channel's last message is.`;
+    m.className = 'dc-msg ' + kind; m.innerHTML = html;
+    $('#dcStats').innerHTML = `<div class="stat ${big > 1e9 ? 'bad' : big > 100e6 ? 'warn' : 'good'}"><div class="k">Largest partition</div><div class="v">${size(big)}</div></div>
+      <div class="stat ${worst === Infinity || worst > 50 ? 'bad' : worst > 5 ? 'warn' : 'good'}"><div class="k">Worst read</div><div class="v">${worst === Infinity ? 'every machine' : num(worst) + (worst === 1 ? ' partition' : ' partitions')}</div></div>
+      <div class="stat acc"><div class="k">Partitions in all</div><div class="v">${num(rows.reduce((a, x) => a + x.r.parts, 0))}</div></div>`;
+  }
+  $('#dcK').addEventListener('segchange', draw);
+  $('#dcB').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>

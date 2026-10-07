@@ -6,34 +6,374 @@
 <title>Case Study: An OOM-Killer Incident</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('os-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .om-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .om-row > span { font-size:12.5px; color:var(--muted); }
+  .om-tbl { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
+  .om-tbl th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); font-weight:600; padding:4px 8px; border-bottom:1px solid var(--border); }
+  .om-tbl td { padding:6px 8px; border-bottom:1px solid var(--border); vertical-align:middle; }
+  .om-tbl td small { display:block; color:var(--muted); font-size:11.5px; }
+  .om-tbl .om-num { font-family:var(--mono); white-space:nowrap; }
+  .om-bar { height:7px; border-radius:4px; background:var(--surface-3); overflow:hidden; margin-top:3px; min-width:70px; }
+  .om-bar i { display:block; height:100%; background:var(--accent-2); transition:width .3s; }
+  .om-tbl select { font:inherit; font-family:var(--mono); font-size:12.5px; padding:3px 6px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); }
+  .om-tbl tr.om-dead td { opacity:.45; }
+  .om-tbl tr.om-dead td:last-child { opacity:1; color:var(--red); font-weight:600; }
+  .om-tbl tr.om-hit td { background:var(--red-soft); }
+  .om-tbl tr.om-top .om-score { color:var(--red); font-weight:700; }
+  .om-wrap { overflow-x:auto; }
+  .om-desc { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--accent-2); min-height:88px; }
+  .om-desc.om-ok { background:var(--green-soft); border-left-color:var(--green); }
+  .om-desc.om-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+  .om-desc.om-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="48">
-<!-- os:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 48</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
     <h1>Case Study: <span class="grad">An OOM-Killer Incident</span></h1>
-    <p class="lead">A service killed at 3 a.m.: overcommit, the OOM killer's choice, cgroup limits, and the postmortem.</p>
+    <p class="lead">At twelve minutes past three in the morning an API stops answering. Its log ends in the middle of an ordinary request. There's no exception, no stack trace and no crash dump, and the process is simply gone. Nothing was wrong with the API. This last case study is an incident of the most common kind there is on Linux, followed the way you would follow it on call: from the symptom, to the one line in the kernel log that explains it, to why the kernel chose that process, and to the changes that stop it happening again. On the way it uses most of what this course has said about memory.</p>
+    <ul class="objectives">
+      <li>Recognise an out-of-memory kill from its symptoms and find the evidence</li>
+      <li>Explain why memory runs out long after the allocations succeeded</li>
+      <li>Work out which process the kernel will choose, and how to change the choice</li>
+      <li>Tell a kill at a container's limit from a kill on a full host</li>
+      <li>Write the fixes: limits, priorities, early warning, and the real root cause</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, C listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Demand paging and overcommit.</b> See <a href="14-page-faults-demand-paging.html">Chapter 14</a>.</li>
+        <li><b>The page cache and reclaim.</b> See <a href="15-page-replacement.html">Chapter 15</a> and <a href="31-page-cache-fsync.html">Chapter 31</a>.</li>
+        <li><b>cgroups and memory limits.</b> See <a href="34-containers-namespaces-cgroups.html">Chapter 34</a>.</li>
+        <li><b>The performance tools.</b> See <a href="37-performance-tools.html">Chapter 37</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The symptoms</li>
-    <li>Overcommit and RSS</li>
-    <li>How the OOM killer picks a victim</li>
-    <li>cgroup memory limits in containers</li>
-    <li>Fixes and prevention</li>
-  </ol>
+  <h2>The symptoms</h2>
+  <p>The host is one 16 GB machine running a database, a Java API, a cache and a nightly reporting job. This is what the person on call sees first:</p>
+<pre class="code"><span class="c">$</span> systemctl status api
+× api.service - Orders API
+     Active: <span class="k">failed</span> (Result: oom-kill) since Mon 2026-03-02 03:12:41 UTC; 14min ago
+   Main PID: 3310 (code=killed, signal=KILL)
+
+<span class="c">$</span> tail -n <span class="m">2</span> /var/log/api/app.log
+03:12:40.981 INFO  GET /orders/88213 200 12ms
+03:12:41.007 INFO  GET /orders/88               <span class="c"># the log stops in the middle of a line</span></pre>
+  <p>Three things together are the signature of an out-of-memory kill: the process died from <b><code>SIGKILL</code></b> (signal 9, or exit status 137 from a container), it left <b>nothing</b> in its own log, and nobody sent the signal. <code>SIGKILL</code> can't be caught (<a href="09-ipc-pipes-signals-shm.html">Chapter 9</a>), so the program gets no chance to print an error, flush a buffer or write a heap dump. The evidence is in the kernel's log instead.</p>
+<pre class="code"><span class="c">$</span> journalctl -k --since <span class="s">"03:10"</span> | grep -A12 oom-killer        <span class="c"># (timestamps trimmed)</span>
+python3 invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=0
+Tasks state (memory values in pages):
+[  pid  ]   uid  tgid total_vm      rss pgtables_bytes swapents oom_score_adj name
+[    742]     0   742     3857      420        69632        0         -1000 sshd
+[   2101]   113  2101  1612201  1310720     10735616        0             0 postgres
+[   3310]  1000  3310  2441205  1572864     12910592        0             0 java
+[   1201]   999  1201   682113   655360      5398528        0             0 redis-server
+[   9917]  1000  9917   702118   652800      5373952        0             0 python3
+oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),global_oom,task=java,pid=3310,uid=1000
+Out of memory: <span class="k">Killed process 3310 (java)</span> total-vm:9764820kB, anon-rss:6291456kB, file-rss:0kB, shmem-rss:0kB, oom_score_adj:0</pre>
+  <p>Read the first and last lines together. <code>python3</code> <i>invoked</i> the OOM killer: it was the process asking for a page at the moment none could be found. <code>java</code> was <i>killed</i>. The process that triggers the kill and the process that dies are chosen by completely different rules, and neither has to be the one at fault. The table in between is the kernel showing its working, and the <code>rss</code> column, in 4 KiB pages, already suggests why Java was picked: 1,572,864 pages is 6 GB, the largest figure there.</p>
+
+  <h2>Overcommit and RSS</h2>
+  <p>Why did memory run out at 03:12 and not when it was allocated? Because allocating memory and using it are different events (<a href="14-page-faults-demand-paging.html">Chapter 14</a>). <code>malloc</code> and <code>mmap</code> hand out <i>address space</i>, and the kernel agrees to far more of it than there is RAM. A physical frame is needed only when a page is first touched, in a page fault. So the failure comes late, at an ordinary instruction that writes to memory, with no return value in which to report an error. Every measure of "memory used" comes from that distinction:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Measure</th><th>What it counts</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td><b>VSZ</b> (virtual size)</td><td>All address space the process has mapped, touched or not</td><td>Very little. A JVM can show 10 GB here and use 1</td></tr>
+        <tr><td><b>RSS</b> (resident set size)</td><td>Pages actually in RAM for this process, including pages it shares with others</td><td>What the OOM killer looks at. Over-counts shared memory when summed across processes</td></tr>
+        <tr><td><b>PSS</b> (proportional set size)</td><td>RSS with each shared page divided among the processes sharing it</td><td>Adding up a multi-process program such as PostgreSQL or Chrome</td></tr>
+        <tr><td><b>Anonymous memory</b></td><td>Heap and stack: pages with no file behind them</td><td>The part that can't be dropped, only swapped. Leaks show up here</td></tr>
+        <tr><td><b>Page cache</b></td><td>Cached file contents, owned by the kernel</td><td>Mostly reclaimable. A machine with almost no "free" memory and a large cache is healthy</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>When a page fault needs a frame and the free list is empty, the kernel works through a sequence before it resorts to killing anything:</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start">A page fault needs a frame, and none is free</li>
+      <li>Reclaim: drop clean page-cache pages, write out dirty ones, move anonymous pages to swap if there is any (<a href="15-page-replacement.html">Chapter 15</a>)</li>
+      <li data-k="decision">Did that free enough? Then give the process its frame and carry on</li>
+      <li data-k="decision">Is the fault inside a cgroup that is at its limit? Then consider only that cgroup's processes</li>
+      <li>Score every candidate process and pick the highest</li>
+      <li>Send it SIGKILL and take its memory back</li>
+      <li data-k="end">Retry the allocation that started all this</li>
+    </ol>
+    <figcaption><b>The path to an OOM kill.</b> The steps before the kill can take a long time. A machine that is nearly out of memory spends seconds or minutes evicting and re-reading its own program code before the kernel gives up, which is why the minutes before a kill are often slower than the kill itself is harmful.</figcaption>
+  </figure>
+
+  <h2>How the OOM killer picks a victim</h2>
+  <p>The aim is to free the most memory by killing the fewest processes, so the score is mostly size. For each process the kernel adds its resident pages, its swapped pages and its page tables, and expresses that as parts per thousand of the machine's memory. Then it adds one number that you control:</p>
+<pre class="code"><span class="c">/* mm/oom_kill.c, in outline */</span>
+points  = rss + swap_entries + page_table_pages;          <span class="c">/* how much killing this would free */</span>
+points += oom_score_adj * total_pages / <span class="m">1000</span>;             <span class="c">/* the administrator's thumb on the scale */</span>
+<span class="k">if</span> (oom_score_adj == <span class="m">-1000</span>) <span class="k">return</span> NEVER;                 <span class="c">/* this process is not a candidate at all */</span></pre>
+<pre class="code"><span class="c">$</span> cat /proc/<span class="m">3310</span>/oom_score /proc/<span class="m">3310</span>/oom_score_adj       <span class="c"># java: 6 GB of 16 GB</span>
+<span class="m">375</span>
+<span class="m">0</span>
+<span class="c">$</span> echo <span class="m">500</span> &gt; /proc/<span class="m">9917</span>/oom_score_adj                       <span class="c"># "if someone must die, prefer this one"</span>
+<span class="c"># for a systemd service, in the unit file:  OOMScoreAdjust=-900</span></pre>
+  <p><code>oom_score_adj</code> runs from −1000 to +1000 and is inherited by child processes. Each step of 100 is worth a tenth of the machine's RAM in the comparison. System services that must survive, such as <code>sshd</code>, are started at −1000, and Kubernetes sets the value on every container from its quality-of-service class: about −997 for pods with guaranteed resources, +1000 for pods that declared none.</p>
+  <p>In the panel below, the reporting job has a leak. Let it run, and see who pays for it.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Who gets killed?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="om-row"><span>Memory limit on the batch job's cgroup</span><div class="seg" id="omLimit"><button class="active" data-v="none">none</button><button data-v="2">memory.max = 2 GB</button></div></div>
+      <div class="controls" style="margin-top:12px">
+        <button class="btn sm primary" id="omStep">Let the leak run ▸</button>
+        <button class="btn sm" id="omReset">↺ Reset</button>
+      </div>
+      <div class="om-wrap"><table class="om-tbl"><thead><tr><th>Process</th><th>RSS</th><th>oom_score_adj</th><th>oom_score</th><th>State</th></tr></thead><tbody id="omRows"></tbody></table></div>
+      <div class="om-desc" id="omDesc"></div>
+      <div class="stats" id="omStats"></div>
+    </div>
+    <div class="panel-foot">A 16 GB host with no swap. The score shown is what <code>/proc/PID/oom_score</code> would report: a thousand times the process's share of RAM, plus its adjustment, and never below zero. Killed services aren't restarted here, so that each kill's effect stays visible.</div>
+  </div>
+
+  <p>Things to notice. With everything at the default, the first kill takes the API. It scores 375 because it is the biggest process, while the leaking job is at 156 and carries on growing into the space that was freed. Only on the second round, at 8.5 GB and a score of 531, is the job itself the largest. Two kills, and the first one hit a bystander. Now reset and set the job's adjustment to +500: it scores 656 and dies first, and nothing else is touched. Try protecting the API instead, with −500. The kernel still has to kill something, so it takes the database, which is worse. Protection moves the damage along; it doesn't remove it. Give the job −1000 and it outlives everything, up to a kernel panic. Finally switch on the 2 GB limit. The job is killed at 2 GB, inside its own cgroup, the scores of the other processes never come into it, and the host doesn't run out at all.</p>
+
+  <h2>cgroup memory limits in containers</h2>
+  <p>That last setting is the important one, and it changes what kind of event the kill is. There are two different out-of-memory situations, and they are often confused:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Host out of memory</th><th>cgroup at its limit</th></tr></thead>
+      <tbody>
+        <tr><td><b>Trigger</b></td><td>The whole machine can't find a free frame</td><td>One cgroup's usage reaches <code>memory.max</code>, however much the host has free</td></tr>
+        <tr><td><b>Candidates</b></td><td>Every process on the machine</td><td>Only the processes in that cgroup</td></tr>
+        <tr><td><b>Kernel log</b></td><td><code>Out of memory: Killed process …</code></td><td><code>Memory cgroup out of memory: Killed process …</code></td></tr>
+        <tr><td><b>Seen as</b></td><td>Some large service dies; others slow down first</td><td>Exit status 137; <code>OOMKilled</code> in <code>docker inspect</code> or <code>kubectl describe pod</code></td></tr>
+        <tr><td><b>Counter</b></td><td><code>oom_kill</code> in <code>/proc/vmstat</code></td><td><code>oom_kill</code> in the cgroup's <code>memory.events</code></td></tr>
+        <tr><td><b>Who is affected</b></td><td>Unpredictable</td><td>The service that exceeded its own budget</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c">$</span> kubectl describe pod report-7c9f | grep -A4 <span class="s">"Last State"</span>
+    Last State:     Terminated
+      Reason:       <span class="k">OOMKilled</span>
+      Exit Code:    137
+<span class="c">$</span> cat /sys/fs/cgroup/kubepods.slice/…/memory.events
+low 0
+high 0
+max 4127                  <span class="c"># times the cgroup hit its limit and had to reclaim</span>
+oom 1
+oom_kill 1</pre>
+  <p>A limit turns an unpredictable failure of the whole machine into a predictable failure of one service, which is the entire reason to set one. Two details catch people out.</p>
+  <ul>
+    <li><b>More than the heap counts.</b> The cgroup is charged for the process's anonymous memory, for page cache its files occupy, for kernel memory used on its behalf, and for files in memory-backed file systems such as <code>/dev/shm</code>. A JVM with a 2 GB heap needs a limit comfortably above 2 GB, because thread stacks, compiled code, class metadata and buffers outside the heap are all extra.</li>
+    <li><b>The runtime has to know about the limit.</b> For years a JVM in a container sized its heap from the <i>host's</i> RAM, since that is what <code>/proc/meminfo</code> reports inside a container, and was killed as soon as it grew into a heap its cgroup didn't allow. Java has read the cgroup limit since 2017–18, and Go has had <code>GOMEMLIMIT</code> since 1.19. A runtime that respects the limit collects garbage harder as it approaches, and fails with its own out-of-memory error, which can be caught, logged and dumped.</li>
+  </ul>
+
+  <h2>Fixes and prevention</h2>
+  <p>Back to the incident. Put together from the kernel log and the job scheduler, the night looked like this:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Time</th><th>What was seen</th><th>What was happening</th></tr></thead>
+      <tbody>
+        <tr><td><b>02:00</b></td><td>Nothing</td><td>The nightly report starts. A change released the day before makes it load a whole table into memory</td></tr>
+        <tr><td><b>02:50</b></td><td>API latency creeping up</td><td>Free memory is gone. The kernel is evicting page cache, including the code of running programs, and reading it back from disk</td></tr>
+        <tr><td><b>03:12</b></td><td>API down. Alert fires</td><td>First OOM kill: <code>java</code>, the largest process at 6 GB. The report, at 2.5 GB, continues</td></tr>
+        <tr><td><b>03:19</b></td><td>Report job "failed"</td><td>Second OOM kill: <code>python3</code>, now 8.5 GB and the largest</td></tr>
+        <tr><td><b>03:31</b></td><td>API restarted by hand; all well</td><td>The cause had already removed itself. Without the kernel log, the incident reads as "the API crashed for no reason"</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The root cause is the leak in the report. But a postmortem that stops there has fixed one bug and left the machine exactly as fragile, so the useful findings are the contributing ones:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Finding</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td><b>A batch job could take memory from the API</b></td><td>Give every service its own cgroup with a memory limit (<code>MemoryMax=</code> in systemd, <code>limits.memory</code> in Kubernetes)</td></tr>
+        <tr><td><b>The kernel's choice of victim was left to chance</b></td><td>Set <code>oom_score_adj</code>: negative for the database and API, positive for batch work</td></tr>
+        <tr><td><b>The first alert was the outage</b></td><td>Alert on memory pressure before the kill: available memory, a rising <code>max</code> count in <code>memory.events</code>, and <code>/proc/pressure/memory</code></td></tr>
+        <tr><td><b>The victim left no evidence</b></td><td>Ship kernel logs to the same place as application logs, and alert on "Killed process"</td></tr>
+        <tr><td><b>The API stayed down until a person restarted it</b></td><td><code>Restart=always</code>, or an orchestrator that restarts it</td></tr>
+        <tr><td><b>The leak itself</b></td><td>Stream the table instead of loading it; add a memory test to the job</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c"># /etc/systemd/system/report.service</span>
+[Service]
+MemoryMax=2G                  <span class="c"># its own budget: at 2 GB, only this job is killed</span>
+MemoryHigh=1500M              <span class="c"># above this the kernel slows it down and reclaims harder: a warning shot</span>
+OOMScoreAdjust=500            <span class="c"># and on a full host, prefer this one</span>
+
+<span class="c">$</span> cat /proc/pressure/memory  <span class="c"># how much time tasks are losing to memory shortage</span>
+some avg10=38.12 avg60=21.40 avg300=7.02 total=194522871
+full avg10=11.07 avg60=5.33 avg300=1.61 total=48210066</pre>
+
+  <div class="callout usecase">
+    <div class="ico">⚖️</div>
+    <div class="body"><div class="title">Facebook's oomd: the kernel's killer arrives too late</div><p>Engineers running Facebook's fleet kept meeting the 02:50 line of that timeline, at scale. The kernel's OOM killer is a last resort by design. It acts only when reclaim has completely failed, and before that point a machine can spend minutes barely alive, evicting and re-reading the pages of the programs it is trying to run. Servers were effectively down long before anything was killed, and when the kill came it followed the kernel's size-based rule and not what the operators would have chosen. Their answer had two parts. They added <b>pressure stall information</b> to the kernel, merged in Linux 4.20 in 2018, which reports the share of time tasks are stalled waiting for memory. That finally gave a direct measure of "this machine is suffering" in place of guesses based on free memory. And they wrote <b>oomd</b>, a daemon in user space that watches those numbers per cgroup and kills a whole cgroup, chosen by policy, when pressure stays high, well before the kernel would act. The idea is now ordinary. systemd ships a version of it, <code>systemd-oomd</code>, and desktop distributions such as Fedora enable it by default, so that a runaway browser tab is killed in seconds and the whole machine doesn't freeze for minutes.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Blaming the victim.</b> The process that was killed is the largest, or the one at its limit. The cause is whichever one <i>grew</i>.</li>
+      <li><b>Looking for the error in the application log.</b> <code>SIGKILL</code> leaves nothing there. Look in the kernel log and in <code>memory.events</code>.</li>
+      <li><b>Treating low "free" memory as the alarm.</b> Free is low on every healthy machine, because of the page cache. Watch available memory and pressure.</li>
+      <li><b>Setting the limit equal to the heap size.</b> The runtime's other memory, and page cache, count too.</li>
+      <li><b>Protecting everything with −1000.</b> Something must be killable. Protect the few things that are irreplaceable, and choose what is sacrificed.</li>
+      <li><b>Fixing only the leak.</b> The next one will come from a different program. Limits and alerts are the lasting fix.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the OOM killer, and how does it decide what to kill?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Linux overcommits memory: allocations succeed as address space, and physical pages are assigned only when touched. So the system can find itself needing a page for a fault when none is free. It first tries to reclaim, by dropping page cache, writing out dirty pages and swapping. If that fails, the out-of-memory killer picks a process and sends it SIGKILL to free memory. The choice is by a badness score: essentially the process's resident memory plus swap plus page tables, as a fraction of total memory, adjusted by <code>oom_score_adj</code>, which ranges from −1000, meaning never kill, to +1000, meaning kill first. The highest score dies. So by default it's the biggest process, which is not necessarily the one that caused the shortage. You can see the scores in <code>/proc/PID/oom_score</code> and the kill in the kernel log as "Out of memory: Killed process". Inside a cgroup with a memory limit the same thing happens locally: when the group hits its limit, a process in that group is chosen.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A container keeps being OOMKilled, but the node has gigabytes free and the application's heap metrics look fine. What is going on?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The node's free memory isn't relevant. The container has its own limit, <code>memory.max</code> on its cgroup, and it's being killed for reaching that. I'd confirm with <code>kubectl describe pod</code> showing OOMKilled and exit code 137, the kernel message "Memory cgroup out of memory", and the <code>oom_kill</code> count in the cgroup's <code>memory.events</code>. The heap looking fine means the memory is elsewhere. The cgroup is charged for everything: the heap, but also thread stacks, native allocations, direct or off-heap buffers, the JIT's code cache and class metadata in a JVM, memory-mapped files and page cache the container generates, and any tmpfs such as <code>/dev/shm</code>. Common causes are a heap limit set equal to the container limit so there's no room for the rest, a runtime that isn't aware of the cgroup limit and sizes itself from the host, a native memory leak, or many threads. I'd compare RSS with the heap size, look at <code>memory.stat</code> for the breakdown between anonymous, file and kernel memory, and then either raise the limit, lower the heap to perhaps 70–75% of it, or find the off-heap growth.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>An OOM kill looks like a process vanishing: SIGKILL, exit status 137, nothing in its own log. The evidence is in the kernel log.</li>
+      <li>Memory runs out when pages are touched, not when they are allocated, and only after reclaim has failed.</li>
+      <li>The victim is the process with the highest score: its share of RAM plus <code>oom_score_adj</code>. That is the largest process, not the guilty one.</li>
+      <li>A cgroup limit makes the kill local: only that group's processes are candidates, whatever the host has free.</li>
+      <li>Everything the cgroup uses counts towards its limit, and a runtime must be told about it.</li>
+      <li>Prevent it with per-service limits, chosen priorities, alerts on memory pressure, and kernel logs someone reads.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A service is found dead with status "killed, signal 9" and its log stops mid-line. Where is the explanation most likely to be?</p>
+      <div class="opts">
+        <button class="opt">In the service's own error log</button>
+        <button class="opt">In a core dump</button>
+        <button class="opt">In the kernel log, as "Out of memory: Killed process"</button>
+        <button class="opt">In the shell history</button>
+      </div>
+      <div class="explain">SIGKILL can't be caught, so the process records nothing. The kernel logs its own decision.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A program allocated 8 GB an hour ago without error. Why is the machine only running out of memory now?</p>
+      <div class="opts">
+        <button class="opt">The allocation reserved address space; physical frames are needed only as the pages are touched</button>
+        <button class="opt">The kernel delays all allocations by an hour</button>
+        <button class="opt">The memory was in swap until now</button>
+        <button class="opt"><code>malloc</code> runs in the background</button>
+      </div>
+      <div class="explain">Overcommit and demand paging: the bill arrives at the page fault, not at <code>malloc</code>.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">On a full 16 GB host, process A uses 6 GB and has <code>oom_score_adj</code> 0. Process B uses 2.5 GB, is leaking, and has <code>oom_score_adj</code> 0. Which is killed?</p>
+      <div class="opts">
+        <button class="opt">B, because it is leaking</button>
+        <button class="opt">B, because it asked for memory last</button>
+        <button class="opt">Both</button>
+        <button class="opt">A, because its score is higher: it holds the larger share of RAM</button>
+      </div>
+      <div class="explain">375 against 156. The kernel doesn't know which process is at fault, only which is biggest.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does setting a process's <code>oom_score_adj</code> to −1000 do?</p>
+      <div class="opts">
+        <button class="opt">Gives it 1000 MB more memory</button>
+        <button class="opt">Removes it from the OOM killer's list of candidates</button>
+        <button class="opt">Makes it the first to be killed</button>
+        <button class="opt">Stops it from allocating memory</button>
+      </div>
+      <div class="explain">It is never chosen. Use it sparingly: something else will be killed in its place.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A container with a 1 GB limit is OOMKilled while its node has 20 GB free. Why?</p>
+      <div class="opts">
+        <button class="opt">The node's free memory is being misreported</button>
+        <button class="opt">The OOM killer chose it because it was the largest on the node</button>
+        <button class="opt">Its cgroup reached its own limit; the host's free memory doesn't enter into it</button>
+        <button class="opt">Containers can't use more than 1 GB</button>
+      </div>
+      <div class="explain">A cgroup OOM is local: the trigger is the group's limit and the candidates are the group's processes.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = OS;
+  const TOTAL = 16, TIMES = ['03:12', '03:19', '03:27', '03:41', '03:58'];
+  const BASE = [
+    { id: 'sshd', name: 'sshd', what: 'remote login', rss: 0.01, adj: -1000, fixed: true },
+    { id: 'pg', name: 'postgres', what: 'the database', rss: 5, adj: 0 },
+    { id: 'java', name: 'java', what: 'the API', rss: 6, adj: 0 },
+    { id: 'redis', name: 'redis-server', what: 'the cache', rss: 2.5, adj: 0 },
+    { id: 'leak', name: 'python3 report.py', what: 'the nightly job, leaking', rss: 0.3, adj: 0 },
+  ];
+  const adj = {};
+  let limit = 'none', P, kills, done, last, cls, text, lost;
+  const gb = (x) => x < 0.1 ? Math.round(x * 1024) + ' MB' : x.toFixed(1) + ' GB';
+  const raw = (p) => 1000 * p.rss / TOTAL + p.adj;
+  const score = (p) => p.adj <= -1000 ? 0 : Math.max(0, Math.round(raw(p)));
+  function restart() {
+    P = BASE.map((b) => Object.assign({}, b, { alive: true, adj: b.fixed ? b.adj : (adj[b.id] || 0) }));
+    kills = 0; done = false; last = null; cls = ''; lost = [];
+    text = 'It is 02:00 and the nightly report has just started. Its memory use is climbing. Adjust the scores if you like, then let it run.';
+  }
+  function step() {
+    const leak = P.find((p) => p.id === 'leak'), others = P.filter((p) => p.alive && p.id !== 'leak').reduce((s, p) => s + p.rss, 0);
+    if (limit === '2') {
+      leak.rss = 2; leak.alive = false; last = leak; kills++; done = true; cls = 'om-ok';
+      text = `<b>02:41: the job reached its cgroup's limit.</b> At 2 GB the kernel could reclaim nothing more inside that cgroup, looked for a victim <i>only among its processes</i>, and killed <code>python3</code>. The log says "Memory cgroup out of memory". The host still had ${gb(TOTAL - others - 2)} free, and the database, the API and the cache never noticed.`;
+      return;
+    }
+    leak.rss = TOTAL - others;
+    const cand = P.filter((p) => p.alive && p.adj > -1000), when = TIMES[kills];
+    if (!cand.length) {
+      done = true; last = null; cls = 'om-bad';
+      text = `<b>${when}: nothing left to kill.</b> Every process the kernel was allowed to choose is dead, and the job, protected by −1000, has filled all 16 GB. <code>Kernel panic - not syncing: System is deadlocked on memory</code>. The machine reboots, which stops the leak after all.`;
+      return;
+    }
+    const v = cand.reduce((a, b) => raw(b) > raw(a) ? b : a), ls = score(leak);
+    v.alive = false; last = v; kills++;
+    if (v.id === 'leak') {
+      done = true; cls = kills === 1 ? 'om-ok' : 'om-warn';
+      text = `<b>${when}: out of memory.</b> The job has grown to ${gb(leak.rss)} and the machine is full. It scores ${ls}, the highest, and is killed. The leak is over. ` + (kills === 1 ? 'Nothing else was touched: the process that caused the shortage is the one that paid for it.' : `It took ${kills} kills to get here, and ${lost.join(' and ')} went first.`);
+    } else {
+      lost.push(v.what); cls = 'om-bad';
+      text = `<b>${when}: out of memory.</b> The job has grown to ${gb(leak.rss)} and the machine is full. The kernel scores every process: <code>${v.name}</code> has ${score(v)}, the highest, and is killed. That is ${v.what}. The job ${leak.adj <= -1000 ? 'can\'t be chosen at all' : 'scores only ' + ls}, so it survives and goes on growing into the ${gb(v.rss)} just freed.`;
+    }
+  }
+  function render() {
+    const live = P.filter((p) => p.alive), top = live.filter((p) => p.adj > -1000).reduce((a, b) => !a || raw(b) > raw(a) ? b : a, null);
+    $('#omRows').innerHTML = P.map((p) => {
+      const opts = [-1000, -500, 0, 500, 1000].map((v) => `<option value="${v}" ${v === p.adj ? 'selected' : ''}>${v > 0 ? '+' + v : String(v).replace('-', '−')}</option>`).join('');
+      return `<tr class="${p.alive ? '' : 'om-dead'} ${p === last ? 'om-hit' : ''} ${p === top && limit === 'none' && !done ? 'om-top' : ''}">
+        <td><b>${p.name}</b><small>${p.what}${p.id === 'leak' && limit === '2' ? ' · memory.max 2 GB' : ''}</small></td>
+        <td class="om-num">${gb(p.rss)}<div class="om-bar"><i style="width:${Math.min(100, p.rss / TOTAL * 100 * 1.6).toFixed(0)}%"></i></div></td>
+        <td>${p.fixed ? '<span class="om-num">−1000</span>' : `<select data-id="${p.id}" aria-label="oom_score_adj for ${p.name}">${opts}</select>`}</td>
+        <td class="om-num om-score">${score(p)}</td>
+        <td>${p.alive ? 'running' : 'killed'}</td></tr>`;
+    }).join('');
+    $$('#omRows select').forEach((s) => { s.onchange = () => { adj[s.dataset.id] = +s.value; restart(); render(); }; });
+    const d = $('#omDesc'); d.className = 'om-desc ' + cls; d.innerHTML = text;
+    const used = live.reduce((s, p) => s + p.rss, 0), leak = P.find((p) => p.id === 'leak');
+    $('#omStats').innerHTML = `<div class="stat"><div class="k">Memory in use</div><div class="v">${used.toFixed(1)} / ${TOTAL} GB</div></div>
+      <div class="stat ${kills ? 'warn' : ''}"><div class="k">OOM kills</div><div class="v">${kills}</div></div>
+      <div class="stat ${lost.length ? 'bad' : kills ? 'good' : ''}"><div class="k">Services lost</div><div class="v">${lost.length}</div></div>
+      <div class="stat ${!leak.alive ? 'good' : kills ? 'bad' : ''}"><div class="k">The leak</div><div class="v">${!leak.alive ? 'stopped' : done ? 'rebooted' : 'running'}</div></div>`;
+    $('#omStep').disabled = done;
+  }
+  $('#omStep').onclick = () => { step(); render(); };
+  $('#omReset').onclick = () => { for (const k in adj) delete adj[k]; restart(); render(); };
+  $('#omLimit').addEventListener('segchange', (e) => { limit = e.detail; restart(); render(); });
+  restart(); render();
+})();
+</script>
 </body>
 </html>

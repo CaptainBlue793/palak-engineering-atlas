@@ -6,33 +6,296 @@
 <title>Data-Size Arithmetic</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sz-top { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .sz-cols { margin-top:12px; font-family:var(--mono); font-size:12.5px; display:flex; flex-wrap:wrap; gap:6px; }
+  .sz-cols span { padding:3px 9px; border-radius:99px; border:1px solid var(--border); background:var(--surface-2); }
+  .sz-map { margin-top:12px; display:flex; flex-wrap:wrap; gap:2px; }
+  .sz-b { height:26px; border-radius:4px; display:flex; align-items:center; justify-content:center; font-family:var(--mono); font-size:10.5px; color:#fff; overflow:hidden; white-space:nowrap; transition:width .3s; min-width:3px; }
+  .sz-hdr { background:color-mix(in srgb, var(--muted) 75%, transparent); }
+  .sz-pad { background:repeating-linear-gradient(45deg, var(--red-soft), var(--red-soft) 4px, transparent 4px, transparent 8px); color:var(--red); border:1px solid var(--red); }
+  .sz-c8 { background:var(--accent); } .sz-c4 { background:var(--accent-2); color:#111; } .sz-cv { background:var(--pink); } .sz-c1 { background:var(--green); }
+  .sz-ctl { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin-top:14px; }
+  @media (max-width:760px) { .sz-ctl { grid-template-columns:1fr; } }
+  .sz-ctl label { font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); display:block; }
+  .sz-ctl input { width:100%; accent-color:var(--accent); margin-top:6px; }
+  .sz-ctl .v { font-family:var(--mono); color:var(--text); float:right; text-transform:none; letter-spacing:0; }
+  .sz-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); }
+</style>
 </head>
 <body data-chapter="0.8">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 8</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 30 min</span></div>
     <h1>Data-Size <span class="grad">Arithmetic</span></h1>
-    <p class="lead">Row sizes, table sizes and index sizes, estimated before you build anything.</p>
+    <p class="lead">"Will it fit?" comes up in every design review and most database interviews: will the table fit in memory, how big will the index be, how much disk do we need in three years? You can answer to within a factor of two with arithmetic you can do on a whiteboard: bytes per row, rows per page, pages per table, plus indexes and growth. This chapter gives you PostgreSQL's real overheads, including the one most people miss: alignment padding between columns.</p>
+    <ul class="objectives">
+      <li>Compute a row's on-disk size from its column types, headers and alignment padding</li>
+      <li>Turn row size into rows per page, table size and B-tree index size</li>
+      <li>Reorder columns to remove padding, and know when it's worth it</li>
+      <li>Project growth over time and compare it with memory and disk budgets</li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>8 KB pages</b> and why databases read whole pages. See <a href="p3-disks-and-files.html">P3</a>.</li>
+        <li><b>Column types and their sizes.</b> See <a href="p4-data-types.html">P4</a>.</li>
+        <li>For back-of-the-envelope estimation in system design more broadly, see the System Design course's <a href="../system-design/p8-estimation-design-questions.html">estimation prerequisite</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Bytes per row</li>
-    <li>Rows per page</li>
-    <li>Table and index size estimates</li>
-    <li>Growth over time</li>
-  </ol>
+  <h2>Bytes per row</h2>
+  <p>A PostgreSQL row on disk (a <b>tuple</b>) is more than its column values:</p>
+  <ul>
+    <li><b>Tuple header: 23 bytes</b>, padded to 24. It records which transactions created and deleted this version of the row (<a href="23-mvcc.html">Chapter 23</a>) and where the next version is. If any column is NULL there's also a null bitmap, one bit per column, which fits inside the padding for tables of up to 8 columns.</li>
+    <li><b>Line pointer: 4 bytes</b> in the page's slot array, pointing at the tuple (<a href="11-pages-heap-files.html">Chapter 11</a>).</li>
+    <li><b>Column values</b>, each at an <b>aligned</b> offset: an 8-byte type such as <code>bigint</code> or <code>timestamptz</code> must start at a multiple of 8, a 4-byte type at a multiple of 4. If the previous column ended elsewhere, the gap is wasted padding.</li>
+    <li>The whole tuple is rounded up to a multiple of 8.</li>
+  </ul>
+  <p>Variable-length values (<code>text</code>, <code>numeric</code>, <code>jsonb</code>) carry a length header: 1 byte for values up to 126 bytes, and those short values need no alignment. Longer values have a 4-byte header and are aligned to 4; values over about 2 KB get compressed or moved out of line by TOAST.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Type</th><th>Bytes</th><th>Aligned to</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><code>boolean</code></td><td>1</td><td>1</td><td>Cheap, but can create padding before an 8-byte column</td></tr>
+        <tr><td><code>smallint</code></td><td>2</td><td>2</td><td></td></tr>
+        <tr><td><code>integer</code>, <code>date</code>, <code>real</code></td><td>4</td><td>4</td><td></td></tr>
+        <tr><td><code>bigint</code>, <code>timestamptz</code>, <code>double precision</code></td><td>8</td><td>8</td><td>Put these first</td></tr>
+        <tr><td><code>uuid</code></td><td>16</td><td>1</td><td>Twice a <code>bigint</code>; no alignment needed</td></tr>
+        <tr><td><code>text</code>, <code>jsonb</code>, <code>numeric</code> (short)</td><td>1 + length</td><td>none</td><td>Up to 126 bytes of data</td></tr>
+        <tr><td><code>text</code>, <code>jsonb</code> (long)</td><td>4 + length</td><td>4</td><td>Compressed or TOASTed beyond ~2 KB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Rows per page, pages per table</h2>
+  <p>An 8 KB page has a 24-byte header, leaving 8,168 bytes. Each row costs its tuple size plus its 4-byte line pointer. So:</p>
+<pre class="code">rows per page = floor(8168 / (tuple_bytes + 4))           <span class="c"># capped at 291 by PostgreSQL</span>
+table pages   = ceil(rows / rows_per_page)
+table bytes   = table pages × 8192</pre>
+  <p>A B-tree index entry is an 8-byte index tuple header (which includes the 6-byte row pointer) plus the key, aligned to 8, plus a 4-byte line pointer. Leaf pages are filled to 90% by default so that inserts don't immediately split them. For a <code>bigint</code> key that's 20 bytes an entry and about 365 entries a page, so roughly <b>21–22 MB per million rows</b>; a <code>uuid</code> key costs about a third more. These are estimates for freshly built structures; real tables carry extra space from updates and deletes (bloat), so add a margin.</p>
+<pre class="code"><span class="k">def</span> <span class="f">table_bytes</span>(rows: <span class="t">int</span>, tuple_bytes: <span class="t">int</span>) -&gt; <span class="t">int</span>:
+    per_page = <span class="f">min</span>(<span class="m">291</span>, (<span class="m">8192</span> - <span class="m">24</span>) // (tuple_bytes + <span class="m">4</span>))
+    <span class="k">return</span> -(-rows // per_page) * <span class="m">8192</span>                    <span class="c"># ceiling division</span>
+
+<span class="k">def</span> <span class="f">btree_bytes</span>(rows: <span class="t">int</span>, key_bytes: <span class="t">int</span>, fill: <span class="t">float</span> = <span class="m">0.9</span>) -&gt; <span class="t">int</span>:
+    entry = <span class="m">8</span> + -(-key_bytes // <span class="m">8</span>) * <span class="m">8</span> + <span class="m">4</span>                  <span class="c"># header + aligned key + line pointer</span>
+    per_page = <span class="f">int</span>((<span class="m">8192</span> - <span class="m">24</span> - <span class="m">16</span>) * fill // entry)
+    <span class="k">return</span> -(-rows // per_page) * <span class="m">8192</span> * <span class="m">1.01</span>              <span class="c"># ~1% for the inner pages</span>
+
+<span class="f">print</span>(<span class="f">table_bytes</span>(<span class="m">100_000_000</span>, <span class="m">152</span>) / <span class="m">1e9</span>)    <span class="c"># 15.8 GB of heap</span>
+<span class="f">print</span>(<span class="f">btree_bytes</span>(<span class="m">100_000_000</span>, <span class="m">8</span>) / <span class="m">1e9</span>)        <span class="c"># 2.3 GB per bigint index</span></pre>
+  <p>Then check your arithmetic against the real thing; PostgreSQL will tell you exactly:</p>
+<pre class="code"><span class="k">SELECT</span> <span class="f">pg_column_size</span>(e.*) <span class="k">AS</span> row_bytes <span class="k">FROM</span> events e <span class="k">LIMIT</span> <span class="m">5</span>;   <span class="c">-- per-row data size (without the line pointer)</span>
+<span class="k">SELECT</span> <span class="f">pg_size_pretty</span>(<span class="f">pg_relation_size</span>(<span class="s">'events'</span>))        <span class="k">AS</span> heap,
+       <span class="f">pg_size_pretty</span>(<span class="f">pg_indexes_size</span>(<span class="s">'events'</span>))         <span class="k">AS</span> indexes,
+       <span class="f">pg_size_pretty</span>(<span class="f">pg_total_relation_size</span>(<span class="s">'events'</span>))  <span class="k">AS</span> total;  <span class="c">-- heap + indexes + TOAST</span></pre>
+
+  <h2>Try it: size a table</h2>
+  <p>Pick a table, read its byte map (each block is a byte range of one row), then reorder the columns and project its size. Striped red blocks are alignment padding: bytes on disk that hold nothing.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Size estimator: from column types to terabytes</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="sz-top">
+        <div class="seg" id="szTbl"><button class="active" data-v="events">events</button><button data-v="orders">orders</button><button data-v="flags">user_flags</button></div>
+        <div class="seg" id="szOrd"><button class="active" data-v="as">Columns as declared</button><button data-v="opt">Largest alignment first</button></div>
+      </div>
+      <div class="sz-cols" id="szCols"></div>
+      <div class="sz-map" id="szMap"></div>
+      <div class="legend"><span><i class="sz-hdr"></i>header</span><span><i class="sz-c8"></i>8-byte aligned</span><span><i class="sz-c4"></i>4-byte</span><span><i class="sz-c1"></i>1–2 byte</span><span><i class="sz-cv"></i>variable length</span><span><i class="sz-pad"></i>padding</span></div>
+      <div class="sz-ctl">
+        <label>New rows per day <span class="v" id="szRateV"></span><input type="range" id="szRate" min="0" max="12" value="6"></label>
+        <label>Years of data <span class="v" id="szYearsV"></span><input type="range" id="szYears" min="1" max="10" value="3"></label>
+        <label>B-tree indexes (bigint keys) <span class="v" id="szIdxV"></span><input type="range" id="szIdx" min="0" max="6" value="2"></label>
+      </div>
+      <div class="stats" id="szStats"></div>
+      <div class="sz-res" id="szRes"></div>
+    </div>
+    <div class="panel-foot">Layout follows PostgreSQL's rules: 24-byte tuple header, typed alignment, short varlena headers for values up to 126 bytes, tuples rounded to 8 bytes, 4-byte line pointers, 8,168 usable bytes per page. Variable-length columns use the average size shown.</div>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Bytes per row</b> 24 header + aligned columns, rounded to 8, + 4 pointer.</li>
+      <li><b>Rows per page</b> 8,168 ÷ that, rounded down.</li>
+      <li><b>Table size</b> Rows ÷ rows per page × 8 KB.</li>
+      <li><b>Add indexes</b> ~22 MB per million rows per bigint B-tree; more for wide keys.</li>
+      <li><b>Add growth and margin</b> Rows per day × retention, plus 20–50% for bloat and free space.</li>
+      <li data-k="end"><b>Compare</b> Hot part vs RAM (does the working set fit?), total vs disk, and backup and restore time.</li>
+    </ol>
+    <figcaption><b>Sizing a table on a whiteboard.</b> Every step is one multiplication or division; the skill is knowing the overheads.</figcaption>
+  </figure>
+
+  <h2>Column order and padding</h2>
+  <p>Alignment means the same columns can take different space depending on their order. A table that alternates <code>boolean</code> and <code>bigint</code> columns pads 7 bytes after every boolean. Declaring 8-byte columns first, then 4-byte, then 2-byte, then 1-byte and variable-length ones removes nearly all of it:</p>
+<pre class="code"><span class="c">-- 24 header + (1 + 7 pad + 8) × 2 + 1 + 7 pad + 8  = 72 bytes per row</span>
+<span class="k">CREATE TABLE</span> flags_bad  (is_admin <span class="t">boolean</span>, user_id <span class="t">bigint</span>, is_beta <span class="t">boolean</span>, org_id <span class="t">bigint</span>, is_locked <span class="t">boolean</span>, updated_at <span class="t">timestamptz</span>);
+
+<span class="c">-- 24 header + 8 + 8 + 8 + 1 + 1 + 1 = 51, rounded to 56 bytes per row: 22% smaller</span>
+<span class="k">CREATE TABLE</span> flags_good (user_id <span class="t">bigint</span>, org_id <span class="t">bigint</span>, updated_at <span class="t">timestamptz</span>, is_admin <span class="t">boolean</span>, is_beta <span class="t">boolean</span>, is_locked <span class="t">boolean</span>);</pre>
+  <p>It's worth doing when you create a large table, because PostgreSQL can't reorder columns afterwards without rewriting the table. For a small table it doesn't matter, and readability should win.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🦊</div>
+    <div class="body"><div class="title">GitLab's rule for column order</div><p>GitLab runs one of the larger public PostgreSQL deployments, with tables of billions of rows. Its database development guidelines include a page on ordering table columns: new tables should list columns from the largest alignment to the smallest (8-byte types, then 4-byte, then 2-byte and 1-byte, with variable-length columns last) specifically to avoid padding. At a billion rows, 8 bytes of padding per row is 8 GB of heap that must be stored, backed up, replicated and, worst of all, competes for the memory that keeps hot pages cached. Reviewers check column order in migrations because fixing it later means rewriting the table.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Sizing from column widths alone.</b> On narrow rows the 28 bytes of header and pointer can be half the total.</li>
+      <li><b>Forgetting the indexes.</b> A table with five indexes often has more bytes in indexes than in the heap.</li>
+      <li><b>Assuming the table stays at its freshly loaded size.</b> Updates and deletes leave dead space; plan for bloat.</li>
+      <li><b>Comparing total size with RAM.</b> What must fit is the <i>working set</i>, the pages queries actually touch, usually recent data and index upper levels.</li>
+      <li><b>Mixing units.</b> Disk vendors use GB (10⁹), PostgreSQL's <code>pg_size_pretty</code> uses binary units (1 kB = 1,024 bytes). The difference is 7% at the gigabyte scale.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Estimate the size of a table of 1 billion rows with two <code>bigint</code>s, a <code>timestamptz</code> and a 20-character text column, plus its primary key index.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Row: 24-byte header, 8 + 8 + 8 for the fixed columns, 21 for the short text with its 1-byte header: 69, rounded to 72, plus a 4-byte line pointer is 76 bytes. 8,168 ÷ 76 ≈ 107 rows per page, so about 9.3 million pages, roughly 76 GB of heap. A bigint primary key is about 22 MB per million rows, so about 22 GB. Call it 100 GB, and plan for 130–150 GB with bloat and free space. That won't fit in a 64 GB server's RAM, so I'd ask what the hot subset is.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your table is 40% larger than your estimate. What could explain it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Bloat first: dead row versions from updates and deletes that VACUUM has marked reusable but that still occupy pages, which I'd check with <code>pgstattuple</code> or the dead-tuple counts in <code>pg_stat_user_tables</code>. Then a fillfactor below 100, padding from column order, NULL bitmaps on wide tables, variable-length columns larger than assumed, or long values stored in TOAST, which <code>pg_total_relation_size</code> counts. Finally, unit confusion between GB and GiB is worth 7%.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Row bytes = 24 header + aligned columns, rounded to 8, plus a 4-byte line pointer.</li>
+      <li>Rows per page = 8,168 ÷ row bytes; table bytes = pages × 8 KB.</li>
+      <li>A bigint B-tree index is about 22 MB per million rows; indexes often rival the heap.</li>
+      <li>Order columns from largest alignment to smallest to avoid padding in big tables.</li>
+      <li>Add growth and a bloat margin, and compare the working set with RAM, not the whole table.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What fixed overhead does every PostgreSQL row carry before any column data?</p>
+      <div class="opts">
+        <button class="opt">None</button>
+        <button class="opt">8 bytes</button>
+        <button class="opt">A 23-byte tuple header (padded to 24) plus a 4-byte line pointer</button>
+        <button class="opt">One full 8 KB page</button>
+      </div>
+      <div class="explain">The header holds MVCC information; the line pointer lives in the page's slot array. Together about 28 bytes per row.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Columns declared as (boolean, bigint, boolean, bigint) waste space because…</p>
+      <div class="opts">
+        <button class="opt">each bigint must start at a multiple of 8, so 7 padding bytes follow each boolean</button>
+        <button class="opt">booleans are stored as 8 bytes</button>
+        <button class="opt">PostgreSQL stores booleans in a separate file</button>
+        <button class="opt">bigints are compressed</button>
+      </div>
+      <div class="explain">Alignment padding. Declaring the bigints first and the booleans after removes it.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Rows are 76 bytes including the line pointer. Roughly how many fit on an 8 KB PostgreSQL page?</p>
+      <div class="opts">
+        <button class="opt">8</button>
+        <button class="opt">54</button>
+        <button class="opt">1,000</button>
+        <button class="opt">About 107</button>
+      </div>
+      <div class="explain">8,168 usable bytes ÷ 76 ≈ 107.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Roughly how big is a B-tree index on a bigint column for 100 million rows?</p>
+      <div class="opts">
+        <button class="opt">About 22 MB</button>
+        <button class="opt">About 2.2 GB</button>
+        <button class="opt">About 800 MB, exactly 8 bytes per row</button>
+        <button class="opt">About 22 GB</button>
+      </div>
+      <div class="explain">Each entry is about 20 bytes (8-byte index tuple header, 8-byte key, 4-byte line pointer), pages are 90% full: around 22 MB per million rows.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A table is 300 GB and the server has 128 GB of RAM. Does it matter?</p>
+      <div class="opts">
+        <button class="opt">Yes: the whole table must fit in RAM to be queried</button>
+        <button class="opt">No: RAM size never matters for databases</button>
+        <button class="opt">It depends on the working set: if queries mostly touch recent rows and index upper levels that fit in RAM, it can perform well</button>
+        <button class="opt">Only if it has no indexes</button>
+      </div>
+      <div class="explain">Databases cache pages, not tables. What matters is whether the pages your queries actually touch stay cached.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DB;
+  // [name, type, bytes (avg data bytes for varlena), align (1,2,4,8 or 'v' for varlena)]
+  const TABLES = {
+    events: [['event_id', 'bigint', 8, 8], ['kind', 'text', 12, 'v'], ['user_id', 'bigint', 8, 8], ['is_test', 'boolean', 1, 1], ['occurred_at', 'timestamptz', 8, 8], ['props', 'jsonb', 80, 'v']],
+    orders: [['order_id', 'bigint', 8, 8], ['status', 'text', 7, 'v'], ['customer_id', 'bigint', 8, 8], ['item_count', 'integer', 4, 4], ['total_cents', 'bigint', 8, 8], ['currency', 'text', 3, 'v'], ['created_at', 'timestamptz', 8, 8], ['note', 'text', 180, 'v']],
+    flags: [['is_admin', 'boolean', 1, 1], ['user_id', 'bigint', 8, 8], ['is_beta', 'boolean', 1, 1], ['org_id', 'bigint', 8, 8], ['is_locked', 'boolean', 1, 1], ['updated_at', 'timestamptz', 8, 8]],
+  };
+  const RATES = [1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6, 3e6, 1e7, 3e7, 1e8, 3e8, 1e9];
+  const alignUp = (x, a) => Math.ceil(x / a) * a;
+  function layout(cols) {
+    const blocks = [{ k: 'hdr', name: 'header', n: 24 }];
+    let off = 24;
+    for (const [name, type, bytes, al] of cols) {
+      let len, a;
+      if (al === 'v') { if (bytes + 1 <= 127) { len = bytes + 1; a = 1; } else { len = bytes + 4; a = 4; } }
+      else { len = bytes; a = al; }
+      const p = alignUp(off, a) - off;
+      if (p) blocks.push({ k: 'pad', name: 'pad', n: p });
+      blocks.push({ k: al === 'v' ? 'v' : al === 8 ? '8' : al === 4 ? '4' : '1', name, type, n: len });
+      off += p + len;
+    }
+    const end = alignUp(off, 8);
+    if (end > off) blocks.push({ k: 'pad', name: 'pad', n: end - off });
+    return { blocks, tuple: end, pad: blocks.filter((b) => b.k === 'pad').reduce((s, b) => s + b.n, 0) };
+  }
+  const order = (cols) => cols.slice().sort((a, b) => rank(b) - rank(a));
+  const rank = (c) => (c[3] === 'v' ? 0.5 : c[3]);
+  function draw() {
+    const base = TABLES[$('#szTbl').dataset.value], opt = $('#szOrd').dataset.value === 'opt';
+    const cols = opt ? order(base) : base;
+    const L = layout(cols);
+    $('#szCols').innerHTML = cols.map((c) => `<span>${c[0]} <b>${c[1]}</b>${c[3] === 'v' ? ' ~' + c[2] + ' B' : ''}</span>`).join('');
+    const unit = Math.max(4, Math.min(9, 900 / L.tuple));
+    $('#szMap').innerHTML = L.blocks.map((b) => `<div class="sz-b sz-${b.k === 'hdr' ? 'hdr' : b.k === 'pad' ? 'pad' : b.k === 'v' ? 'cv' : 'c' + b.k}" style="width:${b.n * unit}px" title="${b.name}${b.type ? ' (' + b.type + ')' : ''}: ${b.n} bytes">${b.k === 'pad' ? (b.n * unit > 14 ? b.n : '') : b.n * unit > (b.name.length + 4) * 6.6 ? b.name + ' ' + b.n : b.n * unit > 18 ? b.n : ''}</div>`).join('');
+    const rate = RATES[+$('#szRate').value], years = +$('#szYears').value, idx = +$('#szIdx').value;
+    const rows = rate * 365 * years;
+    const perPage = Math.min(291, Math.floor(8168 / (L.tuple + 4)));
+    const heap = Math.ceil(rows / perPage) * 8192;
+    const idxBytes = idx * Math.ceil(rows / Math.floor(8152 * 0.9 / 20)) * 8192 * 1.01;
+    const total = (heap + idxBytes) * 1.3;
+    $('#szRateV').textContent = DB.fmt(rate);
+    $('#szYearsV').textContent = years;
+    $('#szIdxV').textContent = idx;
+    $('#szStats').innerHTML =
+      `<div class="stat"><div class="k">Row on disk</div><div class="v">${L.tuple + 4}<small> B</small></div></div>` +
+      `<div class="stat ${L.pad ? 'warn' : 'good'}"><div class="k">Padding per row</div><div class="v">${L.pad}<small> B</small></div></div>` +
+      `<div class="stat"><div class="k">Rows per page</div><div class="v">${perPage}</div></div>` +
+      `<div class="stat"><div class="k">Rows after ${years} y</div><div class="v">${DB.fmt(rows)}</div></div>` +
+      `<div class="stat acc"><div class="k">Heap + indexes</div><div class="v">${DB.bytes(heap + idxBytes)}</div></div>` +
+      `<div class="stat"><div class="k">Plan for (+30%)</div><div class="v">${DB.bytes(total)}</div></div>`;
+    const padMsg = opt
+      ? (layout(base).tuple > L.tuple ? `Largest-alignment-first order saves <b>${layout(base).tuple - L.tuple} bytes per row</b> versus the declared order: ${DB.bytes((layout(base).tuple - L.tuple) * rows)} over ${DB.fmt(rows)} rows, before indexes.` : 'This table was already well ordered: reordering saves nothing.')
+      : (L.pad > 4 ? `<b>${L.pad} bytes</b> of every row are padding (${Math.round(L.pad / L.tuple * 100)}% of the tuple). Switch to "Largest alignment first" to see the saving.` : 'Very little padding here. The 28 bytes of header and pointer are a bigger share than you might expect.');
+    $('#szRes').innerHTML = padMsg + ` Indexes are <b>${Math.round(idxBytes / (heap + idxBytes) * 100)}%</b> of the total.` + (heap + idxBytes > 256e9 ? ' That\'s more than the RAM of most single servers, so ask what the hot working set is.' : '');
+  }
+  ['#szTbl', '#szOrd'].forEach((s) => $(s).addEventListener('segchange', draw));
+  ['#szRate', '#szYears', '#szIdx'].forEach((s) => $(s).addEventListener('input', draw));
+  draw();
+})();
+</script>
 </body>
 </html>

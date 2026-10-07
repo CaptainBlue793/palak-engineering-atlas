@@ -6,34 +6,328 @@
 <title>Deadlocks in Databases</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .dl-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .dl-row > span { font-size:12.5px; color:var(--muted); min-width:150px; }
+  .dl-tl { margin-top:12px; border:1.5px solid var(--border); border-radius:12px; background:var(--surface); overflow:hidden; }
+  .dl-h, .dl-s { display:grid; grid-template-columns:30px minmax(0,1fr) minmax(0,1fr); }
+  .dl-h > div { padding:6px 10px; font-size:12px; font-weight:700; letter-spacing:.03em; color:var(--muted); background:var(--surface-2); border-bottom:1px solid var(--border); }
+  .dl-s > div { padding:6px 10px; border-bottom:1px solid var(--border); font-size:12.5px; min-width:0; }
+  .dl-s:last-child > div { border-bottom:0; }
+  .dl-s > div:first-child { color:var(--muted); font-family:var(--mono); font-size:11.5px; }
+  .dl-s code { display:block; font-size:11.5px; background:none; padding:0; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .dl-s em { display:block; font-style:normal; font-size:12px; margin-top:3px; font-weight:700; color:var(--green); }
+  .dl-s em.dl-w { color:var(--amber); } .dl-s em.dl-e { color:var(--red); font-family:var(--mono); font-weight:600; }
+  .dl-s.dl-hide { opacity:.22; } .dl-s.dl-hide em { visibility:hidden; }
+  .dl-s.dl-cur > div { background:var(--accent-soft); }
+  .dl-state { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:12px; }
+  @media (max-width:640px) { .dl-state { grid-template-columns:1fr; } }
+  .dl-box { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:8px 12px; font-size:13px; min-width:0; }
+  .dl-box h6 { margin:0 0 5px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .dl-box p { margin:2px 0; }
+  .dl-box.dl-cycle { border-color:var(--red); background:var(--red-soft); }
+  .dl-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--border); min-height:52px; }
+  .dl-msg.dl-good { background:var(--green-soft); border-left-color:var(--green); }
+  .dl-msg.dl-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .dl-msg.dl-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
 </head>
 <body data-chapter="24">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 24</span><span class="pill">Intermediate</span><span class="pill">⏱ 40 min</span></div>
     <h1>Deadlocks in <span class="grad">Databases</span></h1>
-    <p class="lead">How two transactions deadlock, how the database detects it, and how to write code that doesn't.</p>
+    <p class="lead">Two transactions each hold a lock the other needs. Neither can go on until the other lets go, and neither will let go until it has gone on. Left alone they would wait for ever. A database doesn't leave them alone: it notices the cycle, picks one transaction, and aborts it with an error so that the other can finish. So a deadlock in a database is an error that some request receives now and then, and it isn't a hang. In the logs it looks like a failure in the database, and the cause is nearly always in the application: two pieces of code that take the same locks in different orders. This chapter reproduces one, shows how the database finds it, and gives the rule that prevents it.</p>
+    <ul class="objectives">
+      <li><span>Reproduce a deadlock with two sessions, and read the error it produces</span></li>
+      <li><span>Explain a wait-for graph and how a database detects a cycle in it</span></li>
+      <li><span>Remove a deadlock by making transactions take locks in a consistent order</span></li>
+      <li><span>Handle the deadlocks that remain by retrying</span></li>
+      <li><span>Tell <code>deadlock_timeout</code>, <code>lock_timeout</code> and <code>statement_timeout</code> apart</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Row locks, and that they are held until commit:</b> <a href="22-two-phase-locking.html">Chapter 22</a>.</li>
+        <li><b>Retrying a transaction after a serialisation failure:</b> <a href="21-isolation-anomalies.html">Chapter 21</a>. The same helper is used here.</li>
+        <li><b>Deadlock in general, and its four conditions:</b> the <a href="../os/index.html">OS course</a> covers them for threads and mutexes.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>A deadlock reproduced</li>
-    <li>Wait-for graphs and detection</li>
-    <li>Lock ordering</li>
-    <li>Retries</li>
-    <li>lock_timeout</li>
-  </ol>
+  <h2>A deadlock reproduced</h2>
+  <p>Alice sends Bob £10 at the same moment as Bob sends Alice £5. Each transfer debits the sender's row and then credits the receiver's.</p>
+  <figure class="seq" data-actors="Transfer 1: A to B|Database|Transfer 2: B to A">
+    <ol>
+      <li data-m="0>1">UPDATE account A<small>Granted: transfer 1 now holds the lock on row A.</small></li>
+      <li data-m="2>1">UPDATE account B<small>Granted: transfer 2 holds the lock on row B.</small></li>
+      <li data-m="0>1" data-k="fail">UPDATE account B<small>Row B is locked by transfer 2. Transfer 1 waits.</small></li>
+      <li data-m="2>1" data-k="fail">UPDATE account A<small>Row A is locked by transfer 1. Transfer 2 waits. Each now waits for the other.</small></li>
+      <li data-m="1-1" data-k="note">one second later, the database looks for a cycle and finds one</li>
+      <li data-m="1>0" data-k="bad">ERROR: deadlock detected</li>
+      <li data-m="1>2" data-k="reply">UPDATE 1<small>Transfer 1 was rolled back, row A is free, and transfer 2 carries on.</small></li>
+    </ol>
+    <figcaption><b>The classic deadlock.</b> Both transfers are correct. They acquired the same two locks in opposite orders, and happened to overlap.</figcaption>
+  </figure>
+<pre class="code">ERROR:  <span class="k">deadlock detected</span>
+DETAIL:  Process 20417 waits for ShareLock on transaction 8841; blocked by process 20988.
+         Process 20988 waits for ShareLock on transaction 8840; blocked by process 20417.
+HINT:  See server log for query details.
+CONTEXT:  while updating tuple (0,2) in relation "accounts"</pre>
+  <p>The message describes the cycle exactly: who waits for whom, all the way round. The server's log adds the statement each process was running. Between them they identify the two code paths involved, which is all the information needed to fix it.</p>
+
+  <h2>Wait-for graphs and detection</h2>
+  <p>The database keeps, in effect, a <b>wait-for graph</b>: a node for every transaction, and an arrow from each waiting transaction to the one holding the lock it wants. Ordinary waiting is a chain of arrows that ends at a transaction which is running and will finish. A deadlock is a <b>cycle</b>, a path of arrows that leads back to where it began, and nothing in a cycle is running.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Approach</th><th>How it works</th><th>Used by</th></tr></thead>
+      <tbody>
+        <tr><td><b>Detect after a delay</b></td><td>A transaction that has waited for <code>deadlock_timeout</code>, 1 second by default, searches the graph for a cycle through itself. If it finds one it aborts itself</td><td>PostgreSQL. Most waits end in milliseconds, so the search is rarely needed</td></tr>
+        <tr><td><b>Detect at once</b></td><td>The graph is checked whenever a transaction starts to wait. The victim is the transaction that has changed the fewest rows</td><td>MySQL InnoDB</td></tr>
+        <tr><td><b>Time out</b></td><td>No graph. A transaction that waits longer than a limit is aborted, deadlock or not</td><td>InnoDB with detection turned off, and many distributed systems</td></tr>
+        <tr><td><b>Prevent</b></td><td>Transactions carry timestamps. An older one that needs a lock held by a younger one forces the younger to abort, so a cycle can't form</td><td>Google Spanner, which calls it wound-wait</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The victim's transaction is rolled back completely and its locks are released. The other transactions never learn that anything happened. Their statements, which had been waiting, simply return.</p>
+
+  <h2>Lock ordering</h2>
+  <p>A cycle needs two transactions that acquire the same locks in different orders. If every transaction that needs several locks takes them <b>in the same order</b>, no cycle is possible. The second transaction to arrive waits at the first lock, holding nothing the first one wants.</p>
+<pre class="code"><span class="c">-- Deadlock-prone: the order of the locks follows the direction of the transfer</span>
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> balance = balance - <span class="m">10</span> <span class="k">WHERE</span> id = :sender;
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> balance = balance + <span class="m">10</span> <span class="k">WHERE</span> id = :receiver;
+
+<span class="c">-- Safe: lock both rows first, always in order of id, then change them in whatever order is convenient</span>
+<span class="k">SELECT</span> id <span class="k">FROM</span> accounts <span class="k">WHERE</span> id <span class="k">IN</span> (:sender, :receiver) <span class="k">ORDER BY</span> id <span class="k">FOR UPDATE</span>;
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> balance = balance - <span class="m">10</span> <span class="k">WHERE</span> id = :sender;
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> balance = balance + <span class="m">10</span> <span class="k">WHERE</span> id = :receiver;</pre>
+  <p>The rule is easy to state, and in a real application the locks are harder to see. These are the places deadlocks usually come from:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Source</th><th>Why the order differs</th><th>Remedy</th></tr></thead>
+      <tbody>
+        <tr><td><b>Two code paths touching the same tables</b></td><td>One updates the order and then its customer, another the customer and then the order</td><td>Agree an order of tables for the whole codebase</td></tr>
+        <tr><td><b>Batch updates and upserts</b></td><td>Two batches contain the same rows in different sequences</td><td>Sort every batch by key before sending it</td></tr>
+        <tr><td><b><code>UPDATE … WHERE id IN (…)</code></b></td><td>Rows are locked in the order the scan finds them, which isn't under your control</td><td>Lock first with <code>SELECT … ORDER BY id FOR UPDATE</code></td></tr>
+        <tr><td><b>Foreign keys</b></td><td>Inserting a child row takes a lock on its parent row that you didn't write</td><td>Know that it happens, and touch parents before children</td></tr>
+        <tr><td><b>Unique indexes</b></td><td>Two transactions insert the same keys in different orders, and each waits to see whether the other will commit</td><td>Sort the inserts, or use <code>ON CONFLICT</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Try it: two transfers</h2>
+  <p>Transfer 1 moves £10 from A to B, and transfer 2 moves £5 from B to A, at the same time. Choose how each decides which row to lock first, and step through.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Lock order and the wait-for graph</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="dl-row"><span>Each transfer locks rows</span><div class="seg" id="dlOrder"><button class="active" data-v="dir">sender first, then receiver</button><button data-v="id">in order of account id, always</button></div></div>
+      <div class="controls">
+        <button class="btn sm primary" id="dlNext">Next step</button>
+        <button class="btn sm" id="dlAll">Run to the end</button>
+        <button class="btn sm ghost" id="dlReset">↺ Reset</button>
+      </div>
+      <div class="dl-tl" id="dlTl"></div>
+      <div class="dl-state">
+        <div class="dl-box" id="dlLocks"></div>
+        <div class="dl-box" id="dlGraph"></div>
+      </div>
+      <div class="dl-msg" id="dlMsg"></div>
+      <div class="stats" id="dlStats"></div>
+    </div>
+    <div class="panel-foot">Both accounts start at £100. With either setting the two transfers do the same work and end with A at £95 and B at £105. The only difference is the order in which each one takes its two row locks.</div>
+  </div>
+
+  <p>Things to notice. With "sender first", the two transfers take their locks in opposite orders, and by the fourth step the wait-for graph has an arrow in each direction. Nothing moves for a second, until transfer 1's deadlock check fires and it is aborted. Transfer 2 completes, and transfer 1 has to be run again by the application: one error, one retry and a second lost. With "in order of account id", transfer 2 asks for row A first, although its own money goes the other way. It finds A locked and waits, holding nothing. The graph has one arrow and no cycle, transfer 1 finishes, and transfer 2 follows. No error is raised, and the wait lasts only as long as transfer 1 took.</p>
+
+  <h2>Retries</h2>
+  <p>Lock ordering removes the deadlocks you know about. In a large application some will remain, from foreign keys, from indexes, from a code path somebody added last week. So a deadlock should be treated like a serialisation failure: an expected outcome under concurrency, to be retried. The error code is <code>40P01</code>.</p>
+<pre class="code"><span class="k">def</span> <span class="f">transfer</span>(conn, sender, receiver, pence):
+    first, second = <span class="f">sorted</span>([sender, receiver])              <span class="c"># always the same order</span>
+    <span class="k">def</span> <span class="f">work</span>(conn):
+        conn.<span class="f">execute</span>(<span class="s">"SELECT 1 FROM accounts WHERE id IN (%s, %s) ORDER BY id FOR UPDATE"</span>, (first, second))
+        conn.<span class="f">execute</span>(<span class="s">"UPDATE accounts SET balance = balance - %s WHERE id = %s"</span>, (pence, sender))
+        conn.<span class="f">execute</span>(<span class="s">"UPDATE accounts SET balance = balance + %s WHERE id = %s"</span>, (pence, receiver))
+    <span class="f">run_transaction</span>(conn, work)                            <span class="c"># Chapter 21's helper: retries on 40001 and 40P01, with backoff</span></pre>
+  <p>Retrying is safe because the victim was rolled back in full: nothing it did has taken effect. The retry must run the whole transaction again, and wait a short, random time first, so that the same two transactions don't collide again in the same way.</p>
+
+  <h2>lock_timeout</h2>
+  <p>Three settings limit waiting, and they are often confused.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Setting</th><th>Default</th><th>What it does</th><th>What it doesn't do</th></tr></thead>
+      <tbody>
+        <tr><td><code>deadlock_timeout</code></td><td>1 s</td><td>How long a transaction waits for a lock before it checks for a deadlock</td><td>Limit ordinary waiting. With no cycle, the wait goes on</td></tr>
+        <tr><td><code>lock_timeout</code></td><td>Off</td><td>Aborts a statement that has waited this long for any one lock</td><td>Limit a statement that is running, not waiting</td></tr>
+        <tr><td><code>statement_timeout</code></td><td>Off</td><td>Aborts a statement that has taken this long in total, for any reason</td><td>Tell you whether the time went on waiting or working</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="k">SET</span> lock_timeout = <span class="s">'2s'</span>;            <span class="c">-- for interactive requests: failing fast beats queueing</span>
+<span class="k">SET</span> log_lock_waits = on;            <span class="c">-- log every wait that outlasts deadlock_timeout, with who was blocking</span>
+
+<span class="k">SELECT</span> deadlocks <span class="k">FROM</span> pg_stat_database <span class="k">WHERE</span> datname = <span class="f">current_database</span>();   <span class="c">-- a counter worth graphing</span></pre>
+  <p>A deadlock is resolved by the database within a second. Plain blocking, where a transaction waits behind another that is merely slow, is resolved by nobody unless you set a limit. Of the two, blocking is the more common in production and does more harm (<a href="22-two-phase-locking.html">Chapter 22</a>).</p>
+
+  <div class="callout usecase">
+    <div class="ico">🔗</div>
+    <div class="body"><div class="title">The foreign-key deadlocks that PostgreSQL 9.3 removed</div><p>Until 2013 a common pattern in PostgreSQL applications produced deadlocks that their authors could not find in their own code, because the locks involved were taken by the database on their behalf. Consider a forum. Posting a message inserts a row into <code>posts</code> that refers to a row in <code>users</code>. To be sure that the user isn't deleted before the insert commits, the foreign-key check took a shared lock on the user's row. Many applications also update the user's row for other reasons, to record the time of their last activity or to count their posts. An update needs an exclusive lock on the row. So two requests for the same user, each inserting a post and then updating the user, would each take the shared lock, which they could both hold, and then each ask for the exclusive lock, which neither could have while the other held the shared one. The result was a deadlock between two transactions that had each written two entirely reasonable statements. It was reported by users of web frameworks for years. The fix, in version 9.3, was to make the locks say more precisely what they protect. A foreign-key check now takes a lock that means only "don't delete this row or change its key", and an update that leaves the key alone takes a weaker lock than one that changes it, and the two are compatible. The deadlock disappeared without any application changing a line. The locks a transaction holds include ones it never asked for, and when a deadlock report names a statement that looks harmless, the foreign keys and unique indexes on the table are the first place to look.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Treating a deadlock error as a database fault.</b> It is the database resolving a conflict that the application's lock order created.</li>
+      <li><b>Not retrying.</b> The victim's work is lost, and a user sees an error for a request that would succeed if run again.</li>
+      <li><b>Raising <code>deadlock_timeout</code> to "avoid deadlocks".</b> It only delays their detection. The transactions still wait.</li>
+      <li><b>Sending batches in arbitrary order.</b> Two workers upserting overlapping sets of rows is the commonest deadlock in data pipelines.</li>
+      <li><b>Long transactions.</b> The longer locks are held, the more chances there are for another transaction to want them in a different order.</li>
+      <li><b>Ignoring the server log.</b> It contains both statements of every deadlock, which is the whole diagnosis.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is a database deadlock, and what does the database do about it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A deadlock is when two or more transactions each hold a lock that another needs and are each waiting for a lock that another holds, so none can proceed. The simplest case: transaction 1 updates row A then tries to update row B, while transaction 2 has updated row B and tries to update row A. Unlike threads deadlocking on mutexes, a database doesn't hang: it tracks who is waiting for whom, a wait-for graph, and looks for cycles. PostgreSQL runs that check when a transaction has waited longer than deadlock_timeout, one second by default; InnoDB checks immediately. When it finds a cycle it picks a victim, rolls that transaction back completely, which releases its locks, and returns a "deadlock detected" error to that client; the other transactions carry on unaware. The application should catch that error and retry the whole transaction, and, better, prevent the deadlock by always acquiring locks in a consistent order.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your service logs a few deadlock errors every hour. How do you investigate, and how do you eliminate them?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I'd start from the server log, because for every deadlock PostgreSQL logs the processes in the cycle, the lock each was waiting for, and the statement each was running; with log_lock_waits on I also see the waits that led up to it. That gives me the two, occasionally three, statements involved, and I can map them to code paths. Then I'd work out which locks each transaction holds at that point and in what order it took them, remembering the implicit ones: row locks from earlier statements in the same transaction, locks on parent rows from foreign-key checks, and waits caused by unique indexes. The fix is to make the order consistent. If two paths touch the same tables in different orders, pick one order. If it is a multi-row update or a batch upsert, sort the rows by primary key, or take the locks up front with SELECT … ORDER BY id FOR UPDATE. If the transaction is long, shorten it, so locks are held briefly and fewer are held together; sometimes the best fix is splitting it. Where the logic allows, replace read-then-write sequences with a single atomic statement. Independently of all that, I'd make sure the application retries on deadlock, error 40P01, with a small random backoff, since retrying is correct and cheap, and I'd keep a graph of the deadlock counter so that a new code path that reintroduces one is noticed.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A deadlock is a cycle of transactions each waiting for a lock that the next one holds.</li>
+      <li>The database finds the cycle in its wait-for graph, aborts one transaction with an error, and the others proceed.</li>
+      <li>PostgreSQL checks only after a wait of <code>deadlock_timeout</code>, so each deadlock costs about a second and one rolled-back transaction.</li>
+      <li>Taking locks in one consistent order, such as by primary key, makes a cycle impossible.</li>
+      <li>Foreign keys, unique indexes and unordered batches take locks you didn't write, so retry on deadlock errors as well.</li>
+      <li><code>lock_timeout</code> limits ordinary waiting, which no deadlock detector will end for you.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Transaction 1 holds a lock on row A and wants row B. Transaction 2 holds B and wants A. What does PostgreSQL do?</p>
+      <div class="opts">
+        <button class="opt">Both wait until a statement timeout</button>
+        <button class="opt">Both are aborted</button>
+        <button class="opt">After about a second, it detects the cycle and aborts one of them with "deadlock detected". The other continues</button>
+        <button class="opt">It grants both locks to both transactions</button>
+      </div>
+      <div class="explain">One victim is enough to break the cycle. Its locks are released when it is rolled back.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What is the most reliable way to prevent the deadlock between two money transfers in opposite directions?</p>
+      <div class="opts">
+        <button class="opt">Always lock the two account rows in the same order, such as by account id</button>
+        <button class="opt">Increase <code>deadlock_timeout</code></button>
+        <button class="opt">Use a higher isolation level</button>
+        <button class="opt">Add an index on the balance column</button>
+      </div>
+      <div class="explain">With a single agreed order, the second transaction waits at the first lock and holds nothing the first one needs.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A transaction receives "deadlock detected". What state is it in, and what should the application do?</p>
+      <div class="opts">
+        <button class="opt">Half its changes are saved. Finish the rest by hand</button>
+        <button class="opt">It is still waiting. Wait longer</button>
+        <button class="opt">It committed. Nothing to do</button>
+        <button class="opt">It has been rolled back in full. Run the whole transaction again, after a short random delay</button>
+      </div>
+      <div class="explain">Nothing the victim did has taken effect, which is what makes the retry safe.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Two workers each run a batch upsert of 500 rows, and the batches overlap. They deadlock now and then. What is the simplest fix?</p>
+      <div class="opts">
+        <button class="opt">Use smaller batches</button>
+        <button class="opt">Sort each batch by key before sending it, so that both workers lock rows in the same order</button>
+        <button class="opt">Run the workers at different times</button>
+        <button class="opt">Drop the unique index</button>
+      </div>
+      <div class="explain">Smaller batches make the deadlock rarer. A consistent order makes it impossible.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does <code>deadlock_timeout = 1s</code> mean?</p>
+      <div class="opts">
+        <button class="opt">A transaction is aborted after waiting 1 second for a lock</button>
+        <button class="opt">Deadlocked transactions are retried after 1 second</button>
+        <button class="opt">A transaction that has waited 1 second for a lock checks whether it is in a deadlock. If it isn't, it goes on waiting</button>
+        <button class="opt">Statements are limited to 1 second</button>
+      </div>
+      <div class="explain">Limiting ordinary lock waits is the job of <code>lock_timeout</code>.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const DEBIT_A = "UPDATE accounts SET balance = balance - 10\nWHERE id = 'A';", CREDIT_B = "UPDATE accounts SET balance = balance + 10\nWHERE id = 'B';";
+  const DEBIT_B = "UPDATE accounts SET balance = balance - 5\nWHERE id = 'B';", CREDIT_A = "UPDATE accounts SET balance = balance + 5\nWHERE id = 'A';";
+  // Step: [session, SQL, result, kind ('' | 'w' wait | 'e' error), state after: { A: holder, B: holder, wait: [[from, to], …], note }]
+  const SC = {
+    dir: [
+      [1, 'BEGIN;\n' + DEBIT_A, 'UPDATE 1: holds the lock on A', '', { A: 1, B: 0, wait: [] }],
+      [2, 'BEGIN;\n' + DEBIT_B, 'UPDATE 1: holds the lock on B', '', { A: 1, B: 2, wait: [] }],
+      [1, CREDIT_B, 'waiting: B is locked by transfer 2', 'w', { A: 1, B: 2, wait: [[1, 2]] }],
+      [2, CREDIT_A, 'waiting: A is locked by transfer 1', 'w', { A: 1, B: 2, wait: [[1, 2], [2, 1]] }],
+      [1, '-- 1 second after it began to wait, transfer 1 checks for a deadlock', 'ERROR: deadlock detected. Transaction rolled back', 'e', { A: 2, B: 2, wait: [], dead: 1 }],
+      [2, '-- its UPDATE of A, which was waiting, now returns\nCOMMIT;', 'committed', '', { A: 0, B: 0, wait: [], done2: true }],
+      [1, '-- the application retries the whole transfer\nBEGIN; ' + DEBIT_A.replace('\n', ' ') + '\n' + CREDIT_B.replace('\n', ' ') + ' COMMIT;', 'committed, at the second attempt', '', { A: 0, B: 0, wait: [], done1: true, done2: true }],
+    ],
+    id: [
+      [1, 'BEGIN;\n' + DEBIT_A, 'UPDATE 1: holds the lock on A', '', { A: 1, B: 0, wait: [] }],
+      [2, 'BEGIN;\n' + CREDIT_A + '   -- A comes first by id', 'waiting: A is locked by transfer 1', 'w', { A: 1, B: 0, wait: [[2, 1]] }],
+      [1, CREDIT_B, 'UPDATE 1: holds the lock on B as well', '', { A: 1, B: 1, wait: [[2, 1]] }],
+      [1, 'COMMIT;', 'committed: both locks released', '', { A: 2, B: 0, wait: [], done1: true }],
+      [2, '-- its UPDATE of A now returns\n' + DEBIT_B + '\nCOMMIT;', 'committed', '', { A: 0, B: 0, wait: [], done1: true, done2: true }],
+    ],
+  };
+  let st;
+  const mode = () => $('#dlOrder').dataset.value;
+  function reset() { st = { i: 0 }; draw(); }
+  function draw() {
+    const S = SC[mode()], n = S.length, done = st.i >= n, cur = st.i ? S[st.i - 1][4] : { A: 0, B: 0, wait: [] };
+    $('#dlTl').innerHTML = '<div class="dl-h"><div></div><div>Transfer 1: £10 from A to B</div><div>Transfer 2: £5 from B to A</div></div>' + S.map((s, k) => {
+      const cell = `<code>${s[1].replace(/&/g, '&amp;').replace(/</g, '&lt;')}</code><em class="${s[3] === 'w' ? 'dl-w' : s[3] === 'e' ? 'dl-e' : ''}">→ ${s[2]}</em>`;
+      return `<div class="dl-s${k >= st.i ? ' dl-hide' : ''}${k === st.i - 1 && !done ? ' dl-cur' : ''}"><div>${k + 1}</div><div>${s[0] === 1 ? cell : ''}</div><div>${s[0] === 2 ? cell : ''}</div></div>`;
+    }).join('');
+    const who = (x) => (x ? 'held by transfer ' + x : 'free');
+    $('#dlLocks').innerHTML = `<h6>Row locks</h6><p>Row A: <b>${who(cur.A)}</b></p><p>Row B: <b>${who(cur.B)}</b></p>`;
+    const cycle = cur.wait.length === 2;
+    $('#dlGraph').className = 'dl-box' + (cycle ? ' dl-cycle' : '');
+    $('#dlGraph').innerHTML = `<h6>Wait-for graph</h6>` + (cur.wait.length ? cur.wait.map((w) => `<p>Transfer ${w[0]} <b>→ waits for →</b> transfer ${w[1]}</p>`).join('') + (cycle ? '<p><b>A cycle: neither can ever proceed.</b></p>' : '<p>One arrow, no cycle: this wait will end.</p>') : '<p>No arrows: nobody is waiting.</p>');
+    const m = $('#dlMsg'); let text, cls = '';
+    if (!st.i) text = mode() === 'dir' ? 'Each transfer will lock its sender\'s row and then its receiver\'s. Step through and watch the wait-for graph.' : 'Each transfer will lock row A and then row B, whichever way its money is going. Step through and watch the wait-for graph.';
+    else if (done) { cls = mode() === 'dir' ? 'dl-warn' : 'dl-good'; text = mode() === 'dir' ? '<b>Both transfers got through, at a price.</b> A is £95 and B is £105. On the way there was one deadlock error, one transaction rolled back and run again, and a second in which nothing moved. Under load this happens to some fraction of all requests.' : '<b>Both transfers got through with no error.</b> A is £95 and B is £105. Transfer 2 waited for the few milliseconds that transfer 1 needed, and that was all. The locks were the same ones as before, taken in one agreed order.'; }
+    else if (cycle) { cls = 'dl-bad'; text = '<b>Deadlock.</b> Transfer 1 holds A and waits for B. Transfer 2 holds B and waits for A. Neither will release anything until it commits, and neither can commit. Only the database can end this.'; }
+    else if (cur.dead) { cls = 'dl-bad'; text = '<b>Transfer 1 is the victim.</b> Its deadlock check found the cycle, and it aborted itself. Everything it had done is rolled back, and its lock on A is released, which lets transfer 2\'s waiting statement through.'; }
+    else if (cur.wait.length) { cls = 'dl-warn'; text = `<b>Transfer ${cur.wait[0][0]} is waiting.</b> ` + (mode() === 'id' ? 'It asked for row A first, as the rule requires, and found it taken. It holds no lock itself, so nothing can be waiting for it, and no cycle can form.' : 'This is still ordinary waiting: transfer 2 is running and could finish. Whether it becomes a deadlock depends on what transfer 2 asks for next.'); }
+    else text = `Step ${st.i} of ${n}. No one is waiting.`;
+    m.className = 'dl-msg ' + cls; m.innerHTML = text;
+    $('#dlNext').disabled = done; $('#dlAll').disabled = done;
+    const dl = S.slice(0, st.i).some((s) => s[3] === 'e');
+    $('#dlStats').innerHTML = `<div class="stat ${dl ? 'bad' : done ? 'good' : ''}"><div class="k">Deadlocks</div><div class="v">${dl ? 1 : 0}</div></div>
+      <div class="stat ${dl ? 'bad' : done ? 'good' : ''}"><div class="k">Transactions rolled back</div><div class="v">${dl ? 1 : 0}</div></div>
+      <div class="stat ${dl ? 'warn' : ''}"><div class="k">Time spent stuck</div><div class="v">${dl ? '1 s' : done ? 'a few ms' : '–'}</div></div>
+      <div class="stat acc"><div class="k">Transfers completed</div><div class="v">${(cur.done1 ? 1 : 0) + (cur.done2 ? 1 : 0)} <small>of 2</small></div></div>`;
+  }
+  $('#dlNext').onclick = () => { if (st.i < SC[mode()].length) st.i++; draw(); };
+  $('#dlAll').onclick = () => { st.i = SC[mode()].length; draw(); };
+  $('#dlReset').onclick = reset;
+  $('#dlOrder').addEventListener('segchange', reset);
+  reset();
+})();
+</script>
 </body>
 </html>
