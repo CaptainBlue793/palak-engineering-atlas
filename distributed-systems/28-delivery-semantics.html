@@ -6,34 +6,354 @@
 <title>Delivery Semantics &amp; Exactly-Once</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ds-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .ds-row > span { font-size:12.5px; color:var(--muted); min-width:112px; }
+  .ds-lane { display:flex; flex-wrap:wrap; align-items:center; gap:6px 8px; margin-top:12px; font-size:13px; }
+  .ds-lane > b { min-width:150px; font-size:12.5px; color:var(--muted); font-weight:600; }
+  .ds-m { padding:3px 10px; border-radius:999px; border:1.5px solid var(--green); background:var(--green-soft); font-size:12.5px; font-variant-numeric:tabular-nums; }
+  .ds-m.ds-dup { border-color:var(--amber, var(--accent)); background:var(--amber-soft, var(--surface-2)); }
+  .ds-m.ds-bad { border-color:var(--red); background:var(--red-soft); }
+  .ds-m.ds-gone { border-style:dashed; border-color:var(--red); background:none; color:var(--muted); }
+  .ds-ev { margin:12px 0 0; padding:8px 12px 8px 30px; border:1px dashed var(--border); border-radius:12px; font-size:13px; color:var(--text-2); min-height:40px; }
+  .ds-ev li { margin:2px 0; }
+  .ds-ev.ds-none { padding-left:12px; list-style:none; }
+  .ds-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--border); min-height:64px; }
+  .ds-res.ds-good { background:var(--green-soft); border-left-color:var(--green); }
+  .ds-res.ds-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="28">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 28</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
     <h1>Delivery Semantics &amp; <span class="grad">Exactly-Once</span></h1>
-    <p class="lead">At-most-once, at-least-once, and what "exactly-once" really means in practice.</p>
+    <p class="lead">A service puts a message on a queue: "payment received, £10, account 77". Another service takes it off and adds £10 to a balance. Between those two sentences are three networks and two processes, any of which can fail at any moment, and the sender's only evidence of success is an acknowledgement that can itself be lost. So after any failure the sender faces a choice it can't escape: send again and risk the message arriving twice, or don't and risk it never arriving. Those are the two honest guarantees, at-least-once and at-most-once. The third, exactly-once, is what everyone wants, and as a statement about <i>delivery</i> it can't be had. What can be had is its effect: a system in which a message may be delivered several times and changes the result only once. This chapter covers how that is built, at each hop, from the two ingredients that make it possible, and what Kafka's "exactly-once" does and doesn't include.</p>
+    <ul class="objectives">
+      <li><span>Define the three delivery semantics, and say which failure each one mishandles</span></li>
+      <li><span>Find the two places in a pipeline where a message is lost or duplicated</span></li>
+      <li><span>Make a consumer idempotent, with a natural key, a table of processed IDs, or an offset stored with the data</span></li>
+      <li><span>Explain how Kafka's idempotent producer and transactions work</span></li>
+      <li><span>State the boundary of Kafka's exactly-once, and what is needed beyond it</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Retries, idempotency keys, and the three outcomes of a call</b>: <a href="04-retries-idempotency.html">Chapter 4</a>. This chapter applies them to messaging.</li>
+        <li><b>The transactional outbox</b>: <a href="22-sagas.html">Chapter 22</a>, which this chapter builds on and doesn't repeat.</li>
+        <li><b>Local transactions</b>: <a href="../databases/10-transactions-acid.html">Databases, Transactions &amp; ACID</a>.</li>
+        <li><b>Flink's checkpoints</b>, for one paragraph near the end: <a href="27-distributed-snapshots.html">Chapter 27</a>.</li>
+      </ul>
+      <p class="mb0">Kafka appears here only for its delivery guarantees. Topics, partitions, replication and consumer groups are <a href="29-kafka-internals.html">Chapter 29</a>. For now: a topic is an append-only log, and a consumer's position in it is a number called its <b>offset</b>.</p>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The three semantics</li>
-    <li>Deduplication</li>
-    <li>Idempotent consumers</li>
-    <li>Transactional outbox</li>
-    <li>Exactly-once in Kafka</li>
-  </ol>
+  <h2>The three semantics</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>At-most-once</th><th>At-least-once</th><th>Exactly-once</th></tr></thead>
+      <tbody>
+        <tr><td><b>Each message's effect happens</b></td><td>Zero times or once</td><td>Once or more</td><td>Once</td></tr>
+        <tr><td><b>On a timeout, the sender</b></td><td>Gives up</td><td>Sends again</td><td>Sends again, and the receiver recognises the repeat</td></tr>
+        <tr><td><b>Can lose</b></td><td>Yes</td><td>No</td><td>No</td></tr>
+        <tr><td><b>Can duplicate</b></td><td>No</td><td>Yes</td><td>The message, yes. The effect, no</td></tr>
+        <tr><td><b>Needs</b></td><td>Nothing</td><td>Retries, and acknowledging only after the work is done</td><td>At-least-once, plus idempotent handling or an atomic commit</td></tr>
+        <tr><td><b>Suits</b></td><td>Metrics, logs, sensor readings where a newer one follows</td><td>Almost everything, provided the handler is idempotent</td><td>Money, counts, anything that mustn't be done twice</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Exactly-once <i>delivery</i> is impossible for the reason given in <a href="04-retries-idempotency.html">Chapter 4</a>: a sender that hears nothing can't tell "the message was lost" from "the acknowledgement was lost", and no number of extra acknowledgements changes that (<a href="39-impossibility-results.html">Chapter 39</a> has the proof). So every system that claims exactly-once is doing the same thing underneath: delivering at least once, and making the second delivery harmless. The accurate names are <b>effectively-once</b> or exactly-once <i>processing</i>.</p>
+
+  <h2>Where it goes wrong</h2>
+  <p>A message crosses two hops, and each has its own window.</p>
+  <p><b>Producer to broker.</b> The producer sends and waits for an acknowledgement. If none comes and it doesn't retry, a lost request is a lost message. If it does retry, a lost acknowledgement is a duplicate: the broker stored the first copy and stores the second.</p>
+  <p><b>Broker to consumer.</b> The consumer does two things with each message: it performs the work, and it records that it has done so by committing its offset. A crash can fall between the two, and the order decides what the crash costs.</p>
+  <figure class="seq" data-actors="Broker|Consumer|Database">
+    <ol>
+      <li data-m="0>1">message at offset 5: "+£10"</li>
+      <li data-m="1>2">UPDATE balance = balance + 10</li>
+      <li data-m="2>1" data-k="reply">committed</li>
+      <li data-m="1>1" data-k="fail">crash, before the offset is committed</li>
+      <li data-m="1>0">restart: where was I?</li>
+      <li data-m="0>1" data-k="reply">your committed offset is 5. Here is the message at offset 5 again</li>
+      <li data-m="1>2" data-k="bad">UPDATE balance = balance + 10<small>the same £10, added a second time</small></li>
+      <li data-m="1>0">commit offset 6</li>
+    </ol>
+    <figcaption><b>Process, then commit: at-least-once.</b> Swap the two steps and the same crash loses the message instead: the offset says it was handled, and it never was.</figcaption>
+  </figure>
+  <p>There is no third ordering. The work and the offset live in two different systems, a database and a broker, and no arrangement of two separate writes is atomic. The ways out are to make the repeat harmless, or to put the two writes in one system so that they become one.</p>
+
+  <h2>Deduplication</h2>
+  <p>To recognise a repeat, a receiver needs something that is the same on both copies and different on every other message: an identity. There are three sources.</p>
+  <ul>
+    <li><b>An ID assigned by the producer</b> when the message is first created, and reused on every resend. A random UUID works. The ID must be created before the first attempt and stored with the message, since an ID generated per attempt identifies nothing.</li>
+    <li><b>A natural key</b> from the business: the payment provider's transaction reference, an order number with a line number.</li>
+    <li><b>A sequence number per producer.</b> Each producer numbers its messages 1, 2, 3. The receiver keeps only the highest number seen from each producer, and drops anything at or below it. This needs constant space, where remembering every ID grows without limit.</li>
+  </ul>
+  <p>The second question is how long to remember. A set of every ID ever seen grows for ever, so real systems keep a <b>window</b>: a time limit, or the last few sequence numbers per producer. A duplicate that arrives after the window has closed gets through, so the window must be longer than the longest retry any sender will attempt. Mobile clients that have been offline for a week are why some windows are measured in weeks.</p>
+
+  <h2>Idempotent consumers</h2>
+  <p>A consumer is idempotent if handling the same message twice leaves the same state as handling it once. There are three ways to build one, in rising order of generality.</p>
+  <p><b>Make the operation itself idempotent.</b> "Set order 8812 to PAID" can be repeated safely. "Add £10 to the balance" can't. Many handlers can be rewritten from the second form to the first: store the payment as a row keyed by its ID, an upsert, and compute the balance from the rows.</p>
+  <p><b>Keep a table of processed IDs, in the same transaction as the work.</b> This is the <i>inbox</i>, the mirror of Chapter 22's outbox.</p>
+<pre class="code"><span class="k">@Transactional</span>
+<span class="k">void</span> <span class="f">handle</span>(<span class="t">PaymentReceived</span> event) {
+	<span class="k">int</span> inserted = jdbc.<span class="f">update</span>(
+			<span class="s">"INSERT INTO processed_events (event_id) VALUES (?) ON CONFLICT DO NOTHING"</span>, event.<span class="f">id</span>());
+	<span class="k">if</span> (inserted == <span class="m">0</span>) <span class="k">return</span>;                                  <span class="c">// seen before: do nothing, and let it be acknowledged</span>
+	jdbc.<span class="f">update</span>(<span class="s">"UPDATE accounts SET balance = balance + ? WHERE id = ?"</span>, event.<span class="f">amount</span>(), event.<span class="f">accountId</span>());
+}                                                              <span class="c">// one commit: the ID and the money, or neither</span></pre>
+  <p>The insert and the update commit together. If the consumer crashes before the commit, neither happened and the redelivery does both. If it crashes after, the redelivery finds the ID and does nothing. The primary key on <code>event_id</code> also settles two consumers handling the same message at once: one insert wins and the other sees zero rows.</p>
+  <p><b>Store the offset with the data.</b> If messages come from a log with offsets, the consumer can write its new offset into the same database, in the same transaction as the work, and ignore the broker's copy of the offset. On restart it reads its position from the database. Work and position are now one atomic write, and the crash window is gone. This protects against the consumer's own crashes. It does nothing about a duplicate that is already in the log as a separate entry, which has its own offset.</p>
+
+  <h2>Try it: six payments through a pipeline</h2>
+  <p>A producer sends six messages, m1 to m6, each "+£10". A broker stores them in a log. A consumer applies them to a balance in a database, which should end at £60. Choose how each side is built and what goes wrong.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Lost, duplicated, or exactly once</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="ds-row"><span>Producer</span><div class="seg" id="dsP"><button data-v="none">no retries</button><button class="active" data-v="retry">retries on timeout</button><button data-v="idem">retries, with sequence numbers</button></div></div>
+      <div class="ds-row"><span>Fault while sending</span><div class="seg" id="dsPF"><button class="active" data-v="none">none</button><button data-v="req">m3's request is lost</button><button data-v="ack">m3's acknowledgement is lost</button></div></div>
+      <div class="ds-row"><span>Consumer</span><div class="seg" id="dsC"><button data-v="before">commit offset, then process</button><button class="active" data-v="after">process, then commit offset</button><button data-v="dedup">process with an ID table, then commit</button><button data-v="txn">process and store offset in one transaction</button></div></div>
+      <div class="ds-row"><span>Fault while consuming</span><div class="seg" id="dsCF"><button class="active" data-v="none">none</button><button data-v="crash">crash between the two steps, on m5</button></div></div>
+      <div class="ds-lane"><b>Broker's log, by offset</b><span id="dsLog"></span></div>
+      <div class="ds-lane"><b>Times applied at the database</b><span id="dsApp"></span></div>
+      <ul class="ds-ev" id="dsEv"></ul>
+      <div class="ds-res" id="dsRes"></div>
+      <div class="stats" id="dsStats"></div>
+    </div>
+    <div class="panel-foot">The pipeline is run in full each time you change a setting: a producer loop, a broker that appends to a log, and a consumer loop that restarts from its stored position after a crash. The list shows only the events where something unusual happened. For the last consumer design the crash falls before the transaction commits, since a single transaction has no "between".</div>
+  </div>
+
+  <p>Things to notice. With no faults, every design gives £60. Start with the producer. Lose m3's acknowledgement with a producer that retries: the log holds m3 twice, seven entries for six messages, and the balance is £70. Change the producer to "no retries" and that fault does no harm, and losing m3's <i>request</i> loses m3 for good: £50. The producer can't tell which of the two has happened, so neither setting is safe against both. Sequence numbers are. The producer still sends m3 twice, and the broker stores it once.</p>
+  <p>Now the consumer, with the sending fault set back to none. Crash on m5 under "commit, then process" and m5 is never applied: £50. Under "process, then commit" it is applied twice: £70. The same crash between the same two steps gives opposite errors. The ID table and the single transaction both give £60.</p>
+  <p>Those last two designs differ in one case, and it is why this chapter takes each hop separately. Use a producer that retries without sequence numbers, lose m3's acknowledgement, and compare them. The consumer with an ID table gives £60: the second m3 carries the same ID and is skipped. The consumer that stores its offset in the transaction gives £70. It handled every log entry exactly once, and the log had m3 in it twice. Across all 72 combinations, three pairings are correct under every fault: the ID table with either retrying producer, and the transactional offset with sequence numbers.</p>
+  <p>One more. Choose no retries, lose m3's request, process then commit, and crash on m5. One message is lost and one is doubled, and the balance is £60. A total that looks right is not evidence that the pipeline is.</p>
+
+  <h2>Transactional outbox</h2>
+  <p>The same gap exists on the sending side, and <a href="22-sagas.html">Chapter 22</a> closed it: a service that must change its database and publish a message writes the message as a row in an outbox table, in the same local transaction, and a relay publishes it afterwards. The relay can crash after publishing and before marking the row as sent, so the outbox is an at-least-once producer by construction.</p>
+  <p>Put the two halves together and the chain is complete. An outbox at each sender guarantees the message is published if and only if the change committed, perhaps twice. An inbox at each receiver guarantees a repeated message changes nothing. Between them the transport needs only to be at-least-once, which every broker can manage. No distributed transaction is involved at any point: each service does one local transaction, twice over.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Technique</th><th>Makes atomic</th><th>Covers</th><th>Doesn't cover</th></tr></thead>
+      <tbody>
+        <tr><td><b>Idempotent operation</b></td><td>Nothing needs to be</td><td>Any number of repeats, for ever</td><td>Operations that can't be phrased that way</td></tr>
+        <tr><td><b>Inbox: table of processed IDs</b></td><td>The ID and the work</td><td>Repeats from any cause, within the window kept</td><td>Effects outside that database</td></tr>
+        <tr><td><b>Offset stored with the data</b></td><td>The position and the work</td><td>The consumer's own crashes</td><td>Duplicates already in the log</td></tr>
+        <tr><td><b>Outbox</b></td><td>The change and the message</td><td>Lost messages at the sender</td><td>Duplicates, which it creates</td></tr>
+        <tr><td><b>Sequence numbers at the broker</b></td><td>Nothing: the broker drops repeats</td><td>The producer's retries</td><td>A producer that restarts and forgets its numbering</td></tr>
+        <tr><td><b>Kafka transactions</b></td><td>Output messages and input offsets</td><td>Read from Kafka, write to Kafka</td><td>Anything outside Kafka</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Exactly-once in Kafka</h2>
+  <p>Kafka added two features in 2017, in version 0.11, that together carry its exactly-once claim. Each closes one of the two windows.</p>
+  <p><b>The idempotent producer</b> closes the producer hop, and is the sequence-number scheme from the deduplication section. When a producer starts, the broker gives it a producer ID. The producer numbers the batches it sends to each partition, and the broker remembers the last few sequence numbers for each producer and partition. A batch that arrives with a number already seen is acknowledged and not appended. A batch that arrives with a gap is rejected, so order is kept as well. It is on by default from Kafka 3.0. Its limit is in the name of the thing it tracks: the producer ID lasts for one run of the producer, so a producer that crashes and restarts gets a new ID, and anything it resends from before the crash is not recognised.</p>
+  <p><b>Transactions</b> extend this across restarts and across several writes. A producer is given a stable <code>transactional.id</code> by its configuration. It can then begin a transaction, send messages to any number of partitions, and commit or abort, and consumers that ask for <code>isolation.level=read_committed</code> see either all of the transaction's messages or none. The feature that makes this more than batching is that <i>a consumer's offsets are themselves stored in a Kafka topic</i>. So a program that reads from one topic and writes to another can put its outputs and its new input position into one transaction.</p>
+<pre class="code">props.<span class="f">put</span>(<span class="s">"transactional.id"</span>, <span class="s">"enricher-"</span> + instance);         <span class="c">// the same id every time this instance starts</span>
+<span class="t">KafkaProducer</span>&lt;<span class="t">String</span>, <span class="t">String</span>&gt; producer = <span class="k">new</span> <span class="t">KafkaProducer</span>&lt;&gt;(props);
+producer.<span class="f">initTransactions</span>();                                     <span class="c">// also shuts out any older process using this id</span>
+
+<span class="k">while</span> (running) {
+	<span class="t">ConsumerRecords</span>&lt;<span class="t">String</span>, <span class="t">String</span>&gt; batch = consumer.<span class="f">poll</span>(<span class="t">Duration</span>.<span class="f">ofMillis</span>(<span class="m">200</span>));
+	<span class="k">if</span> (batch.<span class="f">isEmpty</span>()) <span class="k">continue</span>;
+	producer.<span class="f">beginTransaction</span>();
+	<span class="k">try</span> {
+		<span class="k">for</span> (<span class="t">ConsumerRecord</span>&lt;<span class="t">String</span>, <span class="t">String</span>&gt; r : batch)
+			producer.<span class="f">send</span>(<span class="k">new</span> <span class="t">ProducerRecord</span>&lt;&gt;(<span class="s">"enriched"</span>, r.<span class="f">key</span>(), <span class="f">enrich</span>(r.<span class="f">value</span>())));
+		producer.<span class="f">sendOffsetsToTransaction</span>(<span class="f">nextOffsets</span>(batch), consumer.<span class="f">groupMetadata</span>());   <span class="c">// the input position, in the same transaction</span>
+		producer.<span class="f">commitTransaction</span>();
+	} <span class="k">catch</span> (<span class="t">ProducerFencedException</span> e) {
+		<span class="k">throw</span> e;                                                 <span class="c">// a newer instance has taken over: stop at once</span>
+	} <span class="k">catch</span> (<span class="t">KafkaException</span> e) {
+		producer.<span class="f">abortTransaction</span>();                             <span class="c">// outputs and offsets are both discarded</span>
+		<span class="f">rewindToLastCommitted</span>(consumer);                         <span class="c">// and the batch will be read again</span>
+	}
+}</pre>
+  <p>If the program crashes anywhere in the loop, the open transaction is aborted. Its outputs are never shown to read-committed consumers and its offsets were never advanced, so the replacement instance reads the same batch and produces the same outputs, once. Inside the brokers this is a two-phase commit (<a href="21-two-phase-commit.html">Chapter 21</a>) run by a transaction coordinator whose own state is a replicated log, which is what keeps it from blocking. The call to <code>initTransactions</code> raises an epoch number for the transactional ID, and brokers refuse writes carrying an older epoch. That is a fencing token, the subject of <a href="32-leases-fencing.html">Chapter 32</a>, and it deals with an old instance that was only paused and wakes up believing it is still in charge.</p>
+  <p><b>The boundary.</b> The guarantee covers three things: records read from Kafka, records written to Kafka, and offsets. Everything else the loop does is outside it. If <code>enrich</code> calls a payment API, sends an email or writes to a database, that happens on every attempt, and an aborted transaction doesn't undo it. For effects outside Kafka the earlier sections still apply: an idempotent sink, or a sink that takes part in a two-phase commit tied to the processor's checkpoints, as Flink's does (<a href="27-distributed-snapshots.html">Chapter 27</a>). Kafka Streams turns the whole pattern on with one setting, <code>processing.guarantee=exactly_once_v2</code>, and has the same boundary.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧹</div>
+    <div class="body"><div class="title">Use case: Segment, and remembering sixty billion message IDs</div><p>Segment collects analytics events from its customers' websites and mobile apps and passes them on to hundreds of other tools. The senders are browsers and phones on unreliable networks, built to retry: an app that sends a batch and loses its connection before the reply sends the batch again when the connection returns, which may be a second later or a week. In 2017 Segment's engineers wrote that about 0.6% of what they received was a repeat of something already received, and for customers billed by event count, or counting purchases, that was not acceptable. Every event carries a message ID generated on the device when the event is created, so the repeats were identifiable. The difficulty was scale: to catch a retry a week late, the system had to remember every ID for weeks, and they chose a window of four weeks, which meant about sixty billion IDs, a terabyte and a half on disk. Their design follows this chapter's rules closely. Incoming events go to a Kafka topic partitioned by message ID, so both copies of a duplicate always reach the same worker and no two workers need to coordinate. Each worker keeps its seen IDs in RocksDB, an embedded LSM store, chosen in part since nearly every lookup is for an ID that has <i>not</i> been seen, and its bloom filters answer "definitely absent" without reading the disk (<a href="../databases/14-lsm-trees.html">Databases, LSM trees</a>). The awkward step is the usual one: a worker must record the ID and publish the event to the output topic, in two systems, and may crash between. They made the output topic the single source of truth. An ID counts as seen only if its event is in the output, and a worker that restarts first reads the tail of the output topic and brings its local store into line with it before taking new input. One system holds the truth and the other is a cache of it, which is the "store the offset with the data" idea turned around.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Believing a broker's "exactly-once" covers your database or your HTTP calls.</b> It covers the broker.</li>
+      <li><b>Auto-committing offsets on a timer.</b> The commit is unrelated to whether the work finished, so a crash can lose or repeat.</li>
+      <li><b>Generating the message ID at send time.</b> Each retry gets a fresh ID and nothing can be matched.</li>
+      <li><b>Writing the processed-ID row in a separate transaction from the work.</b> The gap is back.</li>
+      <li><b>A deduplication window shorter than the longest retry.</b> Late duplicates pass straight through.</li>
+      <li><b>Choosing at-most-once by accident.</b> Acknowledging on receipt, before the work, is the default in many client libraries.</li>
+      <li><b>Assuming redelivery keeps the order.</b> A retried message can arrive after its successors.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What are at-most-once, at-least-once and exactly-once delivery? Is exactly-once really possible?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>At-most-once means a message is delivered zero or one times: the sender doesn't retry, or the consumer acknowledges before processing, so a failure loses the message but never duplicates it. At-least-once means one or more times: the sender retries until acknowledged and the consumer acknowledges only after processing, so nothing is lost but a failure can cause a duplicate. Exactly-once means the effect happens once. As pure delivery it is not possible, because when an acknowledgement is lost the sender cannot tell whether the message arrived, so it must either risk a duplicate or risk a loss. What is achievable is exactly-once processing, sometimes called effectively-once: at-least-once delivery combined with idempotent handling, so duplicates have no additional effect. That is done by making the operation naturally idempotent, by recording processed message IDs in the same transaction as the work, or by committing the consumer's position atomically with its output. So in practice I design for at-least-once and make consumers idempotent.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How does Kafka provide exactly-once semantics, and where does it stop?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Two mechanisms. The idempotent producer: each producer gets a producer ID and attaches a per-partition sequence number to every batch; the broker keeps the latest sequence numbers per producer and partition, and discards a batch it has already appended, so a retry after a lost acknowledgement doesn't create a duplicate, and ordering is preserved. That handles the producer-to-broker hop within one producer session. Transactions extend it: a producer with a configured transactional ID can write to several partitions atomically, and because consumer offsets are stored in an internal Kafka topic, it can include the offsets of the input it consumed in the same transaction, using sendOffsetsToTransaction. A transaction coordinator runs a two-phase commit and writes commit or abort markers into the partitions; consumers with isolation level read_committed only see committed data. So in a consume-transform-produce loop, the outputs and the advance of the input position either both happen or neither does, and a crash just means the batch is reprocessed with the earlier attempt's output invisible. The transactional ID also provides fencing: when a new instance calls initTransactions the epoch is bumped and a zombie old instance is rejected. Where it stops: the guarantee is only for state inside Kafka. Any side effect to an external system during processing, a database write, an API call, is still at-least-once, so the sink must be idempotent or participate in a two-phase commit, which is what Flink's transactional sinks do with checkpoints. It also costs latency, since read_committed consumers wait for commit markers, so the commit interval sets a floor on end-to-end delay.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>After a timeout a sender must risk a loss or a duplicate. At-most-once and at-least-once are the two honest choices.</li>
+      <li>Exactly-once delivery is impossible. Exactly-once <i>effect</i> is at-least-once delivery plus a harmless repeat.</li>
+      <li>The consumer's crash window is between doing the work and recording its position. Order decides whether it loses or repeats.</li>
+      <li>Close it with an idempotent operation, a processed-ID table in the same transaction, or the offset stored with the data.</li>
+      <li>Outbox at the sender and inbox at the receiver give effectively-once across services with only local transactions.</li>
+      <li>Kafka: sequence numbers remove producer duplicates, and transactions commit outputs with input offsets. Outside Kafka, you are back to idempotence.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A consumer commits its offset and then processes the message. It crashes between the two. What happens to that message?</p>
+      <div class="opts">
+        <button class="opt">It is processed twice</button>
+        <button class="opt">It is lost: the committed offset says it was handled</button>
+        <button class="opt">It is processed exactly once after the restart</button>
+        <button class="opt">The broker detects the crash and rewinds the offset</button>
+      </div>
+      <div class="explain">Commit-then-process is at-most-once. The reverse order turns the same crash into a duplicate.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why can't a messaging system guarantee exactly-once delivery?</p>
+      <div class="opts">
+        <button class="opt">Brokers can't store messages durably</button>
+        <button class="opt">Networks reorder messages</button>
+        <button class="opt">Consumers are too slow</button>
+        <button class="opt">A sender that gets no acknowledgement can't know whether the message arrived, so it must either resend or not</button>
+      </div>
+      <div class="explain">Resending risks a duplicate and not resending risks a loss. Only the receiver can make the repeat harmless.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">In the inbox pattern, why must the processed-ID row and the business change be in the same transaction?</p>
+      <div class="opts">
+        <button class="opt">Otherwise a crash between them leaves the ID recorded without the work, or the work without the ID</button>
+        <button class="opt">It is faster</button>
+        <button class="opt">The broker requires it</button>
+        <button class="opt">So that the ID can be reused</button>
+      </div>
+      <div class="explain">One commit makes "seen" and "done" the same fact. Two commits bring the crash window back.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does Kafka's idempotent producer use to discard a retried batch?</p>
+      <div class="opts">
+        <button class="opt">A hash of the message contents</button>
+        <button class="opt">The message's timestamp</button>
+        <button class="opt">A producer ID and a sequence number per partition, which the broker remembers</button>
+        <button class="opt">A lookup of every message in the partition</button>
+      </div>
+      <div class="explain">A batch whose number the broker has already stored is acknowledged without being appended again.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A Kafka transactional loop reads a record, calls an external email API, writes an output record and commits. The transaction aborts and the batch is retried. What is true?</p>
+      <div class="opts">
+        <button class="opt">The email is unsent by the abort</button>
+        <button class="opt">The output record appears once, and the email is sent twice</button>
+        <button class="opt">Both the output and the email happen exactly once</button>
+        <button class="opt">The output record appears twice</button>
+      </div>
+      <div class="explain">Kafka's guarantee covers Kafka. The email call needs its own idempotency key.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  const N = 6, AMT = 10;
+  // Runs the whole pipeline and returns the log, how often each message took effect, and the notable events.
+  function simulate(prod, pf, cons, cf) {
+    const ev = [], log = []; let lastSeq = 0;
+    const append = (m) => {
+      if (prod === 'idem' && m.seq <= lastSeq) { ev.push(`<b>Broker:</b> ${m.id} carries sequence number ${m.seq}, which is already stored. Not appended again, and acknowledged.`); return; }
+      lastSeq = Math.max(lastSeq, m.seq); log.push(m);
+    };
+    for (let i = 1; i <= N; i++) {
+      const m = { id: 'm' + i, seq: i };
+      if (i === 3 && pf === 'req') {
+        ev.push('<b>Producer:</b> the request carrying m3 is lost. No acknowledgement comes.');
+        if (prod === 'none') { ev.push('<b>Producer:</b> it doesn\'t retry, and moves on. m3 was never stored.'); continue; }
+        ev.push('<b>Producer:</b> timeout. It sends m3 again, and this time it arrives.'); append(m); continue;
+      }
+      append(m);
+      if (i === 3 && pf === 'ack') {
+        ev.push('<b>Broker:</b> m3 is stored. The acknowledgement is lost on the way back.');
+        if (prod === 'none') { ev.push('<b>Producer:</b> it doesn\'t retry, and moves on without knowing whether m3 arrived. It did.'); continue; }
+        ev.push('<b>Producer:</b> timeout. It can\'t tell a lost request from a lost acknowledgement, so it sends m3 again.'); append(m);
+      }
+    }
+    // The consumer. brokerOffset is its position as the broker knows it; db is everything in the database.
+    const db = { balance: 0, seen: new Set(), offset: 0 }, applied = {};
+    const apply = (m) => { db.balance += AMT; applied[m.id] = (applied[m.id] || 0) + 1; };
+    const crashAt = cf === 'crash' ? log.findIndex((m) => m.id === 'm5') : -1;
+    let brokerOffset = 0, pos = 0, crashed = false, guard = 0;
+    while (pos < log.length && guard++ < 60) {
+      const m = log[pos], crashNow = !crashed && pos === crashAt;
+      if (cons === 'before') {
+        brokerOffset = pos + 1;
+        if (crashNow) { crashed = true; ev.push('<b>Consumer:</b> commits the offset past m5, and crashes before applying it.'); pos = brokerOffset; ev.push('<b>Consumer:</b> restarts from its committed offset. m5 is behind it, and is never applied.'); continue; }
+        apply(m); pos++;
+      } else if (cons === 'after' || cons === 'dedup') {
+        if (cons === 'dedup' && db.seen.has(m.id)) ev.push(`<b>Consumer:</b> ${m.id} is already in the table of processed IDs. Skipped.`);
+        else { db.seen.add(m.id); apply(m); }
+        if (crashNow) { crashed = true; ev.push('<b>Consumer:</b> applies m5, and crashes before committing the offset.'); pos = brokerOffset; ev.push('<b>Consumer:</b> restarts from its committed offset, and the broker delivers m5 again.'); continue; }
+        brokerOffset = pos + 1; pos++;
+      } else {
+        if (crashNow) { crashed = true; ev.push('<b>Consumer:</b> crashes while handling m5. The transaction holding the +£10 and the new offset hadn\'t committed, so neither exists.'); pos = db.offset; ev.push('<b>Consumer:</b> restarts and reads its position from the database. m5 is next.'); continue; }
+        apply(m); db.offset = pos + 1; pos++;
+      }
+    }
+    return { log, applied, ev, balance: db.balance };
+  }
+  function draw() {
+    const prod = $('#dsP').dataset.value, pf = $('#dsPF').dataset.value, cons = $('#dsC').dataset.value, cf = $('#dsCF').dataset.value;
+    const r = simulate(prod, pf, cons, cf), ids = Array.from({ length: N }, (_, i) => 'm' + (i + 1));
+    const copies = (id) => r.log.filter((m) => m.id === id).length, times = (id) => r.applied[id] || 0;
+    const seenInLog = {};
+    $('#dsLog').innerHTML = r.log.map((m) => { const again = seenInLog[m.id]; seenInLog[m.id] = true; return `<span class="ds-m ${again ? 'ds-dup' : ''}">${m.id}</span>`; }).join(' ') + ids.filter((id) => !copies(id)).map((id) => ` <span class="ds-m ds-gone">${id} missing</span>`).join('');
+    $('#dsApp').innerHTML = ids.map((id) => `<span class="ds-m ${times(id) === 1 ? '' : times(id) === 0 ? 'ds-gone' : 'ds-bad'}">${id} ×${times(id)}</span>`).join(' ');
+    const evEl = $('#dsEv'); evEl.className = 'ds-ev' + (r.ev.length ? '' : ' ds-none');
+    evEl.innerHTML = r.ev.length ? r.ev.map((e) => `<li>${e}</li>`).join('') : '<li>Nothing unusual happened: six sends, six acknowledgements, six messages applied.</li>';
+    const lost = ids.filter((id) => times(id) === 0), twice = ids.filter((id) => times(id) > 1), faulty = pf !== 'none' || cf !== 'none';
+    const list = (a) => a.join(' and ');
+    let kind, msg;
+    if (!lost.length && !twice.length) {
+      kind = 'good';
+      msg = faulty ? `<b>Each message took effect once, £${r.balance} in all, in spite of the fault${pf !== 'none' && cf !== 'none' ? 's' : ''}.</b> ${r.log.length > N ? 'The log holds a duplicate, and the consumer\'s table of IDs caught it.' : ''}` : '<b>Each message took effect once.</b> With no faults every design gives this result. They differ only in what a failure costs.';
+    } else {
+      kind = 'bad';
+      const parts = [];
+      if (lost.length) parts.push(`${list(lost)} ${lost.length === 1 ? 'was' : 'were'} never applied: £${lost.length * AMT} missing, ${lost.some((id) => !copies(id)) ? 'lost before reaching the broker' : 'lost at the consumer'}`);
+      if (twice.length) parts.push(`${list(twice)} ${twice.length === 1 ? 'was' : 'were'} applied twice: £${twice.length * AMT} too much`);
+      msg = `<b>${parts.join('. ')}.</b> ` + (r.balance === N * AMT ? `The balance is £${r.balance}, which looks right and isn't: the two errors cancel in the total, and that is how this kind of fault hides.` : `The balance is £${r.balance} and should be £${N * AMT}.`);
+    }
+    const res = $('#dsRes'); res.className = 'ds-res ds-' + kind; res.innerHTML = msg;
+    $('#dsStats').innerHTML = `<div class="stat acc"><div class="k">Balance, of £${N * AMT} expected</div><div class="v">£${r.balance}</div></div>
+      <div class="stat ${r.log.length === N ? '' : 'warn'}"><div class="k">Entries in the log</div><div class="v">${r.log.length} <small>for ${N} messages</small></div></div>
+      <div class="stat ${lost.length ? 'bad' : 'good'}"><div class="k">Messages lost</div><div class="v">${lost.length}</div></div>
+      <div class="stat ${twice.length ? 'bad' : 'good'}"><div class="k">Applied more than once</div><div class="v">${twice.length}</div></div>`;
+  }
+  ['dsP', 'dsPF', 'dsC', 'dsCF'].forEach((id) => $('#' + id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
