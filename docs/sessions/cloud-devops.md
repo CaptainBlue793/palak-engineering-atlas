@@ -29,3 +29,4 @@
   `OPS <n>: <Title>`, case-study hero pill `Case Study`. Use cases come from real systems and incidents and are written
   from memory; figures and dates need checking against sources before they are quoted elsewhere.
 - Ch 1 DevOps & SRE: release-habits simulator (cadence x tests x approval x recovery over 12 seeded weeks; the four DORA metrics and a 99.9% error budget), delivery flow, nines table, roles table, interview rounds, Knight Capital use case
+- Ch 2 Cloud Fundamentals: placement simulator (zones x instances per zone x standby region x failure, 96 settings, with monthly cost), zonal/regional/global scopes, IaaS/PaaS/SaaS, provider name map, shared responsibility, an example bill, OVHcloud Strasbourg fire use case
