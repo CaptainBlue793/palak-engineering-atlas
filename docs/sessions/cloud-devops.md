@@ -19,3 +19,13 @@
 - P6 Processes & systemd: supervisor simulator (4 failure modes × Restart= × RestartSec × start limit, journal output)
 - P7 SSH & Keys: sshd hardening lab (auth.log for an hour of bots, second-session lockout test), ProxyJump vs agent forwarding
 - P8 HTTP APIs & curl: stateful API console (token scopes, 6/min rate limit, dropped responses, idempotency keys, generated curl)
+
+## 2026-10-07 — session 2: chapters 1 to 48
+
+- Setup: standalone clone at `C:\Users\palak\atlas-courses\cloud-devops`, `main` merged in (it now carries the four
+  finished courses). P1 to P8 re-checked at 1100 px and 390 px: no script errors, no overflow. The one table in
+  `p4-yaml-json.html` that was not inside `.table-wrap` is wrapped.
+- Conventions: runtime global `OPS`, theme key `ops-theme`, placeholder marker `<!-- ops:placeholder -->`, commit titles
+  `OPS <n>: <Title>`, case-study hero pill `Case Study`. Use cases come from real systems and incidents and are written
+  from memory; figures and dates need checking against sources before they are quoted elsewhere.
+- Ch 1 DevOps & SRE: release-habits simulator (cadence x tests x approval x recovery over 12 seeded weeks; the four DORA metrics and a 99.9% error budget), delivery flow, nines table, roles table, interview rounds, Knight Capital use case

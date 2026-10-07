@@ -112,3 +112,7 @@
   `databases-v1.0.0` releases.
 - Next: the owner's go-ahead, then Step 4 (shared edits, checks, pull request into main). After that, Cloud & DevOps.
 - Release prepared (2026-10-07, with the owner's go-ahead: "Push these changes and merge them"): the shared edits above are made on this branch. `assets/atlas.js`: `soon` removed and `hours` set to 41 (2,485 minutes). `README.md`: the Distributed Systems row, totals of 452 chapters and ~331 hours (the registry's live courses sum to exactly that), and `distributed-systems/` in the folder tree. Checks: content audit 0 errors across all courses, bundle check, palette check, hub check in light, dark and at 390 px all pass. No release tag is published.
+- Merged (2026-10-07): pull request #6 into `main`, merge commit `3079c20`, at the owner's request. The registry shows the
+  course at 56 lessons and 41 hours; the README totals are 452 chapters and about 331 hours. No release tag was published
+  (the owner has not asked for one). Still open: the README table's order, the home page's meta description, the
+  `.objectives li` fix in `style.css`, and the dates and figures in the real-system write-ups, which are unverified.
