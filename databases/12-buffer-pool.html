@@ -6,33 +6,341 @@
 <title>The Buffer Pool</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .bp-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .bp-row > span { font-size:12.5px; color:var(--muted); min-width:90px; }
+  .bp-trace { display:flex; flex-wrap:wrap; gap:3px; margin-top:14px; }
+  .bp-trace i { font-style:normal; font-family:var(--mono); font-size:11px; min-width:24px; padding:2px 3px; text-align:center; border-radius:5px; border:1px solid var(--border); background:var(--surface); color:var(--text-2); }
+  .bp-trace i.bp-w { font-weight:800; text-decoration:underline; }
+  .bp-trace i.bp-hit { background:var(--green-soft); border-color:var(--green); }
+  .bp-trace i.bp-miss { background:var(--red-soft); border-color:var(--red); }
+  .bp-trace i.bp-cur { box-shadow:0 0 0 2px var(--accent); }
+  .bp-trace i.bp-gap { border:0; background:none; min-width:8px; padding:0; }
+  .bp-frames { display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); gap:6px; margin-top:12px; }
+  @media (max-width:640px) { .bp-frames { grid-template-columns:repeat(4,minmax(0,1fr)); } }
+  .bp-f { position:relative; border:1.5px solid var(--border); border-radius:10px; background:var(--surface); padding:6px 4px 5px; text-align:center; min-height:64px; }
+  .bp-f b { display:block; font-family:var(--mono); font-size:17px; }
+  .bp-f small { display:block; font-size:11px; color:var(--muted); }
+  .bp-f.bp-empty { border-style:dashed; opacity:.5; }
+  .bp-f.bp-hot { border-color:var(--accent); }
+  .bp-f.bp-dirty::after { content:"dirty"; position:absolute; top:-8px; right:4px; font-size:9.5px; font-weight:700; padding:0 5px; border-radius:6px; background:var(--amber); color:#fff; }
+  .bp-f.bp-now { background:var(--green-soft); border-color:var(--green); }
+  .bp-f.bp-now.bp-in { background:var(--red-soft); border-color:var(--red); }
+  .bp-f.bp-hand::before { content:"▲"; position:absolute; bottom:-15px; left:50%; transform:translateX(-50%); font-size:11px; color:var(--accent); }
+  .bp-msg { margin-top:20px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--border); min-height:52px; }
+  .bp-msg.bp-good { background:var(--green-soft); border-left-color:var(--green); }
+  .bp-msg.bp-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="12">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 12</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>The Buffer <span class="grad">Pool</span></h1>
-    <p class="lead">Caching pages in memory, pinning, dirty pages and eviction, with a buffer-pool simulator.</p>
+    <p class="lead">A database is much larger than the memory of the machine it runs on, and reading a page from disk takes a thousand times longer than reading it from memory. So every database keeps a set of pages in RAM and tries to make sure that the next page a query asks for is already there. That set is the <b>buffer pool</b>. Every read and every write of table and index data goes through it. Which pages it holds, which one it gives up when it needs room, and when a changed page is written back to disk decide whether a query takes a millisecond or a second. This chapter covers how the pool works, the eviction policies and their weaknesses, and how to size it.</p>
+    <ul class="objectives">
+      <li><span>Explain what the buffer pool is and the path a page takes into it</span></li>
+      <li><span>Say what a pin count and a dirty flag are for, and who writes dirty pages to disk</span></li>
+      <li><span>Compare FIFO, LRU and clock-sweep eviction, and predict what a large scan does to each</span></li>
+      <li><span>Set <code>shared_buffers</code> sensibly, knowing that the operating system caches too</span></li>
+      <li><span>Measure what is in the pool and how often it is hit</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The cost of a disk read, and the OS page cache:</b> <a href="p3-disks-and-files.html">P3</a>.</li>
+        <li><b>What a page contains:</b> <a href="11-pages-heap-files.html">Chapter 11</a>.</li>
+        <li><b>What COMMIT waits for:</b> <a href="10-transactions-acid.html">Chapter 10</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why a buffer pool</li>
-    <li>Pin counts and dirty flags</li>
-    <li>Eviction: LRU and clock sweep</li>
-    <li>shared_buffers and the OS cache</li>
-  </ol>
+  <h2>Why a buffer pool</h2>
+  <p>The buffer pool is an array of <b>frames</b> in shared memory, each the size of one page, 8 KB. Beside it are a hash table that maps "page 412 of table <code>orders</code>" to the frame holding it, and a small descriptor for each frame. In PostgreSQL the pool's size is the setting <code>shared_buffers</code>, and all the server's processes share the one pool.</p>
+  <p>No part of the database reads a table file directly. The executor, the index code and VACUUM all ask the <b>buffer manager</b> for a page by its identity, and get back a frame. If the page is in the pool, that is a <b>hit</b> and costs a hash lookup. If it isn't, it is a <b>miss</b>: the buffer manager must find a frame to put it in, which usually means removing another page, and then read it from the file.</p>
+  <figure class="seq" data-actors="Backend|Buffer manager|Buffer pool|Disk">
+    <ol>
+      <li data-m="0>1">I need page 412 of orders</li>
+      <li data-m="1>2">look it up in the hash table: not there</li>
+      <li data-m="1>2">choose a victim frame<small>One that nobody is using. The eviction policy decides which.</small></li>
+      <li data-m="1>3" data-k="async">if the victim is dirty, write it out first<small>Its WAL records have to be on disk before it is.</small></li>
+      <li data-m="1>3">read page 412</li>
+      <li data-m="3>2" data-k="reply">8 KB into the frame</li>
+      <li data-m="1>0" data-k="reply">here is the frame, pinned for you</li>
+      <li data-m="0>1">finished: unpin it</li>
+    </ol>
+    <figcaption><b>A miss.</b> A hit is the first and the last two steps only.</figcaption>
+  </figure>
+
+  <h2>Pin counts and dirty flags</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>In each frame's descriptor</th><th>Meaning</th><th>Used for</th></tr></thead>
+      <tbody>
+        <tr><td><b>Tag</b></td><td>Which page of which file is in this frame</td><td>The hash table's key</td></tr>
+        <tr><td><b>Pin count</b></td><td>How many processes are using the page at this moment</td><td>A frame with a pin count above zero must not be evicted</td></tr>
+        <tr><td><b>Usage count</b></td><td>How often it has been used lately, from 0 to 5</td><td>The eviction policy</td></tr>
+        <tr><td><b>Dirty flag</b></td><td>The copy in memory has changes that the file doesn't</td><td>It must be written before the frame can be reused</td></tr>
+        <tr><td><b>Content lock</b></td><td>Shared for readers, exclusive for a writer, held for microseconds</td><td>Stops two processes changing the page's bytes at once</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>A <b>pin</b> is a promise that the page will stay where it is while it is being read. A query pins a page, looks at the tuples it wants, and unpins it, usually within microseconds. A page that is always pinned by somebody can never be evicted, which is one reason why a cursor left open in the middle of a scan is a bad idea.</p>
+  <p>A <b>dirty</b> page is one that has been changed in memory. The change is already safe, because it was recorded in the WAL before COMMIT returned (<a href="10-transactions-acid.html">Chapter 10</a>), so there is no hurry to write the page itself. That delay is deliberate: a page that is updated a hundred times in a minute is written once. Three processes do the writing:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Writer</th><th>When</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><b>Checkpointer</b></td><td>Every few minutes, or after a set amount of WAL</td><td>Writes every dirty page, so that crash recovery need only replay the WAL from that point (<a href="20-wal-recovery.html">Chapter 20</a>)</td></tr>
+        <tr><td><b>Background writer</b></td><td>Continuously, a little at a time</td><td>Writes dirty pages that are likely to be evicted soon, so that clean frames are ready</td></tr>
+        <tr><td><b>A backend</b>, in the middle of a query</td><td>When it needs a frame and the victim is dirty</td><td>Nobody else had written it. The query waits for the write, so this is the case to avoid</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Eviction: LRU and clock sweep</h2>
+  <p>When the pool is full and a page is needed, one has to go. The best page to evict is the one that won't be wanted for the longest time, which nobody can know, so every policy guesses from the past.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Policy</th><th>Evicts</th><th>Good</th><th>Weakness</th></tr></thead>
+      <tbody>
+        <tr><td><b>FIFO</b></td><td>The page that was loaded longest ago</td><td>Trivial</td><td>Ignores use altogether: the most popular page is evicted when its turn comes</td></tr>
+        <tr><td><b>LRU</b></td><td>The page that was used longest ago</td><td>Follows recency, which predicts well</td><td>Every access must move the page to the head of a shared list, under a lock. And one large scan pushes out everything</td></tr>
+        <tr><td><b>Clock sweep</b> (PostgreSQL)</td><td>The first page a rotating hand finds with a usage count of 0</td><td>An access only adds one to a counter. Frequently used pages survive several sweeps</td><td>Approximate. With a pool full of high counts, the hand may go round several times</td></tr>
+        <tr><td><b>LRU with a midpoint</b> (InnoDB)</td><td>From the tail of a list that new pages join five-eighths of the way down</td><td>A page read once by a scan never reaches the protected part</td><td>More to tune</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>PostgreSQL's <b>clock sweep</b> works like this. Each access to a page adds 1 to its usage count, up to 5. When a frame is needed, a hand moves round the frames in a circle. At each one that isn't pinned, it looks at the count. If the count is above zero it subtracts 1 and moves on. If the count is zero, that frame is the victim. A page used once is evicted on the hand's next visit, and a page used constantly needs five full sweeps without a single access.</p>
+  <p>A large sequential scan is the standard test of a policy. It touches a great many pages once each, and they are precisely the pages that should not displace the working set. PostgreSQL has a second defence as well: a scan of a table larger than a quarter of <code>shared_buffers</code> uses a small private ring of buffers, 256 kB, and recycles them, so it passes through the pool without disturbing it. VACUUM and bulk loads do the same.</p>
+
+  <h2>Try it: a buffer pool under two workloads</h2>
+  <p>Four hot pages, 1 to 4, are read over and over, and page 2 is also written. Then a scan reads pages 20 to 31 once each, with a few reads of the hot pages mixed in near its start. Then the hot pages are read again. Step through it under each policy.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Buffer-pool simulator</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="bp-row"><span>Eviction</span><div class="seg" id="bpPol"><button data-v="fifo">FIFO</button><button class="active" data-v="lru">LRU</button><button data-v="clock">Clock sweep</button></div></div>
+      <div class="bp-row"><span>Pool size</span><div class="seg" id="bpSize"><button class="active" data-v="8">8 frames</button><button data-v="16">16 frames</button></div></div>
+      <div class="bp-row"><span>Workload</span><div class="seg" id="bpWork"><button class="active" data-v="scan">hot pages and a scan</button><button data-v="rand">random over 24 pages</button></div></div>
+      <div class="controls">
+        <button class="btn sm primary" id="bpStep">Next access</button>
+        <button class="btn sm" id="bpRun">Run to the end</button>
+        <button class="btn sm ghost" id="bpReset">↺ Reset</button>
+      </div>
+      <div class="bp-trace" id="bpTrace"></div>
+      <div class="bp-frames" id="bpFrames"></div>
+      <div class="bp-msg" id="bpMsg"></div>
+      <div class="stats" id="bpStats"></div>
+    </div>
+    <div class="panel-foot">In the strip of accesses, an underlined number is a write. Under each page in a frame is what the policy looks at: when it was loaded (FIFO), when it was last used (LRU), or its usage count (clock sweep), and the ▲ is the clock hand. No scan ring is used here, so the scan goes through the pool like any other read.</div>
+  </div>
+
+  <p>Things to notice. With 8 frames, FIFO evicts the hot pages as soon as their turn comes, however often they are used: it ends with 24 hits out of 46, evicts a hot page six times, and makes a query stop to write page 2 while it is dirty. LRU does better, 28 hits, because the hot pages that were read during the scan had been used recently. Once the scan runs for six pages without touching them, LRU gives up pages 3 and 4 as well. Clock sweep ends with 30 hits and loses no hot page. Their usage counts stood at 5 when the scan began, the scan's pages came in with 1, and the hand took the scan's own pages every time. With 16 frames there is room for everything, nothing is evicted, and all three policies give the same 30 hits. The random workload shows the limit of any policy: with no pattern to exploit, the three finish within a hit or two of each other, and only a larger pool helps.</p>
+
+  <h2>shared_buffers and the OS cache</h2>
+  <p>PostgreSQL reads and writes its files through the operating system, which has a cache of its own (<a href="p3-disks-and-files.html">P3</a>). A page evicted from the buffer pool is very often still in the OS page cache, and a "read" of it costs a system call and a copy, a few microseconds, and no disk access. This shapes the advice on sizing:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Setting</th><th>Usual value</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td><code>shared_buffers</code></td><td>About 25% of RAM</td><td>Large enough for the hot working set. The rest of memory serves as the OS cache, and for sorts and connections</td></tr>
+        <tr><td><code>effective_cache_size</code></td><td>50 to 75% of RAM</td><td>It allocates nothing. It tells the planner how much is probably cached in total, which makes index scans look cheaper</td></tr>
+        <tr><td>InnoDB's <code>innodb_buffer_pool_size</code></td><td>70 to 80% of RAM</td><td>A different design: InnoDB bypasses the OS cache with direct I/O, so its own pool is the only cache</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c">-- What is in the pool right now, by table and index</span>
+<span class="k">CREATE EXTENSION</span> pg_buffercache;
+<span class="k">SELECT</span> c.relname, <span class="f">count</span>(*) <span class="k">AS</span> buffers, <span class="f">pg_size_pretty</span>(<span class="f">count</span>(*) * <span class="m">8192</span>) <span class="k">AS</span> cached,
+       <span class="f">round</span>(<span class="m">100.0</span> * <span class="f">count</span>(*) * <span class="m">8192</span> / <span class="f">pg_relation_size</span>(c.oid)) <span class="k">AS</span> pct_of_relation
+<span class="k">FROM</span> pg_buffercache b <span class="k">JOIN</span> pg_class c <span class="k">ON</span> b.relfilenode = <span class="f">pg_relation_filenode</span>(c.oid)
+<span class="k">GROUP BY</span> c.oid, c.relname <span class="k">ORDER BY</span> buffers <span class="k">DESC LIMIT</span> <span class="m">3</span>;
+<span class="c">--  relname          | buffers | cached  | pct_of_relation</span>
+<span class="c">--  orders_pkey      |  412877 | 3226 MB |             100</span>
+<span class="c">--  orders           |  391204 | 3056 MB |              11     only the recent tenth of the table is hot</span>
+<span class="c">--  order_items_pkey |  166310 | 1299 MB |              64</span>
+
+<span class="c">-- How often a page was found in the pool</span>
+<span class="k">SELECT</span> <span class="f">round</span>(<span class="m">100.0</span> * blks_hit / <span class="f">nullif</span>(blks_hit + blks_read, <span class="m">0</span>), <span class="m">2</span>) <span class="k">AS</span> hit_pct
+<span class="k">FROM</span> pg_stat_database <span class="k">WHERE</span> datname = <span class="f">current_database</span>();        <span class="c">-- 99.31</span></pre>
+  <p>A transactional workload should show a hit rate in the high nineties. Two cautions apply. A "read" in these statistics means "not in shared_buffers", and the page may well have come from the OS cache without touching the disk. And an average of 99% can hide one query that misses on every page. <code>EXPLAIN (ANALYZE, BUFFERS)</code> gives the figures for a single query (<a href="17-explain.html">Chapter 17</a>).</p>
+
+  <div class="callout usecase">
+    <div class="ico">🥶</div>
+    <div class="body"><div class="title">The server that was slow for an hour after every restart</div><p>A buffer pool holds nothing when the server starts. On a small database nobody notices. On a server with a hundred gigabytes of pool, it meant that after any restart, whether for an upgrade, a crash or a failover to a replica, every query missed, and the database ran at disk speed until ordinary traffic had happened to pull the working set back into memory. That could take an hour or more, during which a system that normally answered in a millisecond answered in tens, and connections piled up behind it. Operators of large MySQL installations at companies such as Facebook found that the warm-up was often the longest part of a maintenance window, and that a replica promoted after a failure was least able to cope at the moment it was needed. The fix they built, which MySQL adopted in version 5.6 in 2013, is simple. At shutdown, and periodically while running, the server writes out the list of which pages are in the pool. This is only the identifiers, a few megabytes. At start-up a background thread reads that list and loads those pages, in an order that suits the disk. PostgreSQL gained the same thing in version 11 as <code>pg_prewarm</code>'s autoprewarm worker. A cache is part of a system's capacity, and a restart or failover plan that assumes a warm cache will fall short until the cache has been rebuilt.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Leaving <code>shared_buffers</code> at its default of 128 MB</b> on a server with 64 GB of memory.</li>
+      <li><b>Giving PostgreSQL 80% of RAM as <code>shared_buffers</code>,</b> as one would InnoDB. It leaves too little for the OS cache, sorts and connections.</li>
+      <li><b>Treating <code>effective_cache_size</code> as an allocation.</b> It is a hint to the planner and reserves nothing.</li>
+      <li><b>Benchmarking with a warm cache</b> and promising those figures for the first minutes after a restart or failover.</li>
+      <li><b>Reading a 99% hit rate as proof of health.</b> On a busy server, 1% of a million page requests a second is 10,000 reads a second.</li>
+      <li><b>Leaving transactions or cursors open.</b> The pages they hold pinned can't be evicted or cleaned up.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is a buffer pool, and why does a database have its own when the operating system already caches files?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The buffer pool is the database's in-memory cache of disk pages: a fixed array of page-sized frames, a hash table from page identity to frame, and per-frame metadata. All reads and writes of table and index data go through it. A database keeps its own cache, instead of relying on the OS page cache, because it needs control the OS can't give. It must enforce write ordering: a dirty page may not reach disk before the WAL records describing its changes, which requires knowing exactly when each page is written. It needs pinning, so that a page stays put while a query is reading it, and its own locks on page contents. It knows things about access patterns that the OS doesn't, such as that a sequential scan's pages shouldn't displace the working set. And a hit in its own pool avoids a system call and a copy. Some systems, like InnoDB, go further and bypass the OS cache with direct I/O; PostgreSQL uses both layers, which is why its buffer pool is typically sized at about a quarter of memory.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why don't databases use a plain LRU list for eviction, and what do they use instead?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Two reasons. First, cost and contention: strict LRU means every page access, even a read, moves that page to the head of a shared list, which requires an exclusive lock on the list. With hundreds of concurrent queries touching thousands of pages a second each, that lock becomes the bottleneck. Second, behaviour: LRU looks only at recency, so a single large table scan, or a backup, touches every page once and makes them all "most recently used", flushing the real working set from memory; afterwards the workload runs from disk until it has warmed up again. So databases approximate LRU with something cheaper and frequency-aware. PostgreSQL uses a clock sweep: each access just increments a small usage counter capped at 5, with no list manipulation, and a hand sweeping the frames decrements counters and evicts the first unpinned frame at zero, so frequently used pages survive several sweeps while a page touched once goes quickly; large scans additionally use a small ring of buffers so that they bypass the main pool. InnoDB keeps an LRU list but inserts newly read pages at a midpoint, into an "old" sublist, and promotes a page to the "young" part only if it is accessed again after a delay, which stops scans and read-ahead from polluting the hot part. Research policies such as LRU-K, 2Q and ARC address the same two problems.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>The buffer pool is a shared array of page-sized frames. Every read and write of data goes through it.</li>
+      <li>A pinned frame can't be evicted. A dirty frame must be written before it is reused, after its WAL.</li>
+      <li>Dirty pages are written by the checkpointer and the background writer, and by a waiting query only when those fall behind.</li>
+      <li>Plain LRU is costly under concurrency and is flushed by one large scan. Clock sweep with usage counts is cheap and protects pages that are used often.</li>
+      <li>PostgreSQL also relies on the OS cache, so <code>shared_buffers</code> is about a quarter of RAM. InnoDB bypasses the OS and takes most of it.</li>
+      <li>A pool is empty after a restart, and performance is poor until it has been warmed.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A frame has a pin count of 2. What does that mean for eviction?</p>
+      <div class="opts">
+        <button class="opt">It is evicted before frames with lower counts</button>
+        <button class="opt">It has been modified twice</button>
+        <button class="opt">Two processes are using the page now, so it can't be evicted</button>
+        <button class="opt">It will be written to disk twice</button>
+      </div>
+      <div class="explain">A pin promises that the page stays in its frame while someone is reading or changing it.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A transaction updates a row and commits. When is the changed table page written to its file?</p>
+      <div class="opts">
+        <button class="opt">Later: by the checkpointer or background writer, or when the frame is needed. COMMIT waited only for the WAL</button>
+        <button class="opt">Before COMMIT returns</button>
+        <button class="opt">Immediately after each UPDATE statement</button>
+        <button class="opt">Only when the server shuts down</button>
+      </div>
+      <div class="explain">The WAL makes the change durable. The page stays dirty in memory and may absorb many more changes before it is written once.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Under plain LRU, what does one scan of a very large table do to the buffer pool?</p>
+      <div class="opts">
+        <button class="opt">Nothing: scans don't use the pool</button>
+        <button class="opt">It evicts only pages that are dirty</button>
+        <button class="opt">It is refused if the pool is full</button>
+        <button class="opt">Every scanned page becomes "most recently used", and the pages the application needs all the time are pushed out</button>
+      </div>
+      <div class="explain">Recency alone can't tell a page read once from a page read a thousand times.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In PostgreSQL's clock sweep, the hand reaches an unpinned frame with a usage count of 3. What happens?</p>
+      <div class="opts">
+        <button class="opt">The frame is evicted</button>
+        <button class="opt">The count is reduced to 2 and the hand moves on</button>
+        <button class="opt">The count is reset to 0 and the frame is evicted</button>
+        <button class="opt">The hand stops and waits</button>
+      </div>
+      <div class="explain">Only a frame found at 0 is evicted. Pages used often are passed over several times.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why is <code>shared_buffers</code> usually about 25% of RAM for PostgreSQL, and not 80%?</p>
+      <div class="opts">
+        <button class="opt">PostgreSQL can't address more memory</button>
+        <button class="opt">Larger pools make every query slower</button>
+        <button class="opt">PostgreSQL also uses the OS page cache, which needs memory, as do sorts and connections</button>
+        <button class="opt">The rest is reserved for the WAL</button>
+      </div>
+      <div class="explain">Pages that leave the pool are often still in the OS cache. InnoDB, which bypasses that cache, is the one that takes 70 to 80%.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const HOT = [1, 2, 3, 4];
+  function trace(kind) {
+    const T = [], add = (p, w) => T.push({ p, w: !!w });
+    if (kind === 'scan') {
+      for (let r = 0; r < 5; r++) HOT.forEach((p) => add(p, p === 2));                        // the working set, warmed up
+      T.push(null);
+      [20, 21, 1, 2, 22, 23, 3, 4, 24, 25, 1, 2, 26, 27, 28, 29, 30, 31].forEach((p) => add(p, false));   // a scan, with the odd hot read
+      T.push(null);
+      for (let r = 0; r < 2; r++) HOT.forEach((p) => add(p, false));                          // back to normal
+    } else {
+      let s = 12345; const rnd = () => (s = (s * 1103515245 + 12345) % 2147483648) / 2147483648;
+      for (let i = 0; i < 44; i++) add(1 + Math.floor(rnd() * 24), rnd() < 0.25);
+    }
+    return T;
+  }
+  let st;
+  const pol = () => $('#bpPol').dataset.value, size = () => +$('#bpSize').dataset.value, work = () => $('#bpWork').dataset.value;
+  function reset() {
+    const T = trace(work());
+    st = { T, acc: T.filter(Boolean), i: 0, frames: Array(size()).fill(null), hand: 0, res: [], hits: 0, ev: 0, flushed: 0, lostHot: 0, now: -1, loaded: false, msg: null, cls: '' };
+    draw();
+  }
+  function step() {
+    if (st.i >= st.acc.length) return false;
+    const a = st.acc[st.i], t = st.i, F = st.frames, N = F.length;
+    let k = F.findIndex((f) => f && f.p === a.p), msg, cls;
+    st.loaded = false;
+    if (k >= 0) {
+      const f = F[k]; f.use = Math.min(5, f.use + 1); f.last = t; if (a.w) f.dirty = true;
+      st.hits++; st.res.push('h'); cls = 'bp-good';
+      msg = `<b>Page ${a.p}: a hit.</b> It is in frame ${k + 1}` + (pol() === 'clock' ? `, and its usage count is now ${f.use}` : pol() === 'lru' ? ', which becomes the most recently used' : '. FIFO takes no notice of the access') + '.' + (a.w ? ' The write makes the page dirty.' : '');
+    } else {
+      st.res.push('m'); cls = 'bp-bad';
+      k = F.findIndex((f) => !f);
+      let how = `It goes into frame ${k + 1}, which was free.`;
+      if (k < 0) {
+        let swept = 0;
+        if (pol() === 'fifo') k = F.reduce((b, f, j) => (f.loaded < F[b].loaded ? j : b), 0);
+        else if (pol() === 'lru') k = F.reduce((b, f, j) => (f.last < F[b].last ? j : b), 0);
+        else { while (F[st.hand].use > 0) { F[st.hand].use--; st.hand = (st.hand + 1) % N; swept++; } k = st.hand; st.hand = (st.hand + 1) % N; }
+        const v = F[k]; st.ev++; if (v.dirty) st.flushed++; if (HOT.includes(v.p) && work() === 'scan') st.lostHot++;
+        how = (pol() === 'clock' ? `The hand passed ${swept} frame${swept === 1 ? '' : 's'}, taking 1 from each count, and stopped at frame ${k + 1}, whose count was 0.` : pol() === 'lru' ? `The least recently used page is in frame ${k + 1}.` : `The page loaded longest ago is in frame ${k + 1}.`) +
+          ` Page ${v.p} is evicted` + (v.dirty ? ', and since it is dirty the query must write it to disk first' : '') + (HOT.includes(v.p) && work() === 'scan' ? '. It is one of the hot pages' : '') + '.';
+      }
+      F[k] = { p: a.p, use: 1, last: t, loaded: t, dirty: a.w }; st.loaded = true;
+      msg = `<b>Page ${a.p}: a miss.</b> ${how}`;
+    }
+    st.now = k; st.i++; st.msg = msg; st.cls = cls;
+    if (st.i >= st.acc.length) st.msg += ` <b>Finished: ${st.hits} hits out of ${st.acc.length}.</b>`;
+    return true;
+  }
+  function draw() {
+    let n = 0;
+    $('#bpTrace').innerHTML = st.T.map((a) => { if (!a) return '<i class="bp-gap"></i>'; const j = n++; return `<i class="${a.w ? 'bp-w ' : ''}${st.res[j] === 'h' ? 'bp-hit' : st.res[j] === 'm' ? 'bp-miss' : ''}${j === st.i ? ' bp-cur' : ''}">${a.p}</i>`; }).join('');
+    const p = pol();
+    $('#bpFrames').innerHTML = st.frames.map((f, k) => !f ? `<div class="bp-f bp-empty${p === 'clock' && k === st.hand ? ' bp-hand' : ''}"><b>·</b><small>free</small></div>` :
+      `<div class="bp-f${HOT.includes(f.p) && work() === 'scan' ? ' bp-hot' : ''}${f.dirty ? ' bp-dirty' : ''}${k === st.now ? ' bp-now' + (st.loaded ? ' bp-in' : '') : ''}${p === 'clock' && k === st.hand ? ' bp-hand' : ''}"><b>${f.p}</b><small>${p === 'clock' ? 'count ' + f.use : p === 'lru' ? 'used @' + (f.last + 1) : 'in @' + (f.loaded + 1)}</small></div>`).join('');
+    const m = $('#bpMsg'); m.className = 'bp-msg ' + (st.cls || '');
+    m.innerHTML = st.msg || 'The pool is empty, as it is after a restart. Press <b>Next access</b>, or run the whole trace and compare the policies.';
+    const done = st.i, hot = st.frames.filter((f) => f && HOT.includes(f.p)).length;
+    $('#bpStats').innerHTML = `<div class="stat"><div class="k">Accesses</div><div class="v">${done} of ${st.acc.length}</div></div>
+      <div class="stat acc"><div class="k">Hits</div><div class="v">${st.hits}${done ? ' <small>' + Math.round(100 * st.hits / done) + '%</small>' : ''}</div></div>
+      <div class="stat"><div class="k">Evictions</div><div class="v">${st.ev}</div></div>
+      <div class="stat ${st.flushed ? 'bad' : 'good'}"><div class="k">Dirty pages a query had to write</div><div class="v">${st.flushed}</div></div>` +
+      (work() === 'scan' ? `<div class="stat ${st.lostHot ? 'bad' : 'good'}"><div class="k">Hot pages evicted</div><div class="v">${st.lostHot}</div></div>` : '');
+  }
+  $('#bpStep').onclick = () => { step(); draw(); };
+  $('#bpRun').onclick = () => { while (step()); draw(); };
+  $('#bpReset').onclick = reset;
+  ['#bpPol', '#bpSize', '#bpWork'].forEach((s) => $(s).addEventListener('segchange', reset));
+  reset();
+})();
+</script>
 </body>
 </html>

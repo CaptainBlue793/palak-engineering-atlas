@@ -6,34 +6,309 @@
 <title>The Cost-Based Optimiser</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .co-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .co-row > span { font-size:12.5px; color:var(--muted); min-width:90px; }
+  .co-sql { margin-top:12px; font-family:var(--mono); font-size:12.5px; padding:8px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); overflow-wrap:anywhere; }
+  .co-cols { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:12px; }
+  @media (max-width:760px) { .co-cols { grid-template-columns:1fr; } }
+  .co-box { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; min-width:0; font-size:13px; }
+  .co-box h6 { margin:0 0 6px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .co-box ul { margin:0; padding-left:18px; }
+  .co-box li { margin:3px 0; }
+  .co-box code { font-size:11.5px; }
+  .co-calc { font-family:var(--mono); font-size:12.5px; margin-top:6px; padding:6px 9px; border-radius:8px; background:var(--surface-2); overflow-wrap:anywhere; }
+  .co-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .co-msg.co-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .co-msg.co-warn { background:var(--amber-soft); border-left-color:var(--amber); }
+</style>
 </head>
 <body data-chapter="19">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 19</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>The Cost-Based <span class="grad">Optimiser</span></h1>
-    <p class="lead">Statistics, selectivity estimates, and why a stale estimate produces a terrible plan.</p>
+    <p class="lead">The planner has to choose a plan before it has read a single row. It can't know how many orders are pending, so it estimates, from a small set of statistics that it collected at some earlier time by sampling the table. Each of its choices, index or sequential scan, nested loop or hash join, which table to start from, follows from those estimates by arithmetic. When the estimates are close the plans are good, and when a plan is terrible the cause is nearly always an estimate that was wrong by a factor of a hundred or more. This chapter covers what statistics the planner keeps, how it turns them into row counts, the three common ways those counts go wrong, and what to do about each one before reaching for a hint.</p>
+    <ul class="objectives">
+      <li><span>Say what statistics PostgreSQL keeps for a column and how they are gathered</span></li>
+      <li><span>Estimate the selectivity of an equality, a range and a combination of conditions as the planner does</span></li>
+      <li><span>Explain why correlated columns, stale statistics and expressions produce wrong estimates</span></li>
+      <li><span>Explain why errors grow with each join</span></li>
+      <li><span>Choose the right remedy for a bad estimate, and know when overriding the planner is justified</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Estimated against actual rows in a plan:</b> <a href="17-explain.html">Chapter 17</a>.</li>
+        <li><b>The three join algorithms and their costs:</b> <a href="18-join-algorithms.html">Chapter 18</a>. The panel here uses the same cost model.</li>
+        <li><b>Selectivity, and when an index is worth using:</b> <a href="09-indexes-first-look.html">Chapter 9</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Statistics and ANALYZE</li>
-    <li>Selectivity estimation</li>
-    <li>Correlated columns</li>
-    <li>Join ordering</li>
-    <li>When to override the planner</li>
-  </ol>
+  <h2>Cost is rows multiplied by prices</h2>
+  <p>The planner gives every candidate plan a <b>cost</b>, and keeps the cheapest. A cost is a count of the work the plan will do, with each kind of work multiplied by a configured price.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Setting</th><th>Default</th><th>Charged for</th></tr></thead>
+      <tbody>
+        <tr><td><code>seq_page_cost</code></td><td>1.0</td><td>Each page read in sequence. This is the unit that the others are relative to</td></tr>
+        <tr><td><code>random_page_cost</code></td><td>4.0</td><td>Each page fetched out of order, as an index scan does. On SSDs it should be about 1.1</td></tr>
+        <tr><td><code>cpu_tuple_cost</code></td><td>0.01</td><td>Each row processed</td></tr>
+        <tr><td><code>cpu_index_tuple_cost</code></td><td>0.005</td><td>Each index entry processed</td></tr>
+        <tr><td><code>cpu_operator_cost</code></td><td>0.0025</td><td>Each operator or function evaluated</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c">-- A sequential scan of orders: 63,694 pages and 5,000,000 rows, with one condition to test</span>
+cost = <span class="m">63694</span> × <span class="m">1.0</span>  +  <span class="m">5000000</span> × <span class="m">0.01</span>  +  <span class="m">5000000</span> × <span class="m">0.0025</span>  =  <span class="m">126194</span>      <span class="c">-- the figure EXPLAIN printed in Chapter 17</span></pre>
+  <p>The prices are fixed and the page counts are known. The uncertain inputs are the row counts: how many rows will pass this filter, how many will come out of that join. Every plan decision in <a href="18-join-algorithms.html">Chapter 18</a> depended on them. So the quality of a plan comes down to one question: how good is the planner's estimate of the number of rows at each step?</p>
+
+  <h2>Statistics and ANALYZE</h2>
+  <p>The <code>ANALYZE</code> command reads a random sample of a table, 30,000 rows by default, and stores a summary of each column. Autovacuum runs it automatically once about 10% of a table's rows have changed.</p>
+<pre class="code"><span class="k">SELECT</span> null_frac, n_distinct, most_common_vals, most_common_freqs, histogram_bounds, correlation
+<span class="k">FROM</span> pg_stats <span class="k">WHERE</span> tablename = <span class="s">'orders'</span> <span class="k">AND</span> attname = <span class="s">'status'</span>;
+
+null_frac         | <span class="m">0</span>
+n_distinct        | <span class="m">5</span>
+most_common_vals  | {delivered,shipped,paid,cancelled,pending}
+most_common_freqs | {<span class="m">0.7412</span>,<span class="m">0.1203</span>,<span class="m">0.0801</span>,<span class="m">0.0383</span>,<span class="m">0.0201</span>}
+histogram_bounds  |                                         <span class="c">-- empty: the common-values list covers everything</span>
+correlation       | <span class="m">0.13</span></pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Statistic</th><th>What it records</th><th>Used to estimate</th></tr></thead>
+      <tbody>
+        <tr><td><b>Rows and pages</b>, in <code>pg_class</code></td><td>The table's size at the last ANALYZE or VACUUM</td><td>Everything: a selectivity is a fraction of this</td></tr>
+        <tr><td><b><code>null_frac</code></b></td><td>The share of rows where the column is NULL</td><td><code>IS NULL</code>, and every comparison, which NULLs never pass</td></tr>
+        <tr><td><b><code>n_distinct</code></b></td><td>How many different values there are</td><td>Equality with an uncommon value, <code>GROUP BY</code>, joins</td></tr>
+        <tr><td><b>Most common values</b></td><td>Up to 100 values, each with its frequency</td><td>Equality with a common value, exactly</td></tr>
+        <tr><td><b>Histogram</b></td><td>101 boundary values that split the remaining rows into 100 equal groups</td><td>Ranges: <code>&lt;</code>, <code>&gt;</code>, <code>BETWEEN</code></td></tr>
+        <tr><td><b><code>correlation</code></b></td><td>How closely the table's physical order follows the column's order, from −1 to 1</td><td>The cost of an index scan, and whether BRIN can work</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Selectivity estimation</h2>
+  <p>The <b>selectivity</b> of a condition is the fraction of rows that pass it. The estimated row count is the table's row count multiplied by the selectivities of the conditions.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Condition</th><th>How the planner estimates it</th><th>Example, on 5 million orders</th></tr></thead>
+      <tbody>
+        <tr><td><code>status = 'pending'</code></td><td>The value is in the common-values list: use its frequency</td><td>0.0201 × 5 M = 100,500</td></tr>
+        <tr><td><code>customer_id = 4242</code></td><td>Not a common value: share the remaining rows equally among the remaining distinct values</td><td>1 ÷ 51,000 customers × 5 M = 98</td></tr>
+        <tr><td><code>total_cents &gt; 50000</code></td><td>Find where the value falls in the histogram, and take the fraction of buckets above it</td><td>7 of 100 buckets: 350,000</td></tr>
+        <tr><td><code>a AND b</code></td><td>Multiply the two selectivities, <b>assuming the conditions are independent</b></td><td>0.0201 × 0.07 × 5 M = 7,035</td></tr>
+        <tr><td><code>a OR b</code></td><td>Add them and subtract the product</td><td>(0.0201 + 0.07 − 0.0014) × 5 M</td></tr>
+        <tr><td><code>lower(email) = 'x'</code>, or any expression it has no statistics for</td><td>A fixed guess: 0.5% for an equality, 33% for an inequality</td><td>25,000, or 1.67 million, whatever the data</td></tr>
+        <tr><td>A join on <code>a.x = b.x</code></td><td>The product of the two inputs' row counts, divided by the larger of the two <code>n_distinct</code> values</td><td>Every order matches its one customer</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Three of these rows are where estimates fail. The statistics describe the table as it was when last analysed. The rule for <code>AND</code> assumes that columns have nothing to do with each other. And an expression the planner can't see into gets a constant.</p>
+
+  <h2>Try it: where estimates come from, and where they fail</h2>
+  <p>A table of a million orders is filtered, and the rows that pass are joined to <code>order_items</code>. The planner estimates how many rows will pass and chooses the join from that, with the costs of <a href="18-join-algorithms.html">Chapter 18</a>.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Estimate, plan and reality</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="co-row"><span>The filter</span><div class="seg" id="coQ"><button class="active" data-v="mcv">a common value</button><button data-v="stale">a value newer than the statistics</button><button data-v="corr">two correlated columns</button><button data-v="expr">arithmetic on a column</button></div></div>
+      <div class="co-row"><span>The remedy</span><div class="seg" id="coFix"><button class="active" data-v="0">not applied</button><button data-v="1">applied</button></div></div>
+      <div class="co-sql" id="coSql"></div>
+      <div class="co-cols">
+        <div class="co-box"><h6>What the planner knows</h6><ul id="coKnow"></ul><div class="co-calc" id="coCalc"></div></div>
+        <div class="co-box"><h6>What it chooses, and what happens</h6><ul id="coPlan"></ul></div>
+      </div>
+      <div class="co-msg" id="coMsg"></div>
+      <div class="stats" id="coStats"></div>
+    </div>
+    <div class="panel-foot">The join costs are the model from Chapter 18: an index nested loop costs about 16 for each outer row, and a hash join about 25,000 plus a little for each row, three times as much on the I/O if its hash table spills. The planner picks whichever is cheaper for the number of rows it expects. "Real cost" is what the chosen plan costs for the rows that actually arrive.</div>
+  </div>
+
+  <p>Things to notice. For the common value the estimate is within 1% and the plan is the right one. For a value that didn't exist when the table was last analysed, the planner expects 1 row and gets 300,000, picks a nested loop, and the query costs 82 times what it should. For the two correlated columns the planner multiplies 3% by 3% and expects 900 rows where there are 30,000, and again picks the loop, 19 times too slow. For the arithmetic it can't use the histogram at all, guesses a third of the table, and builds a hash join for 200 rows that an index would have fetched for an eighth of the cost. The fourth case is an overestimate, which costs much less than the underestimates do. With each remedy applied the estimate comes right, and the planner changes its choice without being told to.</p>
+
+  <h2>Correlated columns</h2>
+  <p>The independence assumption is wrong whenever one column tells you something about another: city and postcode, make and model, country and currency, a status and the date range in which rows have that status. Every row with currency <code>JPY</code> has country <code>JP</code>, so the second condition removes nothing, and the planner has multiplied by it anyway. Each extra correlated condition divides the estimate again, and a query with three of them can be out by a factor of thousands.</p>
+<pre class="code"><span class="k">CREATE STATISTICS</span> orders_country_currency (dependencies, ndistinct, mcv)
+  <span class="k">ON</span> country, currency <span class="k">FROM</span> orders;
+<span class="k">ANALYZE</span> orders;                             <span class="c">-- extended statistics are gathered by ANALYZE, like the others</span></pre>
+  <p><b>Extended statistics</b> tell the planner to measure a group of columns together: how strongly one determines another, how many distinct combinations there are, and which combinations are most common. They cost a little at ANALYZE time and nothing at query time. PostgreSQL doesn't create them by itself, because it can't know which of the many possible column pairs matter. You do, from plans where two conditions on one table give an estimate far too low.</p>
+
+  <h2>Join ordering</h2>
+  <p><a href="18-join-algorithms.html">Chapter 18</a> showed that the planner searches for the cheapest order in which to join tables. That search runs on estimates of the size of each intermediate result, and each of those is made from the estimates below it. An error of 3× in each of five joins can leave the estimate for the final result out by 3⁵, which is 243. Errors that are tolerable for a single table compound into nonsense by the top of a large plan, and the planner then chooses join algorithms and an order for inputs it has badly mismeasured.</p>
+  <div class="callout usecase">
+    <div class="ico">🔬</div>
+    <div class="body"><div class="title">"How good are query optimizers, really?"</div><p>In 2015 a group of researchers in Munich, led by Viktor Leis, published a study with that title, which measured something database developers had long argued about without data. They took a real dataset, the Internet Movie Database, whose columns are full of the correlations that real data has, and wrote 113 queries over it with between 3 and 16 joins each. They then asked PostgreSQL and four other database systems, commercial ones among them, to estimate the size of every intermediate result, and compared the estimates with the truth. For conditions on a single table the estimates were mostly good. For the results of joins they were poor in every system, and they got worse with each join added: for queries with many joins, estimates wrong by a factor of a thousand were ordinary, and most of the errors were underestimates, which is the dangerous direction. The authors then separated the two halves of the optimiser's job. When they gave PostgreSQL the true row counts, its plans were nearly always close to the best possible, even with its simple cost formulas. When they improved the cost formulas and left the estimates alone, little changed. Their conclusion was that the cost model matters far less than the row estimates, and the estimates fail because real columns are correlated. For an engineer reading a slow plan, the practical advice follows directly: look at the row estimates before anything else, and expect them to be worst in the deepest joins.</p></div>
+  </div>
+
+  <h2>When to override the planner</h2>
+  <p>PostgreSQL has no hints in its SQL, by deliberate choice: a hint fixes a plan for today's data and goes on being obeyed when the data has changed. The intended fix is to give the planner better information. The remedies below are in the order to try them.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Run ANALYZE</b> the statistics may simply be old, after a bulk load or on a fast-changing table</li>
+      <li data-k="step"><b>Raise the statistics target</b> for a skewed column whose value isn't in the common-values list: <code>ALTER TABLE … ALTER COLUMN … SET STATISTICS 1000</code></li>
+      <li data-k="step"><b>Create extended statistics</b> for columns that are correlated</li>
+      <li data-k="step"><b>Rewrite the condition</b> so that the bare column is compared with a value, or index the expression, which also gives it statistics</li>
+      <li data-k="step"><b>Correct the prices</b> <code>random_page_cost = 1.1</code> on SSDs, and a truthful <code>effective_cache_size</code></li>
+      <li data-k="decision"><b>Still wrong?</b> restructure the query: a <code>MATERIALIZED</code> CTE fixes what is computed first, and <code>join_collapse_limit = 1</code> fixes the join order as written</li>
+      <li data-k="end"><b>Last resort</b> <code>SET LOCAL enable_nestloop = off</code> for one transaction, or the <code>pg_hint_plan</code> extension, with a comment saying why</li>
+    </ol>
+    <figcaption><b>The ladder of remedies.</b> The early steps fix the cause for every query that touches the table, and the late ones fix one query and may outlive their usefulness.</figcaption>
+  </figure>
+<pre class="code"><span class="c">-- Before: the planner can't use the histogram for an expression</span>
+<span class="k">WHERE</span> total_cents / <span class="m">100</span> &gt; <span class="m">5000</span>             <span class="c">-- a fixed guess: a third of the table</span>
+<span class="k">WHERE</span> <span class="f">date_trunc</span>(<span class="s">'day'</span>, created_at) = <span class="s">'2026-10-07'</span>
+
+<span class="c">-- After: the bare column on one side</span>
+<span class="k">WHERE</span> total_cents &gt; <span class="m">500000</span>                 <span class="c">-- estimated from the histogram, and able to use an index</span>
+<span class="k">WHERE</span> created_at &gt;= <span class="s">'2026-10-07'</span> <span class="k">AND</span> created_at &lt; <span class="s">'2026-10-08'</span></pre>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Querying straight after a bulk load.</b> Autovacuum hasn't analysed the new rows yet. Run <code>ANALYZE</code> as the last step of the load.</li>
+      <li><b>Wrapping a column in a function in <code>WHERE</code>.</b> It hides the column's statistics, and its indexes too.</li>
+      <li><b>Reaching for <code>enable_seqscan = off</code> first.</b> It doesn't fix the estimate, and it applies to the whole session.</li>
+      <li><b>Leaving <code>random_page_cost</code> at 4 on SSDs.</b> The planner then avoids index scans it should be using.</li>
+      <li><b>Assuming temporary tables have statistics.</b> Autovacuum can't see them. Analyse them yourself after filling them.</li>
+      <li><b>Testing on data without the production data's skew.</b> Uniform test data has no correlations and no hot values, so every estimate is good and every plan is fine.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does a database decide whether to use an index for a query?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is a cost-based decision. The planner generates the candidate plans, a sequential scan, an index scan on each usable index, a bitmap scan, and estimates a cost for each as the sum of the page reads and row operations it will do, weighted by configured costs: sequential pages are cheap, random pages cost more, and each row processed costs a little. The key input is selectivity: what fraction of the rows the predicate will match. It estimates that from statistics that ANALYZE collects by sampling each column: the fraction of NULLs, the number of distinct values, a list of the most common values with their frequencies, and a histogram of the rest. If the predicate matches a small fraction, the index scan's few random reads are cheaper than reading the whole table; if it matches, say, a fifth of the table, the random reads would cost more than a sequential scan, and the planner correctly ignores the index. So "the database isn't using my index" usually means either that it estimated, perhaps rightly, that the index wouldn't help, or that its estimate is wrong.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A plan shows an estimate of 50 rows where 200,000 actually came back. What could cause that, and how do you fix each cause?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Four usual causes. First, stale statistics: the table has changed a lot since it was last analysed, for instance after a bulk load, or the queried value is new and isn't in the most-common-values list, so the planner treats it as rare. Fix: ANALYZE, and make autovacuum analyse that table more often. Second, correlated columns: the query has several predicates on the same table, such as city and postcode, and the planner multiplies their selectivities as if independent, underestimating by the product. Fix: CREATE STATISTICS on that column group, with dependencies and MCV, then ANALYZE. Third, a predicate the planner can't estimate: a function or arithmetic on the column, a cast, a LIKE with a leading wildcard, a comparison with a subquery result. It falls back to a default selectivity. Fix: rewrite so the bare column is compared with a constant or range, or create an expression index, which gathers statistics on the expression. Fourth, skew that the sample missed: a column with many distinct values where a few are very common but not captured in a 100-entry MCV list. Fix: raise the statistics target for that column. And if the misestimate is on a join result several levels up, it has probably compounded from a smaller error lower down, so I'd find the lowest node where estimate and actual diverge and fix that one. Only if none of these works would I constrain the planner, with a materialised CTE or a session-local setting for that query.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A plan's cost is page reads and rows processed, multiplied by fixed prices. The uncertain part is the row counts.</li>
+      <li>ANALYZE samples each column and stores its NULL fraction, distinct count, most common values, histogram and physical correlation.</li>
+      <li>Selectivity comes from those: a common value's frequency, a share of the remainder, a fraction of the histogram, and a product for AND.</li>
+      <li>Estimates fail when statistics are stale, when columns are correlated, and when a condition hides the column inside an expression.</li>
+      <li>Errors multiply through joins, so the deepest joins of a large query are the worst estimated. Underestimates do the most damage.</li>
+      <li>Fix the information before the plan: ANALYZE, statistics targets, extended statistics, a sargable rewrite. Force the planner only as a last resort.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A column's statistics list <code>'pending'</code> among the most common values with frequency 0.02. The table has 5 million rows. How many rows does the planner expect for <code>status = 'pending'</code>?</p>
+      <div class="opts">
+        <button class="opt">2</button>
+        <button class="opt">20,000</button>
+        <button class="opt">100,000</button>
+        <button class="opt">1,000,000</button>
+      </div>
+      <div class="explain">For a value in the common-values list, the estimate is its recorded frequency times the row count.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A query has <code>WHERE city = 'Leeds' AND postcode LIKE 'LS%'</code>. Each condition alone matches 1% of rows, and they match the same rows. What does the planner estimate, without extended statistics?</p>
+      <div class="opts">
+        <button class="opt">0.01%: it multiplies the two, a hundred times too low</button>
+        <button class="opt">1%, correctly</button>
+        <button class="opt">2%</button>
+        <button class="opt">It refuses to estimate</button>
+      </div>
+      <div class="explain">The planner assumes that conditions on different columns are independent.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Straight after 10 million rows are bulk-loaded into a table that held 10,000, queries on it get bad plans. What is the first thing to do?</p>
+      <div class="opts">
+        <button class="opt">Add indexes</button>
+        <button class="opt">Increase <code>work_mem</code></button>
+        <button class="opt">Disable sequential scans</button>
+        <button class="opt">Run <code>ANALYZE</code> on the table</button>
+      </div>
+      <div class="explain">The stored statistics still describe the small table. Autovacuum would get to it eventually, and the load should not wait for that.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why does <code>WHERE total_cents / 100 &gt; 5000</code> get a worse estimate than <code>WHERE total_cents &gt; 500000</code>?</p>
+      <div class="opts">
+        <button class="opt">Division is slow</button>
+        <button class="opt">The histogram describes <code>total_cents</code>, not <code>total_cents / 100</code>, so the planner falls back to a fixed guess</button>
+        <button class="opt">The first form returns different rows</button>
+        <button class="opt">Integer division loses precision</button>
+      </div>
+      <div class="explain">Keep the bare column on one side of the comparison, and the planner can use its statistics and its indexes.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">According to the 2015 study of query optimisers, what matters most for getting a good plan?</p>
+      <div class="opts">
+        <button class="opt">A more detailed cost model</button>
+        <button class="opt">Trying more join orders</button>
+        <button class="opt">Accurate estimates of row counts</button>
+        <button class="opt">More indexes</button>
+      </div>
+      <div class="explain">Given the true row counts, even a simple cost model chose plans close to the best.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  const N = 1e6, S = 1e6, S_PAGES = 10000, FIT = 50000;
+  const n = (x) => Math.round(x).toLocaleString('en-GB');
+  // The join costs from Chapter 18.
+  const inl = (r) => r / 100 + 16 * r;
+  const hash = (r) => (S_PAGES + r / 100) * (r > FIT ? 3 : 1) + 0.015 * (r + S);
+  const Q = {
+    mcv: { sql: "WHERE status = 'pending'", actual: 20000, est: [20100, 20100],
+      know: ["<code>status</code> has 5 distinct values, all in the common-values list", "'pending' has frequency 0.0201"], calc: ['0.0201 × 1,000,000 = 20,100', '0.0201 × 1,000,000 = 20,100'],
+      fix: 'Nothing to fix', fixNote: 'There is no remedy to apply: the statistics already describe this value.' },
+    stale: { sql: "WHERE status = 'archived'", actual: 300000, est: [1, 300400],
+      know: [["Statistics date from before the archiving job first ran", "ANALYZE has just been run"], ["'archived' isn't among the values it has seen, so it is taken to be very rare", "'archived' is now in the common-values list, with frequency 0.3004"]],
+      calc: ['no such value in the statistics → 1 row', '0.3004 × 1,000,000 = 300,400'], fix: 'ANALYZE orders;', after: 'After <code>ANALYZE</code>' },
+    corr: { sql: "WHERE country = 'JP' AND currency = 'JPY'", actual: 30000, est: [900, 30100],
+      know: [["<code>country = 'JP'</code>: frequency 0.03", "<code>country = 'JP'</code>: frequency 0.03"], ["<code>currency = 'JPY'</code>: frequency 0.03. The two are assumed to be independent", "Extended statistics: <code>currency</code> is determined by <code>country</code>, so the second condition removes nothing"]],
+      calc: ['0.03 × 0.03 × 1,000,000 = 900', '0.0301 × 1,000,000 = 30,100'], fix: 'CREATE STATISTICS … (dependencies, mcv) ON country, currency FROM orders;', after: 'With extended statistics on the two columns' },
+    expr: { sql: ['WHERE total_cents / 100 > 5000', 'WHERE total_cents > 500000'], actual: 200, est: [333333, 210],
+      know: [["The histogram describes <code>total_cents</code>, and the condition is on <code>total_cents / 100</code>", "The condition is on the bare column, so the histogram applies"], ["With no statistics for the expression, an inequality is guessed at one-third", "500,000 falls in the last of 100 buckets, a fifth of the way from its top"]],
+      calc: ['0.3333 × 1,000,000 = 333,333', '0.01 × 0.21 × 1,000,000 = 210'], fix: 'rewrite the condition so that the bare column is on one side', after: 'With the condition rewritten on the bare column' },
+  };
+  function render() {
+    const key = $('#coQ').dataset.value, q = Q[key], f = key === 'mcv' ? 0 : +$('#coFix').dataset.value;
+    const est = q.est[f], act = q.actual;
+    $('#coSql').textContent = 'SELECT … FROM orders o JOIN order_items i USING (order_id) ' + (Array.isArray(q.sql) ? q.sql[f] : q.sql) + ';';
+    $('#coKnow').innerHTML = q.know.map((k) => `<li>${Array.isArray(k) ? k[f] : k}</li>`).join('');
+    $('#coCalc').textContent = 'estimate: ' + q.calc[f];
+    const pick = inl(est) <= hash(est) ? 'inl' : 'hash', best = inl(act) <= hash(act) ? 'inl' : 'hash';
+    const cost = (p, r) => (p === 'inl' ? inl(r) : hash(r)), name = { inl: 'index nested loop', hash: 'hash join' };
+    const real = cost(pick, act), ideal = cost(best, act), slow = real / ideal;
+    const ratio = Math.max(est, act) / Math.max(1, Math.min(est, act)), dir = est < act ? 'too low' : 'too high';
+    $('#coPlan').innerHTML = `<li>Expecting ${n(est)} row${est === 1 ? '' : 's'}, a nested loop would cost ${n(inl(est))} and a hash join ${n(hash(est))}</li>
+      <li>So it chooses the <b>${name[pick]}</b></li>
+      <li>${n(act)} rows arrive, and that plan really costs <b>${n(real)}</b></li>
+      <li>${pick === best ? 'No other join would have been cheaper' : 'The ' + name[best] + ' would have cost ' + n(ideal)}</li>`;
+    const m = $('#coMsg'); let text, cls = '';
+    if (ratio < 1.5) text = `<b>The estimate is good: ${n(est)} expected, ${n(act)} found.</b> ` + (key === 'mcv' ? 'A value in the common-values list is estimated from its measured frequency, which is as good as an estimate gets. ' + q.fixNote : `${q.after}, the planner has what it needs and picks the ${name[pick]} by itself. Nobody told it which join to use.`);
+    else { cls = slow > 10 ? 'co-bad' : 'co-warn';
+      text = `<b>The estimate is ${n(ratio)} times ${dir}: ${n(est)} expected, ${n(act)} found.</b> The ${name[pick]} was the right choice for ${n(est)} row${est === 1 ? '' : 's'}. For ${n(act)} it costs ${slow >= 10 ? n(slow) : slow.toFixed(1)} times what the ${name[best]} would have. ` + (est < act ? 'An underestimate is the dangerous kind: the planner commits to a loop that then runs far more often than planned.' : 'An overestimate is the milder kind: the planner did more preparation than the rows needed.') + ` The remedy: ` + (q.fix.endsWith(';') ? `<code>${q.fix}</code>` : q.fix + '.'); }
+    m.className = 'co-msg ' + cls; m.innerHTML = text;
+    $('#coStats').innerHTML = `<div class="stat"><div class="k">Estimated rows</div><div class="v">${n(est)}</div></div>
+      <div class="stat"><div class="k">Actual rows</div><div class="v">${n(act)}</div></div>
+      <div class="stat ${ratio >= 10 ? 'bad' : 'good'}"><div class="k">Estimate out by</div><div class="v">${ratio < 1.5 ? ((ratio - 1) * 100 < 1 ? 'under 1%' : Math.round((ratio - 1) * 100) + '%') : n(ratio) + '×'}</div></div>
+      <div class="stat acc"><div class="k">Join chosen</div><div class="v" style="font-size:15px">${name[pick]}</div></div>
+      <div class="stat ${slow > 10 ? 'bad' : slow > 1.01 ? 'warn' : 'good'}"><div class="k">Slower than the best plan</div><div class="v">${slow < 1.01 ? 'no' : (slow >= 10 ? n(slow) : slow.toFixed(1)) + '×'}</div></div>`;
+  }
+  ['#coQ', '#coFix'].forEach((s) => $(s).addEventListener('segchange', render));
+  render();
+})();
+</script>
 </body>
 </html>

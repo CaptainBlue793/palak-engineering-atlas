@@ -6,34 +6,340 @@
 <title>Schema Migrations at Scale</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('db-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .mg-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .mg-row > span { font-size:12.5px; color:var(--muted); min-width:90px; }
+  .mg-steps { display:flex; flex-wrap:wrap; gap:4px; margin-top:12px; }
+  .mg-steps i { font-style:normal; font-size:11.5px; padding:3px 9px; border-radius:9px; border:1.5px solid var(--border); background:var(--surface); color:var(--muted); }
+  .mg-steps i.mg-done { border-color:var(--green); color:var(--text); }
+  .mg-steps i.mg-cur { border-color:var(--accent); background:var(--accent-soft); color:var(--text); font-weight:700; }
+  .mg-steps i.mg-err { border-color:var(--red); background:var(--red-soft); }
+  .mg-cols { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:12px; }
+  @media (max-width:820px) { .mg-cols { grid-template-columns:1fr; } }
+  .mg-box { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:9px 12px; min-width:0; font-size:13px; }
+  .mg-box h6 { margin:0 0 6px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .mg-box code { font-size:11.5px; }
+  .mg-box ul { list-style:none; margin:0; padding:0; }
+  .mg-box li { padding:3px 0; }
+  .mg-box li small { display:block; color:var(--muted); font-size:11.5px; }
+  .mg-inst { display:flex; gap:4px; margin-top:4px; }
+  .mg-inst i { flex:1 1 0; font-style:normal; text-align:center; font-size:11px; font-weight:700; padding:6px 0; border-radius:7px; background:var(--green-soft); border:1.5px solid var(--green); }
+  .mg-inst i.mg-bad { background:var(--red-soft); border-color:var(--red); }
+  .mg-sql { margin-top:12px; font-family:var(--mono); font-size:12px; padding:8px 12px; border-radius:10px; background:var(--surface-2); border:1px solid var(--border); white-space:pre-wrap; overflow-wrap:anywhere; }
+  .mg-msg { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .mg-msg.mg-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="34">
-<!-- db:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 34</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Schema Migrations at <span class="grad">Scale</span></h1>
-    <p class="lead">Adding columns and indexes without downtime: expand–contract, concurrent indexes and backfills.</p>
+    <h1>Schema Migrations <span class="grad">at Scale</span></h1>
+    <p class="lead">On a laptop, renaming a column takes one statement and a moment. On a production table of two hundred million rows, with requests arriving every millisecond and two versions of the application running during a deploy, the same statement can stop the site, in two separate ways. The statement may need a lock that every query has to wait behind, or it may rewrite the table for an hour. And when it finishes, half the application servers are still running code that expects the old schema. Changing a schema under traffic is a discipline with a few firm rules: know what each statement locks, build indexes without blocking writes, never make a change that old code can't tolerate, and move data in small pieces. This chapter covers them.</p>
+    <ul class="objectives">
+      <li><span>Say which schema changes are instant, which scan the table and which rewrite it</span></li>
+      <li><span>Build an index, and add a constraint, without blocking writes</span></li>
+      <li><span>Plan a change as expand, migrate, contract, so that old and new code both work at every step</span></li>
+      <li><span>Backfill a large table in batches without disturbing production</span></li>
+      <li><span>Explain how online schema-change tools copy a table while it is in use</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, SQL + Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Table locks, the lock queue and <code>lock_timeout</code>:</b> <a href="22-two-phase-locking.html">Chapter 22</a>. This chapter assumes that outage and how to avoid it.</li>
+        <li><b>Constraints:</b> <a href="08-constraints-integrity.html">Chapter 8</a>.</li>
+        <li><b>Dead rows and VACUUM:</b> <a href="23-mvcc.html">Chapter 23</a>, for why large updates are costly.</li>
+        <li><b>Replication lag:</b> <a href="25-replication.html">Chapter 25</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Locks taken by ALTER TABLE</li>
-    <li>CREATE INDEX CONCURRENTLY</li>
-    <li>Expand and contract</li>
-    <li>Backfills</li>
-    <li>Online schema-change tools</li>
-  </ol>
+  <h2>Locks taken by ALTER TABLE</h2>
+  <p>Nearly every form of <code>ALTER TABLE</code> takes the strongest table lock, which blocks reads and writes alike (<a href="22-two-phase-locking.html">Chapter 22</a>). What matters is how long it holds it. Some changes only edit the catalogue and are finished in a millisecond. Others have to read every row to check something, or write every row out again in a new form, and hold the lock throughout.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Change</th><th>What it does to the table</th><th>The safe way</th></tr></thead>
+      <tbody>
+        <tr><td><b>Add a nullable column</b>, or one with a constant default</td><td>Catalogue only: instant</td><td>Run it, with a <code>lock_timeout</code></td></tr>
+        <tr><td><b>Add a column with a default that differs for each row</b>, such as a random UUID</td><td>Rewrites every row</td><td>Add it nullable, backfill in batches, then set the default</td></tr>
+        <tr><td><b>Drop a column</b></td><td>Catalogue only: the data stays until rows are rewritten</td><td>Stop all code using it first</td></tr>
+        <tr><td><b>Rename a column or table</b></td><td>Catalogue only, and it breaks every query that used the old name</td><td>Don't. Add a new one, migrate, and drop the old</td></tr>
+        <tr><td><b>Change a column's type</b></td><td>Usually rewrites the whole table and its indexes</td><td>Add a new column of the new type, backfill, switch over</td></tr>
+        <tr><td><b>Add <code>NOT NULL</code></b></td><td>Scans the whole table to check</td><td>Add a <code>CHECK (col IS NOT NULL) NOT VALID</code>, validate it, then set NOT NULL, which uses the validated check and skips the scan</td></tr>
+        <tr><td><b>Add a foreign key or a check constraint</b></td><td>Scans the table, and for a foreign key locks the other table too</td><td>Add it as <code>NOT VALID</code>, then <code>VALIDATE CONSTRAINT</code> separately</td></tr>
+        <tr><td><b>Create an index</b></td><td>Blocks all writes for the whole build</td><td><code>CREATE INDEX CONCURRENTLY</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="k">SET</span> lock_timeout = <span class="s">'3s'</span>;                                  <span class="c">-- every migration starts with this</span>
+
+<span class="c">-- A foreign key in two steps</span>
+<span class="k">ALTER TABLE</span> orders <span class="k">ADD CONSTRAINT</span> orders_customer_fk
+  <span class="k">FOREIGN KEY</span> (customer_id) <span class="k">REFERENCES</span> customers <span class="k">NOT VALID</span>;      <span class="c">-- instant: enforced for new rows from now on</span>
+<span class="k">ALTER TABLE</span> orders <span class="k">VALIDATE CONSTRAINT</span> orders_customer_fk;      <span class="c">-- checks the old rows under a weak lock: reads and writes continue</span></pre>
+  <p>The two-step form works because the two halves need different things. Declaring the rule needs the strong lock for an instant. Checking the existing rows takes a long time and needs only a lock that lets normal traffic through.</p>
+
+  <h2>CREATE INDEX CONCURRENTLY</h2>
+  <p>A plain <code>CREATE INDEX</code> blocks every insert, update and delete on the table until it finishes, which on a large table is minutes or hours. <code>CONCURRENTLY</code> builds the same index while writes carry on.</p>
+<pre class="code"><span class="k">CREATE INDEX CONCURRENTLY</span> orders_customer_created_idx <span class="k">ON</span> orders (customer_id, created_at);
+
+<span class="c">-- If it fails or is cancelled, it leaves a husk behind:</span>
+\d orders
+    "orders_customer_created_idx" btree (customer_id, created_at) <span class="k">INVALID</span>
+<span class="k">DROP INDEX CONCURRENTLY</span> orders_customer_created_idx;           <span class="c">-- remove it and start again</span>
+
+<span class="c">-- A unique constraint without blocking: build the index first, then attach it</span>
+<span class="k">CREATE UNIQUE INDEX CONCURRENTLY</span> users_email_key <span class="k">ON</span> users (email);
+<span class="k">ALTER TABLE</span> users <span class="k">ADD CONSTRAINT</span> users_email_key <span class="k">UNIQUE USING INDEX</span> users_email_key;</pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th><code>CREATE INDEX</code></th><th><code>CREATE INDEX CONCURRENTLY</code></th></tr></thead>
+      <tbody>
+        <tr><td><b>Writes to the table</b></td><td>Blocked for the whole build</td><td>Allowed throughout</td></tr>
+        <tr><td><b>How it works</b></td><td>One scan of the table under a lock</td><td>Two scans, with waits in between for transactions that began before each phase</td></tr>
+        <tr><td><b>Time</b></td><td>The baseline</td><td>Two to three times longer</td></tr>
+        <tr><td><b>Inside a transaction</b></td><td>Allowed</td><td>Not allowed, so a migration tool has to run it by itself</td></tr>
+        <tr><td><b>On failure</b></td><td>Nothing is left behind</td><td>An <code>INVALID</code> index, which slows writes and serves no queries until dropped</td></tr>
+        <tr><td><b>Use on a live table</b></td><td>Never</td><td>Always</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>It waits for older transactions, so a session left idle in a transaction can hold a concurrent build up indefinitely. The same advice as in <a href="22-two-phase-locking.html">Chapter 22</a> applies: look for long-running sessions before starting.</p>
+
+  <h2>Expand and contract</h2>
+  <p>The locks are half the problem. The other half is that the database and the application don't change at the same instant. A deploy replaces application servers a few at a time, so for some minutes old code and new code are both serving requests, and either might be rolled back. A change is safe only if <b>every version of the code that might be running works against the schema as it stands</b>, at every moment.</p>
+  <p>That rules out any change that alters or removes something old code uses. The method that respects it has three phases. <b>Expand</b>: add the new thing beside the old, so that the schema supports both. <b>Migrate</b>: move the code and the data across in steps, each of which can be undone. <b>Contract</b>: when nothing uses the old thing, remove it.</p>
+
+  <h2>Try it: rename a column on a live table</h2>
+  <p>The column <code>users.name</code> is to become <code>users.full_name</code>. Four application servers are running, and deploys replace them two at a time. Choose a method and step through it.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Old code, new code and the schema between them</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="mg-row"><span>Method</span><div class="seg" id="mgM"><button data-v="rename">RENAME COLUMN, then deploy</button><button class="active" data-v="ec">expand and contract</button></div></div>
+      <div class="controls">
+        <button class="btn sm primary" id="mgNext">Next step</button>
+        <button class="btn sm" id="mgBack">← Undo the last step</button>
+        <button class="btn sm ghost" id="mgReset">↺ Reset</button>
+      </div>
+      <div class="mg-steps" id="mgSteps"></div>
+      <div class="mg-sql" id="mgSql"></div>
+      <div class="mg-cols">
+        <div class="mg-box"><h6>The table</h6><ul id="mgSchema"></ul></div>
+        <div class="mg-box"><h6>Application servers</h6><div class="mg-inst" id="mgInst"></div><ul id="mgCode" style="margin-top:8px"></ul></div>
+        <div class="mg-box"><h6>Right now</h6><ul id="mgNow"></ul></div>
+      </div>
+      <div class="mg-msg" id="mgMsg"></div>
+      <div class="stats" id="mgStats"></div>
+    </div>
+    <div class="panel-foot">Each server is marked with the version of the code it runs. A server is red when its queries fail against the schema as it is at that step. "Undo" asks whether the last step can be reversed without harm, which is the question that matters at three in the morning.</div>
+  </div>
+
+  <p>Things to notice. The rename is instant and holds its lock for a millisecond, and it still causes an outage. The moment it runs, all four servers are running code that asks for <code>name</code>, and every query fails until the new code is out. Deploying first and renaming afterwards breaks in the same way from the other side. No ordering of those two steps is safe. Expand and contract takes six steps where the rename and its deploy were two. At each of them every server works, and every step but the last can be reversed. The old column is the safety net until the last step, which is why that step, the only one that destroys anything, comes after the new code has been running for a while.</p>
+
+  <h2>Backfills</h2>
+  <p>The third step in the panel copies the old column into the new one for every existing row. Written as one statement, <code>UPDATE users SET full_name = name</code>, that is a single transaction that locks every row until it finishes, writes a new version of every row (<a href="23-mvcc.html">Chapter 23</a>), generates a great deal of WAL, and pushes replicas far behind (<a href="25-replication.html">Chapter 25</a>). A backfill is done in batches.</p>
+<pre class="code"><span class="k">def</span> <span class="f">backfill</span>(conn, batch=<span class="m">5000</span>):
+    last_id = <span class="m">0</span>
+    <span class="k">while</span> <span class="k">True</span>:
+        <span class="k">with</span> conn.<span class="f">transaction</span>():                                  <span class="c"># one short transaction for each batch</span>
+            rows = conn.<span class="f">execute</span>(<span class="s">"""
+                UPDATE users SET full_name = name
+                WHERE user_id IN (
+                    SELECT user_id FROM users
+                    WHERE user_id &gt; %s AND full_name IS NULL       -- only rows not yet done: safe to run again
+                    ORDER BY user_id LIMIT %s )
+                RETURNING user_id"""</span>, (last_id, batch)).<span class="f">fetchall</span>()
+        <span class="k">if not</span> rows:
+            <span class="k">return</span>
+        last_id = <span class="f">max</span>(r[<span class="m">0</span>] <span class="k">for</span> r <span class="k">in</span> rows)                         <span class="c"># walk the primary key: no rescanning from the start</span>
+        <span class="f">wait_until_replicas_are_within</span>(seconds=<span class="m">2</span>)                  <span class="c"># and let autovacuum and the replicas keep up</span>
+        time.<span class="f">sleep</span>(<span class="m">0.1</span>)</pre>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>A good backfill</th><th>Because</th></tr></thead>
+      <tbody>
+        <tr><td><b>Works in batches of a few thousand rows</b></td><td>Each transaction holds its row locks for milliseconds</td></tr>
+        <tr><td><b>Walks the primary key</b></td><td>Each batch is an index range scan, where <code>OFFSET</code> would rescan from the beginning every time</td></tr>
+        <tr><td><b>Can be stopped and restarted</b></td><td>It will be interrupted. It should skip rows already done</td></tr>
+        <tr><td><b>Throttles itself</b></td><td>It watches replica lag and load, and pauses when they rise</td></tr>
+        <tr><td><b>Runs after new writes already fill the column</b></td><td>Otherwise rows written during the backfill are missed, and it never finishes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Online schema-change tools</h2>
+  <p>Some changes can't be decomposed: altering a column's type in MySQL, for instance, or changing a table's primary key. For these there are tools that perform expand and contract on a whole table.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Create an empty copy of the table</b> with the new schema, beside the original</li>
+      <li data-k="step"><b>Copy the rows across</b> in small batches, in order of primary key</li>
+      <li data-k="step"><b>Apply ongoing changes to the copy</b> every insert, update and delete made to the original meanwhile, captured by triggers or read from the replication log</li>
+      <li data-k="decision"><b>Has the copy caught up?</b> and is replica lag low? Otherwise keep going, or pause</li>
+      <li data-k="step"><b>Cut over</b> lock both tables for an instant and swap their names</li>
+      <li data-k="end"><b>Drop the old table</b> later, once nobody needs to go back</li>
+    </ol>
+    <figcaption><b>A shadow-table migration.</b> The application sees one table throughout. The only blocking moment is the swap.</figcaption>
+  </figure>
+  <p>For MySQL the well-known tools are <code>pt-online-schema-change</code>, which captures changes with triggers, and <code>gh-ost</code>, which reads the replication log. For PostgreSQL, <code>pg_repack</code> rebuilds a table in this way to remove bloat, and tools such as <code>pgroll</code> automate the expand-and-contract sequence itself. All of them need free disk space for a second copy of the table.</p>
+
+  <div class="callout usecase">
+    <div class="ico">👻</div>
+    <div class="body"><div class="title">gh-ost: GitHub's migrations without triggers</div><p>GitHub runs on MySQL and changes its schema several times a day. For years it used the standard tool for the job, which works as the figure above describes and captures ongoing changes with triggers: for every write to the original table, a trigger performs the matching write to the copy, inside the same transaction. On GitHub's busiest tables that had become a problem in itself. The triggers doubled the work of every write for the hours a migration ran, and added contention for locks between the application's writes and the copying process. They couldn't be paused: once in place they fired on every write, whatever the load, so a migration that was hurting production could only be abandoned. And the tool's behaviour couldn't be tested anywhere but on the primary. In 2016 GitHub's database team released a replacement called gh-ost. It uses no triggers. It connects to the database as if it were a replica and reads the replication log, where every committed change is already recorded, and applies those changes to the copy itself. Because it applies them asynchronously and under its own control, the migration's writes are separate from the application's and can be slowed or stopped completely at any moment, which it does automatically whenever replication lag or load passes a threshold. The same design lets a migration run entirely against a replica first, as a test, with a checksum at the end to prove the copy matches. The cut-over is a brief lock and an atomic rename. The schema changes themselves were no different from before. What gh-ost changed was the operator's control over a migration while it was running.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Renaming or dropping a column that running code still uses.</b> The lock is instant and the outage lasts until the deploy finishes.</li>
+      <li><b>A migration with no <code>lock_timeout</code>.</b> If it has to wait for its lock, all traffic waits behind it.</li>
+      <li><b><code>CREATE INDEX</code> without <code>CONCURRENTLY</code></b> on a table that takes writes.</li>
+      <li><b>Leaving an <code>INVALID</code> index</b> after a failed concurrent build. It costs every write and helps no read.</li>
+      <li><b>A backfill as one <code>UPDATE</code>.</b> Hours of row locks, a doubled table, and replicas minutes behind.</li>
+      <li><b>Schema change and code change in one deploy,</b> with no order in which both old and new code work.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you add an index to a large table in production without downtime?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>In PostgreSQL, with <code>CREATE INDEX CONCURRENTLY</code>. A plain CREATE INDEX takes a lock that blocks all writes to the table for the duration of the build, which on a large table is minutes to hours. The concurrent form takes only a weak lock that allows reads and writes; it builds the index in two passes over the table, waiting between phases for transactions that started earlier, so that the index ends up containing every row. The trade-offs: it takes two to three times as long, uses more I/O, can't run inside a transaction block, so migration tooling has to run it on its own, and if it fails or is cancelled it leaves an INVALID index that must be dropped, concurrently, before retrying. Beforehand I'd check for long-running or idle-in-transaction sessions, since it has to wait for them, and I'd watch replication lag and I/O during the build. For a unique constraint, I'd build a unique index concurrently and then attach it with ADD CONSTRAINT … USING INDEX. In MySQL the equivalent is online DDL where the operation supports it, or a tool like gh-ost.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You need to change a column from <code>integer</code> to <code>bigint</code> on a 500 GB table that takes writes constantly. How?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A direct ALTER COLUMN TYPE rewrites the whole table and its indexes under an exclusive lock, hours of downtime, so I'd do it as expand and contract. First, add a new nullable bigint column; that is a catalogue-only change, run with a short lock_timeout and retried if it can't get the lock. Second, make new writes populate it: either deploy application code that writes both columns, or add a trigger that copies the old column to the new on insert and update, which avoids depending on every code path. Third, backfill existing rows in batches of a few thousand by primary-key range, each in its own transaction, idempotent and resumable, throttled on replica lag, with autovacuum keeping up. Fourth, build any needed indexes on the new column concurrently, and add constraints as NOT VALID then validate; if it must be NOT NULL, add a validated check constraint first so that SET NOT NULL can skip its scan. Fifth, verify that the two columns agree everywhere. Sixth, switch reads to the new column, then stop writing the old one, in separate deploys so each can be rolled back. Finally drop the old column and the trigger. If the column is the primary key, the same approach applies with an extra step to swap the constraint using a pre-built unique index, in one short transaction; and foreign keys referencing it need the same treatment on their side. The whole thing takes days of elapsed time and no downtime.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>ALTER TABLE takes the strongest lock. Whether that matters depends on whether the change is catalogue-only, scans the table, or rewrites it.</li>
+      <li>Set <code>lock_timeout</code> on every migration, and split constraints into <code>NOT VALID</code> and <code>VALIDATE</code>.</li>
+      <li>Build indexes with <code>CONCURRENTLY</code>, and drop any that are left <code>INVALID</code>.</li>
+      <li>Old and new code run together during a deploy, so the schema must suit both at every moment.</li>
+      <li>Expand, migrate, contract: add the new beside the old, move code and data in reversible steps, and remove the old last.</li>
+      <li>Backfill in small, restartable, throttled batches along the primary key.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why is renaming a column dangerous on a live system, although the statement is instant?</p>
+      <div class="opts">
+        <button class="opt">It rewrites the whole table</button>
+        <button class="opt">It invalidates every index on the table</button>
+        <button class="opt">Application code that is still running refers to the old name, and its queries fail at once</button>
+        <button class="opt">It can't be rolled back</button>
+      </div>
+      <div class="explain">The database changes in an instant and the application servers don't.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does <code>CREATE INDEX CONCURRENTLY</code> give up, compared with a plain <code>CREATE INDEX</code>?</p>
+      <div class="opts">
+        <button class="opt">Speed and tidiness: it takes longer, can't run in a transaction, and leaves an INVALID index if it fails</button>
+        <button class="opt">Correctness: the index may miss some rows</button>
+        <button class="opt">Uniqueness: it can't build unique indexes</button>
+        <button class="opt">Nothing</button>
+      </div>
+      <div class="explain">In exchange, writes to the table continue during the build.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">How do you add a foreign key to a large, busy table without a long lock?</p>
+      <div class="opts">
+        <button class="opt">Add it inside a transaction</button>
+        <button class="opt">Add it with <code>CONCURRENTLY</code></button>
+        <button class="opt">Disable triggers first</button>
+        <button class="opt">Add it as <code>NOT VALID</code>, then run <code>VALIDATE CONSTRAINT</code> as a separate step</button>
+      </div>
+      <div class="explain">Declaring it is instant. Checking the existing rows is slow and can be done under a weak lock.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In an expand-and-contract migration, when is the old column dropped?</p>
+      <div class="opts">
+        <button class="opt">First, to free the name</button>
+        <button class="opt">Last, after no running code reads or writes it</button>
+        <button class="opt">At the same time as the new column is added</button>
+        <button class="opt">During the backfill</button>
+      </div>
+      <div class="explain">Until then it is what makes every earlier step reversible.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why is a backfill run in batches of a few thousand rows, and not as one UPDATE?</p>
+      <div class="opts">
+        <button class="opt">A single UPDATE can't touch more than a million rows</button>
+        <button class="opt">Batches use less disk space in total</button>
+        <button class="opt">One huge transaction holds row locks for its whole length, bloats the table, and leaves replicas far behind</button>
+        <button class="opt">Batches run in parallel automatically</button>
+      </div>
+      <div class="explain">Small transactions release their locks in milliseconds, and can be paused when replicas or VACUUM fall behind.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DB;
+  // Code versions: what each reads and writes.
+  const CODE = {
+    v1: ['reads name', 'writes name'],
+    v2: ['reads name', 'writes name and full_name'],
+    v3: ['reads full_name', 'writes name and full_name'],
+    v4: ['reads full_name', 'writes full_name'],
+  };
+  // A step: label, SQL or action, columns [name, state], servers (4 versions), can it be undone, note.
+  const PLAN = {
+    rename: [
+      { label: 'start', sql: '-- users(user_id, name): four servers on the original code', cols: [['name', 'in use']], inst: ['v1', 'v1', 'v1', 'v1'], undo: true, note: 'Everything works. The column is to be renamed.' },
+      { label: 'rename', sql: 'ALTER TABLE users RENAME COLUMN name TO full_name;', cols: [['full_name', 'renamed from name']], inst: ['v1', 'v1', 'v1', 'v1'], undo: true, note: '<b>Every request fails.</b> The rename took a millisecond. All four servers are still running code that selects <code>name</code>, and the database answers <code>ERROR: column "name" does not exist</code>. The site is down until new code is deployed.' },
+      { label: 'deploy, halfway', sql: '-- rolling deploy of code that uses full_name: two servers replaced', cols: [['full_name', 'in use']], inst: ['v4', 'v4', 'v1', 'v1'], undo: false, note: '<b>Half the requests fail.</b> The two new servers work. The two old ones are still failing, and will until they are replaced. Rolling the deploy back would make things worse again.' },
+      { label: 'deploy done', sql: '-- all four servers on the new code', cols: [['full_name', 'in use']], inst: ['v4', 'v4', 'v4', 'v4'], undo: false, note: '<b>Working again, after an outage as long as the deploy.</b> And the new code can\'t be rolled back without renaming the column back first, which would break it in turn.' },
+    ],
+    ec: [
+      { label: 'start', sql: '-- users(user_id, name): four servers on the original code', cols: [['name', 'in use']], inst: ['v1', 'v1', 'v1', 'v1'], undo: true, note: 'Everything works. The column is to be renamed.' },
+      { label: '1 expand', sql: "SET lock_timeout = '3s';\nALTER TABLE users ADD COLUMN full_name text;", cols: [['name', 'in use'], ['full_name', 'empty, unused']], inst: ['v1', 'v1', 'v1', 'v1'], undo: true, note: '<b>Expand.</b> A new, nullable column: a catalogue-only change. The old code doesn\'t know it exists and is unaffected.' },
+      { label: '2 write both', sql: '-- deploy code that writes both columns and still reads name', cols: [['name', 'in use'], ['full_name', 'filled for new writes']], inst: ['v2', 'v2', 'v2', 'v2'], undo: true, note: '<b>Write both.</b> From here every new or changed row has both columns. During this deploy old and new servers ran together, and both worked, since <code>name</code> is still correct.' },
+      { label: '3 backfill', sql: '-- in batches of 5,000:\nUPDATE users SET full_name = name WHERE full_name IS NULL AND user_id BETWEEN …;', cols: [['name', 'in use'], ['full_name', 'filled for every row']], inst: ['v2', 'v2', 'v2', 'v2'], undo: true, note: '<b>Backfill.</b> The rows that existed before step 2 are copied across, a few thousand at a time. Now the two columns agree everywhere, and a check can prove it.' },
+      { label: '4 read new', sql: '-- deploy code that reads full_name, and still writes both', cols: [['name', 'kept up to date'], ['full_name', 'in use']], inst: ['v3', 'v3', 'v3', 'v3'], undo: true, note: '<b>Switch reads.</b> If anything is wrong with the new column, this deploy is rolled back and reads return to <code>name</code>, which has been kept correct all along.' },
+      { label: '5 write new only', sql: '-- deploy code that no longer writes name', cols: [['name', 'no longer written'], ['full_name', 'in use']], inst: ['v4', 'v4', 'v4', 'v4'], undo: true, note: '<b>Stop writing the old column.</b> It is now going stale, and nothing reads it. This is the last point at which the old column still exists to go back to.' },
+      { label: '6 contract', sql: "SET lock_timeout = '3s';\nALTER TABLE users DROP COLUMN name;", cols: [['full_name', 'in use']], inst: ['v4', 'v4', 'v4', 'v4'], undo: false, note: '<b>Contract.</b> No running code mentions <code>name</code>, so dropping it breaks nothing. This is the only step that can\'t be undone, and it comes last, usually days after the others.' },
+    ],
+  };
+  // Does a version work with the columns present?
+  const works = (v, cols) => { const have = cols.map((c) => c[0]); return CODE[v].join(' ').match(/name|full_name/g).every((n) => have.includes(n)) && !(/\bname\b/.test(CODE[v].join(' ').replace(/full_name/g, '')) && !have.includes('name')); };
+  let st;
+  const M = () => $('#mgM').dataset.value;
+  function reset() { st = { i: 0, errs: 0 }; draw(); }
+  function draw() {
+    const P = PLAN[M()], s = P[st.i];
+    const fail = s.inst.filter((v) => !works(v, s.cols)).length, pct = fail * 25;
+    $('#mgSteps').innerHTML = P.map((x, k) => `<i class="${k === st.i ? 'mg-cur' : k < st.i ? 'mg-done' : ''}${x.inst.some((v) => !works(v, x.cols)) && k <= st.i ? ' mg-err' : ''}">${x.label}</i>`).join('');
+    $('#mgSql').textContent = s.sql;
+    $('#mgSchema').innerHTML = '<li><code>user_id</code><small>primary key</small></li>' + s.cols.map((c) => `<li><code>${c[0]}</code><small>${c[1]}</small></li>`).join('');
+    $('#mgInst').innerHTML = s.inst.map((v) => `<i class="${works(v, s.cols) ? '' : 'mg-bad'}">${v === 'v1' ? 'old' : v === 'v4' ? 'new' : v}</i>`).join('');
+    const vs = [...new Set(s.inst)];
+    $('#mgCode').innerHTML = vs.map((v) => `<li><b>${v === 'v1' ? 'old' : v === 'v4' ? 'new' : v}</b>: ${CODE[v].join(', ')}</li>`).join('');
+    $('#mgNow').innerHTML = `<li>Requests failing: <b>${pct}%</b></li><li>This step can be undone: <b>${s.undo ? 'yes' : 'no'}</b></li><li>Step ${st.i} of ${P.length - 1}</li>`;
+    const m = $('#mgMsg'); m.className = 'mg-msg ' + (fail ? 'mg-bad' : ''); m.innerHTML = s.note;
+    $('#mgNext').disabled = st.i >= P.length - 1; $('#mgBack').disabled = st.i === 0;
+    const worst = Math.max(...P.slice(0, st.i + 1).map((x) => x.inst.filter((v) => !works(v, x.cols)).length * 25));
+    $('#mgStats').innerHTML = `<div class="stat ${fail ? 'bad' : 'good'}"><div class="k">Requests failing now</div><div class="v">${pct}%</div></div>
+      <div class="stat ${worst ? 'bad' : 'good'}"><div class="k">Worst so far</div><div class="v">${worst}%</div></div>
+      <div class="stat ${s.undo ? 'good' : 'warn'}"><div class="k">Last step reversible</div><div class="v">${s.undo ? 'yes' : 'no'}</div></div>
+      <div class="stat acc"><div class="k">Steps taken</div><div class="v">${st.i} <small>of ${P.length - 1}</small></div></div>`;
+  }
+  $('#mgNext').onclick = () => { if (st.i < PLAN[M()].length - 1) st.i++; draw(); };
+  $('#mgBack').onclick = () => { const s = PLAN[M()][st.i]; if (st.i > 0 && s.undo) st.i--; else if (st.i > 0) { $('#mgMsg').className = 'mg-msg mg-bad'; $('#mgMsg').innerHTML = M() === 'ec' ? '<b>This step can\'t be undone.</b> The column and its data are gone. That is why it was left until nothing depended on it.' : '<b>Going back doesn\'t help.</b> The servers now on the new code need <code>full_name</code>. Renaming the column back would break them, and rolling the code back would break against the renamed column. Each side depends on the other having already changed.'; return; } draw(); };
+  $('#mgReset').onclick = reset;
+  $('#mgM').addEventListener('segchange', reset);
+  reset();
+})();
+</script>
 </body>
 </html>
