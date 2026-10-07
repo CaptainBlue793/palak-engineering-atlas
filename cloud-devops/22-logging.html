@@ -6,33 +6,356 @@
 <title>Logging at Scale</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('ops-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .lg-ctl { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px 18px; }
+  .lg-ctl .lg-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .lg-lines { font-family:var(--mono); font-size:11.5px; line-height:1.55; background:#0d1117; color:#c9d1d9; border-radius:12px; padding:9px 13px; margin-top:14px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .lg-lines .lg-e { color:#ff7b72; } .lg-lines .lg-d { color:#8b949e; } .lg-lines .lg-p { color:#ffa657; } .lg-lines .lg-h { color:#7ee787; }
+  .lg-checks { list-style:none; margin:12px 0 0; padding:0; font-size:13.5px; }
+  .lg-checks li { display:flex; gap:9px; padding:6px 0; border-top:1px solid var(--border); }
+  .lg-checks li:first-child { border-top:0; }
+  .lg-checks li i { flex:none; width:20px; height:20px; border-radius:50%; background:var(--green); color:#fff; font-style:normal; font-size:12px; font-weight:800; display:inline-flex; align-items:center; justify-content:center; margin-top:1px; }
+  .lg-checks li.lg-x i { background:var(--red); } .lg-checks li.lg-w i { background:var(--amber); }
+  .lg-checks code { font-size:12px; }
+</style>
 </head>
 <body data-chapter="22">
-<!-- ops:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 22</span><span class="pill">Intermediate</span><span class="pill">⏱ 40 min</span></div>
     <h1>Logging at <span class="grad">Scale</span></h1>
-    <p class="lead">Structured logs, shipping and indexing, retention, and logs vs metrics.</p>
+    <p class="lead">A metric tells you that 5% of payments are failing. A log line tells you that this payment, for this request, failed because the upstream rejected an expired token. Logs are the detailed record, and they are also the most expensive kind of telemetry: one busy service writes more bytes of log than it serves of real data, and at scale the logging bill rivals the compute bill. Operating logs is therefore a set of trade-offs between what you can afford to keep and what you will wish you had kept. This chapter covers structured logging, the pipeline that carries logs off the nodes, the two ways of storing them for search, and how retention and filtering control the cost. The simulator runs an hour of logs through a pipeline you configure and checks which questions you can still answer.</p>
+    <ul class="objectives">
+      <li><span>Write log lines as structured events with consistent fields and a correlation ID</span></li>
+      <li><span>Describe the path of a log line from a container to a search box</span></li>
+      <li><span>Say what a collector can do to logs in flight: parse, enrich, filter, sample, redact</span></li>
+      <li><span>Compare full-text indexing with label indexing over object storage</span></li>
+      <li><span>Set retention and filtering to control cost, and know what each choice loses</span></li>
+      <li><span>Decide whether a question belongs to logs or to metrics</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Bash · Docker · K8s · Terraform listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Metrics, labels and cardinality:</b> <a href="21-metrics-prometheus.html">Chapter 21</a>. Logs are where the high-cardinality detail goes.</li>
+        <li><b><code>jq</code> and JSON:</b> <a href="p4-yaml-json.html">Prerequisite 4</a>. <b>Storage classes and lifecycle rules:</b> <a href="04-storage.html">Chapter 4</a>.</li>
+        <li><b>Containers write to stdout,</b> and <code>kubectl logs</code> reads it back: <a href="07-containers-docker.html">Chapters 7</a> and <a href="11-kubernetes-architecture.html">11</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Structured logging</li>
-    <li>Collectors and pipelines</li>
-    <li>Indexing and search</li>
-    <li>Retention and cost</li>
-  </ol>
+  <h2>Structured logging</h2>
+  <p>A traditional log line is a sentence written for a person. That works while one person reads one file. It fails when a machine has to answer "show me every failed payment over 100 euros in the last hour" across four hundred pods, because the machine would first have to parse the sentence, and every service phrases its sentences differently.</p>
+<pre class="code"><span class="c"># Unstructured: three services, three formats</span>
+203.0.113.7 - - [07/Oct/2026:10:42:07 +0000] "POST /api/pay HTTP/1.1" 502 153
+ts=10:42:07 level=info service=checkout msg="request completed" status=200 duration_ms=41
+[ERROR] 10:42:07 payments: upstream returned 502 for order 812 (trace a3f91c)
+
+<span class="c"># Structured: one JSON object per line, the same field names everywhere</span>
+{"ts":"2026-10-07T10:42:07.318Z","level":"error","service":"payments","version":"4.18.2",
+ "trace_id":"a3f91c","route":"/api/pay","status":502,"duration_ms":1840,
+ "msg":"upstream returned 502","upstream":"acquirer","order_id":812}</pre>
+  <p>A <b>structured log</b> is an event with named fields. The practices that make it useful:</p>
+  <ul>
+    <li><b>One event per line, as JSON, written to stdout.</b> The application does not open files, rotate them or ship them. The platform collects stdout.</li>
+    <li><b>The same core fields in every service:</b> timestamp in UTC, level, service, version, and a message that is a constant string. Put the variable parts in fields, not in the message: <code>"msg":"upstream returned 502"</code> with <code>"order_id":812</code>, not <code>"order 812 failed"</code>.</li>
+    <li><b>A correlation ID on every line.</b> The first service to see a request creates a <code>trace_id</code> and every service downstream logs the same one. Searching for that ID then returns the whole story of one request, in order, across services (and <a href="23-tracing-opentelemetry.html">Chapter 23</a> uses the same ID for traces).</li>
+    <li><b>Levels that mean something:</b> ERROR for a failed operation someone may need to act on, WARN for something odd that was handled, INFO for normal business events, DEBUG for the detail a developer needs.</li>
+    <li><b>Never log secrets or personal data:</b> passwords, tokens, card numbers, full request bodies. Logs are copied to more systems, and read by more people, than any database.</li>
+  </ul>
+<pre class="code">$ <span class="f">kubectl</span> logs deploy/payments -n shop --since=1h | <span class="f">jq</span> -c <span class="s">'select(.status &gt;= 500) | {ts, trace_id, msg, upstream}'</span>
+{"ts":"2026-10-07T10:42:07.318Z","trace_id":"a3f91c","msg":"upstream returned 502","upstream":"acquirer"}
+
+$ <span class="f">kubectl</span> logs deploy/payments -n shop --since=1h | <span class="f">jq</span> -r <span class="s">'select(.level == "error") | .msg'</span> | <span class="f">sort</span> | <span class="f">uniq</span> -c | <span class="f">sort</span> -rn
+     38 upstream returned 502
+      3 card declined by issuer</pre>
+  <p>The second command works only because the message is a constant. With the order number in the message there would be 41 different lines, each seen once.</p>
+
+  <h2>Collectors and pipelines</h2>
+  <p><code>kubectl logs</code> reads a file on one node, for one pod, and that file is deleted when the pod is. To search across everything and keep history, logs have to leave the node. The path has four stages.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Emit</b> the container writes JSON lines to stdout; the runtime writes them to a file on the node</li>
+      <li data-k="step"><b>Collect</b> an agent on every node tails those files and attaches the pod's name, namespace and labels</li>
+      <li data-k="step"><b>Process</b> parse, drop what is not worth keeping, sample, redact, and batch</li>
+      <li data-k="store"><b>Store</b> a backend indexes the logs for search and keeps them for the retention period</li>
+      <li data-k="end"><b>Query</b> a person searches from a dashboard, or an alert rule counts matching lines</li>
+    </ol>
+    <figcaption><b>A logging pipeline.</b> The middle stage is where cost is decided: every line dropped there is never transported, indexed or stored.</figcaption>
+  </figure>
+  <p>The <b>collector</b> usually runs as a DaemonSet, one pod per node: Fluent Bit, Vector, Grafana Alloy and the OpenTelemetry Collector are the common ones. It must not lose logs when the backend is slow, so it buffers to disk and retries, which also means the backend can receive the same line twice. A collector's configuration is a small pipeline of its own.</p>
+<pre class="code"><span class="c"># OpenTelemetry Collector, running on every node</span>
+<span class="k">receivers</span>:
+  <span class="k">filelog</span>:
+    <span class="k">include</span>: [/var/log/pods/*/*/*.log]
+    <span class="k">operators</span>:
+      - { <span class="k">type</span>: container }                      <span class="c"># unwrap the container runtime's line format</span>
+      - { <span class="k">type</span>: json_parser, <span class="k">if</span>: <span class="s">'body matches "^{"'</span> }   <span class="c"># structured lines become fields</span>
+<span class="k">processors</span>:
+  <span class="k">k8sattributes</span>: {}                              <span class="c"># add namespace, pod, deployment, node</span>
+  <span class="k">filter/drop-debug</span>:
+    <span class="k">logs</span>:
+      <span class="k">log_record</span>: [<span class="s">'severity_number &lt; SEVERITY_NUMBER_INFO'</span>]    <span class="c"># drop DEBUG before it costs anything</span>
+  <span class="k">transform/redact</span>:
+    <span class="k">log_statements</span>:
+      - <span class="k">context</span>: log
+        <span class="k">statements</span>:
+          - replace_pattern(body, <span class="s">"[0-9]{4} ?[0-9]{4} ?[0-9]{4} ?[0-9]{4}"</span>, <span class="s">"[REDACTED-CARD]"</span>)
+  <span class="k">batch</span>: {}
+<span class="k">exporters</span>:
+  <span class="k">otlphttp</span>: { <span class="k">endpoint</span>: http://logs-gateway.observability:4318 }
+<span class="k">service</span>:
+  <span class="k">pipelines</span>:
+    <span class="k">logs</span>:
+      <span class="k">receivers</span>: [filelog]
+      <span class="k">processors</span>: [k8sattributes, filter/drop-debug, transform/redact, batch]
+      <span class="k">exporters</span>: [otlphttp]</pre>
+
+  <figure class="seq" data-actors="Container|Node agent|Log store|Engineer">
+    <ol>
+      <li data-m="0>0">write one JSON line to stdout</li>
+      <li data-m="0>1" data-k="async">the line appears in a file under /var/log/pods</li>
+      <li data-m="1>1">parse it; add pod and namespace; drop, sample or redact by rule</li>
+      <li data-m="1>2">send a compressed batch<small>buffered on disk and retried if the store is slow</small></li>
+      <li data-m="2>2">index and store</li>
+      <li data-m="3>2">search: trace_id = a3f91c</li>
+      <li data-m="2>3" data-k="reply">four lines from three services, in time order</li>
+    </ol>
+    <figcaption><b>One line's journey.</b> Typically a few seconds from write to searchable. If the node dies first, whatever the agent had not yet shipped is lost, which is one reason not to treat logs as a transaction record.</figcaption>
+  </figure>
+
+  <h2>Indexing and search</h2>
+  <p>Where the logs land decides what searches are fast and what the storage costs. There are two main designs.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Full-text index</th><th>Label index over object storage</th></tr></thead>
+      <tbody>
+        <tr><td><b>Examples</b></td><td>Elasticsearch, OpenSearch, Splunk</td><td>Grafana Loki and similar</td></tr>
+        <tr><td><b>What is indexed</b></td><td>Every word of every line</td><td>Only a few labels per stream (service, namespace, level). The lines themselves are compressed chunks in object storage</td></tr>
+        <tr><td><b>"Find this request ID anywhere in the last week"</b></td><td>Fast: look it up in the index</td><td>Slow: every chunk in the time range has to be read and scanned</td></tr>
+        <tr><td><b>"Errors from payments in the last hour"</b></td><td>Fast</td><td>Fast: the labels select a small set of chunks</td></tr>
+        <tr><td><b>Storage used</b></td><td>More than the raw logs: data plus index, on fast disks</td><td>A fraction of the raw logs: compressed, on object storage</td></tr>
+        <tr><td><b>Cost per gigabyte ingested</b></td><td>High</td><td>Low</td></tr>
+        <tr><td><b>Operating it</b></td><td>A cluster to size, shard and upgrade</td><td>Mostly stateless services in front of a bucket</td></tr>
+        <tr><td><b>Fits</b></td><td>Security investigations, unpredictable searches</td><td>Application debugging, where you usually know the service and the time</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c"># Full-text store (Lucene-style query): any field, any word</span>
+service:payments AND status:[500 TO 599] AND upstream:acquirer
+
+<span class="c"># Label store (LogQL): choose streams by label, then filter and parse the lines</span>
+{namespace=<span class="s">"shop"</span>, service=<span class="s">"payments"</span>} | json | status &gt;= <span class="m">500</span> | upstream = <span class="s">"acquirer"</span>
+
+<span class="c"># Counting lines over time turns logs into a metric, in either system</span>
+<span class="f">sum by</span> (service) (<span class="f">count_over_time</span>({namespace=<span class="s">"shop"</span>} | json | level = <span class="s">"error"</span> [<span class="m">5m</span>]))</pre>
+  <p>The last query is legitimate for rare events, and a poor way to measure anything frequent. If you need "requests per second" or "error ratio", emit a metric: it costs a few bytes every fifteen seconds instead of a line per request, and it does not change when you start sampling the logs.</p>
+
+  <h2>Retention and cost</h2>
+  <p>Log volume is close to linear in traffic, and the bill has three parts: getting the bytes in (network, parsing, indexing), keeping them (storage × days), and querying them. The levers, from most effective to least:</p>
+  <ul>
+    <li><b>Do not emit it.</b> DEBUG off in production by default, with a way to turn it on for one service or one request when you need it.</li>
+    <li><b>Drop or sample in the collector.</b> Health-check requests, successful requests on very busy endpoints. Keep every error and warning.</li>
+    <li><b>Keep less for less time.</b> Thirty days searchable is plenty for debugging; a year belongs in archive storage. Use different retention for different streams: audit logs long and immutable, DEBUG a few days.</li>
+    <li><b>Tier the storage.</b> Recent logs on fast storage, older ones moved to cheaper classes by lifecycle rules (<a href="04-storage.html">Chapter 4</a>).</li>
+    <li><b>Give each team a budget</b> and show them their volume. The noisiest service is usually unaware that it is.</li>
+  </ul>
+  <p>Every one of these loses something, and the simulator shows what.</p>
+
+  <h2>Simulator: an hour of logs through your pipeline</h2>
+  <p>Three services write 500 GB of logs a day. The hour shown contains one failed payment (trace <code>a3f91c</code>) whose cause is recorded in a DEBUG line, and a bug in <code>checkout</code> that writes customers' email addresses and card numbers into some INFO lines. Configure the pipeline, then read the bill and the four questions underneath.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">What you keep, what it costs, what you can still answer</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="lg-ctl">
+        <div><div class="lg-l">Format</div><div class="seg" id="lgFmt"><button class="active" data-v="raw">Each service's own text</button><button data-v="json">Structured JSON</button></div></div>
+        <div><div class="lg-l">DEBUG lines</div><div class="seg" id="lgDbg"><button class="active" data-v="keep">Keep</button><button data-v="drop">Drop in the collector</button></div></div>
+        <div><div class="lg-l">INFO lines</div><div class="seg" id="lgSmp"><button class="active" data-v="all">Keep all</button><button data-v="tenth">Keep 1 in 10</button></div></div>
+        <div><div class="lg-l">Personal data</div><div class="seg" id="lgPii"><button class="active" data-v="no">No redaction</button><button data-v="yes">Redact in the collector</button></div></div>
+        <div><div class="lg-l">Store</div><div class="seg" id="lgStore"><button class="active" data-v="full">Full-text index</button><button data-v="label">Labels + object storage</button></div></div>
+        <div><div class="lg-l">Retention</div><div class="seg" id="lgRet"><button data-v="7">7 days</button><button class="active" data-v="30">30 days</button><button data-v="90">90 days</button></div></div>
+      </div>
+      <div class="stats" id="lgStats"></div>
+      <div class="lg-lines" id="lgLines"></div>
+      <ol class="lg-checks" id="lgChecks"></ol>
+    </div>
+    <div class="panel-foot">The hour is 1,200 generated events, 60% DEBUG, 34% INFO, 4% WARN and 2% ERROR, with sizes of 420, 260, 300 and 900 bytes; the proportions are scaled to 500 GB a day. Each answer below is computed by running the question against the events that survive your pipeline. Prices are illustrative: a full-text store at $0.50 per GB ingested and $0.10 per GB-month stored, with 30% index overhead; a label store at $0.05 per GB ingested and $0.023 per GB-month on object storage after compression to 15%.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>The starting point</b> keeps everything, as each service's own text, in a full-text store for 30 days: $9,450 a month. Two of the four questions fail. Fourteen lines an hour hold a card number, and the search for 5xx responses finds 8 of 22, because only one of the three formats writes <code>status=</code>.</li>
+    <li><b>Switch to structured JSON.</b> The bill does not move, and the 5xx question now returns all 22 from one condition on one field. Structure costs nothing to store and decides what you can ask.</li>
+    <li><b>Drop DEBUG.</b> Volume falls to 31% and the bill to $2,971: DEBUG was 60% of the lines and most of the bytes. Now read the first answer. The error is still there and its explanation is gone. That is the real price of the cheapest saving, and the reason to be able to switch DEBUG back on for one service when you need it.</li>
+    <li><b>Keep 1 in 10 INFO lines as well.</b> 10% of the volume, $947. The count of checkout requests now says 17 where the truth is 126. Anything you were measuring by counting log lines has just become wrong.</li>
+    <li><b>Redact.</b> The lines with personal data go to zero, and the sample line at the bottom of the box shows what was stored instead. The saving here is not money.</li>
+    <li><b>Change the store</b> to labels over object storage. The same trimmed pipeline costs $80 a month instead of $947. Then put everything back, DEBUG and all INFO, on that store for 90 days: $905, with all four questions answered. That is a tenth of the starting bill for three times the retention. What you gave up is in the comparison table above: a search for one ID across everything is slow.</li>
+  </ul>
+
+  <div class="callout usecase">
+    <div class="ico">🔐</div>
+    <div class="body"><div class="title">Use case: Twitter, May 2018, and passwords in a log</div><p>On 3 May 2018 Twitter asked all of its users, about 330 million accounts, to consider changing their passwords. Nothing had been breached. The company stored passwords correctly, as hashes that cannot be reversed. But a bug had been writing passwords to an internal log <i>before</i> the hashing step, so that the plain text sat in a log file. Twitter found it during an internal review, removed the data, fixed the bug, and said it had no sign that anyone had misused the log, and then told everyone anyway, because it could not prove that nobody had read it. GitHub disclosed a very similar bug the same week, and Facebook reported one the following year that had left hundreds of millions of passwords readable in internal logs. The pattern is the same each time: a developer logs a request or an object "for debugging", and one of its fields is a secret. Logs are less protected than the database, copied to more systems, kept by retention rules written for convenience, and readable by many more people. That is why the defences in this chapter come in layers: log named fields instead of whole objects, keep secrets out of loggable types in code, redact known patterns in the collector, and restrict who can search production logs. Any one of them fails sometimes.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Free-text messages with the data inside them.</b> Unsearchable, uncountable and different in every service.</li>
+      <li><b>No correlation ID.</b> Finding one request's lines across five services becomes guesswork by timestamp.</li>
+      <li><b>Logging whole requests, responses or objects.</b> That is how passwords, tokens and card numbers reach the logs.</li>
+      <li><b>DEBUG on in production, for ever.</b> Most of the bill, read by nobody.</li>
+      <li><b>Using logs to count things.</b> A metric is cheaper, faster and survives sampling.</li>
+      <li><b>One retention period for everything.</b> Audit logs need years; debug output needs days.</li>
+      <li><b>Sampling errors.</b> Sample the boring majority and keep every error and warning.</li>
+      <li><b>Applications that write log files</b> inside the container, or ship logs themselves. The disk fills, or the logs are lost with the pod.</li>
+      <li><b>A collector with no buffer and no limits.</b> When the backend slows down, either logs are lost or the agent takes the node's memory.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is structured logging, and why does it matter?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Structured logging means each log entry is an event with named fields, usually one JSON object per line, instead of a free-text sentence. Every service uses the same core fields: timestamp, level, service, a constant message and a correlation ID, with the variable data in separate fields. It matters because at scale logs are read by machines first. With fields I can filter by status or service, group by message to see which errors are most frequent, and pull every line for one request across services by its trace ID, without writing a parser for each service's wording. It also makes processing in the pipeline reliable: dropping a level, redacting a field or sampling a route are simple rules on fields.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> The logging bill has doubled in six months and finance wants it halved. What do you do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I would start by measuring where the volume comes from: bytes per service, per level and per message pattern. It is nearly always concentrated, with a few services and a few repeated lines producing most of it, typically DEBUG output left on, health checks and per-request INFO lines on busy endpoints. Then I work down the levers in order of effect. Stop emitting what nobody reads: DEBUG off by default with a way to enable it per service or per request. Drop or sample in the collector: health checks dropped, successful requests on the hottest routes sampled, every warning and error kept. Replace counting-by-logs with metrics, so that sampling does not break dashboards. Shorten and tier retention: perhaps two weeks searchable for application logs, a short period for anything verbose, and audit and security logs archived to cheap object storage for as long as compliance requires. If the store is a full-text index and most searches are "this service, this time range", move application logs to a label-indexed store on object storage and keep the full-text system for security data. Throughout I would keep correlation IDs intact so that what remains is still usable, show each team its own volume and give it a budget, and agree with the teams what questions the logs must still answer, because every one of these cuts removes some ability to investigate and that should be a decision, not a surprise during an incident.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Log events, not sentences: JSON to stdout, the same fields in every service, a constant message, a correlation ID.</li>
+      <li>An agent on each node collects, enriches, filters, samples, redacts and ships. That stage decides the cost.</li>
+      <li>Full-text indexes make any search fast and cost the most. Label indexes over object storage are cheap and need you to narrow by service and time.</li>
+      <li>Cost is ingest plus storage × retention. Drop DEBUG, sample the routine, keep every error.</li>
+      <li>Each saving removes an answer: without DEBUG you may see that something failed and not why.</li>
+      <li>Count with metrics, explain with logs.</li>
+      <li>Secrets and personal data must never be logged; redact in the pipeline as a second line of defence.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which log line is easiest to work with at scale?</p>
+      <div class="opts">
+        <button class="opt"><code>ERROR: could not charge order 812 for jo@example.com, upstream said 502!!</code></button>
+        <button class="opt"><code>{"level":"error","service":"payments","msg":"upstream returned 502","order_id":812,"trace_id":"a3f91c"}</code></button>
+        <button class="opt"><code>payment failed</code></button>
+        <button class="opt">A multi-line stack trace with no timestamp</button>
+      </div>
+      <div class="explain">Named fields, a constant message and a correlation ID, with no personal data. The first option hides its data inside a sentence and logs an email address.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A request passes through five services and fails. What lets you collect all its log lines in one search?</p>
+      <div class="opts">
+        <button class="opt">Searching each service for the same timestamp</button>
+        <button class="opt">The pod name</button>
+        <button class="opt">The log level</button>
+        <button class="opt">A correlation ID, created at the edge and logged by every service that handles the request</button>
+      </div>
+      <div class="explain">Timestamps overlap between thousands of requests. A shared ID on every line identifies one request exactly.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A team drops all DEBUG lines in the collector to cut costs. What is the main thing they give up?</p>
+      <div class="opts">
+        <button class="opt">The detail that often explains why an error happened, even though the error itself is still logged</button>
+        <button class="opt">The ability to count requests</button>
+        <button class="opt">All error messages</button>
+        <button class="opt">Correlation IDs</button>
+      </div>
+      <div class="explain">Errors are kept. What is lost is the surrounding detail, so the usual compromise is DEBUG off by default with a way to enable it selectively.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Engineers nearly always search "errors from service X in the last hour". Which store is the economical fit?</p>
+      <div class="opts">
+        <button class="opt">A full-text index of every word, on fast disks</button>
+        <button class="opt">Text files on each node</button>
+        <button class="opt">A store that indexes a few labels and keeps compressed lines in object storage</button>
+        <button class="opt">A relational database with one row per line</button>
+      </div>
+      <div class="explain">When queries are narrowed by service and time, a label index finds the right chunks quickly at a fraction of the storage cost. Full-text indexing earns its price on needle-in-a-haystack searches.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A dashboard shows "requests per minute" by counting INFO log lines. The team then starts sampling INFO lines at 10%. What happens?</p>
+      <div class="opts">
+        <button class="opt">Nothing: the store compensates</button>
+        <button class="opt">The dashboard drops to a tenth of the true value. Request counts should come from a metric</button>
+        <button class="opt">The dashboard becomes more accurate</button>
+        <button class="opt">Errors stop being logged</button>
+      </div>
+      <div class="explain">Anything computed by counting log lines changes when the pipeline changes. A counter metric is unaffected and far cheaper.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = OPS;
+  const SIZE = { DEBUG: 420, INFO: 260, WARN: 300, ERROR: 900 }, GB_DAY = 500, TRACE = 'a3f91c';
+  const EVENTS = (() => {
+    let seed = 20261007; const rnd = (n) => { seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff; return (seed >>> 11) % n; };
+    const hex = () => (rnd(0xffffff) + 0x1000000).toString(16).slice(1), out = [];
+    for (let i = 0; i < 1200; i++) {
+      const s = rnd(100), svc = s < 40 ? 'web' : s < 75 ? 'checkout' : 'payments', l = rnd(100), level = l < 60 ? 'DEBUG' : l < 94 ? 'INFO' : l < 98 ? 'WARN' : 'ERROR';
+      const e = { i, t: i * 3, svc, level, trace: hex(), status: level === 'ERROR' ? [500, 502, 503][rnd(3)] : level === 'INFO' ? 200 : 0, ms: 20 + rnd(80), pii: false };
+      e.msg = level === 'ERROR' ? `upstream returned ${e.status}` : level === 'INFO' ? 'request completed' : level === 'WARN' ? 'retrying after timeout' : 'cache lookup';
+      if (svc === 'checkout' && level === 'INFO' && rnd(100) < 12) { e.pii = true; e.msg = 'payment authorised'; e.extra = 'jo.kim@example.com card 4111 1111 1111 1111'; }
+      out.push(e);
+    }
+    const put = (i, o) => { out[i] = { ...out[i], ...o, i, t: i * 3, trace: TRACE, pii: false, extra: undefined }; };   // one failed payment, with its cause at DEBUG
+    put(840, { svc: 'web', level: 'INFO', status: 200, msg: 'request accepted' });
+    put(841, { svc: 'checkout', level: 'INFO', status: 200, msg: 'request completed' });
+    put(842, { svc: 'payments', level: 'DEBUG', status: 0, msg: 'token cache hit: token expired 9 s ago' });
+    put(843, { svc: 'payments', level: 'ERROR', status: 502, msg: 'upstream returned 502' });
+    return out;
+  })();
+  const clock = (t) => '10:' + String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(t % 60).padStart(2, '0');
+  const red = (s, on) => on ? s.replace(/[\w.]+@[\w.]+/g, '[REDACTED-EMAIL]').replace(/\d{4} \d{4} \d{4} \d{4}/g, '[REDACTED-CARD]') : s;
+  function text(e, o) {                                    // how the line is stored
+    const extra = e.extra ? ' ' + red(e.extra, o.pii) : '';
+    if (o.fmt === 'json') return JSON.stringify({ ts: clock(e.t), level: e.level.toLowerCase(), service: e.svc, ...(e.status ? { status: e.status } : {}), trace_id: e.trace, msg: e.msg + extra });
+    if (e.svc === 'web') return `${clock(e.t)} web[${e.level}] "POST /api/pay" ${e.status || '-'} ${e.ms}ms trace=${e.trace}`;
+    if (e.svc === 'checkout') return `ts=${clock(e.t)} level=${e.level.toLowerCase()} service=checkout msg="${e.msg}${extra}"${e.status ? ' status=' + e.status : ''} trace_id=${e.trace}`;
+    return `[${e.level}] ${clock(e.t)} payments: ${e.msg} (trace ${e.trace})`;
+  }
+  const opts = () => ({ fmt: $('#lgFmt').dataset.value || 'raw', dbg: ($('#lgDbg').dataset.value || 'keep') === 'drop', smp: ($('#lgSmp').dataset.value || 'all') === 'tenth', pii: ($('#lgPii').dataset.value || 'no') === 'yes', store: $('#lgStore').dataset.value || 'full', ret: +($('#lgRet').dataset.value || 30) });
+  function draw() {
+    const o = opts();
+    const kept = EVENTS.filter((e) => !(o.dbg && e.level === 'DEBUG') && !(o.smp && e.level === 'INFO' && e.trace !== TRACE && e.i % 10 !== 0));
+    const lines = kept.map((e) => ({ e, s: text(e, o) }));
+    const bytes = (a) => a.reduce((s, e) => s + SIZE[e.level], 0), frac = bytes(kept) / bytes(EVENTS), gb = GB_DAY * frac;
+    const cost = o.store === 'full' ? 0.50 * gb * 30 + 0.10 * gb * o.ret * 1.3 : 0.05 * gb * 30 + 0.023 * gb * o.ret * 0.15;
+    // the four questions, each answered from the stored lines only
+    const mine = lines.filter((l) => l.s.includes(TRACE)), sawError = mine.some((l) => /ERROR|"error"/.test(l.s)), sawCause = mine.some((l) => l.s.includes('token expired'));
+    const trueReq = EVENTS.filter((e) => e.svc === 'checkout' && e.level === 'INFO').length, seenReq = lines.filter((l) => l.e.svc === 'checkout' && l.e.level === 'INFO').length;
+    const piiLines = lines.filter((l) => /@example\.com|\d{4} \d{4} \d{4} \d{4}/.test(l.s)).length;
+    const true5 = EVENTS.filter((e) => e.status >= 500).length;
+    const found5 = o.fmt === 'json' ? lines.filter((l) => { try { return JSON.parse(l.s).status >= 500; } catch (x) { return false; } }).length : lines.filter((l) => /status=5\d\d/.test(l.s)).length;
+    $('#lgStats').innerHTML = `<div class="stat"><div class="k">Volume kept</div><div class="v">${Math.round(frac * 100)}% <small>${Math.round(gb)} GB a day</small></div></div>`
+      + `<div class="stat acc"><div class="k">Cost per month</div><div class="v">$${Math.round(cost).toLocaleString('en-GB')}</div></div>`
+      + `<div class="stat"><div class="k">Lines stored this hour</div><div class="v">${kept.length} <small>of ${EVENTS.length}</small></div></div>`
+      + `<div class="stat ${piiLines ? 'bad' : 'good'}"><div class="k">Lines holding personal data</div><div class="v">${piiLines}</div></div>`;
+    const pii = lines.find((l) => l.e.pii), show = mine.concat(pii ? [pii] : []);
+    $('#lgLines').innerHTML = '<span class="lg-h"># as stored: every line for trace a3f91c, and one line from the checkout bug</span>\n' + show.map((l) => `<span class="${l.e.level === 'ERROR' ? 'lg-e' : l.e.level === 'DEBUG' ? 'lg-d' : l.e.pii ? 'lg-p' : ''}">${l.s.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</span>`).join('\n');
+    const li = [];
+    li.push(sawCause ? ['', `<b>Why did request a3f91c fail?</b> Answered. The ERROR says the upstream returned 502, and the DEBUG line just before it says the cached token had expired 9 seconds earlier.`] : ['w', `<b>Why did request a3f91c fail?</b> Half answered. You can see <i>that</i> it failed: "upstream returned 502". The line that says <i>why</i> was DEBUG, and DEBUG was dropped before it was stored.`]);
+    li.push(seenReq === trueReq ? ['', `<b>How many checkout requests this hour?</b> Counting INFO lines gives ${seenReq}, which is right, at the price of storing a line per request.`] : ['x', `<b>How many checkout requests this hour?</b> Counting INFO lines gives ${seenReq}. The true number is ${trueReq}. Sampling made every count from logs wrong by about a factor of ten: this number should have been a metric.`]);
+    li.push(piiLines ? ['x', `<b>Is personal data in the log store?</b> Yes: ${piiLines} lines this hour contain an email address and a card number, and they will be kept for ${o.ret} days and readable by everyone with access to logs.`] : ['', '<b>Is personal data in the log store?</b> No. The collector replaced the email addresses and card numbers before the lines left the node. The bug in checkout still needs fixing: redaction only knows the patterns it was given.']);
+    li.push(found5 === true5 ? ['', `<b>Show every 5xx response.</b> <code>status &gt;= 500</code> returns all ${true5}, from all three services, because they share one field.`] : ['x', `<b>Show every 5xx response.</b> A search for <code>status=5</code> finds ${found5} of ${true5}. It only matches checkout's format: web writes the status as a bare number after the request, and payments writes it inside a sentence. Each format needs its own pattern, and the next format change breaks it.`]);
+    $('#lgChecks').innerHTML = li.map(([c, t]) => `<li class="${c ? 'lg-' + c : ''}"><i>${c === 'x' ? '×' : c === 'w' ? '!' : '✓'}</i><span>${t}</span></li>`).join('');
+    $('#lgChecks').dataset.x = JSON.stringify({ kept: kept.length, total: EVENTS.length, frac, gb, cost, sawError, sawCause, trueReq, seenReq, piiLines, true5, found5, shown: show.length, byLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].map((l) => EVENTS.filter((e) => e.level === l).length), keptByLevel: ['DEBUG', 'INFO', 'WARN', 'ERROR'].map((l) => kept.filter((e) => e.level === l).length), piiTotal: EVENTS.filter((e) => e.pii).length });
+  }
+  ['#lgFmt', '#lgDbg', '#lgSmp', '#lgPii', '#lgStore', '#lgRet'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
