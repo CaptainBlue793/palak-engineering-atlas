@@ -97,3 +97,10 @@
   and ~290 hours (the registry's live courses sum to exactly that), and `databases/` in the folder tree. Checks: content audit
   0 errors across all courses, bundle check, palette check, hub check in light, dark and at 390 px all pass. Left for later, as
   before: the `.objectives li` fix, the README table's order, and the home page's meta description. No release tag is published.
+
+## 2026-10-07 — merged
+- Pull request #5 merged into `main` (merge commit f4b18dd) with the owner's go-ahead; the course is live on the Atlas hub and on
+  GitHub Pages at 56 lessons and 41 hours.
+- Still open: no `databases-v1.0.0` release is published (the owner has not asked for one); the README table's order, the home
+  page's meta description and the `.objectives li` fix in `style.css`; the dates and figures in the real-system write-ups have
+  not been checked against sources.
