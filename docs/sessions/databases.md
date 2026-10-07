@@ -92,3 +92,8 @@
   meta description, and release `networks-v1.0.0`.
 - Next: the owner's go-ahead, then Step 4 (shared edits, checks, pull request into main, and release `databases-v1.0.0` if wanted).
   After that, the next course (Distributed Systems).
+- Release prepared (2026-10-07, with the owner's go-ahead): the shared edits above are made on this branch. `assets/atlas.js`:
+  `soon` removed and `hours` set to 41 (2,475 minutes). `README.md`: the Database Internals & SQL row, totals of 396 chapters
+  and ~290 hours (the registry's live courses sum to exactly that), and `databases/` in the folder tree. Checks: content audit
+  0 errors across all courses, bundle check, palette check, hub check in light, dark and at 390 px all pass. Left for later, as
+  before: the `.objectives li` fix, the README table's order, and the home page's meta description. No release tag is published.

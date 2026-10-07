@@ -114,7 +114,7 @@
       topics: ['SQL', 'Indexes', 'Query plans', 'Transactions & MVCC', 'Replication', '8 case studies'],
       lang: 'SQL + Python',
       chapters: 56,
-      hours: 42,
+      hours: 41,
       c1: '#a16207', c2: '#4d7c0f', d1: '#facc15', d2: '#a3e635',
       store: 'db',
       indexVar: 'DB_INDEX',
@@ -122,7 +122,6 @@
       first: 'p1-tables-and-keys.html',
       dist: 'databases-course.html',
       release: null,
-      soon: true,
     },
     {
       id: 'lld',
