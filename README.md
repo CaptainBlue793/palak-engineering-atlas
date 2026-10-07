@@ -25,8 +25,46 @@ page also suggests an order through the courses for each kind of role.
 ## Optional accounts
 
 Learners can sign in with **email + phone** and a one-time code (sent by email) to sync progress across
-devices. It runs on a small Cloudflare Worker + D1 backend in `api/` and stays switched off until that is
-deployed — see **[ACCOUNTS.md](ACCOUNTS.md)** for how it works and the setup steps.
+devices. The configured backend is a Cloudflare Worker + D1 database in `api/`, with Resend delivering
+sign-in emails — see **[ACCOUNTS.md](ACCOUNTS.md)** for how it works and the setup steps.
+
+### Website, accounts and email workflow
+
+The website is hosted on **GitHub Pages**. Its JavaScript calls the account API at
+`https://atlas-accounts-api.atlas-accounts-api.workers.dev`. Your domain **`palakdebpatra.com`**
+provides the email identity: sign-in codes are sent from **`login@palakdebpatra.com`**.
+
+```mermaid
+flowchart TD
+    Pages["GitHub Pages<br/>Static course website"]
+    Browser["Learner's browser"]
+    Local["Browser localStorage<br/>Progress on this device"]
+    Worker["Cloudflare Worker<br/>Accounts API"]
+    DB[("Cloudflare D1<br/>Codes, sessions and progress")]
+    Resend["Resend<br/>Email delivery"]
+    Inbox["Recipient email service<br/>Learner's inbox"]
+    DNS["Cloudflare DNS<br/>palakdebpatra.com<br/>SPF, DKIM and DMARC"]
+
+    Pages -->|Serves HTML, CSS and JavaScript| Browser
+    Browser <-->|Saves and reads progress| Local
+    Browser -->|1. Request code with email and phone| Worker
+    Worker <-->|Stores and reads account data| DB
+    Worker -->|2. Send six-digit code through email API| Resend
+    Resend -->|3. Email from login@palakdebpatra.com| Inbox
+    Inbox -.->|Recipient mail server checks sender records| DNS
+    Inbox -->|4. Learner reads the code| Browser
+    Browser -->|5. Verify code and sync progress| Worker
+```
+
+**DNS is the public directory for your domain.** Cloudflare manages its records; SPF identifies
+authorized email senders, DKIM lets receiving mail servers verify email signatures, and DMARC tells
+them how to handle authentication failures. The current DMARC policy, `p=none`, requests monitoring
+without requiring rejection or quarantine.
+
+The custom domain is used for sending email; the website and API use the addresses above.
+Without signing in, progress stays in the browser. After signing in, the Worker syncs it with D1
+so the learner can continue on another device. Codes expire after five minutes; the phone number
+is part of the account identity, and codes are delivered by email.
 
 ```
 palak-engineering-atlas/
