@@ -6,33 +6,290 @@
 <title>State Machine Replication</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sm-row { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-top:8px; }
+  .sm-row > span { font-size:12.5px; color:var(--muted); min-width:92px; }
+  .sm-row .btn { padding:4px 10px; }
+  .sm-h { margin:14px 0 6px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .sm-log { display:flex; flex-wrap:wrap; gap:4px; min-height:30px; align-items:center; }
+  .sm-log i { font-style:normal; font-family:var(--mono); font-size:12px; padding:2px 7px; border-radius:7px; border:1.5px solid var(--border); background:var(--surface); white-space:nowrap; }
+  .sm-log i small { color:var(--muted); font-size:10.5px; margin-right:3px; }
+  .sm-log i.sm-snap { border-color:var(--accent); background:var(--accent-soft); font-weight:700; }
+  .sm-log em { font-style:normal; font-size:12.5px; color:var(--muted); }
+  .sm-reps { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+  @media (max-width:760px) { .sm-reps { grid-template-columns:1fr; } }
+  .sm-r { border:1.5px solid var(--green); border-radius:12px; background:var(--green-soft); padding:8px 11px; min-width:0; }
+  .sm-r.sm-odd { border-color:var(--red); background:var(--red-soft); }
+  .sm-r h6 { margin:0; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .sm-r b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
+  .sm-r .sm-log i { font-size:11px; padding:1px 5px; }
+  .sm-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--green-soft); border-left:3px solid var(--green); min-height:52px; }
+  .sm-res.sm-bad { background:var(--red-soft); border-left-color:var(--red); }
+</style>
 </head>
 <body data-chapter="15">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 15</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>State Machine <span class="grad">Replication</span></h1>
-    <p class="lead">Same log, same order, same state: the idea behind every consensus-based system.</p>
+    <p class="lead">Suppose three machines each run a copy of the same program. Start them all in the same state, feed each of them the same commands in the same order, and make sure the program's behaviour depends on nothing except its state and the command in front of it. Then the three copies will pass through the same states and give the same answers, for ever, with no further effort. That observation is <b>state machine replication</b>, and it is the idea underneath every consensus-based system: etcd, ZooKeeper, Spanner, CockroachDB, Kafka's controller, every blockchain. It turns the problem of replicating an arbitrary service into the narrower problem of getting a group of machines to agree on one list. Chapters <a href="16-paxos.html">16</a> to <a href="18-raft-log-replication.html">18</a> are about reaching that agreement. This chapter is about what the list is, what can be put in it, and why its order is the only thing that matters.</p>
+    <ul class="objectives">
+      <li><span>State the principle of state machine replication and its three conditions</span></li>
+      <li><span>Find the non-determinism in a piece of code, and remove it</span></li>
+      <li><span>Describe the replicated log, and the path of a command from client to reply</span></li>
+      <li><span>Show with an example that the same commands in a different order give a different state</span></li>
+      <li><span>Explain why logs need snapshots, and what a snapshot must contain</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Primary–backup replication</b> from <a href="14-primary-backup.html">Chapter 14</a>, including its remark about deterministic operations.</li>
+        <li><b>Total order from logical timestamps</b> from <a href="07-lamport-clocks.html">Chapter 7</a>.</li>
+        <li><b>Retries and idempotency</b> from <a href="04-retries-idempotency.html">Chapter 4</a>.</li>
+        <li><b>The write-ahead log</b> of one database, in the Databases course: <a href="../databases/20-wal-recovery.html">WAL &amp; Recovery</a>. The replicated log is the same idea across machines.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Deterministic state machines</li>
-    <li>The replicated log</li>
-    <li>Why order is everything</li>
-    <li>Snapshots</li>
-  </ol>
+  <h2>Deterministic state machines</h2>
+  <p>A <b>state machine</b>, in this sense, is anything that holds some state and changes it only by processing commands one at a time: a key-value store handling <code>put</code> and <code>delete</code>, a lock table handling <code>acquire</code> and <code>release</code>, a bank ledger handling transfers. It is <b>deterministic</b> if the new state and the output depend only on the old state and the command. Run it twice from the same start on the same commands and it does the same thing.</p>
+<pre class="code"><span class="k">interface</span> <span class="t">StateMachine</span> {
+	<span class="t">Result</span> <span class="f">apply</span>(<span class="t">Command</span> command);          <span class="c">// must depend on nothing but this.state and command</span>
+}</pre>
+  <p>The principle then has three conditions: the same initial state, the same commands, in the same order. Given those, the copies never differ. The first is easy, and the third is the work of consensus. The second hides a trap, since a great deal of ordinary code isn't deterministic, in ways that never matter on one machine.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Source of non-determinism</th><th>Example</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><b>The clock</b></td><td><code>expiresAt = now() + ttl</code>, evaluated on each replica</td><td>The leader reads its clock once and puts the timestamp in the command</td></tr>
+        <tr><td><b>Random numbers</b></td><td>Generating an ID or picking a random server during <code>apply</code></td><td>Generate before logging, and log the value</td></tr>
+        <tr><td><b>Iteration order</b></td><td>Looping over a <code>HashMap</code>, whose order can differ between processes</td><td>Use an ordered structure, or sort first</td></tr>
+        <tr><td><b>Threads</b></td><td>Applying two commands in parallel, with the interleaving left to the scheduler</td><td>Apply on one thread, or parallelise only commands proved not to interact</td></tr>
+        <tr><td><b>The outside world</b></td><td>Calling another service, or reading a local file, during <code>apply</code></td><td>Do it before logging and log the result, or after applying, as a side effect that isn't part of the state</td></tr>
+        <tr><td><b>Versions</b></td><td>Two replicas running different releases of the code that handle a command differently</td><td>Version the commands, and switch behaviour at an agreed log position</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="code"><span class="c">// Wrong: every replica computes its own expiry, and they differ by however far apart their clocks and apply times are.</span>
+<span class="k">case</span> <span class="t">SetWithTtl</span> c -&gt; store.<span class="f">put</span>(c.<span class="f">key</span>(), <span class="k">new</span> <span class="t">Entry</span>(c.<span class="f">value</span>(), <span class="t">Instant</span>.<span class="f">now</span>().<span class="f">plus</span>(c.<span class="f">ttl</span>())));
+
+<span class="c">// Right: the leader decided the expiry when it accepted the command. Every replica stores the same instant.</span>
+<span class="k">case</span> <span class="t">SetWithExpiry</span> c -&gt; store.<span class="f">put</span>(c.<span class="f">key</span>(), <span class="k">new</span> <span class="t">Entry</span>(c.<span class="f">value</span>(), c.<span class="f">expiresAt</span>()));</pre>
+
+  <h2>The replicated log</h2>
+  <p>The commands are kept in a <b>log</b>: a numbered list to which entries are only ever added at the end. Entry 1, entry 2, entry 3, and so on. Each replica has a copy of the log and a state machine, and applies the entries to the machine strictly in order of their numbers.</p>
+  <figure class="seq" data-actors="Client|Leader|Follower 1|Follower 2">
+    <ol>
+      <li data-m="0>1">command: withdraw 30</li>
+      <li data-m="1>1">append it to the log as entry 7<small>not applied yet</small></li>
+      <li data-m="1>2">entry 7</li>
+      <li data-m="1>3">entry 7</li>
+      <li data-m="2>1" data-k="reply">stored</li>
+      <li data-m="1>1">a majority has entry 7: it is committed. Apply entries up to 7<small>the leader and one follower are two of three</small></li>
+      <li data-m="1>0" data-k="reply">result of the withdrawal</li>
+      <li data-m="3>1" data-k="async">stored<small>the slower follower catches up and applies entry 7 in its turn</small></li>
+    </ol>
+    <figcaption><b>A command's path.</b> Agreed first, applied second. An entry is never applied until it is certain to stay in the log at that position.</figcaption>
+  </figure>
+  <p>The job of the consensus protocol is exactly one guarantee about this log: <b>every replica that has an entry at position <i>n</i> has the same entry there, and once an entry is committed it never changes.</b> Everything else is built on top. A replica that was down for an hour comes back, fetches the entries it missed, applies them in order and arrives at the same state as the others. A replica that is slow is behind and never different.</p>
+<pre class="code"><span class="k">void</span> <span class="f">applyCommitted</span>() {                            <span class="c">// runs on one thread, on every replica</span>
+	<span class="k">while</span> (lastApplied &lt; commitIndex) {
+		<span class="t">Entry</span> entry = log.<span class="f">get</span>(++lastApplied);
+		<span class="t">Result</span> result = machine.<span class="f">apply</span>(entry.<span class="f">command</span>());
+		waiting.<span class="f">complete</span>(entry.<span class="f">index</span>(), result);       <span class="c">// on the leader, this answers the client</span>
+	}
+}</pre>
+  <p>One practical addition belongs to the state machine itself. A client that gets no reply will send its command again (<a href="04-retries-idempotency.html">Chapter 4</a>), and the first attempt may already be in the log. So each command carries a client ID and a sequence number, and the state machine keeps, as part of its state, the last sequence number it applied for each client together with the result. A repeat is recognised when it is applied and answered from that table without being executed again. Since the table is part of the replicated state, every replica makes the same decision.</p>
+
+  <h2>Why order is everything</h2>
+  <p>If commands commuted, so that applying them in any order gave the same result, replication would be easy, and <a href="25-crdts.html">Chapter 25</a> shows how far that idea can be pushed. Most commands don't. "Add 50" and "double it" give different balances depending on which comes first. "Withdraw 120" succeeds after a deposit and fails before one. Two <code>put</code> operations on the same key leave whichever came second. So the replicas must agree on the order, and agreement on the set of commands isn't enough.</p>
+
+  <h2>Try it: three replicas of one account</h2>
+  <p>An account that starts at 100, held on three replicas. Add commands to the log and watch each replica apply them. Then break each of the two conditions in turn.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Same commands, same order, same state</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="sm-row"><span>Add a command</span><button class="btn sm" data-c="D">deposit 50</button><button class="btn sm" data-c="W">withdraw 30</button><button class="btn sm" data-c="X">double it</button><button class="btn sm" data-c="F">take a 10% fee</button><button class="btn sm" data-c="B">add a bonus</button></div>
+      <div class="sm-row"><span>Replicas apply</span><div class="seg" id="smO"><button class="active" data-v="log">the one agreed log</button><button data-v="arrival">whatever order reached them</button></div></div>
+      <div class="sm-row"><span>The bonus is</span><div class="seg" id="smB"><button class="active" data-v="leader">chosen by the leader and logged</button><button data-v="local">computed by each replica</button></div></div>
+      <div class="controls">
+        <button class="btn sm" id="smSnap">Take a snapshot</button>
+        <button class="btn sm ghost" id="smReset">↺ Reset</button>
+      </div>
+      <div class="sm-h">The log</div>
+      <div class="sm-log" id="smLog"></div>
+      <div class="sm-h">The replicas, and the order in which each applied the commands</div>
+      <div class="sm-reps" id="smReps"></div>
+      <div class="sm-res" id="smRes"></div>
+      <div class="stats" id="smStats"></div>
+    </div>
+    <div class="panel-foot">The bonus stands for any command that isn't deterministic: when each replica computes it, the first adds 1, the second 2 and the third 3, as if each had read its own clock. In "whatever order reached them", the second replica receives each pair of commands swapped and the third receives the first command last, as an unordered network might deliver them. The fee is a tenth of the balance, rounded down. The log holds 12 commands.</div>
+  </div>
+
+  <p>Things to notice. Add a deposit, a doubling and a fee, with both conditions satisfied: the three balances agree after every command. Switch to "whatever order reached them". The same three commands are on every replica, nothing was lost or duplicated, and the balances are three different numbers, since doubling 150 isn't the same as adding 50 to 200. Switch back, add a bonus, and set it to be computed by each replica: now the logs are identical, entry for entry and in order, and the balances still drift apart, by a little more with every bonus. The first failure is what consensus prevents, and the second is what the programmer has to prevent. Then take a snapshot, and look at the log: everything up to that point is replaced by one entry holding the balance, and a new replica joining would load it and replay only what came after.</p>
+
+  <h2>Snapshots</h2>
+  <p>A log that is only ever added to grows without limit, and a replica that restarts, or a new one that joins, would have to replay it from the first entry. After a year that could mean billions of commands to rebuild a state of a few megabytes.</p>
+  <p>The remedy is to save the state itself now and then. A <b>snapshot</b> is a copy of the state machine's whole state as it stood immediately after applying some entry <i>n</i>. Once it is safely stored, entries 1 to <i>n</i> are no longer needed and can be deleted. A replica that restarts loads the snapshot and replays the entries after <i>n</i>. A replica that has fallen so far behind that the leader has already discarded the entries it needs is sent the snapshot.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>A snapshot must</th><th>Because</th></tr></thead>
+      <tbody>
+        <tr><td><b>Record the index of the last entry it includes</b></td><td>Replay has to start at exactly the next one. One entry applied twice or skipped, and the replica has diverged</td></tr>
+        <tr><td><b>Include everything <code>apply</code> reads</b>, the table of client sequence numbers among it</td><td>Otherwise a replica restored from it would execute a retried command a second time</td></tr>
+        <tr><td><b>Be taken at one point in the log</b>, though the machine goes on applying meanwhile</td><td>A copy that mixes the state before and after entry <i>n</i> + 1 corresponds to no log position at all</td></tr>
+        <tr><td><b>Be written completely before any log is discarded</b></td><td>A crash halfway through must leave either the old snapshot and the full log, or the new snapshot</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The third row is the hard one in practice. Stopping the state machine while gigabytes are written out would stall the service, so implementations take a consistent view some other way: by forking the process, so that the operating system's copy-on-write keeps the child's memory frozen while the parent carries on, which is how Redis saves to disk (the <a href="../os/index.html">OS course</a> covers the mechanism), or by keeping the state in a structure that supports cheap point-in-time views, such as an LSM tree or a copy-on-write B-tree.</p>
+  <p>Snapshots also show that there are two things one can replicate. <b>State machine replication</b> ships the commands, and every replica executes them. <a href="14-primary-backup.html">Chapter 14</a>'s alternative ships the <i>resulting state</i>: the primary executes, and sends the backup the new values. Shipping commands is compact and needs determinism. Shipping state tolerates any non-determinism, since only one machine computes, and can be much larger. Many systems mix the two: the log carries commands whose non-deterministic parts have already been resolved by the leader, which is shipping a little state inside each command.</p>
+
+  <div class="callout usecase">
+    <div class="ico">📄</div>
+    <div class="body"><div class="title">Use case: "Paxos Made Live", and what the principle leaves out</div><p>In 2007 three Google engineers published an account of rebuilding Chubby, the company's lock service, on a replicated state machine of their own making. The paper is called "Paxos Made Live", and its theme is the distance between the principle, which fits in a paragraph, and a system that can be trusted with production data. They reported that the consensus algorithm, the part the literature is about, was the smaller share of the work. Snapshots were among the hardest parts. The consensus layer knew about the log and nothing about the application's state, and the application knew about its state and nothing about the log, so the two had to be made to cooperate: the application takes a snapshot that corresponds to a precise log position while continuing to serve requests, tells the log which position that was, and only then may the log be truncated, with every step safe against a crash in the middle. A replica that fell too far behind had to be brought back with a snapshot and the log that followed it, fetched from different places. Determinism got the same treatment. Since nothing in the principle detects a replica that has quietly diverged, they added a check: the leader periodically computes a checksum of its state and has the replicas compare theirs. The check found real divergences, and the causes they list are instructive: an operator's mistake during an upgrade, and what looked like faulty hardware corrupting memory. Neither is in any model of the algorithm. They also describe the disk of a replica being wiped and the replica rejoining as though it had forgotten promises it had made, which the protocol's proof assumes never happens. The paper's conclusion is one the rest of this course bears out: the algorithm gives you agreement on a log, and a production replicated state machine is that plus snapshots, membership changes, corruption checks and a great deal of testing.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Reading the clock, or generating a random value, inside <code>apply</code>.</b> Each replica gets its own answer.</li>
+      <li><b>Applying an entry before it is committed.</b> If the entry is later replaced, the state machine can't be un-applied.</li>
+      <li><b>Applying committed entries on several threads</b> without proving the commands independent.</li>
+      <li><b>No de-duplication of client retries,</b> or a de-duplication table kept outside the replicated state.</li>
+      <li><b>A snapshot that leaves out part of the state,</b> or doesn't record the log position it corresponds to.</li>
+      <li><b>Never comparing replicas.</b> Divergence is silent, and a periodic checksum is the only thing that finds it.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is state machine replication?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is a way of replicating any deterministic service. You model the service as a state machine: it has state, and it changes only by applying commands one at a time. If several replicas start in the same state and apply the same sequence of commands in the same order, and the machine is deterministic, they end up in identical states and produce identical outputs. So the replication problem reduces to getting the replicas to agree on one ordered log of commands, which is what a consensus protocol such as Raft or Paxos does. A client's command goes to the leader, is appended to the log, replicated to a majority, and only once it is committed is it applied to the state machine and the result returned. A replica that falls behind just replays the log. The two things you have to take care of yourself are determinism, so nothing in apply may depend on local clocks, randomness, thread timing or iteration order, and log growth, which is handled by taking snapshots of the state and discarding the log before them.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Two replicas of your replicated key-value store are found to hold different values for a key, though their logs are identical. How could that happen, and how would you find the cause?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>If the logs are identical and the states differ, either the state machine isn't deterministic or the state was damaged outside the log. I'd go through the candidates. Non-determinism in apply: a time-to-live computed from the local clock, an ID or tie-break from a random generator, iteration over an unordered map when a command touches many keys, floating-point results that differ between CPU types or compiler versions, or commands applied on multiple threads. Version skew: the replicas ran different releases at some point, and the two releases handle some command differently, so the same entry produced different states. Snapshot problems: a snapshot that omitted part of the state, or was taken while applies were in progress so that it matches no log index, or replay that started from the wrong index after loading one, so an entry was applied twice or skipped. Duplicate handling: a retried command executed twice on a replica whose de-duplication table wasn't in its snapshot. And outside the model entirely: disk or memory corruption, or someone modifying a replica's data directly. To find it, I'd first establish when they diverged, by replaying the log from the last known-good snapshot on a test machine and comparing state checksums at intervals, a bisection over the log index. Once I have the first entry after which they differ, the command type usually points at the code path. To prevent a recurrence I'd add a periodic checksum comparison between replicas, as Chubby did, and a test that replays recorded logs through the state machine twice, in different processes and on different builds, and asserts identical results.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Same start, same deterministic commands, same order: the replicas stay identical. Replication reduces to agreeing on a log.</li>
+      <li>Determinism has to be engineered: no clocks, randomness, unordered iteration, thread races or outside calls inside <code>apply</code>.</li>
+      <li>An entry is applied only after it is committed, in index order, on every replica.</li>
+      <li>Most commands don't commute, so agreeing on the set of commands isn't enough. The order is the state.</li>
+      <li>Client retries are de-duplicated by a table that is itself part of the replicated state.</li>
+      <li>Snapshots bound the log. Each records the index it covers and everything <code>apply</code> depends on.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which three conditions make replicas of a state machine stay identical?</p>
+      <div class="opts">
+        <button class="opt">The same hardware, the same clock and the same network</button>
+        <button class="opt">The same leader, the same term and the same majority</button>
+        <button class="opt">The same initial state, the same deterministic commands, and the same order</button>
+        <button class="opt">The same commands, applied at the same wall-clock time, by the same thread</button>
+      </div>
+      <div class="explain">Nothing else is needed, and losing any one of the three lets the copies diverge.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A command sets a key to expire "in 60 seconds". How should a replicated state machine handle it?</p>
+      <div class="opts">
+        <button class="opt">The leader computes the absolute expiry time once, and that time is stored in the log entry</button>
+        <button class="opt">Each replica adds 60 seconds to its own clock when it applies the entry</button>
+        <button class="opt">Each replica starts a 60-second timer</button>
+        <button class="opt">Expiry can't be supported</button>
+      </div>
+      <div class="explain">Replicas apply the entry at different moments, on different clocks. The value has to be decided once and carried in the command.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why isn't it enough for replicas to agree on the <i>set</i> of commands?</p>
+      <div class="opts">
+        <button class="opt">Sets can't be sent over a network</button>
+        <button class="opt">Some commands might be duplicated</button>
+        <button class="opt">A set takes more memory than a log</button>
+        <button class="opt">Most commands don't commute, so the same commands in different orders give different states</button>
+      </div>
+      <div class="explain">"Add 50, then double" and "double, then add 50" start and end in different places.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is an entry applied to the state machine only after it has been committed?</p>
+      <div class="opts">
+        <button class="opt">To give followers time to catch up</button>
+        <button class="opt">An uncommitted entry may still be replaced, and the state machine has no way to undo an apply</button>
+        <button class="opt">Because applying is slow</button>
+        <button class="opt">To keep the log short</button>
+      </div>
+      <div class="explain">Commitment is the promise that the entry will stay at that index. Before it, the result could turn out to belong to a history that never happened.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A snapshot is taken after applying entry 5,000. What must it record besides the data?</p>
+      <div class="opts">
+        <button class="opt">The wall-clock time it was taken</button>
+        <button class="opt">The names of the replicas</button>
+        <button class="opt">That it covers the log up to entry 5,000, together with any other state <code>apply</code> reads, such as the client de-duplication table</button>
+        <button class="opt">Nothing else</button>
+      </div>
+      <div class="explain">Replay must resume at exactly entry 5,001, with everything in place that later commands depend on.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  const MAX = 12, START = 100;
+  const CMD = { D: { label: '+50', f: (b) => b + 50 }, W: { label: '−30', f: (b) => b - 30 }, X: { label: '×2', f: (b) => b * 2 }, F: { label: 'fee 10%', f: (b) => b - Math.floor(b / 10) }, B: { label: 'bonus', f: (b, r, local) => b + (local ? r + 1 : 2) } };
+  let st;
+  function reset() { st = { log: [], snap: null, last: null }; draw(); }
+  // The order in which replica r receives the commands still in the log.
+  function orderFor(r, n) {
+    const idx = [...Array(n).keys()];
+    if ($('#smO').dataset.value === 'log' || r === 0) return idx;
+    if (r === 1) { for (let i = 0; i + 1 < n; i += 2) [idx[i], idx[i + 1]] = [idx[i + 1], idx[i]]; return idx; }      // each pair swapped
+    return n > 1 ? idx.slice(1).concat(0) : idx;                                                                       // the first one arrives last
+  }
+  function run(r) { const local = $('#smB').dataset.value === 'local', ord = orderFor(r, st.log.length); let b = st.snap ? st.snap.bal : START; ord.forEach((i) => { b = CMD[st.log[i]].f(b, r, local); }); return { ord, b }; }
+  function draw() {
+    const res = [0, 1, 2].map(run), same = res.every((x) => x.b === res[0].b), base = st.snap ? st.snap.at : 0;
+    $('#smLog').innerHTML = (st.snap ? `<i class="sm-snap">snapshot: balance ${st.snap.bal} after entry ${st.snap.at}</i>` : '') + (st.log.map((c, i) => `<i><small>${base + i + 1}</small>${CMD[c].label}</i>`).join('') || (st.snap ? '' : '<em>empty: add a command</em>'));
+    $('#smReps').innerHTML = res.map((x, r) => `<div class="sm-r ${same ? '' : 'sm-odd'}"><h6>Replica ${r + 1}</h6><b>${x.b}</b><div class="sm-log">${x.ord.map((i) => `<i><small>${base + i + 1}</small>${CMD[st.log[i]].label}</i>`).join('') || '<em>nothing applied since the start</em>'}</div></div>`).join('');
+    const order = $('#smO').dataset.value, local = $('#smB').dataset.value === 'local', hasBonus = st.log.includes('B'), m = $('#smRes');
+    let html;
+    if (same) { m.className = 'sm-res';
+      if (!st.log.length) html = st.snap ? `<b>All three replicas hold the snapshot: ${st.snap.bal}.</b> The ${st.snap.at} entries it replaced are gone from the log. A replica joining now loads one value and replays nothing.` : '<b>Three replicas, all at 100.</b> Add commands.';
+      else if (order === 'arrival' && st.log.length > 1) html = `<b>They agree, this time.</b> The orders differ and the result happens to be the same, since ${new Set(st.log).size === 1 ? 'every command is the same' : 'these particular commands commute'}. Add a command of a different kind.`;
+      else if (local && hasBonus) html = '<b>They agree.</b> That is unexpected with a locally computed bonus: check the commands.';
+      else html = `<b>All three replicas hold ${res[0].b}.</b> Each applied the same ${st.log.length === 1 ? 'command' : st.log.length + ' commands'} in the same order${hasBonus ? ', and the bonus was a value fixed by the leader and carried in the log' : ''}. No replica consulted another to get there.`; }
+    else { m.className = 'sm-res sm-bad';
+      const why = order === 'arrival' && local && hasBonus ? 'Both conditions are broken: the replicas applied the commands in different orders, and the bonus is computed differently on each.' : order === 'arrival' ? 'Every replica has the same commands, with none lost and none repeated, in a different order. These commands don\'t commute, so the order is part of the answer.' : 'The logs are identical, entry for entry. The bonus isn\'t deterministic: each replica computed its own, as if from its own clock, and no amount of agreement on the log can repair that.';
+      html = `<b>The replicas have diverged: ${res.map((x) => x.b).join(', ')}.</b> ${why}`; }
+    m.innerHTML = html;
+    $('#smStats').innerHTML = `<div class="stat acc"><div class="k">Commands so far</div><div class="v">${base + st.log.length}</div></div>
+      <div class="stat ${same ? 'good' : 'bad'}"><div class="k">Replicas agree</div><div class="v">${same ? 'yes' : 'no'}</div></div>
+      <div class="stat"><div class="k">Entries kept in the log</div><div class="v">${st.log.length}</div></div>
+      <div class="stat ${st.snap ? 'good' : ''}"><div class="k">A new replica would replay</div><div class="v">${st.log.length} <small>of ${base + st.log.length}</small></div></div>`;
+    $$('button[data-c]').forEach((b) => { b.disabled = st.log.length >= MAX; });
+    $('#smSnap').disabled = !st.log.length || !same;
+    $('#smSnap').title = same ? '' : 'The replicas disagree, so there is no one state to save';
+  }
+  $$('button[data-c]').forEach((b) => { b.onclick = () => { if (st.log.length < MAX) st.log.push(b.dataset.c); draw(); }; });
+  $('#smSnap').onclick = () => { const r = run(0); st.snap = { bal: r.b, at: (st.snap ? st.snap.at : 0) + st.log.length }; st.log = []; draw(); };
+  $('#smReset').onclick = reset;
+  $('#smO').addEventListener('segchange', draw); $('#smB').addEventListener('segchange', draw);
+  reset();
+})();
+</script>
 </body>
 </html>
