@@ -6,34 +6,368 @@
 <title>Autoscaling: HPA, VPA &amp; Cluster Autoscaler</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('ops-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .as-ctl { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:12px 18px; }
+  .as-ctl .as-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .as-chart { margin-top:16px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:8px 8px 2px; }
+  .as-chart svg { display:block; width:100%; height:auto; }
+  .as-dem { fill:none; stroke:var(--accent); stroke-width:2; vector-effect:non-scaling-stroke; }
+  .as-cap { fill:none; stroke:var(--green); stroke-width:2.5; vector-effect:non-scaling-stroke; }
+  .as-over { fill:var(--red); opacity:.22; }
+  .as-ax { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); font-family:var(--mono); padding:2px 0 4px; }
+  .as-log { font-family:var(--mono); font-size:12px; line-height:1.6; background:#0d1117; color:#c9d1d9; border-radius:12px; padding:9px 13px; margin-top:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .as-log b { color:#7ee787; font-weight:600; }
+  .as-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="25">
-<!-- ops:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 25</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>Autoscaling: <span class="grad">HPA, VPA &amp; Cluster Autoscaler</span></h1>
-    <p class="lead">Scaling pods and nodes on real signals, and the lag that makes naive autoscaling fail.</p>
+    <p class="lead">Kubernetes can change three things about a workload without being asked: how many pods it has, how large each pod is, and how many nodes there are to put them on. Three different controllers do that, they watch different signals, and they act in sequence, so a burst of traffic sets off a chain: a metric rises, a controller notices, pods are created, they find no room, a node is ordered, the node boots, an image is pulled, the application starts. Each link takes time, and for that time the service is short of capacity. Autoscaling well is mostly the craft of shortening that chain. This chapter covers each autoscaler and then the lag, with a simulator that triples the traffic and counts the requests lost while the cluster catches up.</p>
+    <ul class="objectives">
+      <li><span>Apply the HPA formula and explain tolerance, stabilisation and why resource requests are required</span></li>
+      <li><span>Choose a scaling metric, and say why CPU reacts badly to a sudden jump</span></li>
+      <li><span>Explain what the VPA does and why it should not share a metric with the HPA</span></li>
+      <li><span>Compare the Cluster Autoscaler with Karpenter</span></li>
+      <li><span>List the links in the scaling chain and how to shorten each one</span></li>
+      <li><span>Use KEDA to scale on queue length and to scale to zero</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Bash · Docker · K8s · Terraform listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Target tracking, boot time and why saturation hides the size of an overload:</b> <a href="03-compute.html">Chapter 3</a>, which did this for virtual machines. This chapter is the Kubernetes version, with two more layers.</li>
+        <li><b>Requests, limits, readiness and what Pending means:</b> <a href="12-pods-deployments-services.html">Chapter 12</a>. <b>The scheduler:</b> <a href="11-kubernetes-architecture.html">Chapter 11</a>.</li>
+        <li><b>Metrics, and the difference between a cause and a symptom:</b> <a href="21-metrics-prometheus.html">Chapter 21</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>HPA on CPU and custom metrics</li>
-    <li>VPA</li>
-    <li>Cluster autoscaler and Karpenter</li>
-    <li>Scaling lag</li>
-    <li>KEDA</li>
-  </ol>
+  <h2>Three autoscalers</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Horizontal Pod Autoscaler</th><th>Vertical Pod Autoscaler</th><th>Node autoscaler</th></tr></thead>
+      <tbody>
+        <tr><td><b>Changes</b></td><td>The number of pods</td><td>Each pod's CPU and memory requests</td><td>The number of nodes</td></tr>
+        <tr><td><b>Watches</b></td><td>A metric per pod: CPU, requests per second, queue length</td><td>What each container has actually used over days</td><td>Pods that are Pending because no node has room</td></tr>
+        <tr><td><b>Reacts in</b></td><td>Tens of seconds</td><td>Hours to days</td><td>One to several minutes</td></tr>
+        <tr><td><b>Good for</b></td><td>Stateless services under changing load</td><td>Right-sizing; workloads that cannot be replicated</td><td>Making room for whatever the other two ask for</td></tr>
+        <tr><td><b>Needs</b></td><td>Resource requests on the pods; a metrics pipeline</td><td>A restart to apply new values, on most clusters</td><td>Cloud capacity and quota</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Everything rests on <b>resource requests</b>. The HPA expresses CPU utilisation as a percentage of the request. The scheduler places pods by their requests. The node autoscaler adds nodes when requests do not fit. A workload with no requests, or with requests that are fiction, cannot be autoscaled sensibly by any of the three.</p>
+
+  <h2>HPA on CPU and custom metrics</h2>
+  <p>The Horizontal Pod Autoscaler runs one calculation, every 15 seconds:</p>
+<pre class="code">                                   current metric value
+  desired replicas = ceil( current replicas × ────────────────────── )
+                                    target metric value
+
+  10 pods at 91% CPU, target 70%:   ceil(10 × 91 ÷ 70) = 13
+  13 pods at 70%:                   ceil(13 × 70 ÷ 70) = 13     no change
+  13 pods at 40%, later:            ceil(13 × 40 ÷ 70) = 8      scale in, after the stabilisation window</pre>
+<pre class="code"><span class="k">apiVersion</span>: autoscaling/v2
+<span class="k">kind</span>: HorizontalPodAutoscaler
+<span class="k">metadata</span>: { <span class="k">name</span>: checkout, <span class="k">namespace</span>: shop }
+<span class="k">spec</span>:
+  <span class="k">scaleTargetRef</span>: { <span class="k">apiVersion</span>: apps/v1, <span class="k">kind</span>: Deployment, <span class="k">name</span>: checkout }
+  <span class="k">minReplicas</span>: <span class="m">10</span>
+  <span class="k">maxReplicas</span>: <span class="m">60</span>
+  <span class="k">metrics</span>:
+    - <span class="k">type</span>: Resource
+      <span class="k">resource</span>: { <span class="k">name</span>: cpu, <span class="k">target</span>: { <span class="k">type</span>: Utilization, <span class="k">averageUtilization</span>: <span class="m">70</span> } }
+    - <span class="k">type</span>: Pods                                 <span class="c"># a custom metric, served by a metrics adapter</span>
+      <span class="k">pods</span>:
+        <span class="k">metric</span>: { <span class="k">name</span>: http_requests_per_second }
+        <span class="k">target</span>: { <span class="k">type</span>: AverageValue, <span class="k">averageValue</span>: <span class="s">"70"</span> }
+  <span class="k">behavior</span>:
+    <span class="k">scaleUp</span>:   { <span class="k">stabilizationWindowSeconds</span>: <span class="m">0</span> }       <span class="c"># add pods at once</span>
+    <span class="k">scaleDown</span>:
+      <span class="k">stabilizationWindowSeconds</span>: <span class="m">300</span>                <span class="c"># remove them only after five calm minutes</span>
+      <span class="k">policies</span>: [{ <span class="k">type</span>: Percent, <span class="k">value</span>: <span class="m">25</span>, <span class="k">periodSeconds</span>: <span class="m">60</span> }]</pre>
+  <p>With several metrics the HPA computes a replica count for each and takes the largest. A few details shape its behaviour. Changes within 10% of the target are ignored, so it does not flap. Scale-down waits for a <b>stabilisation window</b>, five minutes by default, and uses the highest recommendation seen in it. And it is bounded by <code>minReplicas</code> and <code>maxReplicas</code>, which you set from what the service needs to survive and what its dependencies can stand.</p>
+  <p>The choice of metric matters more than any tuning. <b>CPU</b> is free and it is the default, and it has the flaw Chapter 3 demonstrated: a saturated pod reports 100% whether it is slightly or hugely overloaded, so with a 70% target the HPA can ask for at most 100 ÷ 70, about 1.4 times, the current pods per round. <b>Requests per second per pod</b> has no ceiling: if each pod should take 70 requests a second and 2,100 are arriving, the answer is 30 pods, in one step. For workers, the right metric is the <b>length of the queue</b>. Use the signal that measures demand, not the one that measures how hard the existing pods are struggling.</p>
+
+  <h2>VPA</h2>
+  <p>The <b>Vertical Pod Autoscaler</b> watches what each container really uses and recommends requests to match, and it can apply them. Its first use is simply to tell you the truth: most requests are guesses made once, and the VPA's recommendation in <code>Off</code> mode is the cheapest right-sizing tool there is (<a href="31-finops.html">Chapter 31</a>). In its automatic modes it changes requests by replacing pods, although recent Kubernetes versions can resize a running pod in place. It suits things you cannot simply run more copies of: a database, a single-instance controller, a batch job.</p>
+<pre class="code"><span class="k">apiVersion</span>: autoscaling.k8s.io/v1
+<span class="k">kind</span>: VerticalPodAutoscaler
+<span class="k">metadata</span>: { <span class="k">name</span>: checkout, <span class="k">namespace</span>: shop }
+<span class="k">spec</span>:
+  <span class="k">targetRef</span>: { <span class="k">apiVersion</span>: apps/v1, <span class="k">kind</span>: Deployment, <span class="k">name</span>: checkout }
+  <span class="k">updatePolicy</span>: { <span class="k">updateMode</span>: <span class="s">"Off"</span> }          <span class="c"># recommend only; read it with kubectl describe vpa</span></pre>
+  <p>One rule: do not let the HPA and the VPA act on the same metric for the same workload. If the HPA scales on CPU utilisation and the VPA raises the CPU request, utilisation falls, the HPA removes pods, utilisation rises, and the two chase each other. Scale horizontally on a traffic metric and let the VPA manage memory, or use the VPA for recommendations only.</p>
+
+  <h2>Cluster Autoscaler and Karpenter</h2>
+  <p>When the HPA asks for pods that fit on no node, they sit in <code>Pending</code>. A node autoscaler turns that into machines.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Cluster Autoscaler</th><th>Karpenter</th></tr></thead>
+      <tbody>
+        <tr><td><b>Works through</b></td><td>Node groups you define in advance, each one instance type or a few similar ones</td><td>The cloud's instance API directly</td></tr>
+        <tr><td><b>Decides</b></td><td>Which existing group to grow by one or more nodes</td><td>Which instance types and sizes fit the pending pods best, then launches them</td></tr>
+        <tr><td><b>From Pending pod to ready node</b></td><td>Typically two minutes or more</td><td>Typically about a minute</td></tr>
+        <tr><td><b>Removing nodes</b></td><td>A node underused for ten minutes is drained and removed</td><td>Continuous consolidation: repacks pods onto fewer or cheaper nodes</td></tr>
+        <tr><td><b>Spot and mixed capacity</b></td><td>One group per kind</td><td>Chosen per launch, with fallback</td></tr>
+        <tr><td><b>Runs on</b></td><td>Every major cloud</td><td>AWS first, others following</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Both obey the same inputs: pod requests, node selectors, topology constraints, and <b>PodDisruptionBudgets</b>, which say how many pods of a workload may be evicted at once when nodes are drained. And both are limited by things outside the cluster: instance quotas, the availability of the type you want in that zone, and IP addresses in the subnets (<a href="05-vpc-networking.html">Chapter 5</a>).</p>
+
+  <h2>Scaling lag</h2>
+  <p>Put the pieces in order and you have the path from "traffic rose" to "new capacity is serving".</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Metric</b> the load has to show up in a scraped, averaged metric: 15 to 60 seconds</li>
+      <li data-k="step"><b>HPA</b> its next 15-second sync computes more replicas; the Deployment creates pods</li>
+      <li data-k="decision"><b>Room?</b> yes: the pod is scheduled at once. No: it is Pending</li>
+      <li data-k="step"><b>Node</b> the autoscaler orders an instance; it boots and joins: one to several minutes</li>
+      <li data-k="step"><b>Image</b> a new node has nothing cached and pulls the whole image</li>
+      <li data-k="step"><b>Start</b> the application initialises; the readiness probe passes</li>
+      <li data-k="end"><b>Serving</b> the pod is added to the Service's endpoints</li>
+    </ol>
+    <figcaption><b>The scaling chain.</b> With room on existing nodes it takes under a minute. Through a new node it takes several, and a saturated CPU metric can make the whole chain run more than once.</figcaption>
+  </figure>
+  <p>Each link has its own remedy:</p>
+  <ul>
+    <li><b>Metric and HPA:</b> scale on a demand signal, with a short scrape interval. For traffic that rises at known times, raise <code>minReplicas</code> on a schedule beforehand.</li>
+    <li><b>Room:</b> keep headroom. The standard trick is <i>placeholder pods</i>: a Deployment of do-nothing pods with a very low priority that reserve a node's worth of space. A real pod evicts them instantly and starts, and the evicted placeholders become the Pending pods that order the next node.</li>
+    <li><b>Node:</b> a faster provisioner, and instance types that are actually available.</li>
+    <li><b>Image:</b> small images (<a href="08-dockerfiles.html">Chapter 8</a>), and pre-pulled or baked onto the node image for the largest.</li>
+    <li><b>Start:</b> fast application start-up, and a readiness probe that passes as soon as it truthfully can.</li>
+    <li><b>And for what remains:</b> a lower utilisation target, so that existing pods can absorb more while help arrives.</li>
+  </ul>
+
+  <h2>Simulator: traffic triples</h2>
+  <p>A service runs 10 pods on 2 nodes, five pods to a node. Each pod can serve 100 requests a second and the HPA aims for 70. At time zero, traffic jumps from 700 to 2,100 requests a second and stays there: the service now needs 30 pods and has capacity for 1,000 requests. Choose the set-up and see how long the gap lasts.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">From overload to capacity</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="as-ctl">
+        <div><div class="as-l">HPA metric</div><div class="seg" id="asMet"><button class="active" data-v="cpu">CPU, target 70%</button><button data-v="rps">Requests per pod, target 70</button></div></div>
+        <div><div class="as-l">Spare room in the cluster</div><div class="seg" id="asRoom"><button class="active" data-v="0">None</button><button data-v="5">One node of placeholder pods</button></div></div>
+        <div><div class="as-l">New nodes come from</div><div class="seg" id="asNode"><button class="active" data-v="130">Cluster Autoscaler, 130 s</button><button data-v="60">Karpenter, 60 s</button></div></div>
+        <div><div class="as-l">Image pull on a new node</div><div class="seg" id="asImg"><button class="active" data-v="40">1.2 GB image, 40 s</button><button data-v="5">120 MB image, 5 s</button></div></div>
+        <div><div class="as-l">Application start</div><div class="seg" id="asApp"><button class="active" data-v="30">30 s</button><button data-v="3">3 s</button></div></div>
+      </div>
+      <div class="as-chart"><svg id="asSvg" viewBox="0 0 720 190" preserveAspectRatio="none" role="img" aria-label="Demand and serving capacity over time"></svg><div class="as-ax" id="asAx"></div></div>
+      <div class="legend"><span><i style="background:var(--accent)"></i> demand (requests a second)</span><span><i style="background:var(--green)"></i> capacity of ready pods</span><span><i style="background:var(--red);opacity:.4"></i> requests that cannot be served</span></div>
+      <div class="stats" id="asStats"></div>
+      <div class="as-log" id="asLog"></div>
+      <div class="as-why" id="asWhy"></div>
+    </div>
+    <div class="panel-foot">The model runs second by second. The HPA syncs every 15 seconds and sees metrics 30 seconds old. With CPU it computes from utilisation capped at 100%; with requests per pod it computes from the real request rate. A new pod on an existing node starts from a cached image; on a new node the image is pulled first. A pod is ready 5 seconds after its application has started, when the readiness probe next passes. Nodes hold five pods, are ordered as soon as pods are Pending, and arrive in parallel. Requests above the capacity of ready pods are counted as lost.</div>
+  </div>
+
+  <p><b>Things to try.</b> Change one setting at a time and read the log each time.</p>
+  <ul>
+    <li><b>The starting point:</b> CPU metric, no spare room, a slow node provisioner, a large image and a slow start. The service is short of capacity for 7 minutes 55 seconds and loses 402,500 requests. The log shows three HPA rounds, at 0:30, 4:30 and 8:30, and the first new pod does not serve until 3:55.</li>
+    <li><b>Switch the metric to requests per pod.</b> One decision, for all 30 replicas, at 0:30. Recovery falls to 3:55 and losses to 258,500, with the same nodes, image and application. The metric alone was worth half the outage.</li>
+    <li><b>Go back to CPU and add the placeholder room.</b> The first five pods serve at 1:05 instead of 3:55, because they did not wait for a node. Recovery is 5:10: better, and still three rounds.</li>
+    <li><b>Use both.</b> Recovery is 3:55 again, since the last pods still wait for nodes, but losses fall to 173,500: the headroom carried part of the load while the nodes were on their way.</li>
+    <li><b>Then shorten the node path</b> one link at a time: the faster provisioner brings recovery to 2:45, the small image to 2:10, the fast start to 1:43, with 80,800 requests lost. That is a fifth of where you began.</li>
+    <li><b>What is left.</b> In the best case the first new pod serves at 0:38, and thirty of those seconds passed before the HPA knew anything. No autoscaler removes that. The first half-minute of a spike is carried by the capacity already running, which is the argument for a utilisation target with real headroom in it.</li>
+  </ul>
+
+  <h2>KEDA</h2>
+  <p>The HPA is built around metrics of the pods themselves. Many workloads should scale on something outside: messages waiting in a queue, lag on a Kafka topic, rows in a table, the time of day. <b>KEDA</b> (Kubernetes Event-Driven Autoscaling) is the standard add-on for that. You declare a <code>ScaledObject</code> with one or more <i>scalers</i>, and KEDA creates and feeds an ordinary HPA for you. It adds one thing the HPA cannot do alone: scaling to <b>zero</b> when there is nothing to do, and back to one when the first event arrives.</p>
+<pre class="code"><span class="k">apiVersion</span>: keda.sh/v1alpha1
+<span class="k">kind</span>: ScaledObject
+<span class="k">metadata</span>: { <span class="k">name</span>: invoice-worker, <span class="k">namespace</span>: shop }
+<span class="k">spec</span>:
+  <span class="k">scaleTargetRef</span>: { <span class="k">name</span>: invoice-worker }
+  <span class="k">minReplicaCount</span>: <span class="m">0</span>                      <span class="c"># no messages, no pods</span>
+  <span class="k">maxReplicaCount</span>: <span class="m">40</span>
+  <span class="k">triggers</span>:
+    - <span class="k">type</span>: aws-sqs-queue
+      <span class="k">metadata</span>:
+        <span class="k">queueURL</span>: https://sqs.eu-west-2.amazonaws.com/111122223333/invoices
+        <span class="k">queueLength</span>: <span class="s">"20"</span>                 <span class="c"># aim for 20 waiting messages per pod</span>
+        <span class="k">awsRegion</span>: eu-west-2
+    - <span class="k">type</span>: cron                          <span class="c"># and never fewer than 5 during the month-end run</span>
+      <span class="k">metadata</span>: { <span class="k">timezone</span>: Europe/London, <span class="k">start</span>: <span class="s">"0 6 28 * *"</span>, <span class="k">end</span>: <span class="s">"0 20 28 * *"</span>, <span class="k">desiredReplicas</span>: <span class="s">"5"</span> }</pre>
+  <figure class="seq" data-actors="Queue|KEDA|HPA|Deployment">
+    <ol>
+      <li data-m="1>0">how many messages are waiting?<small>polled every 30 seconds</small></li>
+      <li data-m="0>1" data-k="reply">0</li>
+      <li data-m="1>3">scale to 0 replicas<small>KEDA does this itself: an HPA cannot go below 1</small></li>
+      <li data-m="0>0" data-k="note">400 invoices arrive</li>
+      <li data-m="1>0">how many messages are waiting?</li>
+      <li data-m="0>1" data-k="reply">400</li>
+      <li data-m="1>3">scale from 0 to 1</li>
+      <li data-m="1>2" data-k="async">external metric: 400 messages, target 20 per pod</li>
+      <li data-m="2>3">scale to 20 replicas</li>
+    </ol>
+    <figcaption><b>Scaling on a queue with KEDA.</b> Queue length measures demand directly, so the HPA reaches the right size in one step. The first message waits for a pod to start, which is the price of scaling to zero.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">📱</div>
+    <div class="body"><div class="title">Use case: Pokémon GO and fifty times the forecast</div><p>When Niantic launched Pokémon GO in July 2016, its backend ran on Kubernetes on Google Cloud, with player data in Google's managed NoSQL database. Google's engineers later described the launch from their side. Niantic had planned capacity around a target level of traffic and had agreed a worst case of five times that target. Within fifteen minutes of the game going live in Australia and New Zealand, traffic had passed the target. It kept going, and eventually reached about fifty times the target: ten times the worst case anyone had planned for. The system had autoscaling, and autoscaling was not what saved it. Google's reliability engineers joined Niantic's, and together they provisioned capacity ahead of each country's launch instead of waiting for load to trigger it, added tens of thousands of cores to what became the largest Kubernetes cluster Google's cloud had run for a customer, and even upgraded the cluster to a newer version while it was serving millions of players, in order to raise its node limit. The launch in Japan two weeks later was planned with that experience and went smoothly. Everything in this chapter has a boundary, and this story is at it. Autoscaling reacts within limits set in advance: a maximum replica count, a quota, a database's throughput, the minutes a node takes to boot. For a predictable event, capacity is put in place beforehand, and <a href="39-capacity-planning.html">Chapter 39</a> is about how to work out how much.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>No resource requests,</b> or invented ones. Utilisation is a percentage of the request, and scheduling and node scaling work from requests.</li>
+      <li><b>Scaling on CPU for a workload that waits on I/O.</b> CPU stays low while the service drowns. Scale on requests or queue length.</li>
+      <li><b>A utilisation target of 90%.</b> No room to absorb anything while new pods start.</li>
+      <li><b>HPA and VPA on the same metric.</b> They fight.</li>
+      <li><b><code>replicas</code> set in the manifest</b> of an autoscaled Deployment: every deployment resets the count (<a href="18-gitops-argo.html">Chapter 18</a>).</li>
+      <li><b><code>maxReplicas</code> as an afterthought.</b> Too low and it caps you during the incident; too high and a runaway scale-up exhausts the database's connections.</li>
+      <li><b>Forgetting the layers below:</b> quota, subnet addresses, instance availability. The HPA asks; the cloud may say no.</li>
+      <li><b>No PodDisruptionBudget.</b> Node consolidation evicts every replica of a small service at once.</li>
+      <li><b>Scale-down as fast as scale-up.</b> The pod count oscillates with every wave in the traffic.</li>
+      <li><b>Never testing it.</b> The first real spike is the load test, in production.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does the Horizontal Pod Autoscaler decide how many pods to run?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Every 15 seconds it reads a metric for the pods of a workload and computes desired replicas as the current count times the current value over the target, rounded up. With 10 pods at 91% CPU and a 70% target that is 13. CPU utilisation is measured against each pod's request, so requests have to be set. It ignores differences within 10% of the target, scales up quickly, and waits through a stabilisation window, five minutes by default, before scaling down, taking the highest recent recommendation. It stays between the configured minimum and maximum. It can also use custom metrics such as requests per second per pod, or external ones such as queue length, and with several metrics it takes the largest answer. If the new pods do not fit on the existing nodes, they are Pending until a node autoscaler adds a node.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A service has an HPA on CPU, and every traffic spike still causes several minutes of errors before it recovers. Where does the time go, and what would you change?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>I would lay out the chain and measure each link for a real spike. First detection: the metrics pipeline averages over a window and the HPA syncs every 15 seconds, so half a minute passes before anything is decided. Then the decision itself: saturated pods report 100% CPU, so with a 70% target the HPA can only ask for about 1.4 times the current pods, and a tripling of traffic takes three rounds, each waiting for the previous pods to become ready. Then placement: if the nodes are full the new pods are Pending, and a node takes one to several minutes to be ordered, boot and join. Then the image has to be pulled on the empty node, and the application has to start and pass readiness. Events and timestamps on the HPA, the pods and the nodes show which of these dominates. The changes follow the chain. Scale on requests per second per pod so the right count is computed in one step. Keep headroom with low-priority placeholder pods so the first new pods start on existing nodes in seconds. Use a faster node provisioner and instance types that are available. Shrink the image and the start-up time. Lower the utilisation target and raise the minimum replicas, on a schedule if the spikes are predictable. And make the service shed excess load cleanly, so that the requests it does accept stay fast while capacity arrives. Then I would run a load test that reproduces the spike and confirm the gap is gone.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>HPA changes pod count, VPA changes pod size, the node autoscaler changes node count. All three work from resource requests.</li>
+      <li>HPA: desired = ceil(current × metric ÷ target), every 15 seconds, with a 10% tolerance and a slow scale-down.</li>
+      <li>Scale on a measure of demand. Saturated CPU caps each round at about 1.4 times.</li>
+      <li>Do not point the HPA and the VPA at the same metric.</li>
+      <li>The Cluster Autoscaler grows predefined node groups; Karpenter launches whatever fits the pending pods, faster.</li>
+      <li>Scaling lag is a chain: metric, decision, room, node, image, start. Headroom removes the slowest links for the first pods.</li>
+      <li>KEDA scales on external events and to zero. Autoscaling works inside limits; known events need capacity in advance.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">An HPA targets 60% CPU. The Deployment has 8 pods averaging 90%. How many replicas does it ask for?</p>
+      <div class="opts">
+        <button class="opt">9</button>
+        <button class="opt">10</button>
+        <button class="opt">12</button>
+        <button class="opt">16</button>
+      </div>
+      <div class="explain">ceil(8 × 90 ÷ 60) = 12. The same load spread over 12 pods gives 60% each.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Traffic to a service triples in a second. Its HPA scales on CPU with a 70% target. Why does it take several rounds to reach the right size?</p>
+      <div class="opts">
+        <button class="opt">Saturated pods report 100% CPU, so each round can ask for only about 1.4 times the current pods</button>
+        <button class="opt">The HPA may add only one pod per minute</button>
+        <button class="opt">CPU metrics are collected once an hour</button>
+        <button class="opt">The Deployment's rolling update limits it</button>
+      </div>
+      <div class="explain">Utilisation cannot exceed 100%, so the formula gives at most 100 ÷ 70 of the current count. A metric of demand, such as requests per pod, has no such ceiling.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">The HPA has raised a Deployment from 10 to 20 replicas, and the 10 new pods stay Pending. What is the most likely reason, and what resolves it?</p>
+      <div class="opts">
+        <button class="opt">The image is too large; wait for the pull</button>
+        <button class="opt">The readiness probe is failing; fix the probe</button>
+        <button class="opt">maxReplicas was reached; raise it</button>
+        <button class="opt">No node has room for their requests; a node autoscaler adds nodes, if quota and capacity allow</button>
+      </div>
+      <div class="explain">Pending means unscheduled. Pulling and probing happen only after a pod has been placed on a node.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What are low-priority "placeholder" pods for?</p>
+      <div class="opts">
+        <button class="opt">Testing the readiness probe</button>
+        <button class="opt">Reserving spare room: real pods evict them and start at once, while the evicted placeholders trigger the next node</button>
+        <button class="opt">Keeping the image cache warm</button>
+        <button class="opt">Stopping the HPA from scaling down</button>
+      </div>
+      <div class="explain">They turn a multi-minute wait for a node into a few seconds for the first new pods, at the cost of paying for a little idle capacity.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A worker Deployment processes messages from a queue, and on most nights the queue is empty. Which approach fits best?</p>
+      <div class="opts">
+        <button class="opt">An HPA on CPU with a minimum of 5 replicas</button>
+        <button class="opt">A VPA in automatic mode</button>
+        <button class="opt">KEDA with a queue-length trigger and a minimum of zero replicas</button>
+        <button class="opt">A fixed replica count sized for the daily peak</button>
+      </div>
+      <div class="explain">Queue length is the demand. KEDA feeds it to an HPA and can scale the workers to zero when the queue is empty.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = OPS;
+  const DEMAND = 2100, POD = 100, TARGET = 70, PER_NODE = 5, END = 900, LAG = 30, SYNC = 15, PROBE = 5, MAXR = 60;
+  const mmss = (t) => Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0');
+  function run(o) {
+    const pods = Array.from({ length: 10 }, () => ({ ready: -1 }));      // ready: the second from which the pod serves
+    let free = +o.room, replicas = 10, pending = 0, rounds = 0, nodes = 0; const arrivals = [], log = [], cap = [];
+    const readyAt = (t) => pods.filter((p) => p.ready <= t).length;
+    let lost = 0, recovered = null;
+    for (let t = 0; t <= END; t++) {
+      arrivals.filter((a) => a.t === t).forEach((a) => {                  // a node joins: place Pending pods on it
+        const k = Math.min(PER_NODE, pending); pending -= k; free += PER_NODE - k;
+        for (let i = 0; i < k; i++) pods.push({ ready: t + (+o.img) + (+o.app) + PROBE });
+        log.push([t, `a new node is Ready; ${k} Pending pod${k === 1 ? '' : 's'} scheduled on it, pulling the image`]);
+      });
+      if (t > 0 && t % SYNC === 0 && t >= LAG) {                           // an HPA sync, looking at metrics from 30 seconds ago
+        const n = readyAt(t - LAG), dem = t - LAG >= 0 ? DEMAND : 700;
+        const ratio = o.met === 'cpu' ? Math.min(100, dem / (n * POD) * 100) / TARGET : dem / n / TARGET;
+        const want = Math.min(MAXR, Math.ceil(n * ratio - 1e-9));
+        if (ratio > 1.1 && want > replicas) {
+          const add = want - replicas, onOld = Math.min(free, add); rounds++; replicas = want; free -= onOld;
+          for (let i = 0; i < onOld; i++) pods.push({ ready: t + (+o.app) + PROBE });
+          const wait = add - onOld; pending += wait;
+          log.push([t, `HPA: ${o.met === 'cpu' ? 'CPU at ' + Math.round(ratio * TARGET) + '%' : Math.round(dem / n) + ' requests per pod'} on ${n} pods → <b>${want} replicas</b> (+${add})${onOld ? `; ${onOld} start on existing nodes` : ''}${wait ? `; ${wait} Pending` : ''}`]);
+          if (wait) { const need = Math.ceil(wait / PER_NODE); nodes += need; for (let i = 0; i < need; i++) arrivals.push({ t: t + (+o.node) }); log.push([t, `node autoscaler: ${wait} Pending pod${wait === 1 ? '' : 's'} → ordering ${need} node${need === 1 ? '' : 's'}`]); }
+        }
+      }
+      const c = readyAt(t) * POD; cap.push(c);
+      if (c < DEMAND) lost += DEMAND - c; else if (recovered === null) { recovered = t; log.push([t, `<b>${readyAt(t)} pods ready: capacity covers demand</b>`]); }
+    }
+    return { cap, log, lost, recovered, rounds, nodes, final: readyAt(END), firstNew: Math.min(...pods.filter((p) => p.ready > 0).map((p) => p.ready)) };
+  }
+  const opts = () => ({ met: $('#asMet').dataset.value || 'cpu', room: $('#asRoom').dataset.value || '0', node: $('#asNode').dataset.value || '130', img: $('#asImg').dataset.value || '40', app: $('#asApp').dataset.value || '30' });
+  function draw() {
+    const o = opts(), R = run(o), W = 720, H = 190, top = 3400, x = (t) => t / END * W, y = (v) => H - v / top * H;
+    let s = '', pts = '';
+    for (let t = 0; t < END; t++) { if (R.cap[t] < DEMAND) s += `<rect class="as-over" x="${x(t).toFixed(2)}" width="${(W / END + 0.3).toFixed(2)}" y="${y(DEMAND).toFixed(1)}" height="${(y(R.cap[t]) - y(DEMAND)).toFixed(1)}"/>`; pts += `${x(t).toFixed(1)},${y(R.cap[t]).toFixed(1)} ${x(t + 1).toFixed(1)},${y(R.cap[t]).toFixed(1)} `; }
+    s += `<polyline class="as-dem" points="0,${y(DEMAND)} ${W},${y(DEMAND)}"/><polyline class="as-cap" points="${pts}"/>`;
+    $('#asSvg').innerHTML = s;
+    $('#asAx').innerHTML = '<span>0:00, traffic triples</span><span>3:45</span><span>7:30</span><span>11:15</span><span>15:00</span>';
+    $('#asStats').innerHTML = `<div class="stat ${R.recovered !== null && R.recovered <= 90 ? 'good' : R.recovered === null || R.recovered > 240 ? 'bad' : 'warn'}"><div class="k">Short of capacity for</div><div class="v">${R.recovered === null ? 'over 15:00' : mmss(R.recovered)}</div></div>`
+      + `<div class="stat"><div class="k">Requests lost</div><div class="v">${Math.round(R.lost).toLocaleString('en-GB')}</div></div>`
+      + `<div class="stat"><div class="k">First new pod serving at</div><div class="v">${mmss(R.firstNew)}</div></div>`
+      + `<div class="stat"><div class="k">HPA scale-ups</div><div class="v">${R.rounds}</div></div>`
+      + `<div class="stat"><div class="k">Nodes added</div><div class="v">${R.nodes}</div></div>`;
+    $('#asLog').innerHTML = R.log.sort((a, b) => a[0] - b[0]).map(([t, m]) => `${mmss(t)}  ${m}`).join('\n');
+    const newNode = +o.node + +o.img + +o.app + PROBE, old = +o.app + PROBE;
+    let why = `<b>${R.recovered === null ? 'Still short after fifteen minutes' : 'Capacity caught up after ' + mmss(R.recovered)}</b>, and ${Math.round(R.lost).toLocaleString('en-GB')} requests were lost on the way. `;
+    why += o.met === 'cpu' ? `The HPA needed ${R.rounds} rounds: each time it saw 100% CPU and asked for about 1.4 times what was running, then had to wait for those pods before it could see that it was still not enough. ` : `The HPA asked for all 30 replicas in its first decision, because requests per pod says how big the gap is. `;
+    why += +o.room ? `The placeholder room let the first 5 pods start in ${old} seconds, without waiting for a node. ` : `With no spare room every new pod waited for a node: ${newNode} seconds from Pending to serving (${o.node} to get the node, ${o.img} to pull the image, ${o.app} to start, 5 for the probe). `;
+    why += 'The log above is the chain, with a timestamp on every link.';
+    $('#asWhy').innerHTML = why;
+    $('#asWhy').dataset.x = JSON.stringify({ recovered: R.recovered, lost: Math.round(R.lost), rounds: R.rounds, nodes: R.nodes, final: R.final, firstNew: R.firstNew, mono: R.cap.every((c, i) => !i || c >= R.cap[i - 1]), capEnd: R.cap[END], logs: R.log.length });
+  }
+  ['#asMet', '#asRoom', '#asNode', '#asImg', '#asApp'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>

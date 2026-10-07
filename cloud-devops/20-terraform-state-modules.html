@@ -6,34 +6,383 @@
 <title>Terraform State, Modules &amp; Teams</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('ops-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ts-ctl { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px 18px; }
+  @media (max-width:820px) { .ts-ctl { grid-template-columns:1fr; } }
+  .ts-ctl .ts-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .ts-log { list-style:none; margin:14px 0 0; padding:0; font-size:13px; }
+  .ts-log li { display:grid; grid-template-columns:64px minmax(0,1fr); gap:10px; padding:5px 0; border-top:1px solid var(--border); align-items:start; }
+  .ts-log li:first-child { border-top:0; }
+  .ts-log b { font-family:var(--mono); font-size:11.5px; border-radius:999px; padding:1px 8px; color:#fff; text-align:center; }
+  .ts-log .ts-a b { background:#3b82f6; } .ts-log .ts-b b { background:#7c3aed; } .ts-log .ts-s b { background:var(--muted); }
+  .ts-log .ts-err span { color:var(--red); font-weight:600; }
+  .ts-log code { font-size:12px; }
+  .ts-tbl { margin-top:12px; }
+  .ts-tbl td, .ts-tbl th { font-size:12.5px; }
+  .ts-y { color:var(--green); font-weight:700; } .ts-n { color:var(--red); font-weight:700; }
+  .ts-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  .ts-why.ts-bad { background:transparent; border:2px solid var(--red); }
+</style>
 </head>
 <body data-chapter="20">
-<!-- ops:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 20</span><span class="pill">Intermediate</span><span class="pill">⏱ 50 min</span></div>
     <h1>Terraform State, Modules &amp; <span class="grad">Teams</span></h1>
-    <p class="lead">Remote state and locking, modules, workspaces, and running Terraform safely in CI.</p>
+    <p class="lead">Chapter 19 worked with one person, one directory and one environment. Real Terraform is used by a team, across several environments, from a pipeline, and nearly every hard problem at that scale is about one file: the state. Who holds it, who may write it, what happens when two people write it at once, and how much of your infrastructure a single mistake in it can reach. This chapter covers what the state is for, remote backends and locking, modules for reuse, how to separate environments, and what a safe Terraform pipeline looks like. The simulator runs two engineers against one state under each kind of backend and counts the resources nobody is managing afterwards.</p>
+    <ul class="objectives">
+      <li><span>Explain what the state file contains and why Terraform cannot work without it</span></li>
+      <li><span>Configure a remote backend, and explain locking and versioning</span></li>
+      <li><span>Predict what happens when two applies overlap, with and without a lock</span></li>
+      <li><span>Write and call a module, and pin its version</span></li>
+      <li><span>Choose between workspaces and directories for environments, and split state by blast radius</span></li>
+      <li><span>Design a plan-on-pull-request, apply-on-merge pipeline</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Bash · Docker · K8s · Terraform listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Resources, plan and apply, and the dependency graph:</b> <a href="19-terraform-basics.html">Chapter 19</a>.</li>
+        <li><b>Object storage with versioning:</b> <a href="04-storage.html">Chapter 4</a>. <b>Roles assumed by a CI job:</b> <a href="06-iam.html">Chapter 6</a> and <a href="10-ci-github-actions.html">Chapter 10</a>.</li>
+        <li><b>The same question for Kubernetes manifests,</b> one definition and several environments, was answered in <a href="16-helm-kustomize.html">Chapter 16</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>State and why it matters</li>
-    <li>Remote backends and locking</li>
-    <li>Modules</li>
-    <li>Environments</li>
-    <li>Terraform in CI</li>
-  </ol>
+  <h2>State and why it matters</h2>
+  <p>Your configuration says <code>aws_instance.web</code>. The cloud knows only <code>i-0a1b2c3d4e5f67890</code>. The <b>state</b> is the file that connects the two: for every resource Terraform manages, it records the resource's address in the code, its real ID, the attributes it had at the last apply, and what it depends on.</p>
+<pre class="code">$ <span class="f">terraform</span> state list
+aws_instance.web
+aws_security_group.web
+aws_subnet.app
+aws_vpc.main
+$ <span class="f">terraform</span> state show aws_instance.web | <span class="f">head</span> -4
+# aws_instance.web:
+resource "aws_instance" "web" {
+    id            = "i-0a1b2c3d4e5f67890"
+    instance_type = "t3.small"</pre>
+  <p>Without the state, Terraform could not tell "this instance is mine and needs changing" from "an instance should be created". That makes the state the single point of truth about ownership, and it has four properties you must respect.</p>
+  <ul>
+    <li><b>It is required.</b> Lose it and Terraform believes nothing exists. The next plan proposes to create everything again, and the real resources become <i>orphans</i>: running, billed and managed by nobody.</li>
+    <li><b>It must be the only copy.</b> Two diverging copies of the state mean two different opinions about what exists.</li>
+    <li><b>It contains secrets.</b> Every attribute is stored, in plain text, including generated database passwords and private keys. Anyone who can read the state can read those.</li>
+    <li><b>It is not yours to edit.</b> Change it only through Terraform's own commands and blocks.</li>
+  </ul>
+<pre class="code"><span class="c"># Renaming a resource in code without destroying it: tell Terraform it is the same object</span>
+<span class="k">moved</span> {
+  from = aws_instance.web
+  to   = aws_instance.frontend
+}
+
+<span class="c"># Adopting something that was created by hand: bring it under management</span>
+<span class="k">import</span> {
+  to = aws_s3_bucket.uploads
+  id = <span class="s">"acme-shop-uploads"</span>
+}
+
+<span class="c"># Letting go of a resource without deleting it</span>
+<span class="k">removed</span> {
+  from = aws_instance.legacy
+  lifecycle { destroy = <span class="k">false</span> }
+}</pre>
+  <p>These blocks are reviewed in a pull request and planned like any other change, which is why they are preferable to the older <code>terraform state mv</code> and <code>terraform state rm</code> commands that edit the state directly.</p>
+
+  <h2>Remote backends and locking</h2>
+  <p>By default the state is a file called <code>terraform.tfstate</code> in the working directory. That is fine for an experiment and wrong for a team: it lives on one laptop, it tempts people to commit it to Git with its secrets, and nothing stops two people from applying at once. A <b>backend</b> moves the state to shared storage.</p>
+<pre class="code"><span class="k">terraform</span> {
+  <span class="k">backend</span> <span class="s">"s3"</span> {
+    bucket       = <span class="s">"acme-terraform-state"</span>           <span class="c"># versioned, encrypted, not public, access tightly limited</span>
+    key          = <span class="s">"prod/network/terraform.tfstate"</span>  <span class="c"># one key per configuration</span>
+    region       = <span class="s">"eu-west-2"</span>
+    encrypt      = <span class="k">true</span>
+    use_lockfile = <span class="k">true</span>                             <span class="c"># take a lock in the bucket before reading or writing</span>
+  }
+}</pre>
+  <p>A good backend gives you four things. <b>One shared copy</b> that everyone and the pipeline read. <b>Locking</b>: before a plan or an apply, Terraform takes a lock on the state, and a second run fails at once instead of working from a copy that is about to be out of date. <b>Versioning</b>: every write keeps the previous version, so a corrupted or deleted state can be rolled back. And <b>access control and encryption</b>, because of the secrets inside. Object storage with a lock is the common choice on every cloud (S3, Azure Blob Storage, Google Cloud Storage), and hosted services such as HCP Terraform provide the same and run the applies for you.</p>
+
+  <figure class="seq" data-actors="Alice|Backend: state and lock|Bob">
+    <ol>
+      <li data-m="0>1">terraform apply: take the lock</li>
+      <li data-m="1>0" data-k="reply">locked by alice; state serial 5</li>
+      <li data-m="2>1">terraform apply: take the lock</li>
+      <li data-m="1>2" data-k="fail">Error acquiring the state lock<small>held by alice since 10:42:07</small></li>
+      <li data-m="0>0">create the subnet in the cloud</li>
+      <li data-m="0>1">write state serial 6; release the lock</li>
+      <li data-m="2>1">try again: take the lock</li>
+      <li data-m="1>2" data-k="reply">locked by bob; state serial 6<small>Bob now plans against a state that includes Alice's subnet</small></li>
+    </ol>
+    <figcaption><b>A lock turns a race into a queue.</b> The failure Bob sees is the system working. If a crashed run leaves a lock behind, <code>terraform force-unlock</code> removes it, and you use it only when you are certain nothing is running.</figcaption>
+  </figure>
+
+  <h2>Simulator: two engineers, one state</h2>
+  <p>The infrastructure has four resources and a state at serial 5. Alice adds a subnet. Bob adds a worker instance. Choose where the state is kept and what happens, and read the timeline and the table underneath: every resource that is in the cloud and missing from the state is an orphan.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Who knows what exists?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="ts-ctl">
+        <div><div class="ts-l">Where the state lives</div>
+          <div class="seg" id="tsBack"><button class="active" data-v="local">A file on each laptop</button><button data-v="remote">Shared bucket, no lock</button><button data-v="locked">Shared bucket, locked and versioned</button></div></div>
+        <div><div class="ts-l">What happens</div>
+          <div class="seg" id="tsWhat"><button class="active" data-v="overlap">Both apply at the same time</button><button data-v="seq">One after the other</button><button data-v="lost">The state file is deleted</button></div></div>
+      </div>
+      <ol class="ts-log" id="tsLog"></ol>
+      <div class="table-wrap ts-tbl"><table class="t" id="tsTbl"></table></div>
+      <div class="stats" id="tsStats"></div>
+      <div class="ts-why" id="tsWhy"></div>
+    </div>
+    <div class="panel-foot">The model runs real steps in an order set by the scenario. An apply reads the state, creates its resource in the cloud, and writes back the state it read plus its own addition, with the serial number raised by one. With a file per laptop, each person reads and writes their own copy. With a shared bucket and no lock, the last write wins. With a lock, a second run is refused until the first has finished, and then starts from the new state. A versioned bucket keeps every earlier version of the state.</div>
+  </div>
+
+  <p><b>Things to try.</b> There are nine combinations, and each one is a situation teams get into.</p>
+  <ul>
+    <li><b>A file on each laptop, both apply.</b> Both applies succeed. The cloud has six resources and each state file knows five of them, a different five. The table marks two resources as disputed. Choose "one after the other": the result is the same, because taking turns does not help when each person has a private copy.</li>
+    <li><b>Shared bucket, no lock, at the same time.</b> Read the timeline's last line. Both read serial 5; Alice writes serial 6; Bob writes his own serial 6 over it. One orphan: Alice's subnet exists, is billed, and is in no state. Both commands printed "Apply complete".</li>
+    <li><b>The same backend, one after the other.</b> No problem at all, which is the dangerous part: an unlocked shared state works every day until two runs overlap.</li>
+    <li><b>Locked, at the same time.</b> Bob gets "Error acquiring the state lock", waits, and runs again against serial 6. The final state is serial 7 with all six resources. The cost of correctness was one refused command.</li>
+    <li><b>The state file is deleted.</b> On a laptop: the plan says "4 to add", and applying it builds a second VPC and a second instance next to the first. In an unversioned bucket: four orphans, each to be imported by hand. In a versioned bucket: the previous version is restored and the plan shows no changes.</li>
+  </ul>
+
+  <h2>Modules</h2>
+  <p>A <b>module</b> is a directory of Terraform files used as a unit, with input variables as its parameters and outputs as its results. The directory you run Terraform in is the <i>root module</i>; anything it calls is a child module. Modules are how a team writes "a service with a load balancer, an autoscaling group and alarms" once and uses it twenty times.</p>
+<pre class="code"><span class="c"># modules/service/variables.tf</span>
+<span class="k">variable</span> <span class="s">"name"</span>          { type = string }
+<span class="k">variable</span> <span class="s">"subnet_ids"</span>    { type = list(string) }
+<span class="k">variable</span> <span class="s">"instance_type"</span> {
+  type    = string
+  default = <span class="s">"t3.small"</span>
+}
+
+<span class="c"># modules/service/outputs.tf</span>
+<span class="k">output</span> <span class="s">"load_balancer_dns"</span> { value = aws_lb.this.dns_name }
+
+<span class="c"># envs/prod/main.tf: the root module calls it</span>
+<span class="k">module</span> <span class="s">"checkout"</span> {
+  source        = <span class="s">"git::https://github.com/acme/terraform-modules.git//service?ref=v2.4.0"</span>   <span class="c"># pinned</span>
+  name          = <span class="s">"checkout"</span>
+  subnet_ids    = module.network.private_subnet_ids      <span class="c"># another module's output</span>
+  instance_type = <span class="s">"t3.medium"</span>
+}
+
+<span class="k">module</span> <span class="s">"network"</span> {
+  source  = <span class="s">"terraform-aws-modules/vpc/aws"</span>               <span class="c"># from the public registry</span>
+  version = <span class="s">"~&gt; 5.13"</span>
+  cidr    = <span class="s">"10.0.0.0/16"</span>
+}</pre>
+  <p>Three habits keep modules useful. <b>Pin the version</b> of every module you do not keep in the same repository, exactly as you pin images and actions: an unpinned source is someone else's change arriving in your plan. <b>Keep the interface small</b>: a module with sixty variables has reproduced the provider and hidden nothing. And <b>do not wrap a single resource</b>. A module earns its place when it encodes a decision your organisation made, such as "every bucket is encrypted, versioned and private".</p>
+
+  <h2>Environments</h2>
+  <p>Development, staging and production should be the same code with different inputs and, above all, <b>separate states</b>, so that a mistake in one cannot reach another. There are two ways to get that.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Workspaces</th><th>A directory per environment</th></tr></thead>
+      <tbody>
+        <tr><td><b>How</b></td><td>One configuration; <code>terraform workspace select prod</code> switches which state it uses</td><td><code>envs/dev</code>, <code>envs/staging</code>, <code>envs/prod</code>: each a small root module that calls the shared modules, with its own backend key</td></tr>
+        <tr><td><b>Which environment am I about to change?</b></td><td>Whatever was selected last, which is invisible in the code</td><td>The directory you are standing in</td></tr>
+        <tr><td><b>Environments that differ in structure</b></td><td>Awkward: conditionals on the workspace name</td><td>Natural: each root module says what it contains</td></tr>
+        <tr><td><b>Separate credentials and accounts</b></td><td>Hard: one backend and provider configuration</td><td>Easy: each directory has its own</td></tr>
+        <tr><td><b>Good for</b></td><td>Many short-lived copies of the same thing, such as one per pull request</td><td>Long-lived environments. The usual choice</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The same reasoning applies inside one environment. Everything in a state can be destroyed by one bad apply to that state, so the size of a state is your <b>blast radius</b>. Split by how often things change and how much it would hurt to lose them: the network and DNS in one state, databases in another, each service in its own. A service's configuration then reads the network's IDs through that state's outputs or through data sources, and cannot touch the network itself. Plans also get faster, since each one refreshes tens of resources and not thousands.</p>
+<pre class="code">infrastructure/
+├── modules/                 <span class="c"># shared, versioned building blocks</span>
+│   ├── network/
+│   └── service/
+└── envs/
+    ├── staging/
+    │   ├── network/         <span class="c"># its own state: staging/network/terraform.tfstate</span>
+    │   └── checkout/        <span class="c"># its own state: staging/checkout/terraform.tfstate</span>
+    └── prod/
+        ├── network/
+        ├── data/            <span class="c"># databases: changed rarely, guarded most</span>
+        └── checkout/</pre>
+
+  <h2>Terraform in CI</h2>
+  <p>Once state is shared and locked, the last step is to stop running applies from laptops at all. The pipeline becomes the only thing with permission to change infrastructure, and a pull request becomes the only way to ask.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Pull request</b> a change to <code>.tf</code> files</li>
+      <li data-k="step"><b>Check</b> <code>terraform fmt -check</code>, <code>validate</code>, a linter and policy checks on the code</li>
+      <li data-k="step"><b>Plan</b> with a read-only role; post the plan as a comment on the pull request</li>
+      <li data-k="decision"><b>Review</b> a person reads the plan, not only the diff. Anything destroyed or replaced?</li>
+      <li data-k="store"><b>Merge</b> plan again and save the file; production waits for an approval</li>
+      <li data-k="end"><b>Apply</b> exactly that saved plan, with a role that can write, one run at a time</li>
+    </ol>
+    <figcaption><b>Plan on pull request, apply on merge.</b> The reviewer approves an effect, not a piece of text. A scheduled plan each night that expects "No changes" catches drift between runs.</figcaption>
+  </figure>
+  <p>The details that matter: the pipeline gets its cloud access by assuming a role with its identity token, with no stored keys (<a href="06-iam.html">Chapter 6</a>); the planning role can only read, and only the apply job on the main branch can assume the role that writes; runs for one state never overlap, which the state lock guarantees and a concurrency group makes orderly; and the plan output is treated as sensitive, because it can contain secrets.</p>
+
+  <div class="callout usecase">
+    <div class="ico">⌨️</div>
+    <div class="body"><div class="title">Use case: Amazon S3, 28 February 2017, and a tool that did what it was told</div><p>For about four hours on 28 February 2017, Amazon S3 in Northern Virginia was largely unavailable, and a good part of the internet that depends on it went with it. Amazon's summary of the event is short and candid. An engineer on the S3 team was debugging a slow billing system and ran an established command, from a runbook, to take a small number of servers out of service. One of the inputs was entered incorrectly, and the command removed a much larger set than intended. Those servers supported two of S3's core subsystems, the one that tracks where every object is and the one that allocates new storage, and both had to be restarted in full, which at S3's size took hours because they had not been completely restarted in years. Amazon did not blame the typing. It changed the tool: capacity is now removed more slowly, and the tool refuses any request that would take a subsystem below its minimum required capacity. Hold that against this chapter. The command was authorised, the person was qualified and the procedure was followed. What was missing was a limit on how much one command could reach. In Terraform that limit is the boundary of a state, the roles a pipeline may assume, and protections such as <code>prevent_destroy</code>. Design them on the assumption that one day someone will type the wrong value, because someone will.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>State on a laptop, or committed to Git.</b> It is lost, or duplicated, or leaks every secret in it.</li>
+      <li><b>A shared backend without locking.</b> Two applies overlap and one quietly erases the other's record.</li>
+      <li><b>A state bucket without versioning,</b> or one that half the company can read.</li>
+      <li><b>Editing the state by hand,</b> or reaching for <code>force-unlock</code> while a run is still going.</li>
+      <li><b>One state for everything.</b> Every plan is slow, and every mistake can reach production's database.</li>
+      <li><b>Workspaces for production and development,</b> and an apply to whichever one happened to be selected.</li>
+      <li><b>Unpinned module sources.</b> A change upstream shows up in your next plan.</li>
+      <li><b>Modules as thin wrappers</b> with a variable for every argument: more code, no decisions.</li>
+      <li><b>Applying from laptops "just this once".</b> The pipeline's record is no longer complete, and the local credentials needed for it are a risk in themselves.</li>
+      <li><b>Renaming a resource without a <code>moved</code> block.</b> Terraform sees one resource deleted and another created.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the Terraform state, and why keep it in a remote backend with locking?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The state is Terraform's record of what it manages: it maps each resource in the code to the real object's ID and stores its last known attributes and dependencies. Terraform needs it to know whether to create, update or delete, so losing it or having two copies means resources that nobody manages or that get created twice. A remote backend keeps one shared copy in storage the whole team and the pipeline use. Locking makes sure only one plan or apply works on that copy at a time, so two runs cannot overwrite each other's results. Versioning on the bucket lets me recover an earlier state, and because the state contains secrets in plain text it is encrypted and access to it is restricted. It never goes into Git.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A company has three environments and about twenty services, all in one Terraform configuration with one state. Plans take fifteen minutes and people are afraid to apply. How would you restructure it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The fear is rational: one state means any apply can reach everything, and every plan refreshes every resource. I would split along two lines. First by environment, with a directory per environment, each its own root module, backend key and, ideally, cloud account, so production's credentials and state are separate from development's. Second, inside each environment, by lifecycle and blast radius: a foundation layer for the network and DNS that changes rarely, a data layer for databases with the strictest protection, and one state per service. The shared parts become versioned modules, so the twenty services call the same "service" module pinned to a release, and a change to the pattern is rolled through environments by bumping the version in development first. Layers read each other's outputs through remote state or data sources and cannot modify each other. For the migration itself I would not destroy and recreate anything: I would move resources between states with <code>moved</code> and <code>import</code> or <code>removed</code> blocks, one slice at a time, checking that each new configuration plans to "No changes" before the next. Then the workflow: plan on every pull request with the output posted for review, apply only from the pipeline on merge, with approval for production, short-lived credentials, a nightly drift check, and <code>prevent_destroy</code> plus cloud-level deletion protection on the stateful resources. Plans drop to seconds for a service, and the worst a mistake in one service can do is break that service.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>The state maps code to real IDs. It is required, must be unique, contains secrets and is not edited by hand.</li>
+      <li>A remote backend gives one shared copy, locking, versioning, encryption and access control.</li>
+      <li>Without a lock, overlapping applies leave orphans: real resources missing from the state.</li>
+      <li>Refactor with <code>moved</code>, <code>import</code> and <code>removed</code> blocks, which are planned and reviewed like any change.</li>
+      <li>Modules package decisions for reuse. Pin their versions and keep their interfaces small.</li>
+      <li>Separate environments by directory and state; split state further to limit the blast radius of one apply.</li>
+      <li>Plan on the pull request, review the plan, apply the saved plan from the pipeline with short-lived credentials.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A team's state file is accidentally deleted, and there is no earlier version. The infrastructure is untouched. What does <code>terraform plan</code> show?</p>
+      <div class="opts">
+        <button class="opt">No changes</button>
+        <button class="opt">A plan to create every resource again, because Terraform no longer knows that any of them exist</button>
+        <button class="opt">A plan to destroy everything</button>
+        <button class="opt">An automatic rebuild of the state from the cloud</button>
+      </div>
+      <div class="explain">The state is the only record of what Terraform owns. Without it the existing resources are orphans, and recovering means importing each one.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Two engineers run <code>terraform apply</code> at the same moment against a shared state in a bucket with no locking. Each adds a different resource. What is the likely result?</p>
+      <div class="opts">
+        <button class="opt">Both resources are created and both are recorded</button>
+        <button class="opt">The second apply waits for the first</button>
+        <button class="opt">Neither resource is created</button>
+        <button class="opt">Both resources are created, and the state written last omits the other one, which becomes an orphan</button>
+      </div>
+      <div class="explain">Each run read the same old state and wrote back that state plus its own resource. The last write replaces the first.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">You rename <code>aws_instance.web</code> to <code>aws_instance.frontend</code> in the code. Without anything else, what does the plan show, and what prevents it?</p>
+      <div class="opts">
+        <button class="opt">One instance destroyed and one created; a <code>moved</code> block tells Terraform they are the same object</button>
+        <button class="opt">No changes; names are cosmetic</button>
+        <button class="opt">An in-place update of the name</button>
+        <button class="opt">An error; resources cannot be renamed</button>
+      </div>
+      <div class="explain">The address is how the state identifies a resource. A new address looks like a new resource unless a <code>moved</code> block connects the two.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why split infrastructure into several states (network, data, each service) instead of one?</p>
+      <div class="opts">
+        <button class="opt">Terraform limits a state to 100 resources</button>
+        <button class="opt">Separate states are required for modules</button>
+        <button class="opt">One apply can only affect what is in its state, so mistakes are contained, and plans are faster</button>
+        <button class="opt">It removes the need for locking</button>
+      </div>
+      <div class="explain">The boundary of a state is the boundary of what one run can change or destroy. Smaller states mean a smaller blast radius and quicker plans.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In a "plan on pull request, apply on merge" pipeline, what should the apply job run?</p>
+      <div class="opts">
+        <button class="opt">A fresh <code>terraform apply -auto-approve</code> from a developer's laptop</button>
+        <button class="opt">The saved plan file that was produced and approved for that commit</button>
+        <button class="opt"><code>terraform destroy</code> followed by <code>terraform apply</code></button>
+        <button class="opt">Whatever plan the newest pull request produced</button>
+      </div>
+      <div class="explain">Applying a saved plan guarantees that the reviewed effect is the effect that happens, even if the cloud changed in between: a stale plan is refused.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = OPS;
+  const BASE = ['aws_vpc.main', 'aws_subnet.a', 'aws_security_group.web', 'aws_instance.web'];
+  const WHO = { alice: { adds: 'aws_subnet.b', name: 'Alice' }, bob: { adds: 'aws_instance.worker', name: 'Bob' } };
+  const clone = (x) => JSON.parse(JSON.stringify(x));
+  function run(back, what) {
+    const log = [], cloud = BASE.slice(), start = { serial: 5, res: BASE.slice() };
+    let remote = clone(start), versions = [clone(start)], lock = null;
+    const local = { alice: clone(start), bob: clone(start) }, snap = {}, say = (who, t, err) => log.push({ who, t, err: !!err });
+    const out = { log, cloud, back, what, dup: [] };
+    if (what === 'lost') {
+      say('sys', 'The state file is deleted by mistake.');
+      if (back === 'local') { local.alice = null; say('alice', '<code>terraform plan</code>: no state found. <b>Plan: 4 to add, 0 to change, 0 to destroy.</b>'); say('alice', 'She applies. The VPC and the instance are created a second time; the subnet fails, because its address range is already taken by the original.', true); cloud.push('aws_vpc.main (second copy)', 'aws_instance.web (second copy)'); out.dup = ['aws_vpc.main (second copy)', 'aws_instance.web (second copy)']; local.alice = { serial: 1, res: out.dup.slice() }; out.states = { 'Alice\'s file': local.alice, 'Bob\'s file': local.bob }; }
+      else if (back === 'remote') { remote = null; say('alice', '<code>terraform plan</code>: the bucket has no state object. <b>Plan: 4 to add.</b> The bucket is not versioned, so there is nothing to restore.'); say('alice', 'She stops before applying. Every resource is now an orphan, and each must be brought back with an <code>import</code> block, one by one.', true); out.states = { 'Shared state': { serial: 0, res: [] } }; }
+      else { say('alice', '<code>terraform plan</code>: the bucket has no current state object. She does not apply.'); say('sys', 'The bucket is versioned: the deleted object is restored from its previous version, serial 5.'); say('alice', '<code>terraform plan</code>: <b>No changes.</b>'); out.states = { 'Shared state': remote }; out.restored = true; }
+      return out;
+    }
+    const queue = what === 'overlap' ? [['alice', 'begin'], ['bob', 'begin'], ['alice', 'create'], ['bob', 'create'], ['alice', 'write'], ['bob', 'write']] : [['alice', 'begin'], ['alice', 'create'], ['alice', 'write'], ['bob', 'begin'], ['bob', 'create'], ['bob', 'write']];
+    let guard = 0;
+    while (queue.length && guard++ < 40) {
+      const [u, op] = queue.shift(), me = WHO[u];
+      if (op === 'begin') {
+        if (back === 'locked') {
+          if (lock && lock !== u) { say(u, `<code>terraform apply</code>: <b>Error acquiring the state lock.</b> Lock held by ${lock}. Nothing was read and nothing was changed. ${me.name} waits.`, true); out.refused = true; for (let i = queue.length - 1; i >= 0; i--) if (queue[i][0] === u) queue.splice(i, 1); queue.push([u, 'begin'], [u, 'create'], [u, 'write']); continue; }
+          lock = u;
+        }
+        snap[u] = clone(back === 'local' ? local[u] : remote);
+        say(u, `<code>terraform apply</code>: ${back === 'locked' ? 'takes the lock, ' : ''}reads ${back === 'local' ? 'the state file on ' + (u === 'alice' ? 'her' : 'his') + ' laptop' : 'the shared state'}, serial ${snap[u].serial} (${snap[u].res.length} resources). Plan: 1 to add.`);
+      } else if (op === 'create') { cloud.push(me.adds); say(u, `creates <code>${me.adds}</code> in the cloud.`); }
+      else {
+        const next = { serial: snap[u].serial + 1, res: snap[u].res.concat(me.adds) };
+        if (back === 'local') local[u] = next;
+        else { const lost = remote.res.filter((r) => !next.res.includes(r)); remote = next; versions.push(clone(next)); if (lost.length) { say(u, `writes the shared state as serial ${next.serial}: the state ${me.name} read, plus <code>${me.adds}</code>. <b>That overwrites the version containing <code>${lost.join(', ')}</code>.</b>`, true); if (back === 'locked') lock = null; continue; } }
+        say(u, `writes ${back === 'local' ? (u === 'alice' ? 'her' : 'his') + ' own state file' : 'the shared state'} as serial ${next.serial} (${next.res.length} resources)${back === 'locked' ? ' and releases the lock' : ''}.`);
+        if (back === 'locked') lock = null;
+      }
+    }
+    out.states = back === 'local' ? { 'Alice\'s file': local.alice, 'Bob\'s file': local.bob } : { 'Shared state': remote };
+    return out;
+  }
+  const opts = () => ({ back: $('#tsBack').dataset.value || 'local', what: $('#tsWhat').dataset.value || 'overlap' });
+  function draw() {
+    const o = opts(), R = run(o.back, o.what), names = Object.keys(R.states);
+    $('#tsLog').innerHTML = R.log.map((l) => `<li class="ts-${l.who === 'alice' ? 'a' : l.who === 'bob' ? 'b' : 's'}${l.err ? ' ts-err' : ''}"><b>${l.who === 'sys' ? '…' : WHO[l.who].name}</b><span>${l.t}</span></li>`).join('');
+    const inAll = (r) => names.every((n) => R.states[n].res.includes(r)), inNone = (r) => names.every((n) => !R.states[n].res.includes(r));
+    const status = (r) => inAll(r) ? '<span class="ts-y">managed</span>' : inNone(r) ? '<span class="ts-n">orphan: nobody\'s state has it</span>' : '<span class="ts-n">disputed: one state has it, the other does not</span>';
+    $('#tsTbl').innerHTML = `<thead><tr><th>Resource in the cloud</th>${names.map((n) => `<th>${n}${R.states[n].serial ? ' (serial ' + R.states[n].serial + ')' : ''}</th>`).join('')}<th>Status</th></tr></thead><tbody>` + R.cloud.map((r) => `<tr><td><code>${r}</code></td>${names.map((n) => `<td>${R.states[n].res.includes(r) ? '<span class="ts-y">recorded</span>' : '<span class="ts-n">missing</span>'}</td>`).join('')}<td>${status(r)}</td></tr>`).join('') + '</tbody>';
+    const orphans = R.cloud.filter(inNone).length, disputed = R.cloud.filter((r) => !inAll(r) && !inNone(r)).length, ok = orphans === 0 && disputed === 0;
+    $('#tsStats').innerHTML = `<div class="stat"><div class="k">Resources in the cloud</div><div class="v">${R.cloud.length}</div></div>`
+      + `<div class="stat ${orphans ? 'bad' : 'good'}"><div class="k">Orphans</div><div class="v">${orphans}</div></div>`
+      + `<div class="stat ${disputed ? 'bad' : 'good'}"><div class="k">Disputed</div><div class="v">${disputed}</div></div>`
+      + `<div class="stat"><div class="k">Copies of the state</div><div class="v">${names.length}</div></div>`;
+    let why;
+    if (o.what === 'lost') why = o.back === 'local' ? '<b>The only copy is gone, and so is Terraform\'s knowledge of what it owns.</b> The plan to "add 4" is Terraform being honest: it sees nothing. Applying it made a second VPC and a second instance beside the originals, and the originals are now described only by Bob\'s stale file.' : o.back === 'remote' ? '<b>A shared bucket protected against a lost laptop, and not against a deletion.</b> Without versioning there is no earlier state to return to. All four resources are orphans until each is imported again.' : '<b>The deletion cost a few minutes.</b> A versioned bucket keeps every earlier state, so the previous version is restored and the next plan shows no changes. Versioning is the backup of the one file Terraform cannot work without.';
+    else if (o.back === 'local') why = `<b>Two files, two different accounts of the same cloud.</b> Both applies succeeded and both resources exist. Alice's state has never heard of Bob's instance and Bob's has never heard of Alice's subnet${o.what === 'seq' ? ', although they did not even overlap: taking turns does not help when each has a private copy' : ''}. Whichever file is treated as the truth, one resource is unmanaged. If the files are in Git, this is where the merge conflict in a JSON file appears.`;
+    else if (o.back === 'remote' && o.what === 'overlap') why = '<b>Both applies report success, and the state is wrong.</b> Each read serial 5. Alice wrote serial 6 with her subnet; Bob then wrote his own serial 6, built from the serial 5 he had read, and Alice\'s subnet vanished from the record. It still exists and is still billed. The next plan from the code that defines it will try to create it again.';
+    else if (o.back === 'remote') why = '<b>It worked, because they happened not to overlap.</b> Bob read the state after Alice had written it. Nothing enforced that. Switch to "at the same time" to see the same backend on a less lucky day.';
+    else why = o.what === 'overlap' ? '<b>Bob\'s first attempt was refused, and that refusal is the feature.</b> He lost a minute. When he ran again he read serial 6, with Alice\'s subnet in it, and wrote serial 7. Every resource is recorded once.' : '<b>The lock was taken and released twice and nobody noticed it.</b> That is how it should feel on a normal day.';
+    const w = $('#tsWhy'); w.classList.toggle('ts-bad', !ok); w.innerHTML = why;
+    w.dataset.x = JSON.stringify({ cloud: R.cloud, states: R.states, orphans, disputed, ok, refused: !!R.refused, restored: !!R.restored, steps: R.log.length, errs: R.log.filter((l) => l.err).length });
+  }
+  ['#tsBack', '#tsWhat'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>

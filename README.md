@@ -2,7 +2,7 @@
 
 **[captainblue793.github.io/palak-engineering-atlas](https://captainblue793.github.io/palak-engineering-atlas/)**
 
-Every interactive engineering course I've written, in one place — **452 chapters (388 main chapters plus a 64-chapter Prerequisites level), ~331 hours,
+Every interactive engineering course I've written, in one place — **508 chapters (436 main chapters plus a 72-chapter Prerequisites level), ~370 hours,
 zero dependencies**. No walls of text: every chapter has animated diagrams, simulators you can
 break, an interview drill and a quiz. It all runs in your browser, offline, with no account and
 no build step.
@@ -17,9 +17,9 @@ no build step.
 | **[Computer Networks](networks/)** | 8 prerequisites + 48 | TCP/IP layer by layer, DNS, TLS, HTTP/2 and 3, BGP, CDNs and packet-level debugging in Python and the CLI — plus 8 case studies |
 | **[Database Internals & SQL](databases/)** | 8 prerequisites + 48 | SQL from the first SELECT, then pages, B-trees and LSM trees, query plans, WAL, MVCC, replication and sharding in PostgreSQL and Python — plus 8 case studies |
 | **[Distributed Systems](distributed-systems/)** | 8 prerequisites + 48 | Clocks, replication, quorums, Paxos and Raft, two-phase commit, CRDTs, Kafka and stream processing in Java — plus 8 case studies |
+| **[Cloud & DevOps](cloud-devops/)** | 8 prerequisites + 48 | Docker, Kubernetes, CI/CD, Terraform and observability, then SLOs, disaster recovery, cost and incident response in Bash, YAML and Terraform — plus 8 case studies |
 
-**On the way:** Cloud & DevOps — see [the plan](docs/superpowers/specs/2026-09-30-atlas-expansion-design.md). The Atlas home
-page also suggests an order through the courses for each kind of role.
+The Atlas home page suggests an order through the courses for each kind of role.
 
 
 ## Optional accounts
@@ -77,7 +77,8 @@ palak-engineering-atlas/
 ├── os/
 ├── networks/
 ├── databases/
-└── distributed-systems/
+├── distributed-systems/
+└── cloud-devops/
 ```
 
 ## What the Atlas adds

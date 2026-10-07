@@ -6,33 +6,325 @@
 <title>HTTP APIs &amp; curl</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('ops-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ha-form { display:grid; grid-template-columns:110px minmax(0,1fr) minmax(0,1fr); gap:10px; }
+  @media (max-width:820px) { .ha-form { grid-template-columns:1fr; } }
+  .ha-form label { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }
+  .ha-form select { width:100%; margin-top:5px; }
+  .ha-opts { display:flex; flex-wrap:wrap; gap:14px; margin-top:10px; font-size:13.5px; align-items:center; }
+  .ha-opts label { display:inline-flex; gap:7px; align-items:center; cursor:pointer; }
+  .ha-curl { font-family:var(--mono); font-size:12.5px; background:#0d1117; color:#7ee787; border-radius:12px; padding:10px 14px; white-space:pre-wrap; word-break:break-all; margin-top:12px; }
+  .ha-wire { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; margin-top:12px; }
+  @media (max-width:820px) { .ha-wire { grid-template-columns:1fr; } }
+  .ha-box { font-family:var(--mono); font-size:12px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:10px 14px; white-space:pre-wrap; word-break:break-all; line-height:1.55; min-height:120px; }
+  .ha-box .ha-h { color:var(--muted); }
+  .ha-st { font-weight:800; }
+  .ha-st.ha-2 { color:var(--green); } .ha-st.ha-4 { color:var(--amber); } .ha-st.ha-5 { color:var(--red); }
+  .ha-why { margin-top:10px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  .ha-db { font-size:13px; margin-top:10px; }
+</style>
 </head>
 <body data-chapter="0.8">
-<!-- ops:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 8</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 30 min</span></div>
     <h1>HTTP APIs &amp; <span class="grad">curl</span></h1>
-    <p class="lead">Calling cloud APIs by hand: methods, headers, auth tokens and reading error responses.</p>
+    <p class="lead">Everything in the cloud is an API call. The console's buttons, <code>aws</code> and <code>kubectl</code> commands, Terraform providers and CI pipelines all send HTTP requests to an API and read the answer. When one of them fails, you get a status code and a JSON error, and the fastest way to understand it is to make the same call yourself. This chapter covers methods and status codes from an operator's angle, tokens and headers, the <code>curl</code> flags you will use, and the two habits that make automation safe: retrying the right errors and making writes idempotent.</p>
+    <ul class="objectives">
+      <li><span>Pick the right HTTP method, and know which ones are safe to retry</span></li>
+      <li><span>Read status codes: 401 vs 403, 404, 409, 422, 429 and the 5xx family</span></li>
+      <li><span>Send authenticated JSON requests with <code>curl</code>, and fail on HTTP errors</span></li>
+      <li><span>Handle rate limits with <code>Retry-After</code> and backoff</span></li>
+      <li><span>Make a POST safe to retry with an idempotency key</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Bash · Docker · K8s · Terraform listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>curl basics and the request chain</b> (DNS, TCP, TLS, HTTP): <a href="p5-networking-for-ops.html">Prerequisite 5</a>.</li>
+        <li><b>JSON and <code>jq</code>:</b> <a href="p4-yaml-json.html">Prerequisite 4</a>. <b>Retry loops in Bash:</b> <a href="p2-bash-scripting.html">Prerequisite 2</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Methods and status codes</li>
-    <li>Headers and auth</li>
-    <li>curl flags you will use</li>
-    <li>Reading API errors</li>
-  </ol>
+  <h2>Methods and what they promise</h2>
+  <p>Most cloud APIs are REST-style: URLs name resources (<code>/v1/deployments/dep_812</code>) and the HTTP method says what to do with them. What matters to an operator is not the theory but two promises each method makes, because they decide whether automation may retry it blindly:</p>
+  <ul>
+    <li><b>Safe</b>: does not change anything. <code>GET</code> and <code>HEAD</code> are safe, so you can call them as often as you like.</li>
+    <li><b>Idempotent</b>: doing it twice has the same effect as doing it once. <code>PUT</code> (replace this resource with this body) and <code>DELETE</code> are idempotent: a retried <code>PUT</code> writes the same thing again; a retried <code>DELETE</code> finds it already gone.</li>
+    <li><code>POST</code> (create something new, or trigger an action) is <b>neither</b>. If a <code>POST /deployments</code> times out and you send it again, you may get two deployments, and you cannot tell from the timeout whether the first one happened. <code>PATCH</code> (change some fields) is not guaranteed to be idempotent either.</li>
+  </ul>
+
+  <h2>Status codes an operator reads every day</h2>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Code</th><th>Meaning</th><th>Usually whose problem</th><th>Retry?</th></tr></thead>
+      <tbody>
+        <tr><td>200 / 201 / 204</td><td>OK / created / OK with no body</td><td>nobody</td><td>no need</td></tr>
+        <tr><td>400 / 422</td><td>The request is malformed / well-formed but invalid (a missing field)</td><td>the caller</td><td>no: fix the request</td></tr>
+        <tr><td>401</td><td>Not authenticated: no token, or an expired or invalid one</td><td>the caller's credentials</td><td>only after getting a new token</td></tr>
+        <tr><td>403</td><td>Authenticated, but not allowed to do this</td><td>permissions (Chapter 6)</td><td>no</td></tr>
+        <tr><td>404</td><td>No such resource (or you may not see it; some APIs hide 403 as 404)</td><td>the caller, or a typo in the region or ID</td><td>no</td></tr>
+        <tr><td>409</td><td>Conflict with the current state (already exists, already in progress, version mismatch)</td><td>timing</td><td>after re-reading the state</td></tr>
+        <tr><td>429</td><td>Too many requests: rate limited</td><td>the caller's request rate</td><td>yes, after <code>Retry-After</code></td></tr>
+        <tr><td>500</td><td>The server failed</td><td>the server</td><td>with backoff, if the request is idempotent</td></tr>
+        <tr><td>502 / 503 / 504</td><td>A proxy could not reach / the service is overloaded or down / a proxy timed out</td><td>the server side</td><td>with backoff, if idempotent; honour <code>Retry-After</code> on 503</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The single most useful distinction is <b>4xx versus 5xx</b>: 4xx means "you asked wrong, asking again will not help", 5xx means "we failed, it may work later". Retrying a 400 a hundred times is how a broken script becomes a self-inflicted rate limit.</p>
+
+  <h2>curl for APIs</h2>
+<pre class="code">TOKEN=<span class="s">"$(cat ~/.config/deployctl/token)"</span>            <span class="c"># never paste tokens into commands that land in history</span>
+
+<span class="c"># GET with a bearer token; -f fails on HTTP errors, -sS is quiet but still shows errors</span>
+$ <span class="f">curl</span> -fsS -H <span class="s">"Authorization: Bearer $TOKEN"</span> https://api.example.com/v1/deployments?service=checkout | <span class="f">jq</span> <span class="s">'.items[0]'</span>
+
+<span class="c"># POST JSON (--json sets the body and both Content-Type and Accept headers; curl 7.82+)</span>
+$ <span class="f">curl</span> -sS --fail-with-body -X POST https://api.example.com/v1/deployments \
+    -H <span class="s">"Authorization: Bearer $TOKEN"</span> \
+    -H <span class="s">"Idempotency-Key: $(uuidgen)"</span> \
+    --json <span class="s">'{"service":"checkout","version":"4.18.2"}'</span>
+
+<span class="c"># Just the status code, for scripts</span>
+$ <span class="f">curl</span> -s -o /dev/null -w <span class="s">'%{http_code}\n'</span> https://api.example.com/healthz
+200
+
+<span class="c"># Let curl retry transient failures (timeouts, 408, 429, 500, 502, 503, 504) with backoff</span>
+$ <span class="f">curl</span> -fsS --retry <span class="m">5</span> --retry-max-time <span class="m">60</span> https://api.example.com/v1/deployments/dep_812</pre>
+  <p>Four habits. <b>Use <code>-f</code> or <code>--fail-with-body</code> in scripts</b>: without it, curl exits 0 on a 500 and your <code>set -e</code> never fires (Prerequisite 2). <b>Read the token from a file or environment variable</b>, not the command line, where it ends up in shell history and in <code>ps</code> output. <b>Keep the request ID</b>: most APIs return one in a header (<code>x-request-id</code>, <code>x-amzn-requestid</code>), and it is the first thing a provider's support team asks for. And let the official CLI or SDK do request signing when the API needs it (AWS's SigV4 signs every request with your secret key); <code>curl</code> is for understanding and quick checks.</p>
+
+  <h2>Simulator: a deployments API</h2>
+  <p>A small API that starts deployments. Your tokens have different scopes, the API allows 6 requests a minute, and a deployment of <code>checkout</code> takes a while to finish. Send requests and read the raw responses; the box under the form shows the <code>curl</code> command you would type.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">API console: https://api.example.com</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="ha-form">
+        <label>Method<select class="inp" id="haM"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option></select></label>
+        <label>Path<select class="inp" id="haP"><option value="/v1/deployments">/v1/deployments</option><option value="/v1/deployments/dep_812">/v1/deployments/dep_812</option><option value="/v1/deploymnets">/v1/deploymnets (typo)</option><option value="/v1/services/checkout/config">/v1/services/checkout/config</option></select></label>
+        <label>Token<select class="inp" id="haT"><option value="none">(no Authorization header)</option><option value="expired">expired token</option><option value="read">token with deploy:read</option><option value="write" selected>token with deploy:write</option></select></label>
+      </div>
+      <div class="ha-opts">
+        <label>Body <select class="inp" id="haB"><option value="ok">{"service":"checkout","version":"4.18.2"}</option><option value="bad">{"service":"checkout"}</option><option value="none">(no body)</option></select></label>
+        <label><input type="checkbox" id="haK"> Idempotency-Key header</label>
+        <label><input type="checkbox" id="haDrop"> network drops the response</label>
+      </div>
+      <div class="controls"><button class="btn sm primary" id="haSend">Send</button><button class="btn sm" id="haRetry">Retry the last request</button><button class="btn sm" id="haWait">⏱ Wait 60 s</button><button class="btn sm" id="haReset">↺ Reset API</button></div>
+      <div class="ha-curl" id="haCurl"></div>
+      <div class="ha-wire"><div class="ha-box" id="haReq"></div><div class="ha-box" id="haRes"></div></div>
+      <div class="ha-why" id="haWhy"></div>
+      <div class="ha-db" id="haDb"></div>
+    </div>
+    <div class="panel-foot">The API keeps its state between requests: deployments you create stay, the rate-limit window counts every request (even failed ones), and stored idempotency keys replay their first response. "Network drops the response" makes the server do the work but your client see a timeout.</div>
+  </div>
+
+  <figure class="seq" data-actors="Pipeline|API|Database">
+    <ol>
+      <li data-m="0>1">POST /v1/deployments, Idempotency-Key: 7f3c…</li>
+      <li data-m="1>2">insert dep_913; store key 7f3c → 201 response</li>
+      <li data-m="1>0" data-k="fail">201 Created (lost: connection reset)</li>
+      <li data-m="0>0">timeout: did it happen? retry with the SAME key</li>
+      <li data-m="0>1">POST /v1/deployments, Idempotency-Key: 7f3c…</li>
+      <li data-m="1>2">key 7f3c seen: load stored response</li>
+      <li data-m="1>0" data-k="reply">201 Created dep_913 (replayed, no new deployment)</li>
+    </ol>
+    <figcaption><b>Idempotency keys make POST retry-safe.</b> The client invents a unique key per logical operation and reuses it on every retry; the server remembers the key with the first result. Without the key, the retry would start a second deployment.</figcaption>
+  </figure>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Response</b> or no response?</li>
+      <li data-k="decision"><b>2xx</b> done. <b>4xx</b> (not 408/429): fix the request, do not retry</li>
+      <li data-k="decision"><b>429 / 503</b> wait for <code>Retry-After</code>, then retry</li>
+      <li data-k="decision"><b>5xx or timeout</b> retry only if idempotent (or with the same idempotency key)</li>
+      <li data-k="end"><b>Backoff</b> 1 s, 2 s, 4 s… plus jitter; give up after a budget</li>
+    </ol>
+    <figcaption><b>When to retry an API call.</b> Every SDK and every pipeline step should encode this; it is what <code>curl --retry</code> and the AWS SDKs' retry modes do for you.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">💳</div>
+    <div class="body"><div class="title">Use case: why payment APIs made idempotency keys famous</div><p>When a payment request times out, the client cannot know whether the customer was charged. Stripe's API solves this with an <code>Idempotency-Key</code> header on POST requests: the first request's result is saved under that key, and a retry with the same key returns the saved result instead of charging again. Stripe documents that keys can be removed after they are at least 24 hours old, so retries must happen within that window. The same pattern now appears in many cloud and internal APIs, and it is the right default for any automation that creates things: deployments, tickets, DNS records, invoices.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>curl without <code>-f</code> in scripts:</b> a 500 is exit code 0.</li>
+      <li><b>Retrying 4xx errors.</b> A 400 or 403 will fail the same way every time, and the retries burn your rate limit.</li>
+      <li><b>Retrying POST blindly</b> after a timeout: duplicate deployments, charges or records. Use an idempotency key.</li>
+      <li><b>Ignoring <code>Retry-After</code></b> and retrying immediately on 429, which keeps you rate-limited.</li>
+      <li><b>Tokens on the command line</b> or in logs. Read them from a file or environment variable and mask them in CI.</li>
+      <li><b>Confusing 401 and 403:</b> 401 means "who are you?" (fix the token), 403 means "not allowed" (fix the permission).</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the difference between a 401 and a 403?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>401 Unauthorized really means unauthenticated: the server does not know who you are, because the token is missing, expired or invalid, so getting a fresh token can fix it. 403 Forbidden means the server knows who you are and you are not allowed to do this; a new token with the same permissions will fail the same way, so the fix is the role or policy. Some APIs return 404 instead of 403 so as not to reveal that a resource exists.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your pipeline's "create DNS record" step sometimes times out, and the retry then fails with 409 Conflict. How do you make the step reliable?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The first call succeeded but the response was lost, so the retry tries to create something that now exists. Options, best first: use an idempotency key if the API supports one, so the retry returns the original result; or use an idempotent operation such as PUT/"upsert" that sets the record to the desired value whether or not it exists; or treat 409 as "check the current state": GET the record and succeed if it already matches. More generally, steps should converge on a desired state rather than issue one-shot commands, which is exactly what Terraform and Kubernetes do (Chapters 11 and 19).</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>GET is safe; PUT and DELETE are idempotent; POST is neither, so retrying it can duplicate work.</li>
+      <li>4xx means fix the request (401: identity, 403: permission, 422: body); 5xx means the server failed.</li>
+      <li>Retry only 429, 503, other 5xx and timeouts, with backoff and jitter, honouring <code>Retry-After</code>.</li>
+      <li>In scripts use <code>curl -fsS</code> (or <code>--fail-with-body</code>), read tokens from files, and keep request IDs.</li>
+      <li>Idempotency keys make creates safe to retry; desired-state APIs make them unnecessary.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A script's <code>POST /v1/deployments</code> times out. What is the risk of simply sending it again?</p>
+      <div class="opts">
+        <button class="opt">None: POST is idempotent</button>
+        <button class="opt">The API will return 401</button>
+        <button class="opt">The first request may have succeeded, so the retry can create a second deployment</button>
+        <button class="opt">The retry will be rejected with 404</button>
+      </div>
+      <div class="explain">A timeout does not tell you whether the server did the work. POST is not idempotent, so use an idempotency key (or an idempotent operation) before retrying.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A token with only <code>deploy:read</code> sends <code>POST /v1/deployments</code>. Which status code fits?</p>
+      <div class="opts">
+        <button class="opt">403 Forbidden</button>
+        <button class="opt">401 Unauthorized</button>
+        <button class="opt">404 Not Found</button>
+        <button class="opt">429 Too Many Requests</button>
+      </div>
+      <div class="explain">The caller is authenticated (the token is valid) but lacks the permission. 401 would mean the token itself is missing or invalid.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Which error should a script NOT retry automatically?</p>
+      <div class="opts">
+        <button class="opt">503 Service Unavailable with Retry-After: 10</button>
+        <button class="opt">429 Too Many Requests</button>
+        <button class="opt">A connection timeout on a GET</button>
+        <button class="opt">422 Unprocessable Entity: "version is required"</button>
+      </div>
+      <div class="explain">422 is a client error: the same body will fail the same way. 429 and 503 ask you to come back later; a GET is safe to repeat.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why add <code>-f</code> (or <code>--fail-with-body</code>) to curl calls in a CI script?</p>
+      <div class="opts">
+        <button class="opt">It makes requests faster</button>
+        <button class="opt">Without it curl exits 0 even on HTTP 4xx/5xx, so the step "passes" and set -e never fires</button>
+        <button class="opt">It forces HTTPS</button>
+        <button class="opt">It retries failed requests</button>
+      </div>
+      <div class="explain">By default curl only fails on transport errors. -f turns HTTP error statuses into a non-zero exit code (22); --fail-with-body also prints the error body.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">An API answers <code>429</code> with <code>Retry-After: 30</code>. What should the client do?</p>
+      <div class="opts">
+        <button class="opt">Retry immediately, up to 10 times</button>
+        <button class="opt">Treat it as a permanent failure</button>
+        <button class="opt">Wait at least 30 seconds before retrying, and reduce its request rate</button>
+        <button class="opt">Switch to a different HTTP method</button>
+      </div>
+      <div class="explain">Retry-After is the server telling you when to come back. Retrying sooner just extends the throttling.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = OPS;
+  let S, last;
+  function fresh() { S = { deps: [{ id: 'dep_812', service: 'checkout', version: '4.18.1', status: 'succeeded' }], window: [], now: 0, keys: {}, seq: 913, cfg: { replicas: 3 } }; last = null; }
+  const LIMIT = 6;
+  const uuid = () => '7f3c' + Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0') + '-…';
+  let keyVal = uuid();
+  function curlFor(r) {
+    const parts = [`curl -sS --fail-with-body${r.m === 'GET' ? '' : ' -X ' + r.m} https://api.example.com${r.p}`];
+    if (r.t !== 'none') parts.push('-H "Authorization: Bearer $TOKEN"');
+    if (r.k && r.m === 'POST') parts.push(`-H "Idempotency-Key: ${keyVal}"`);
+    if (r.b !== 'none' && (r.m === 'POST' || r.m === 'PUT')) parts.push(`--json '${r.m === 'PUT' ? '{"replicas":4}' : (r.b === 'ok' ? '{"service":"checkout","version":"4.18.2"}' : '{"service":"checkout"}')}'`);
+    const note = r.t === 'none' ? '# no token' : '# $TOKEN has ' + (r.t === 'expired' ? 'expired' : r.t === 'read' ? 'scope deploy:read' : 'scope deploy:write');
+    return note + '\n$ ' + parts.join(' \\\n    ');
+  }
+  function respond(r) {
+    const H = { 'content-type': 'application/json', 'x-request-id': 'req_' + Math.floor(Math.random() * 1e8).toString(36) };
+    S.window = S.window.filter((x) => x > S.now - 60);
+    if (S.window.length >= LIMIT) return { st: 429, H: { ...H, 'retry-after': String(Math.ceil(60 - (S.now - S.window[0]))), 'x-ratelimit-remaining': '0' }, b: { error: 'rate_limited', message: `Limit of ${LIMIT} requests per minute exceeded` }, why: '<b>429: rate limited.</b> Every request counts against the window, including the failed ones. Wait for <code>Retry-After</code> (press "Wait 60 s"); retrying sooner just extends the throttling.' };
+    S.window.push(S.now);
+    H['x-ratelimit-remaining'] = String(LIMIT - S.window.length);
+    if (r.p === '/v1/deploymnets') return { st: 404, H, b: { error: 'not_found', message: 'No route for POST/GET /v1/deploymnets' }, why: '<b>404: no such resource.</b> A typo in the path (or a wrong region or ID). Retrying will not help.' };
+    if (r.t === 'none') return { st: 401, H: { ...H, 'www-authenticate': 'Bearer' }, b: { error: 'unauthenticated', message: 'Missing Authorization header' }, why: '<b>401: who are you?</b> No credentials were sent. Add the <code>Authorization</code> header.' };
+    if (r.t === 'expired') return { st: 401, H: { ...H, 'www-authenticate': 'Bearer error="invalid_token"' }, b: { error: 'invalid_token', message: 'Token expired at 2026-10-01T08:00:00Z' }, why: '<b>401 again, but different:</b> the token was sent and has expired. Get a new token; the permission itself is fine.' };
+    const write = r.m !== 'GET';
+    if (write && r.t === 'read') return { st: 403, H, b: { error: 'forbidden', message: 'Token lacks scope deploy:write' }, why: '<b>403: known, but not allowed.</b> The token is valid, it just lacks <code>deploy:write</code>. A fresh token with the same scope fails the same way; fix the permission (Chapter 6).' };
+    if (r.p === '/v1/deployments') {
+      if (r.m === 'GET') return { st: 200, H, b: { items: S.deps.slice().reverse(), next: null }, why: '<b>200.</b> GET is safe: call it as often as you like (within the rate limit).' };
+      if (r.m === 'POST') {
+        if (r.k && S.keys[keyVal]) { const prev = S.keys[keyVal]; return { ...prev, H: { ...prev.H, 'idempotent-replayed': 'true', 'x-ratelimit-remaining': H['x-ratelimit-remaining'] }, why: `<b>${prev.st}, replayed.</b> The server recognised the Idempotency-Key and returned the stored result of the first request. No new deployment was created.` }; }
+        if (r.b !== 'ok') return { st: 422, H, b: { error: 'validation_failed', details: [{ field: 'version', message: 'is required' }] }, why: '<b>422: well-formed JSON, invalid content.</b> The <code>version</code> field is missing. Fix the body; do not retry as is.' };
+        const dupes = S.deps.filter((x) => x.version === '4.18.2').length;
+        const d = { id: 'dep_' + S.seq++, service: 'checkout', version: '4.18.2', status: dupes ? 'queued' : 'in_progress' };
+        if (dupes) { S.deps.push(d); return { st: 201, H, b: d, why: `<b>201, but look at the server state below:</b> ${dupes + 1} deployments of the same version now exist. ${r.k ? 'You pressed Send, which is a new operation with a new Idempotency-Key, so the server created another deployment. A retry must reuse the key: that is what the Retry button does.' : 'A second POST created a duplicate, because POST is not idempotent. With an Idempotency-Key, a retry would have replayed the first result instead.'}` }; }
+        S.deps.push(d);
+        const res = { st: 201, H: { ...H, location: '/v1/deployments/' + d.id }, b: d, why: '<b>201 Created.</b> The deployment started.' + (r.k ? ' Its result is stored under your Idempotency-Key, so a retry with the same key is safe.' : ' Try dropping the response and retrying to see why POSTs need idempotency keys.') };
+        if (r.k) S.keys[keyVal] = res;
+        return res;
+      }
+      return { st: 405, H: { ...H, allow: 'GET, POST' }, b: { error: 'method_not_allowed' }, why: '<b>405:</b> this collection accepts only GET and POST.' };
+    }
+    if (r.p === '/v1/deployments/dep_812') {
+      if (r.m === 'GET') return { st: 200, H, b: S.deps[0], why: '<b>200.</b> A single resource by ID.' };
+      if (r.m === 'DELETE') return { st: 409, H, b: { error: 'conflict', message: 'Finished deployments cannot be deleted; roll forward or roll back instead' }, why: '<b>409: conflicts with the current state.</b> The request is valid in general, but not for a deployment that already finished.' };
+      return { st: 405, H: { ...H, allow: 'GET, DELETE' }, b: { error: 'method_not_allowed' }, why: '<b>405:</b> wrong method for this resource.' };
+    }
+    if (r.p === '/v1/services/checkout/config') {
+      if (r.m === 'PUT') { S.cfg = { replicas: 4 }; return { st: 200, H, b: { service: 'checkout', ...S.cfg }, why: '<b>200.</b> PUT replaces the config with your body. It is idempotent: send it ten times and replicas is still 4, so retrying it after a timeout is safe.' }; }
+      if (r.m === 'GET') return { st: 200, H, b: { service: 'checkout', ...S.cfg }, why: '<b>200.</b> Current config.' };
+      return { st: 405, H: { ...H, allow: 'GET, PUT' }, b: { error: 'method_not_allowed' }, why: '<b>405:</b> config accepts GET and PUT.' };
+    }
+  }
+  function send(r) {
+    last = r;
+    const res = respond(r);
+    S.now += 3;
+    $('#haCurl').textContent = curlFor(r);
+    const body = r.b !== 'none' && (r.m === 'POST' || r.m === 'PUT') ? '\n\n' + (r.m === 'PUT' ? '{"replicas":4}' : r.b === 'ok' ? '{"service":"checkout","version":"4.18.2"}' : '{"service":"checkout"}') : '';
+    $('#haReq').innerHTML = `<b>${r.m} ${r.p} HTTP/1.1</b>\n<span class="ha-h">Host: api.example.com${r.t !== 'none' ? '\nAuthorization: Bearer eyJhbGciOi…' : ''}${r.k && r.m === 'POST' ? '\nIdempotency-Key: ' + keyVal : ''}${body ? '\nContent-Type: application/json' : ''}</span>` + body.replace(/</g, '&lt;');
+    if (r.drop && res.st < 300) {
+      $('#haRes').innerHTML = `<span class="ha-st ha-5">curl: (28) Operation timed out after 30001 milliseconds with 0 bytes received</span>\n\n<span class="ha-h"># the server did the work (look at the table), but the response never arrived</span>`;
+      $('#haWhy').innerHTML = '<b>Timeout: did it happen or not?</b> From the client you cannot tell. Press <b>Retry the last request</b> and see what a blind retry does, with and without an Idempotency-Key.';
+    } else {
+      const cls = 'ha-' + String(res.st)[0];
+      $('#haRes').innerHTML = `<span class="ha-st ${cls}">HTTP/1.1 ${res.st} ${({ 200: 'OK', 201: 'Created', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict', 422: 'Unprocessable Entity', 429: 'Too Many Requests' })[res.st]}</span>\n<span class="ha-h">${Object.entries(res.H).map(([k, v]) => k + ': ' + v).join('\n')}</span>\n\n${JSON.stringify(res.b, null, 2).replace(/</g, '&lt;')}`;
+      $('#haWhy').innerHTML = res.why;
+    }
+    table();
+  }
+  function table() {
+    S.window = S.window.filter((x) => x > S.now - 60);
+    $('#haDb').innerHTML = `<b>Server state:</b> ${S.deps.map((d) => `<code>${d.id}</code> ${d.version} <span class="muted">${d.status}</span>`).join(' · ')} &nbsp;|&nbsp; rate limit: <b>${LIMIT - S.window.length}</b> of ${LIMIT} left this minute`;
+  }
+  const form = () => ({ m: $('#haM').value, p: $('#haP').value, t: $('#haT').value, b: $('#haB').value, k: $('#haK').checked, drop: $('#haDrop').checked });
+  $('#haSend').onclick = () => { keyVal = uuid(); send(form()); };   // a new logical operation gets a new key; Retry reuses it
+  $('#haRetry').onclick = () => { if (!last) return; send({ ...last, drop: false }); };
+  $('#haWait').onclick = () => { S.now += 60; table(); $('#haWhy').innerHTML = 'A minute passed: the rate-limit window has emptied.'; };
+  $('#haReset').onclick = () => { fresh(); keyVal = uuid(); $('#haCurl').textContent = curlFor(form()); $('#haReq').textContent = ''; $('#haRes').textContent = ''; $('#haWhy').innerHTML = 'API reset. Try: POST with the drop box ticked, then Retry, first without and then with an Idempotency-Key.'; table(); };
+  ['#haM', '#haP', '#haT', '#haB', '#haK'].forEach((id) => $(id).addEventListener('change', () => { $('#haCurl').textContent = curlFor(form()); }));
+  fresh(); $('#haCurl').textContent = curlFor(form());
+  $('#haWhy').innerHTML = 'Pick a method, path and token, then Send. A good first experiment: POST with "network drops the response" ticked, then Retry.';
+  table();
+})();
+</script>
 </body>
 </html>

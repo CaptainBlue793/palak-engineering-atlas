@@ -6,33 +6,295 @@
 <title>Case Study: AWS us-east-1, December 2021</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('ops-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ue-ctl { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px 18px; margin-bottom:14px; }
+  .ue-ctl .ue-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .ue-rows { list-style:none; margin:0; padding:0; border:1px solid var(--border); border-radius:12px; overflow:hidden; font-size:13.5px; }
+  .ue-rows li { display:grid; grid-template-columns:minmax(0,230px) 96px minmax(0,1fr); gap:10px; padding:8px 12px; border-top:1px solid var(--border); align-items:baseline; }
+  @media (max-width:700px) { .ue-rows li { grid-template-columns:minmax(0,1fr) 96px; } .ue-rows li small { grid-column:1 / -1; } }
+  .ue-rows li:first-child { border-top:0; }
+  .ue-rows b { font-weight:700; }
+  .ue-rows span { justify-self:start; font-size:10.5px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; border-radius:999px; padding:2px 9px; color:#fff; background:var(--green); white-space:nowrap; }
+  .ue-rows span.ue-bad { background:var(--red); } .ue-rows span.ue-warn { background:var(--amber); } .ue-rows span.ue-na { background:var(--surface-2); color:var(--muted); border:1px solid var(--border); }
+  .ue-rows small { color:var(--muted); font-size:12.5px; }
+  .ue-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="44">
-<!-- ops:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 44</span><span class="pill" style="background:var(--pink-soft);color:var(--pink);border-color:transparent">Case Study</span><span class="pill">⏱ 40 min</span></div>
     <h1>Case Study: <span class="grad">AWS us-east-1, December 2021</span></h1>
-    <p class="lead">An internal network overload that took down services far beyond one region's customers.</p>
+    <p class="lead">On 7 December 2021 the largest cloud region in the world had a bad day, and a strange one. Virtual machines in us-east-1 kept running. Storage kept answering. Yet for about seven hours companies could not launch servers, sign in to the console, or change a DNS record, delivery drivers could not scan parcels, and video doorbells went blank, including for customers who believed they had nothing in that region. The fault was in a part of AWS that customers never see: an internal network that the provider's own management systems run on. This case study follows AWS's published summary. It is the clearest real illustration of two ideas that earlier chapters stated in the abstract: the difference between a control plane and a data plane, and the danger of a hidden dependency on one place. The simulator asks what your own architecture would have done that morning.</p>
+    <ul class="objectives">
+      <li><span>Describe what failed inside AWS, and why customers' running servers were unaffected</span></li>
+      <li><span>Explain how retries turned a brief surge into hours of congestion</span></li>
+      <li><span>Separate control-plane operations from data-plane operations for common services</span></li>
+      <li><span>Name the "global" services whose control planes live in one region</span></li>
+      <li><span>Design recovery that needs no control-plane call</span></li>
+      <li><span>Audit an architecture for hidden dependencies on a single region</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Bash · Docker · K8s · Terraform listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Regions, zones and what a provider promises about each:</b> <a href="02-cloud-fundamentals.html">Chapter 2</a>.</li>
+        <li><b>Static stability, and control and data planes in outline:</b> <a href="33-multi-region.html">Chapter 33</a>. This chapter is the worked example.</li>
+        <li><b>Retries, backoff and jitter:</b> the Distributed Systems course's <a href="../distributed-systems/04-retries-idempotency.html">chapter on retries</a>.</li>
+        <li><b>Temporary credentials and roles:</b> <a href="06-iam.html">Chapter 6</a>.</li>
+        <li><b>A Kubernetes control plane failing while workloads run</b> is the same idea at smaller scale: <a href="11-kubernetes-architecture.html">Chapter 11</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>What failed</li>
-    <li>Why it spread</li>
-    <li>Control plane vs data plane</li>
-    <li>Lessons for your architecture</li>
-  </ol>
+  <h2>What failed</h2>
+  <p>AWS runs two networks in each region. The <b>main network</b> carries customers' traffic: your instances, your load balancers, your requests to storage. A separate <b>internal network</b> hosts the systems AWS uses to run the region: monitoring, internal DNS, authorisation services and parts of the machinery that launches and manages resources. The two are joined by a set of networking devices that pass traffic between them and translate addresses.</p>
+  <p>At about 7:30 in the morning, Pacific time, an automated process began adding capacity to one of the AWS services in the main network. It was routine. On this occasion it caused a large number of clients inside the internal network to behave in an unexpected way, and together they produced a surge of new connections to the devices between the two networks. The devices were overwhelmed. Communication between the networks became slow and lossy.</p>
+  <figure class="seq" data-actors="Scaling activity|Internal clients|Boundary devices|Internal services|Operators">
+    <ol>
+      <li data-m="0>1">a service in the main network adds capacity, automatically</li>
+      <li data-m="1>2" data-k="bad">an unexpected surge of connections across the boundary</li>
+      <li data-m="2>2" data-k="fail">devices overloaded: delays and errors between the two networks</li>
+      <li data-m="1>2" data-k="bad">requests fail, so clients retry, without backing off enough</li>
+      <li data-m="2>3" data-k="fail">monitoring, internal DNS and authorisation become hard to reach</li>
+      <li data-m="3>4" data-k="fail">dashboards go blank: the people fixing it cannot see the system</li>
+      <li data-m="4>3">about two hours in: move internal DNS traffic away from the congested paths</li>
+      <li data-m="4>2">then, step by step: isolate the heaviest sources of traffic, add capacity</li>
+      <li data-m="2>4" data-k="reply">about seven hours in: congestion clears</li>
+    </ol>
+    <figcaption><b>The shape of the incident,</b> following AWS's published summary. The trigger was over in minutes. The congestion it started lasted most of a working day.</figcaption>
+  </figure>
+  <p>The detail that made the day long is the sixth line. The congestion cut the operations teams off from their own real-time monitoring, which lived in the internal network. They had to work out what was happening from logs, cautiously, because the affected devices were carrying whatever traffic was still getting through and a wrong move could make things worse. Moving the internal DNS traffic helped considerably after about two hours. The devices did not fully recover until 2:22 in the afternoon, and some services took a few hours more to catch up.</p>
+
+  <h2>Why it spread</h2>
+  <p>Two mechanisms turned a surge into an outage, and both are general.</p>
+  <p><b>Retries kept the overload alive.</b> When requests across the boundary began to fail, the clients tried again. Well-behaved clients wait longer after each failure, with some randomness, so that load falls when a system is struggling. AWS's summary says its clients had backoff behaviour, and that a latent fault prevented them from backing off adequately in this situation. So each failure produced more attempts, more attempts produced more congestion, and the congestion produced more failures. Such a loop can keep a system overloaded long after its original cause has gone, a state researchers call a <b>metastable failure</b>. The only ways out are to reduce the load from outside or to add capacity, and both were hard to do blind.</p>
+  <p><b>Everything shared the same foundation.</b> The internal network was a dependency of a great many services at once, because the things on it, DNS, authorisation and monitoring, are what all the other services use. This is the same pattern as the network plugin in <a href="43-case-kubernetes-outage.html">Chapter 43</a>, at the scale of a cloud region. It reached even the tools for telling customers what was happening. The public Service Health Dashboard could not be updated for some time, because the system used to post to it depended on the affected network, and the support centre was impaired in the same way. For a while the page that customers were told to check showed that all was well.</p>
+
+  <h2>Control plane vs data plane</h2>
+  <p>The most instructive thing about the day is the pattern of what broke and what did not. It follows one line exactly.</p>
+  <ul>
+    <li>A service's <b>data plane</b> does its everyday work: an instance runs, a load balancer forwards a request, a DNS server answers a query, a database returns a row.</li>
+    <li>Its <b>control plane</b> changes things: launch an instance, create a load balancer, edit a DNS record, attach a role.</li>
+  </ul>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Service</th><th>Kept working (data plane)</th><th>Impaired (control plane, or dependent on the internal network)</th></tr></thead>
+      <tbody>
+        <tr><td><b>Virtual machines</b></td><td>Instances already running</td><td>Launching, describing and modifying instances</td></tr>
+        <tr><td><b>Load balancers</b></td><td>Existing load balancers forwarding traffic</td><td>Creating them, and registering new targets promptly</td></tr>
+        <tr><td><b>Containers</b></td><td>Tasks and pods already running</td><td>Starting replacements for any that failed</td></tr>
+        <tr><td><b>DNS (Route 53)</b></td><td>Answering queries; health checks and automatic failover</td><td>Changing records through the API</td></tr>
+        <tr><td><b>Object storage and key-value databases</b></td><td>Reads and writes from running applications</td><td>Mostly unaffected</td></tr>
+        <tr><td><b>Functions (Lambda)</b></td><td>Invocations ran normally</td><td>Requests arriving through API Gateway, which returned errors</td></tr>
+        <tr><td><b>Sign-in and credentials</b></td><td>Credentials already held, until they expired</td><td>The console; token requests for some identity integrations</td></tr>
+        <tr><td><b>Monitoring</b></td><td></td><td>Metrics and alarms were delayed, which also delayed customers' own autoscaling</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Providers build data planes to keep working without their control planes, and that held. A system that was simply <i>running</i> in us-east-1, with enough capacity already in place, largely sailed through. Systems that needed to <i>change</i> something did not: those scaling up for the morning's traffic, replacing a failed container, or failing over by editing a record.</p>
+  <p>That explains customers in us-east-1. It does not explain customers elsewhere, and for them the lesson is about the word <b>global</b>. Several AWS services present themselves as having no region: identity management, DNS, the content delivery network, the organisation of accounts. Their data planes really are spread around the world. Their <b>control planes are each hosted in one region, and for most of them that region is us-east-1</b>. The same has long been true of the original, "global" endpoint of the token service, <code>sts.amazonaws.com</code>, which is why AWS recommends the regional endpoints. So a company running entirely in Europe could be affected that day if any part of its path, creating a role, changing a DNS record, signing people in, or fetching a token from the global endpoint, quietly led to Virginia.</p>
+<pre class="code"><span class="c"># Does our code call the global token endpoint? (It is served from us-east-1.)</span>
+$ <span class="f">grep</span> -rn <span class="s">"sts.amazonaws.com"</span> services/ infrastructure/
+services/exporter/config.yaml:14:  sts_endpoint: https://sts.amazonaws.com
+
+<span class="c"># Use the regional endpoints instead. One setting, for every SDK and the CLI:</span>
+$ <span class="k">export</span> AWS_STS_REGIONAL_ENDPOINTS=regional
+$ <span class="f">aws</span> sts get-caller-identity --region eu-west-1 --debug 2&gt;&amp;1 | <span class="f">grep</span> -o <span class="s">"sts\.[a-z0-9.-]*amazonaws.com"</span> | <span class="f">head</span> -1
+sts.eu-west-1.amazonaws.com</pre>
+
+  <h2>Lessons for your architecture</h2>
+  <p>None of the lessons is "avoid us-east-1" or "avoid AWS". Every provider has had an incident of this shape. The lessons are about what your recovery depends on.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Be statically stable</b> have the capacity you need already running. Recovery that begins with "launch more" depends on the control plane at its worst moment</li>
+      <li data-k="step"><b>Fail over on the data plane</b> health checks that move traffic by themselves, not a script that edits records</li>
+      <li data-k="step"><b>Use regional endpoints</b> for tokens and APIs, so a workload in one region does not call another</li>
+      <li data-k="step"><b>Know your global dependencies</b> list every service you use whose control plane has a home region, and what you could not do if it were down</li>
+      <li data-k="step"><b>Look at your suppliers too</b> your CI system, identity provider, paging tool and status page are hosted somewhere. Find out where</li>
+      <li data-k="decision"><b>Watch from outside</b> a monitor and a status page that do not share the failure. Do not rely on the provider's dashboard to tell you</li>
+      <li data-k="end"><b>Make clients back off</b> with exponential delays, jitter and a retry budget, and test that they really do</li>
+    </ol>
+    <figcaption><b>What December 2021 asks of an architecture.</b> The fifth step catches people out: a company with nothing in us-east-1 found it could not deploy or page anyone, because its tools ran there.</figcaption>
+  </figure>
+  <p>One caution against over-learning. Going multi-region is not the main lesson, and for many systems it is not worth the cost (<a href="33-multi-region.html">Chapter 33</a>). A single-region system with its capacity already provisioned did well that day. A two-region system whose failover needed a DNS API call did badly. What mattered was whether surviving required changing anything.</p>
+
+  <h2>Simulator: your architecture, that morning</h2>
+  <p>It is 7:30 a.m. Pacific time on 7 December 2021. For the next seven hours, control-plane operations in us-east-1 fail and the services listed above are impaired. Describe your system.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">What still works?</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="ue-ctl">
+        <div><div class="ue-l">Where the workload runs</div><div class="seg" id="ueWhere"><button class="active" data-v="use1">us-east-1 only</button><button data-v="multi">us-east-1 and us-west-2</button><button data-v="other">eu-west-1 only</button></div></div>
+        <div><div class="ue-l">Capacity for today's peak</div><div class="seg" id="ueCap"><button data-v="static">Already running</button><button class="active" data-v="scale">Autoscaling will launch it</button></div></div>
+        <div><div class="ue-l">Requests reach the service through</div><div class="seg" id="ueFront"><button class="active" data-v="lb">An existing load balancer</button><button data-v="apigw">API Gateway</button></div></div>
+        <div><div class="ue-l">Moving traffic between regions</div><div class="seg" id="ueSteer"><button data-v="health">Health checks, automatic</button><button class="active" data-v="api">A script edits DNS records</button></div></div>
+        <div><div class="ue-l">The service gets its AWS credentials from</div><div class="seg" id="ueSts"><button data-v="regional">Its region's token endpoint</button><button class="active" data-v="global">The global endpoint</button></div></div>
+      </div>
+      <ul class="ue-rows" id="ueRows"></ul>
+      <div class="stats" id="ueStats"></div>
+      <div class="ue-why" id="ueWhy"></div>
+    </div>
+    <div class="panel-foot">Rules, simplified from the published summary: running instances and existing load balancers keep serving; nothing can be launched in us-east-1; API Gateway in us-east-1 returns errors; DNS health checks keep working and record changes do not; the global token endpoint is unreachable, so credentials from it stop working once the cached ones expire, within the hour, wherever the workload runs. Other regions' own control planes are unaffected.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul id="ue-notes">
+    <li><b>The starting system</b> is a common one: one region, autoscaling for the peak, a script for DNS, and credentials from the global endpoint. It is <b>down</b>, and the cause is the last of those, not the one people expect.</li>
+    <li><b>Switch to the regional token endpoint.</b> Now it is <b>degraded</b>: existing instances serve, and the launches the morning peak needed all fail. Switch capacity to "already running" and it is <b>up</b>, in a single region, for all seven hours.</li>
+    <li><b>Choose two regions, API Gateway, and the DNS script.</b> Degraded, with a healthy second region that cannot be given the traffic. Change steering to health checks: <b>up</b> within a minute or two, and no API was called.</li>
+    <li><b>Two regions, a load balancer, autoscaling and health checks:</b> still degraded. The region is short of capacity but alive, so its health checks pass. A second region does not replace having enough capacity in the first.</li>
+    <li><b>Move the workload to eu-west-1 only,</b> with the global token endpoint. Down. Four of the five rows say "n/a" and the fifth is enough.</li>
+    <li>Of the 48 combinations, 14 stay up, 6 are degraded and 28 go down. Of those 28, 24 are every combination that uses the global endpoint, in all three locations. The other 4 are a single region behind API Gateway.</li>
+  </ul>
+
+  <div class="callout usecase">
+    <div class="ico">📟</div>
+    <div class="body"><div class="title">Use case: Kinesis, a year earlier, and the dashboard that could not say so</div><p>The 2021 incident had a rehearsal. On 25 November 2020, the day before the American Thanksgiving holiday, the same region suffered a long outage that began in a single service, Kinesis, which carries streams of data. Engineers had added a modest amount of capacity to the fleet of servers at the front of the service. Each of those servers keeps a thread open for every other server in the fleet, so adding servers increased the thread count on all of them, and the addition pushed every server over a limit set in the operating system's configuration. They failed together. Bringing the fleet back took most of the day, because the servers had to be restarted slowly to avoid a second collapse. The outage did not stay in Kinesis. Other AWS services were built on it: the sign-in service used it for analytics and, through a fault in how it handled the failure, began refusing logins; the monitoring service used it to ingest metrics, so alarms and autoscaling stopped working; and services that depended on those were affected in turn. And, as would happen again a year later, AWS could not post updates to its Service Health Dashboard at first, because the tool for doing so depended on the sign-in service that was down. AWS's write-up listed the fixes: larger servers so that fewer were needed, alarms on thread counts, isolating parts of the fleet from each other, and removing the dashboard's dependency. The value of reading the two incidents together is the pattern. Routine capacity changes were the trigger both times. A shared internal dependency carried the failure outwards both times. And both times the system for announcing the problem turned out to stand on the thing that had failed.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>A recovery plan whose first step is a control-plane call:</b> launch, scale, create, update.</li>
+      <li><b>Running close to capacity and relying on autoscaling to save you during an incident.</b></li>
+      <li><b>Failover by editing DNS records</b> when health-check failover would work without any API.</li>
+      <li><b>Assuming a "global" service has no home.</b> Its control plane does.</li>
+      <li><b>Calling the global token endpoint</b> from workloads in other regions.</li>
+      <li><b>Believing a workload outside us-east-1 has no dependency on it,</b> without checking your suppliers and tools.</li>
+      <li><b>Trusting the provider's status page as your monitor.</b> It may be the last to know, or unable to say.</li>
+      <li><b>Your own status page, alerting or runbooks hosted on the infrastructure they report on.</b></li>
+      <li><b>Clients that retry immediately and for ever.</b> They turn a blip into an outage, for you and for whoever you call.</li>
+      <li><b>Concluding "go multi-region" or "leave the cloud"</b> when the cheaper fix is to stop needing changes during a failure.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the difference between a control plane and a data plane, and why does it matter in an outage?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The data plane is the part of a service that does the work users depend on moment to moment: serving requests from running instances, forwarding traffic through a load balancer, answering DNS queries. The control plane is the part that makes changes: launching instances, creating load balancers, editing DNS records, changing permissions. Providers design data planes to keep running when control planes fail, and control planes are more complex and fail more often, especially in large incidents when everyone is trying to make changes at once. In AWS's us-east-1 outage in December 2021, running instances were fine, but nothing could be launched and records could not be changed for hours. So it matters for design: a system survives a control-plane outage if it does not need to change anything to keep working. That means capacity already provisioned, failover driven by health checks, and no API calls in the recovery path.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your company runs only in eu-west-1. During a us-east-1 outage, parts of your product break anyway. How could that happen, and how would you find the causes beforehand?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>There are three kinds of route by which that happens. The first is the provider's own global services. Identity management, DNS management, the CDN's configuration and account organisation have control planes hosted in us-east-1, so creating a role, changing a record or updating a distribution fails even though our data plane in Europe is fine. The global token endpoint is the sharpest case: if our services or tools request credentials from it and not from the regional endpoint, they lose access to everything once cached credentials expire. The second route is our suppliers. Our CI system, container registry, identity provider, feature-flag service, paging tool, payment or email provider may run in us-east-1, and each can take away something we need: the ability to deploy, to sign in, to be alerted, to complete a purchase. The third is our own design choices that span regions: an artefact bucket or a secrets store created in us-east-1 years ago, a third-party webhook, replication to a bucket there. To find them beforehand I would do it as an audit with evidence, not from memory. Search the code and infrastructure definitions for region names and global endpoints. Read a sample of DNS resolutions and outbound connections from production to see where traffic really goes. Ask each supplier where they host and what their own dependencies are. Then test it: in a game day, block access to us-east-1 endpoints from a staging environment and see what breaks, which always finds something the audit missed. For each dependency found I would decide whether to remove it, for example by switching to regional endpoints, to tolerate it, by caching or degrading gracefully, or to accept it knowingly and write down what we cannot do during such an event.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>The December 2021 outage was congestion on AWS's internal network, started by routine scaling and sustained by retries.</li>
+      <li>Data planes kept working: running instances served. Control planes did not: nothing could be launched or changed.</li>
+      <li>Shared internal foundations spread a failure to many services, and to the tools for monitoring and announcing it.</li>
+      <li>"Global" services have control planes with a home region, usually us-east-1.</li>
+      <li>Survive by not needing change: capacity in place, failover by health check, regional endpoints.</li>
+      <li>Audit your suppliers and tools for where they run. Monitor and communicate from outside.</li>
+      <li>Clients that back off properly prevent a surge from becoming a standing overload.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">During the outage, which of these kept working in us-east-1?</p>
+      <div class="opts">
+        <button class="opt">Launching new virtual machines</button>
+        <button class="opt">Virtual machines that were already running</button>
+        <button class="opt">Changing DNS records</button>
+        <button class="opt">Signing in to the management console</button>
+      </div>
+      <div class="explain">Running instances are data plane. The other three need control-plane systems that were cut off by the congested internal network.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why did the congestion last for hours after a trigger that took minutes?</p>
+      <div class="opts">
+        <button class="opt">The trigger kept being repeated by operators</button>
+        <button class="opt">The devices were physically damaged</button>
+        <button class="opt">Customers launched too many instances</button>
+        <button class="opt">Failed requests were retried without enough backoff, so the retries themselves kept the devices overloaded</button>
+      </div>
+      <div class="explain">A loop of failure, retry and more load can sustain itself after its cause has gone. It ends only when load is reduced or capacity added.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A service running only in eu-west-1 requests its credentials from <code>sts.amazonaws.com</code>. What happens to it during a us-east-1 outage?</p>
+      <div class="opts">
+        <button class="opt">It works until its cached credentials expire, then loses access to AWS services</button>
+        <button class="opt">Nothing: it is in another region</button>
+        <button class="opt">It is immediately terminated</button>
+        <button class="opt">It fails over to us-west-2</button>
+      </div>
+      <div class="explain">The global token endpoint is served from us-east-1. Regional endpoints remove the dependency.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which failover design would have worked that morning?</p>
+      <div class="opts">
+        <button class="opt">An operator updates the DNS record to point at the other region</button>
+        <button class="opt">A script launches a new environment in the other region</button>
+        <button class="opt">DNS health checks stop returning the unhealthy region, with capacity already running in the other</button>
+        <button class="opt">A new load balancer is created in the other region</button>
+      </div>
+      <div class="explain">Health checks and query answering are data plane and kept working. The other three need control-plane calls that were failing.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why could AWS not update its Service Health Dashboard promptly?</p>
+      <div class="opts">
+        <button class="opt">Nobody was on duty</button>
+        <button class="opt">The tool used to post updates depended on the network that had failed</button>
+        <button class="opt">The dashboard is updated only once a day</button>
+        <button class="opt">Customers had overloaded it</button>
+      </div>
+      <div class="explain">A status page that shares a dependency with the thing it reports on goes quiet exactly when it is needed. Host yours elsewhere.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = OPS;
+  function run(o) {
+    const inE = o.where !== 'other', multi = o.where === 'multi', cred = o.sts === 'global';
+    const east = !inE ? 'na' : o.front === 'apigw' ? 'bad' : o.cap === 'scale' ? 'warn' : 'ok';                       // the us-east-1 part
+    const rows = [];
+    rows.push(['Serve requests in us-east-1', east, east === 'na' ? 'nothing runs there' : east === 'bad' ? 'API Gateway returns errors' : east === 'warn' ? 'existing instances serve, but there are too few for the morning peak' : 'running instances and the existing load balancer carry on']);
+    rows.push(['Add capacity in us-east-1', !inE ? 'na' : 'bad', !inE ? 'not needed' : o.cap === 'scale' ? 'launches fail, and you needed them' : 'launches fail, and you do not need any']);
+    let moved = false;
+    if (!multi) rows.push(['Move traffic to another region', 'na', inE ? 'there is no other region' : 'not needed']);
+    else if (o.steer === 'health') { moved = east === 'bad'; rows.push(['Move traffic to another region', 'ok', east === 'bad' ? 'health checks fail in us-east-1, so DNS stops answering with it' : east === 'warn' ? 'health checks still pass, so nothing moves: the region is slow, not dead' : 'health checks pass; nothing needs to move']); }
+    else rows.push(['Move traffic to another region', 'bad', 'the script cannot change DNS records: that API is down']);
+    rows.push(['Refresh AWS credentials', cred ? 'bad' : 'ok', cred ? 'the global endpoint is unreachable: access to storage and databases stops within the hour' : 'the regional endpoint answers']);
+    rows.push(['Read the provider\'s status page', 'warn', 'shows no problem for the first hours']);
+    let overall;
+    if (cred) overall = 'down';
+    else if (!inE || east === 'ok') overall = 'up';
+    else if (!multi) overall = east === 'bad' ? 'down' : 'degraded';
+    else overall = moved ? 'up' : 'degraded';
+    return { rows, overall, east, moved, cred };
+  }
+  function draw() {
+    const o = { where: $('#ueWhere').dataset.value || 'use1', cap: $('#ueCap').dataset.value || 'scale', front: $('#ueFront').dataset.value || 'lb', steer: $('#ueSteer').dataset.value || 'api', sts: $('#ueSts').dataset.value || 'global' };
+    const R = run(o), L = { ok: 'works', bad: 'fails', warn: 'impaired', na: 'n/a' };
+    $('#ueRows').innerHTML = R.rows.map(([n, s, t], i) => `<li><b>${n}</b><span class="ue-${s === 'ok' ? 'ok' : s}">${i === 4 ? 'misleading' : L[s]}</span><small>${t}</small></li>`).join('');
+    $('#ueStats').innerHTML = `<div class="stat ${R.overall === 'up' ? 'good' : R.overall === 'down' ? 'bad' : 'warn'}"><div class="k">Your service, for seven hours</div><div class="v">${{ up: 'Up', degraded: 'Degraded', down: 'Down' }[R.overall]}</div></div>`
+      + `<div class="stat"><div class="k">Things that fail or are impaired</div><div class="v">${R.rows.filter((r) => r[1] === 'bad' || r[1] === 'warn').length} of 5</div></div>`;
+    let why;
+    if (R.cred) why = `<b>Down, wherever it runs.</b> The service asks the global token endpoint for credentials, and that endpoint lives in us-east-1. Once the credentials it holds expire, it can no longer read its storage or its database. ${o.where === 'other' ? 'Nothing of yours is in us-east-1, and it made no difference.' : o.where === 'multi' ? 'Both regions use the same endpoint, so the second region fails with the first.' : ''} The fix is one configuration setting.`;
+    else if (o.where === 'other') why = '<b>Up, and unaware.</b> The workload, its control plane and its token endpoint are all in eu-west-1. The remaining exposure is to things this panel does not show: suppliers and tools that run in us-east-1, and changes to global services such as DNS records and roles.';
+    else if (R.east === 'ok') why = `<b>Up.</b> Everything needed was already running, and running things kept running. Nothing could be launched or changed for seven hours, and the service did not need either. This is static stability${o.where === 'use1' ? ', in a single region' : ''}.`;
+    else if (!o.where.startsWith('multi')) why = R.east === 'bad' ? '<b>Down.</b> Requests enter through API Gateway, which was returning errors in us-east-1, and there is nowhere else to send them.' : '<b>Degraded.</b> The instances already running serve what they can. The morning peak needed more, the autoscaler asked for them, and every launch failed. Capacity that was already running would have made this a quiet day.';
+    else if (R.moved) why = '<b>Up, after a minute or two.</b> API Gateway in us-east-1 failed the health checks, DNS stopped handing that region out, and us-west-2 took the traffic. No API was called to make that happen. us-west-2 could also add capacity, because its own control plane was unaffected.';
+    else if (o.steer === 'api') why = `<b>Degraded, with a second region standing idle.</b> us-west-2 is healthy${R.east === 'bad' ? ' and us-east-1 is returning errors to half your users' : ' and us-east-1 cannot scale for the peak'}. Moving traffic means changing a DNS record, and the API for that is one of the things that is down. The failover plan depended on the failure not having happened.`;
+    else why = '<b>Degraded.</b> us-east-1 is short of capacity, not dead, so its health checks pass and DNS keeps sending it half the traffic. Health checks only remove a region that fails them. The cure is the same as for a single region: have the capacity already running.';
+    $('#ueWhy').innerHTML = why;
+    $('#ueWhy').dataset.x = JSON.stringify({ overall: R.overall, east: R.east, moved: R.moved, states: R.rows.map((r) => r[1]), rows: document.querySelectorAll('#ueRows li').length });
+  }
+  ['#ueWhere', '#ueCap', '#ueFront', '#ueSteer', '#ueSts'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
