@@ -39,3 +39,4 @@
 ## Chapters, session 2 (one commit each)
 - Ch 6 Physical clocks, NTP & skew: NTP exchange lab (client offset, request and reply delay, drift, poll interval; estimate, hidden asymmetry error, delay bound, worst error before the next poll), NtpSample and LwwRegister in Java, LWW losing a newer write, PTP, Facebook ntpd to chrony
 - Ch 7 Lamport clocks: space-time sandbox (three processes, add local events and messages, click two events for happens-before or concurrent against their timestamps, tie-broken total order), LamportClock and Stamp in Java, the one-way clock condition, Raft terms as a logical clock
+- Ch 8 Vector clocks: three-device shopping list (edit offline, sync pairwise, version vectors compared entry by entry, siblings kept on conflict, merge on one device), VectorClock with compareTo and HybridClock in Java, version-vector costs, Riak's sibling explosion and dotted version vectors
