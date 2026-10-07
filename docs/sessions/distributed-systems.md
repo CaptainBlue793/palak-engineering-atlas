@@ -111,3 +111,4 @@
   `style.css`, the README table's order, the home page's meta description, and the unpublished `networks-v1.0.0` and
   `databases-v1.0.0` releases.
 - Next: the owner's go-ahead, then Step 4 (shared edits, checks, pull request into main). After that, Cloud & DevOps.
+- Release prepared (2026-10-07, with the owner's go-ahead: "Push these changes and merge them"): the shared edits above are made on this branch. `assets/atlas.js`: `soon` removed and `hours` set to 41 (2,485 minutes). `README.md`: the Distributed Systems row, totals of 452 chapters and ~331 hours (the registry's live courses sum to exactly that), and `distributed-systems/` in the folder tree. Checks: content audit 0 errors across all courses, bundle check, palette check, hub check in light, dark and at 390 px all pass. No release tag is published.
