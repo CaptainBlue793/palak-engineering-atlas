@@ -78,3 +78,48 @@
 - Ch 46 Case study, cost blowout: the invoice explorer (4 groupings x 4 alerting modes, 16 settings checked against hand-written row tables and an independent day-by-day account: 77,100 wasted with no alert, 29,500 with a budget on actual spend from day 16, 3,400 with forecast or anomaly alerts); the investigation method, NAT gateway bytes via flow logs, debug logging, a forgotten GPU experiment, traps table, budgets and anomaly detection; Milkie Way's 72,000-dollar night
 - Ch 47 Case study, monolith to Kubernetes: strangler-fig simulator (5 preparations x 4 weighted routes x 1 job, 5,184 settings checked against restated rules: 40% of requests fail if search moves unprepared, 4% as a canary; 1 fully sound end state); server assumptions table, containerising without splitting, weighted Ingress canaries, operational changes, seven typical failures; GitHub's Rails monolith on Kubernetes
 - Ch 48 Case study, tj-actions/changed-files March 2025: workflow blast-radius simulator (reference x ran x visibility x token permission x credentials, 48 settings checked against a decision list: 24 pinned and safe, 12 unaffected by luck, 12 affected from minor to critical); moved tags, memory dump to logs and why masking failed, blast-radius table, pinning by hash with an update robot, least-privilege tokens and separated jobs; Ultralytics December 2024
+
+## 2026-10-08 — status: all 56 lessons written
+- Chapters 1 to 48 were written in session 2, one commit each (`OPS <n>: <title>`), on `feature/devops-course`. With the 8
+  prerequisites from session 1 the course is complete: 56 lessons, 2,365 minutes (39.4 hours) by the pills.
+- Every lesson has one interactive panel, driven through a headless-browser script at 1100 px and 390 px before its commit.
+  Each panel was checked against an independently written rule, table or hand-worked numbers, and the measured figures are
+  quoted in the lesson's "Things to try" list. Stateful panels were also run as random walks against a shadow model: the
+  container lifecycle (7), tag and digest (9), cluster components (11), config propagation (13), storage (15), GitOps (18),
+  Terraform plans (19) and the twelve-row migration (42).
+- End-of-course checks: no placeholders left; all 56 pages swept at 1100 px and at 390 px with no script errors, no
+  overflow and the full structure; no bare tables outside `.table-wrap`; bundle rebuilt (60 pages, 2.66 MB, 280 flashcards,
+  970 search entries); content audit 0 errors across all courses (508 chapters); palette and hub checks pass.
+- Two fixes to the course home page (`cloud-devops/index.html`), found by those checks. The palette check expects the hero
+  title to carry the registry's literal gradient `linear-gradient(100deg,#334155,#ea580c)`; session 1 had replaced it with
+  theme variables so that it reads in dark mode, which made the check fail. The literal is back for light mode and dark
+  mode overrides it with the variables; both were read back from the rendered page. And the "house style" strip widened the
+  page to 628 px on a 500 px screen, because its code sample could not shrink inside the grid: `.style-strip > *` now has
+  `min-width: 0`.
+- Decisions made while writing, so later sessions do not double-teach: RBAC and pod security are in Ch 36; managed-database
+  operations are in Ch 32 (feature coverage table) with storage classes in Ch 4; Kubernetes Secrets are Ch 13 and stores,
+  KMS and rotation Ch 28; pinning is introduced in Ch 9 (images) and Ch 29 (everything) with the Actions case in Ch 48;
+  canaries are Ch 17, and Ch 34, 41, 45 and 47 use them by link; static stability and the (N-1)/N rule are Ch 33 and Ch 44
+  is the worked incident; RPO/RTO definitions link to System Design Ch 22 and backup mechanics to Databases Ch 35;
+  retries and backoff link to Distributed Systems Ch 4; the strangler fig as a design idea links to System Design Ch 15.
+- Ch 40 is 47 KB, above the usual 44 KB ceiling, because it carries sixteen drill scenarios with their outputs.
+- Not verified against sources. The real-system write-ups were written from memory and are worth a read by the owner before
+  release: Knight Capital, OVHcloud, Netflix (2012 outage, region evacuation), Dropbox, Slack 2021, Capital One, Codecov,
+  Travis CI, Spotify, Monzo, Tesla, IngressNightmare, GitLab 2017, Cloudflare 2019, Atlassian 2022, S3 2017, Twitter 2018,
+  Pokemon GO, Prime Video, Uber 2016, SolarWinds (and the incident table in Ch 29), Code Spaces, Pinterest, Lyft and Snap
+  commitments, UniSuper, Google DiRT, Spotify and Backstage, RBAC Buster, Fastly 2021, Facebook FBAR, HealthCare.gov, Etsy,
+  Stripe, Reddit Pi-Day, Datadog 2023, AWS December 2021 and Kinesis 2020, CrowdStrike and McAfee 2010, Milkie Way, GitHub
+  on Kubernetes, tj-actions 2025 and Ultralytics 2024. Also from memory: the cloud list prices in Ch 31 and 46, the
+  Kubernetes defaults in Ch 40, and the commit hash quoted for `actions/checkout` v4.2.2 in Ch 29, 41 and 48, which should
+  be checked against the action's repository since the text tells readers to pin by hash.
+- Needs a shared change (release, Step 4 of the playbook; not done, waiting for the owner's go-ahead): in `assets/atlas.js`
+  remove `soon: true` from the cloud-devops entry; `chapters` is already 56; `hours` is 40 and the lessons total 2,365
+  minutes (39.4 hours), so 39 would match how the other courses were set. In `README.md` add the Cloud & DevOps row to the
+  course table, remove the "On the way" line, change the totals to 508 chapters (436 main + 72 prerequisites) and about 370
+  hours, and add `cloud-devops/` to the folder tree. `origin/main` has moved by one commit since this branch last merged it
+  (`699ddc4`, the owner's README change), so `main` has to be merged into the branch first and the README edits made on top.
+- Open, outside this course's folder and not touched: the same phone-width overflow of the home page's style strip exists on
+  the released LLD, OS, Networks, Databases and Distributed Systems home pages (scroll width 586 to 710 px on a 500 px
+  screen); the fix is the same one-line rule in each `index.html`. Still open from before: the `.objectives li` flex fix in
+  `style.css`, the README table's order, the home page's meta description, and the unpublished release tags.
+- Next: the owner's go-ahead, then Step 4 (merge `main`, shared edits, checks, pull request into `main`).
