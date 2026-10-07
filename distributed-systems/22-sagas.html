@@ -6,33 +6,439 @@
 <title>Sagas &amp; Compensation</title>
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dist-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sg-row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; margin-top:8px; }
+  .sg-row > span { font-size:12.5px; color:var(--muted); min-width:92px; }
+  .sg-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
+  @media (max-width:820px) { .sg-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .sg-s { border:1.5px solid var(--border); border-radius:12px; background:var(--surface); padding:8px 11px; min-width:0; font-size:13px; }
+  .sg-s h6 { margin:0 0 3px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .sg-s b { display:block; font-size:14.5px; overflow-wrap:anywhere; }
+  .sg-s small { display:block; font-size:11.5px; color:var(--muted); min-height:17px; }
+  .sg-s.sg-now { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-soft, transparent); }
+  .sg-log { margin:12px 0 0; padding:8px 12px; border:1px dashed var(--border); border-radius:12px; font-size:12.5px; font-family:var(--mono, ui-monospace, monospace); color:var(--text-2); display:flex; flex-wrap:wrap; gap:4px 14px; min-height:36px; }
+  .sg-log b { font-family:inherit; color:var(--muted); font-weight:600; }
+  .sg-log .sg-c { color:var(--amber, var(--accent)); }
+  .sg-log .sg-x { color:var(--red); }
+  .sg-res { margin-top:12px; padding:10px 14px; border-radius:12px; font-size:14px; background:var(--surface-2); border-left:3px solid var(--border); min-height:68px; }
+  .sg-res.sg-good { background:var(--green-soft); border-left-color:var(--green); }
+  .sg-res.sg-bad { background:var(--red-soft); border-left-color:var(--red); }
+  .sg-res.sg-warn { background:var(--amber-soft, var(--surface-2)); border-left-color:var(--amber, var(--accent)); }
+</style>
 </head>
 <body data-chapter="22">
-<!-- dist:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 22</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Sagas &amp; <span class="grad">Compensation</span></h1>
-    <p class="lead">Long-running transactions as a series of local steps with compensations, orchestrated or choreographed.</p>
+    <p class="lead">Placing an order in a system built from services touches four of them: the order service records it, inventory reserves the item, payments charges the card, and shipping books a courier. All four should happen or none should. <a href="21-two-phase-commit.html">Chapter 21</a>'s answer, two-phase commit, would need each service to hold locks while waiting on the others, and the payment provider is another company that offers no such thing. The answer used in practice gives up on doing the four things at one instant. Each service commits its own step in its own database, straight away. If a later step can't be done, the earlier ones are <b>compensated</b>: the stock is released and the card refunded. This is a <b>saga</b>. It is simple to describe and easy to get subtly wrong, since a refund is not the same as never having charged, and for a while the rest of the world can see a half-finished order. This chapter covers how to build one that ends in a sensible state whatever fails.</p>
+    <ul class="objectives">
+      <li><span>Explain why two-phase commit is the wrong tool between independent services</span></li>
+      <li><span>Design a saga: order its steps, and give each one a compensation</span></li>
+      <li><span>Say what a saga gives up compared with a transaction, and how to limit the damage</span></li>
+      <li><span>Compare orchestration with choreography</span></li>
+      <li><span>Use the outbox pattern to update a database and publish a message without losing either</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Java listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Two-phase commit and why it blocks</b>: <a href="21-two-phase-commit.html">Chapter 21</a>.</li>
+        <li><b>Retries and idempotency keys</b>: <a href="04-retries-idempotency.html">Chapter 4</a>. This chapter relies on them in every step and doesn't explain them again.</li>
+        <li><b>Local transactions and isolation</b>, from the Databases course: <a href="../databases/10-transactions-acid.html">Transactions &amp; ACID</a> and <a href="../databases/21-isolation-anomalies.html">Isolation Anomalies</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why not 2PC across services</li>
-    <li>Compensating actions</li>
-    <li>Orchestration vs choreography</li>
-    <li>The outbox pattern</li>
-  </ol>
+  <h2>Why not 2PC across services</h2>
+  <p>Two-phase commit works well inside one system, where the participants are shards of one database run by one team. Between services it fails on four counts.</p>
+  <ul>
+    <li><b>Locks would be held across team boundaries.</b> A prepared participant keeps its locks until the coordinator speaks. Inventory's rows would be frozen whenever payments was slow, and an outage in any one service would become a stall in all of them.</li>
+    <li><b>Availability multiplies.</b> Every participant must be up for any transaction to commit. Four services at 99.9% give about 99.6% (<a href="p4-failure-arithmetic.html">P4</a>).</li>
+    <li><b>The participants can't take part.</b> Two-phase commit needs each one to expose prepare and commit. HTTP and gRPC APIs don't. A card network, a courier's API, an email provider and most message brokers have no "prepare".</li>
+    <li><b>The work can be long.</b> A payment may wait for the customer's bank to approve it. A booking may wait for a person. No one holds database locks for minutes.</li>
+  </ul>
+  <p>Each service also owns its own database, which is the point of having separate services. So the only atomic thing available is a <b>local transaction</b> in one of them.</p>
+
+  <h2>The saga</h2>
+  <p>A saga is a sequence of local transactions, T<sub>1</sub>, T<sub>2</sub> … T<sub>n</sub>, each in one service, each committed as soon as it is done. Each has a <b>compensating transaction</b>, C<sub>1</sub> … C<sub>n</sub>, that reverses its effect. The saga promises one of two outcomes: every step runs, or some run and then their compensations run, in reverse order. The idea and the name come from a 1987 paper by Hector Garcia-Molina and Kenneth Salem, written about long-running transactions inside a single database. It became common practice when systems were split into services.</p>
+  <figure class="seq" data-actors="Orchestrator|Inventory|Payments|Shipping">
+    <ol>
+      <li data-m="0>1">reserve 1 unit</li>
+      <li data-m="1>0" data-k="reply">reserved<small>committed in Inventory's database. Other shoppers see one unit fewer</small></li>
+      <li data-m="0>2">charge £40</li>
+      <li data-m="2>0" data-k="reply">charged<small>committed. The money has moved</small></li>
+      <li data-m="0>3">book a courier</li>
+      <li data-m="3>0" data-k="fail">refused: no courier serves this address</li>
+      <li data-m="0>2" data-k="async">refund £40<small>compensation for the charge. A new transaction, not a rollback</small></li>
+      <li data-m="2>0" data-k="reply">refunded</li>
+      <li data-m="0>1" data-k="async">release 1 unit<small>compensation for the reservation</small></li>
+      <li data-m="1>0" data-k="reply">released</li>
+      <li data-m="0>0" data-k="note">mark the order CANCELLED, and tell the customer why</li>
+    </ol>
+    <figcaption><b>A saga that fails at its third step.</b> The two completed steps are compensated in reverse order. No service ever waited on another while holding a lock.</figcaption>
+  </figure>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Two-phase commit</th><th>Saga</th></tr></thead>
+      <tbody>
+        <tr><td><b>All or nothing</b></td><td>At one instant</td><td>In the end: all, or done and then compensated</td></tr>
+        <tr><td><b>Isolation</b></td><td>Others never see a partial result</td><td>None. Each step is visible as soon as it commits</td></tr>
+        <tr><td><b>Locks across services</b></td><td>Held through both phases</td><td>Never</td></tr>
+        <tr><td><b>If one service is down</b></td><td>Nothing commits. Prepared participants may block</td><td>The saga waits or compensates. Other work carries on</td></tr>
+        <tr><td><b>What each service provides</b></td><td>Prepare and commit</td><td>An action and a compensation, both safe to repeat</td></tr>
+        <tr><td><b>How long it may run</b></td><td>Milliseconds</td><td>Seconds to days</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Compensating actions</h2>
+  <p>A compensation is not a rollback. A rollback makes a change vanish as though it never happened. A compensation is a second, visible change that offsets the first. After a refund the customer's statement shows two lines, the confirmation email was still sent, and a shopper who saw "sold out" in the meantime has gone elsewhere. So compensations are designed step by step, as business decisions: a cancelled booking may carry a fee, and a refund may be a credit note.</p>
+  <p>Some steps can't be compensated at all. A parcel handed to a courier, a message sent to a customer, a payout to a bank account: none can be taken back. That gives each step one of three roles, and the roles decide the order.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Kind of step</th><th>Meaning</th><th>Examples</th></tr></thead>
+      <tbody>
+        <tr><td><b>Compensatable</b></td><td>Can be reversed afterwards. These go first</td><td>Create a PENDING order, reserve stock, authorise a card</td></tr>
+        <tr><td><b>Pivot</b></td><td>The point of no return. If it succeeds the saga will finish; if it fails the saga compensates</td><td>Capture the payment, hand over to the courier</td></tr>
+        <tr><td><b>Retriable</b></td><td>Can't fail for a business reason, only for a technical one, so it is retried until it works. These go last</td><td>Mark the order CONFIRMED, send the email, award loyalty points</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>So: put everything that might be refused before anything that can't be reversed. Check stock and authorise the card before telling the warehouse to pack.</p>
+  <p>Three rules make compensations dependable.</p>
+  <ul>
+    <li><b>A compensation must succeed in the end.</b> There is no compensation for a compensation. If the refund call fails it is retried, for hours if need be, and if it can never succeed a person is alerted. A saga can pause at this point. It can't give up.</li>
+    <li><b>Every action and compensation is idempotent.</b> Each will be sent more than once, after a timeout or a crash (<a href="04-retries-idempotency.html">Chapter 4</a>). The saga's ID and step number make a natural idempotency key.</li>
+    <li><b>A compensation may arrive before its action.</b> The orchestrator sends "reserve", times out, and sends "release". The delayed "reserve" then arrives. The service must record that this key was cancelled, and refuse the late request, or the stock stays reserved for ever.</li>
+  </ul>
+
+  <h2>What a saga gives up</h2>
+  <p>A saga keeps atomicity in its weakened form, and each step is consistent and durable. It has no <b>isolation</b>. Between the first step and the last, other requests see and act on a state that may be about to be reversed. The anomalies are those of <a href="../databases/21-isolation-anomalies.html">the Databases course</a>, appearing now between services where no isolation level can be set: a second saga overwrites the first one's change (a lost update), or reads a reservation that is later released (a dirty read). The usual countermeasures:</p>
+  <ul>
+    <li><b>A semantic lock.</b> The first step marks the record: the order is PENDING, the seat is HELD. Other code checks the marker and waits, refuses, or warns. It is a lock in the application's data, with a meaning the business chose.</li>
+    <li><b>Commutative updates.</b> "Reduce the balance by 40" and "increase it by 40" give the right result in any order with other updates. "Set the balance to 60" doesn't.</li>
+    <li><b>Re-read before acting.</b> A step checks that what it read earlier is unchanged, and aborts the saga if not, as an optimistic transaction would.</li>
+    <li><b>Order by risk.</b> Put the step most likely to be refused first, so that most failed sagas have nothing to compensate.</li>
+  </ul>
+
+  <h2>Try it: an order, and what can go wrong</h2>
+  <p>One order for the last unit in stock, at £40, across four services. Choose a design and a fault, and step through.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">An order saga, one step at a time</span><span class="p-tag">Interactive</span></div>
+    <div class="panel-body">
+      <div class="sg-row"><span>Design</span><div class="seg" id="sgD"><button data-v="stop">a chain of calls, stop on failure</button><button data-v="nokeys">saga, without idempotency keys</button><button class="active" data-v="saga">saga</button></div></div>
+      <div class="sg-row"><span>What goes wrong</span><div class="seg" id="sgF"><button class="active" data-v="none">nothing</button><button data-v="declined">card declined</button><button data-v="nocourier">no courier</button><button data-v="lost">the reply from Payments is lost</button><button data-v="crash">the orchestrator crashes after charging</button></div></div>
+      <div class="controls">
+        <button class="btn sm primary" id="sgNext">Next step</button>
+        <button class="btn sm ghost" id="sgReset">↺ Start again</button>
+      </div>
+      <div class="sg-grid" id="sgGrid"></div>
+      <div class="sg-log" id="sgLog"></div>
+      <div class="sg-res" id="sgRes"></div>
+      <div class="stats" id="sgStats"></div>
+    </div>
+    <div class="panel-foot">Each card is one service's own database, and every change shown has been committed there. The dashed box is the orchestrator's durable log. The services really do deduplicate by key: with keys on, a repeated request returns the saved result, and with keys off, each request is treated as new.</div>
+  </div>
+
+  <p>Things to notice. With nothing wrong, every design gives the same five steps. The differences appear under failure. A plain chain of calls that stops at the first error leaves whatever it had done: with a declined card the last unit stays reserved for an order that will never complete, and with no courier the customer has paid £40 for nothing. The saga handles both by compensating in reverse, and the "no courier" run shows a compensation failing once and being retried, since it can't be abandoned. Watch the "another shopper sees" figure during that run: it reads "sold out" from the reservation until the release, for an item that was never sold. That is the missing isolation.</p>
+  <p>The last two faults are about not knowing. When the reply from Payments is lost, the charge has happened and the orchestrator can't tell. When the orchestrator crashes, its log says the step was started and not that it finished. In both cases the only safe move is to send the step again, and whether that is harmless depends on the key. With keys, Payments recognises the request and returns the first result: £40. Without them it charges twice and the saga completes "successfully" with £80 taken. The chain of calls, having no log, does nothing at all after the crash: the card is charged and no code remembers the order.</p>
+
+  <h2>Orchestration vs choreography</h2>
+  <p>There are two ways to decide who runs the next step. With <b>orchestration</b>, one component holds the saga's definition, calls each service in turn, and records progress in a durable log, as in the figure and the panel. With <b>choreography</b>, there is no such component. Each service publishes an event when it finishes its step, and the next service reacts: inventory hears <code>OrderPlaced</code> and reserves, payments hears <code>StockReserved</code> and charges, and on failure a service publishes <code>PaymentDeclined</code>, which inventory hears and releases.</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th></th><th>Orchestration</th><th>Choreography</th></tr></thead>
+      <tbody>
+        <tr><td><b>Where the flow is written down</b></td><td>In one place</td><td>Nowhere. It is implied by who subscribes to what</td></tr>
+        <tr><td><b>Coupling</b></td><td>The orchestrator knows every service. The services know nothing of each other</td><td>Each service knows the events of its neighbours</td></tr>
+        <tr><td><b>"Where is order 8812 stuck?"</b></td><td>Read the orchestrator's log</td><td>Trace events across every service (<a href="36-distributed-tracing.html">Chapter 36</a>)</td></tr>
+        <tr><td><b>Adding a step</b></td><td>Change the orchestrator</td><td>Add a subscriber, and check every compensation path still works</td></tr>
+        <tr><td><b>Risk</b></td><td>The orchestrator grows into a place where all business logic collects</td><td>Cycles of events, and flows that nobody fully understands</td></tr>
+        <tr><td><b>Suits</b></td><td>Flows of more than three or four steps, or with branching</td><td>Short flows, and reactions that are optional (send an email, update search)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>An orchestrator is small. Its one firm requirement is that it logs each step before sending it, so that after a crash it can resume and not start again.</p>
+<pre class="code"><span class="k">record</span> <span class="t">Step</span>&lt;<span class="t">C</span>&gt;(<span class="t">String</span> name, <span class="t">BiConsumer</span>&lt;<span class="t">C</span>, <span class="t">String</span>&gt; action, <span class="t">BiConsumer</span>&lt;<span class="t">C</span>, <span class="t">String</span>&gt; compensation) {}
+
+<span class="k">void</span> <span class="f">run</span>(<span class="t">String</span> sagaId, <span class="t">C</span> ctx) {
+	<span class="k">int</span> i = log.<span class="f">firstUnfinishedStep</span>(sagaId);                  <span class="c">// 0 for a new saga; where it stopped, after a crash</span>
+	<span class="k">try</span> {
+		<span class="k">for</span> (; i &lt; steps.<span class="f">size</span>(); i++) {
+			log.<span class="f">append</span>(sagaId, i, STARTED);                     <span class="c">// before the call, so a crash can't hide it</span>
+			<span class="f">retryOnTimeout</span>(steps.<span class="f">get</span>(i).<span class="f">action</span>(), ctx, sagaId + <span class="s">":"</span> + i);   <span class="c">// the key makes the retry safe</span>
+			log.<span class="f">append</span>(sagaId, i, DONE);
+		}
+		log.<span class="f">append</span>(sagaId, COMPLETED);
+	} <span class="k">catch</span> (<span class="t">BusinessRefusal</span> e) {                             <span class="c">// "card declined", not "connection reset"</span>
+		log.<span class="f">append</span>(sagaId, i, REFUSED);
+		<span class="k">for</span> (<span class="k">int</span> j = i - 1; j &gt;= 0; j--) {
+			<span class="f">retryUntilItWorks</span>(steps.<span class="f">get</span>(j).<span class="f">compensation</span>(), ctx, sagaId + <span class="s">":undo:"</span> + j);
+			log.<span class="f">append</span>(sagaId, j, COMPENSATED);
+		}
+		log.<span class="f">append</span>(sagaId, CANCELLED);
+	}
+}</pre>
+  <p>The distinction in the <code>catch</code> matters. A refusal is an answer: the step didn't happen and won't. A timeout is not an answer, and treating it as a refusal is how a card gets charged for a cancelled order. A real orchestrator also resumes a saga that crashed while compensating, which this sketch leaves out.</p>
+
+  <h2>The outbox pattern</h2>
+  <p>Every saga step has the same small problem inside it. The service must do two things: change its own database, and tell someone, by publishing an event or replying to the orchestrator. Those are two systems, with no transaction between them. This is the <b>dual-write problem</b>.</p>
+  <ul>
+    <li>Commit, then publish: a crash between the two leaves the order saved and no event sent. The saga stops for ever, silently.</li>
+    <li>Publish, then commit: a crash, or a failed commit, leaves an event announcing an order that doesn't exist.</li>
+  </ul>
+  <p>The <b>transactional outbox</b> removes the second system from the critical moment. The service writes the event as a row in an <code>outbox</code> table, in the same local transaction as the business change. One commit makes both durable or neither. A separate relay then reads the table and publishes.</p>
+<pre class="code"><span class="c">// 1. One local transaction: the business row and the message stand or fall together.</span>
+<span class="k">@Transactional</span>
+<span class="k">void</span> <span class="f">placeOrder</span>(<span class="t">Order</span> order) {
+	orders.<span class="f">insert</span>(order);
+	outbox.<span class="f">insert</span>(<span class="k">new</span> <span class="t">OutboxRow</span>(<span class="t">UUID</span>.<span class="f">randomUUID</span>(), <span class="s">"orders"</span>, order.<span class="f">id</span>(), <span class="s">"OrderPlaced"</span>, <span class="f">toJson</span>(order)));
+}
+
+<span class="c">// 2. The relay, on a timer. A crash after send and before markSent means the row is sent again.</span>
+<span class="k">void</span> <span class="f">relay</span>() {
+	<span class="k">for</span> (<span class="t">OutboxRow</span> row : outbox.<span class="f">oldestUnsent</span>(<span class="m">100</span>)) {        <span class="c">// ... WHERE sent_at IS NULL ORDER BY id LIMIT 100</span>
+		broker.<span class="f">send</span>(row.<span class="f">topic</span>(), row.<span class="f">key</span>(), row.<span class="f">payload</span>(), row.<span class="f">id</span>()).<span class="f">get</span>();   <span class="c">// wait for the broker's acknowledgement</span>
+		outbox.<span class="f">markSent</span>(row.<span class="f">id</span>());
+	}
+}</pre>
+  <p>The relay can fail between sending and marking, so a message may be published twice. It is never lost. That is <b>at-least-once</b> delivery, and it is why each row carries an ID for consumers to deduplicate on. <a href="28-delivery-semantics.html">Chapter 28</a> takes delivery guarantees further. A common alternative to polling is <b>change data capture</b>: a tool such as Debezium reads the database's write-ahead log (<a href="../databases/20-wal-recovery.html">Databases, WAL</a>), and publishes each new outbox row as it commits, in commit order and with no polling delay.</p>
+  <p>The receiving side has the mirror image, an <b>inbox</b>: record the message's ID in a table in the same transaction as the work it triggers, and skip any ID already there.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧭</div>
+    <div class="body"><div class="title">Use case: Cadence and Temporal, the orchestrator as a product</div><p>Writing an orchestrator by hand means writing the same things each time: a durable log, timers, retries with backoff, recovery after a crash, and a way to see which step each of a million sagas has reached. Engineers at Uber built this once as a general service, Cadence, and released it as open source in 2017. Its lead authors had built workflow services before, Amazon's Simple Workflow Service among them, and in 2019 they started Temporal, a fork that has since become the more widely used of the two. The model is called durable execution. The developer writes the saga as ordinary code, a Java method that calls <code>inventory.reserve()</code>, then <code>payments.charge()</code>, with a <code>try</code> and <code>catch</code> for compensation. The calls are to "activities", which run in the developer's own workers, and the engine records the result of each one in an event history kept in its database. If the worker running the method dies, another worker starts the same method from the top and <i>replays</i> it: each activity call returns its recorded result at once without running again, until the code reaches the point where the history ends, and from there it continues for real. The method may sleep for thirty days in one line, since the sleep is a durable timer in the engine and not a thread. The price is the rule of <a href="15-state-machine-replication.html">Chapter 15</a>: replay only works if the workflow code is deterministic. It mustn't read the clock, generate a random number, or branch on anything not in the history, and changing the code of a workflow while instances are part-way through needs explicit versioning, for the same reason. Activities are run at least once, so the engine doesn't remove the need for idempotency keys in the services it calls. It removes the log, the timers and the recovery.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Treating a timeout as a refusal.</b> The step may have happened. Retry with the same key, and compensate only on a definite answer.</li>
+      <li><b>Compensations that can fail and aren't retried.</b> The saga ends half undone, with nobody told.</li>
+      <li><b>Putting an irreversible step early.</b> The email is sent, then the card is declined.</li>
+      <li><b>No marker on in-progress records.</b> Other requests treat a PENDING order or a held seat as final.</li>
+      <li><b>Committing to the database and then publishing, with no outbox.</b> It works until the first crash between the two.</li>
+      <li><b>Not handling a compensation that arrives before its action.</b> The late action then takes effect after the saga is over.</li>
+      <li><b>Using a saga where one database would do.</b> If the steps could share a database, a local transaction is simpler and stronger.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is a saga, and how does it differ from a distributed transaction?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A saga is a way to keep data consistent across several services without a distributed transaction. The operation is split into a sequence of local transactions, one per service, and each commits on its own straight away. Each step has a compensating action that reverses its business effect. If a step fails, the saga runs the compensations for the steps already done, in reverse order, so the end result is either everything done or everything undone. The differences from a distributed transaction such as two-phase commit: there are no locks held across services and no blocking, so services stay independent and available. But there is no isolation, so other requests can see intermediate states, like stock reserved for an order that later fails. And compensation isn't a true rollback; it is a new action, a refund and not an un-charge, and some actions such as sending an email can't be undone at all. So you design for it: order the steps so the irreversible ones come last, make every action and compensation idempotent because they will be retried, and mark in-progress records as pending.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A service must update its database and publish an event. How do you make that reliable?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>That is the dual-write problem: two systems, no shared transaction, and a crash between the two writes leaves them disagreeing. If I commit and then publish, a crash loses the event. If I publish and then commit, a failed commit leaves a false event. A distributed transaction between the database and the broker is usually unavailable or undesirable. The standard fix is the transactional outbox. In the same local transaction as the business change, I insert a row into an outbox table holding the event. One commit covers both. A separate relay process reads unsent rows in order, publishes them to the broker, waits for the acknowledgement, and marks them sent. If the relay crashes after publishing and before marking, it publishes that row again, so delivery is at-least-once, never zero. Each event therefore carries a unique ID, and consumers deduplicate, typically with an inbox table of processed IDs written in the same transaction as their own work. Instead of polling, the relay can be change data capture: a tool like Debezium tails the database's log and emits outbox inserts in commit order, with lower latency and no polling load. Things to watch: ordering, which is per aggregate if I key messages by the entity ID and the relay preserves order; cleaning up sent rows so the table doesn't grow; and monitoring the oldest unsent row, since a stuck relay means every downstream saga silently stalls. The alternative design is event sourcing, where the event log is the source of truth and there is only one write, but that is a much larger commitment.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Between independent services there is no shared transaction. The building block is a local transaction in one service.</li>
+      <li>A saga is a sequence of local transactions, each with a compensation, ending in all done or all compensated.</li>
+      <li>Compensation is a new, visible action. Order the steps: compensatable first, then the pivot, then retriable ones.</li>
+      <li>Every action and compensation must be idempotent, and compensations must be retried until they succeed.</li>
+      <li>A saga has no isolation. Use a PENDING marker, commutative updates and re-reads to contain it.</li>
+      <li>Orchestration keeps the flow in one place with a durable log. Choreography spreads it across events.</li>
+      <li>The outbox pattern makes "update the database and publish" atomic, at the price of duplicates.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why is two-phase commit a poor fit across microservices?</p>
+      <div class="opts">
+        <button class="opt">It can't guarantee atomicity</button>
+        <button class="opt">It holds locks in every service until all have answered, and needs each of them, third parties included, to support prepare</button>
+        <button class="opt">It needs synchronised clocks</button>
+        <button class="opt">It only works with two participants</button>
+      </div>
+      <div class="explain">One slow or failed service stalls the rest, and most service APIs offer no prepare step.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A saga has reserved stock and charged the card, and then booking the courier is refused. What happens?</p>
+      <div class="opts">
+        <button class="opt">The databases roll both changes back</button>
+        <button class="opt">The saga stops and waits for an operator</button>
+        <button class="opt">The stock is released, then the card is refunded</button>
+        <button class="opt">The card is refunded, then the stock is released: compensations run in reverse order</button>
+      </div>
+      <div class="explain">Both steps have committed, so they can only be offset by new transactions, last one first.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">The orchestrator's call to "charge card" times out. What should it do?</p>
+      <div class="opts">
+        <button class="opt">Send the same request again with the same idempotency key</button>
+        <button class="opt">Treat it as declined and start compensating</button>
+        <button class="opt">Carry on to the next step</button>
+        <button class="opt">Send a refund, to be safe</button>
+      </div>
+      <div class="explain">A timeout doesn't say whether the charge happened. The key lets the service answer for the first attempt.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which property of a database transaction does a saga not provide?</p>
+      <div class="opts">
+        <button class="opt">Durability</button>
+        <button class="opt">Consistency of each step</button>
+        <button class="opt">Isolation: other requests can see and act on the intermediate states</button>
+        <button class="opt">Any form of atomicity</button>
+      </div>
+      <div class="explain">Each step commits and is visible at once, which is why in-progress records are marked PENDING.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does the transactional outbox guarantee?</p>
+      <div class="opts">
+        <button class="opt">Each event is published exactly once</button>
+        <button class="opt">An event is published if and only if the business change committed, possibly more than once</button>
+        <button class="opt">Events are published before the change commits</button>
+        <button class="opt">Consumers never need to deduplicate</button>
+      </div>
+      <div class="explain">The row and the change share one commit. The relay may send a row twice after a crash, so consumers deduplicate by ID.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = DIST;
+  const PRICE = 40;
+  const STEPS = [
+    { name: 'Create order', svc: 0, comp: 'Cancel order' },
+    { name: 'Reserve stock', svc: 1, comp: 'Release stock' },
+    { name: 'Charge card', svc: 2, comp: 'Refund card' },
+    { name: 'Book courier', svc: 3, comp: 'Cancel courier' },
+    { name: 'Confirm order', svc: 0, comp: null },
+  ];
+  let s;
+  const fresh = () => ({ order: 'none', avail: 1, reserved: 0, sold: 0, charged: 0, refunded: 0, courier: 'none', keys: new Set(), log: [], mode: 'forward', at: 0, tried: {}, calls: 0, up: true, fwd: 0, comps: 0, now: -1, refundFailed: false, kind: '', msg: '' });
+  // The four services. Each remembers the keys it has handled and answers a repeat from memory.
+  function act(i, key, fault) {
+    if (s.keys.has(key)) return 'repeat';
+    if (i === 2 && fault === 'declined') return 'refused';
+    if (i === 3 && fault === 'nocourier') return 'refused';
+    s.keys.add(key);
+    if (i === 0) s.order = 'PENDING';
+    if (i === 1) { s.avail--; s.reserved++; }
+    if (i === 2) s.charged += PRICE;
+    if (i === 3) s.courier = 'booked';
+    if (i === 4) { s.order = 'CONFIRMED'; s.reserved--; s.sold++; }
+    return 'ok';
+  }
+  function comp(i, key) {
+    if (s.keys.has(key)) return;
+    s.keys.add(key);
+    if (i === 0) s.order = 'CANCELLED';
+    if (i === 1) { s.avail++; s.reserved--; }
+    if (i === 2) s.refunded += PRICE;
+    if (i === 3) s.courier = 'cancelled';
+  }
+  const DONE = [
+    '<b>Orders creates the order as PENDING,</b> and commits. PENDING is a marker for everyone else: this order isn\'t settled.',
+    '<b>Inventory reserves the last unit,</b> and commits. This is a real change in a real database: another shopper is now told the item is sold out.',
+    `<b>Payments charges £${PRICE},</b> and commits. Nothing is locked anywhere. Each step so far was an ordinary local transaction.`,
+    '<b>Shipping books a courier.</b> Past this point no remaining step can be refused.',
+    '<b>Orders marks the order CONFIRMED,</b> and the reservation becomes a sale. The order is complete.',
+  ];
+  const UNDONE = [
+    '<b>Compensation: Orders marks the order CANCELLED.</b> The saga has ended, with every completed step offset by another.',
+    '<b>Compensation: Inventory releases the unit.</b> It is on sale again. For the length of the saga, other shoppers were told it had sold out.',
+    `<b>Compensation: Payments refunds £${PRICE}.</b> The customer's statement will show a charge and a refund, which is not the same as nothing.`,
+    '<b>Compensation: Shipping cancels the courier.</b>',
+  ];
+  function step() {
+    const fault = $('#sgF').dataset.value, design = $('#sgD').dataset.value, saga = design !== 'stop', keyed = design === 'saga';
+    const key = (kind, i) => keyed ? `${kind}:${i}` : `${kind}:${i}:${s.calls++}`;
+    if (!s.up) {
+      s.up = true; s.now = -1;
+      if (!saga) { s.mode = 'stuck'; return ['bad', '<b>The process restarts.</b> The chain of calls was a method running in memory, and it is gone. Nothing records that an order was half-way through, so no code will ever finish it or undo it.']; }
+      return ['warn', '<b>The orchestrator restarts and reads its log.</b> The last entry is "Charge card: started", with no "done". It can\'t tell whether the charge happened. The only thing it can do is send the step again.'];
+    }
+    if (s.mode === 'forward') {
+      const i = s.at, st = STEPS[i], first = !s.tried[i]; s.tried[i] = true; s.now = st.svc;
+      if (saga && first) s.log.push(`${st.name}: started`);
+      const r = act(i, key('do', i), fault);
+      if (r === 'refused') {
+        const why = i === 2 ? 'Payments answers: card declined' : 'Shipping answers: no courier serves this address';
+        if (!saga) { s.mode = 'stuck'; return ['bad', `<b>${why}.</b> The code throws an exception and the request fails. Everything done before this step stays as it is.`]; }
+        s.log.push(`<span class="sg-x">${st.name}: refused</span>`); s.mode = 'comp'; s.at = i - 1;
+        return ['warn', `<b>${why}.</b> That is a definite answer: the step didn't happen. The orchestrator stops going forward and will now undo the ${i === 2 ? 'two' : 'three'} completed steps, last one first.`];
+      }
+      if (i === 2 && first && fault === 'lost') {
+        if (!saga) { s.mode = 'stuck'; return ['bad', `<b>Payments charges £${PRICE}, and its reply is lost.</b> The call times out, the code treats the timeout as a failure, and the request fails. The customer is told the order didn't go through.`]; }
+        return ['warn', `<b>Payments charges £${PRICE}, and its reply is lost.</b> The orchestrator sees a timeout. It doesn't know whether the card was charged, so it can't safely go forward or compensate. It will send the step again.`];
+      }
+      if (i === 2 && first && fault === 'crash') {
+        s.up = false;
+        return ['bad', `<b>Payments charges £${PRICE} and replies. The ${saga ? 'orchestrator' : 'process making the calls'} crashes</b> before it can record that.`];
+      }
+      s.fwd++; s.at++;
+      if (saga) s.log.push(`${st.name}: done`);
+      if (s.at === STEPS.length) s.mode = 'done';
+      if (i === 2 && !first) {
+        return r === 'repeat'
+          ? ['good', `<b>The orchestrator sends "charge" again with the same key.</b> Payments finds the key, sees it has done this already, and returns the saved result without touching the card. The customer has been charged £${s.charged}, once.`]
+          : ['bad', `<b>The orchestrator sends "charge" again.</b> With no key, Payments can't tell this from a new purchase, and charges again. The customer has now paid £${s.charged}. The saga carries on, unaware.`];
+      }
+      return [i === 4 ? 'good' : '', DONE[i]];
+    }
+    if (s.mode === 'comp') {
+      const i = s.at; s.now = STEPS[i].svc;
+      if (i === 2 && !s.refundFailed) { s.refundFailed = true; s.log.push('<span class="sg-x">Refund card: failed</span>'); return ['warn', '<b>The refund call fails:</b> Payments returns an error. There is no compensation for a compensation, so the orchestrator can\'t move on and can\'t give up. It logs the failure and will try again.']; }
+      comp(i, key('undo', i)); s.comps++;
+      s.log.push(`<span class="sg-c">${STEPS[i].comp}: done</span>`);
+      s.at--; if (s.at < 0) s.mode = 'cancelled';
+      return [s.mode === 'cancelled' ? 'good' : 'warn', UNDONE[i]];
+    }
+    return ['', ''];
+  }
+  function verdict() {
+    const net = s.charged - s.refunded, bad = [];
+    if (s.mode === 'done' && net !== PRICE) bad.push(`the customer paid £${net} for a £${PRICE} order`);
+    if (s.mode === 'cancelled' && net !== 0) bad.push(`£${net} kept for a cancelled order`);
+    if (s.mode === 'stuck') {
+      if (net > 0) bad.push(`£${net} taken and nothing will be sent`);
+      if (s.reserved) bad.push('the last unit is reserved for an order that will never complete');
+      if (s.order === 'PENDING') bad.push('the order stays PENDING');
+    }
+    return bad;
+  }
+  function reset() { s = fresh(); s.msg = '<b>Ready.</b> A customer orders the last unit in stock, for £' + PRICE + '.'; draw(); }
+  function draw() {
+    const design = $('#sgD').dataset.value, net = s.charged - s.refunded, over = ['done', 'cancelled', 'stuck'].includes(s.mode), bad = verdict();
+    const card = (i, title, main, sub) => `<div class="sg-s ${s.now === i ? 'sg-now' : ''}"><h6>${title}</h6><b>${main}</b><small>${sub}</small></div>`;
+    $('#sgGrid').innerHTML = card(0, 'Orders', s.order === 'none' ? 'no order yet' : s.order, 'order 8812')
+      + card(1, 'Inventory', `${s.avail} on sale, ${s.reserved} reserved`, s.sold ? `${s.sold} sold` : '')
+      + card(2, 'Payments', `charged £${s.charged}`, s.refunded ? `refunded £${s.refunded}` : '')
+      + card(3, 'Shipping', s.courier === 'none' ? 'no booking' : 'courier ' + s.courier, '');
+    $('#sgLog').innerHTML = design === 'stop' ? '<b>No log:</b> <span>the steps are calls made one after another by one method</span>'
+      : '<b>Orchestrator\'s log' + (s.up ? '' : ' (orchestrator down)') + ':</b> ' + (s.log.length ? s.log.map((l) => `<span>${l}</span>`).join('') : '<span>empty</span>');
+    const r = $('#sgRes'); let kind = s.kind, msg = s.msg;
+    if (over && bad.length) { kind = 'bad'; msg += ` <b>Left behind:</b> ${bad.join('; ')}.`; }
+    r.className = 'sg-res ' + (kind ? 'sg-' + kind : ''); r.innerHTML = msg;
+    const sees = s.avail > 0 ? '1 in stock' : 'sold out';
+    const outcome = !over ? 'in progress' : s.mode === 'stuck' ? 'abandoned' : bad.length ? s.mode === 'done' ? 'completed, wrongly' : 'cancelled, wrongly' : s.mode === 'done' ? 'completed' : 'cancelled cleanly';
+    $('#sgStats').innerHTML = `<div class="stat acc"><div class="k">Steps done, and undone</div><div class="v">${s.fwd}, ${s.comps}</div></div>
+      <div class="stat ${net === 0 || (net === PRICE && s.mode !== 'stuck' && s.mode !== 'comp') ? '' : 'bad'}"><div class="k">Customer has paid</div><div class="v">£${net}</div></div>
+      <div class="stat ${s.avail === 0 && !s.sold ? 'warn' : ''}"><div class="k">Another shopper sees</div><div class="v" style="font-size:16px">${sees}</div></div>
+      <div class="stat ${!over ? '' : bad.length || s.mode === 'stuck' ? 'bad' : 'good'}"><div class="k">Outcome</div><div class="v" style="font-size:16px">${outcome}</div></div>`;
+    $('#sgNext').disabled = over;
+  }
+  $('#sgNext').onclick = () => { if (['done', 'cancelled', 'stuck'].includes(s.mode)) return; const [kind, msg] = step(); s.kind = kind; s.msg = msg; draw(); };
+  $('#sgReset').onclick = reset;
+  $('#sgD').addEventListener('segchange', reset);
+  $('#sgF').addEventListener('segchange', reset);
+  reset();
+})();
+</script>
 </body>
 </html>
