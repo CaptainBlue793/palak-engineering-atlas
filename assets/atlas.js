@@ -205,7 +205,7 @@
       topics: ['Docker', 'Kubernetes', 'CI/CD', 'Terraform', 'Observability', '8 case studies'],
       lang: 'Bash · Docker · K8s · Terraform',
       chapters: 56,
-      hours: 40,
+      hours: 39,
       c1: '#334155', c2: '#ea580c', d1: '#94a3b8', d2: '#fb923c',
       store: 'ops',
       indexVar: 'OPS_INDEX',
@@ -213,7 +213,6 @@
       first: 'p1-linux-command-line.html',
       dist: 'cloud-devops-course.html',
       release: null,
-      soon: true,
     },
     {
       id: 'ml-ai-systems',

@@ -123,3 +123,14 @@
   screen); the fix is the same one-line rule in each `index.html`. Still open from before: the `.objectives li` flex fix in
   `style.css`, the README table's order, the home page's meta description, and the unpublished release tags.
 - Next: the owner's go-ahead, then Step 4 (merge `main`, shared edits, checks, pull request into `main`).
+- Release prepared (2026-10-08, with the owner's go-ahead: "do that", in reply to the three requests in the status
+  report: release, 39 hours, and the home-page fix on the other courses). `main` merged into the branch (it brought the
+  owner's README commit `699ddc4`). `assets/atlas.js`: `soon` removed from the cloud-devops entry and `hours` set to 39.
+  `README.md`: the Cloud & DevOps row, totals of 508 chapters (436 main + 72 prerequisites) and ~370 hours, the "On the way"
+  line removed, and `cloud-devops/` in the folder tree. The registry's nine live courses sum to exactly 508 chapters and 370
+  hours. The style-strip rule (`.style-strip > * { min-width: 0; }`) is added to the home pages of LLD, OS, Networks,
+  Databases and Distributed Systems; each was checked at 390 px and 1100 px with no overflow and no script errors. Their
+  offline bundles were not rebuilt: a rebuild in this clone re-embeds every page with this checkout's line endings and
+  rewrites the whole file, so the same 122 characters were inserted into each committed bundle, which then differs from
+  the previous one by exactly that insertion and still opens in headless Chrome. Checks: content audit 0 errors across all
+  508 chapters, palette check and hub check pass. No release tag is published.
