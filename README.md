@@ -9,15 +9,15 @@ no build step.
 
 | Course | Chapters | Covers |
 |---|---|---|
-| **[System Design](system-design/)** | 8 prerequisites + 42 | Caching, sharding, queues, consensus, multi-region — plus 17 case studies |
-| **[ML & AI Systems](ml-ai-systems/)** | 8 prerequisites + 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
 | **[DSA](dsa/)** | 8 prerequisites + 56 | Every structure and algorithm, in one consistent C++ house style |
-| **[Low-Level Design](lld/)** | 8 prerequisites + 46 | SOLID, design patterns, concurrency and 16 case studies in Java |
 | **[OS & Concurrency](os/)** | 8 prerequisites + 48 | Processes, virtual memory, file systems, locks, epoll and containers in C — plus 8 case studies |
 | **[Computer Networks](networks/)** | 8 prerequisites + 48 | TCP/IP layer by layer, DNS, TLS, HTTP/2 and 3, BGP, CDNs and packet-level debugging in Python and the CLI — plus 8 case studies |
 | **[Database Internals & SQL](databases/)** | 8 prerequisites + 48 | SQL from the first SELECT, then pages, B-trees and LSM trees, query plans, WAL, MVCC, replication and sharding in PostgreSQL and Python — plus 8 case studies |
+| **[Low-Level Design](lld/)** | 8 prerequisites + 46 | SOLID, design patterns, concurrency and 16 case studies in Java |
+| **[System Design](system-design/)** | 8 prerequisites + 42 | Caching, sharding, queues, consensus, multi-region — plus 17 case studies |
 | **[Distributed Systems](distributed-systems/)** | 8 prerequisites + 48 | Clocks, replication, quorums, Paxos and Raft, two-phase commit, CRDTs, Kafka and stream processing in Java — plus 8 case studies |
 | **[Cloud & DevOps](cloud-devops/)** | 8 prerequisites + 48 | Docker, Kubernetes, CI/CD, Terraform and observability, then SLOs, disaster recovery, cost and incident response in Bash, YAML and Terraform — plus 8 case studies |
+| **[ML & AI Systems](ml-ai-systems/)** | 8 prerequisites + 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
 
 The Atlas home page suggests an order through the courses for each kind of role.
 
@@ -70,15 +70,15 @@ is part of the account identity, and codes are delivered by email.
 palak-engineering-atlas/
 ├── index.html          ← the Atlas (start here)
 ├── assets/atlas.js     ← the COURSES registry + hub runtime
-├── system-design/      ← each course is a self-contained site
-├── ml-ai-systems/
-├── dsa/
-├── lld/
+├── dsa/                ← each course is a self-contained site
 ├── os/
 ├── networks/
 ├── databases/
+├── lld/
+├── system-design/
 ├── distributed-systems/
-└── cloud-devops/
+├── cloud-devops/
+└── ml-ai-systems/
 ```
 
 ## What the Atlas adds
@@ -87,11 +87,11 @@ The courses are **not** merged into one file — each stays a standalone site wi
 search, progress, glossary, flashcards and mock-interview room. The Atlas joins them at the
 entry point:
 
-- **Combined progress** — reads each course's own `localStorage` key (`sd-done`, `ml-done`,
-  `dsa-done`, `lld-done`), so ticking a chapter off inside a course shows up on the hub, and vice versa.
-  The chapter mosaic on the home page is one square per chapter, all 228 of them.
+- **Combined progress** — reads each course's own `localStorage` key (`dsa-done`, `os-done`,
+  `net-done` and so on), so ticking a chapter off inside a course shows up on the hub, and vice versa.
+  The chapter mosaic on the home page is one square per chapter, all 508 of them.
 - **Resume** — deep-links to the next unread chapter of whichever course you're furthest into.
-- **Cross-course search** — `Ctrl+K` (or `/`) searches ~3,500 chapter, section and demo entries
+- **Cross-course search** — `Ctrl+K` (or `/`) searches ~9,300 chapter, section and demo entries
   across every released course at once, filterable by course, deep-linking to the exact anchor.
   The indexes load lazily after first paint, so the page opens instantly.
 - **Shared theme** — the toggle writes every course's theme key, so it carries across.
@@ -122,7 +122,7 @@ that sets `window.<INDEX_VAR>` to `[{ n, f, ti, lv, e: [{ t, a, k }] }]`.
 
 ## History
 
-These three courses previously lived in their own repositories
+Three of the courses previously lived in their own repositories
 ([system design](https://github.com/CaptainBlue793/palak-system-design-playlist),
 [ML & AI systems](https://github.com/CaptainBlue793/palak_ML_AI_system_playlist),
 [DSA](https://github.com/CaptainBlue793/palak-DSA-playlist)). Those are archived and kept only
