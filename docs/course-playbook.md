@@ -102,6 +102,21 @@ System Design chapter. Every chapter file:
 Line endings: the checkout uses CRLF (`core.autocrlf=true`). If a rebuild flips line endings on files you didn't
 change, restore them with `git checkout -- <file>`.
 
+## Cross-course links
+
+Each chapter that shares a topic with another course carries a "Related chapters in other courses" block above
+its key takeaways. The blocks are generated; don't edit them in a chapter.
+
+- The topic map is `tools/crosslinks-map.cjs`: one line per topic, listing the chapters that teach it
+  (`'db/13'` is `databases/13-b-trees.html`). A topic needs chapters from at least two courses.
+- When a new chapter teaches something another course also teaches, add it to the topic's line (or add a topic),
+  then run `node tools/crosslinks.cjs apply`. This rewrites the block in every chapter the topic touches, so it
+  changes files in other course folders: do it at release time, with the other shared changes.
+- `node tools/crosslinks.cjs check` fails if a reference is wrong or a block is out of date.
+  `node tools/crosslinks.cjs report` lists the chapters with no links out.
+- In the offline bundle, `build.js` points cross-course links at the live site, because other courses are not in
+  the bundle.
+
 ## Step 4 — release (only when every chapter is written, and only with the owner's go-ahead)
 
 1. `git fetch origin && git merge origin/main`.
@@ -110,7 +125,8 @@ change, restore them with `git checkout -- <file>`.
    (P + main) and `hours` to the real numbers. Nothing else on the home page needs changing.
 4. `README.md`: add the course to the table; remove it from the "On the way" line.
 5. Checks: `node tools/content-audit.cjs check`, `node tools/content-audit.cjs bundle`,
-   `node tools/palette-check.cjs`, `node tools/hub-check.cjs`, `--theme dark`, `--width 390`.
+   `node tools/crosslinks.cjs check`, `node tools/palette-check.cjs`, `node tools/hub-check.cjs`,
+   `--theme dark`, `--width 390`.
 6. Ask the owner, then merge into `main`, push, wait for GitHub Pages, and
    `gh release create <folder>-v1.0.0 <folder>/dist/<dist-file> --title "<Course> v1.0.0"`.
 7. Final entry in `docs/sessions/<folder>.md`.
