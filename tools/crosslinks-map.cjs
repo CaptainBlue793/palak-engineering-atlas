@@ -1,0 +1,193 @@
+'use strict';
+/* The cross-course topic map: which chapters in different courses teach the same idea.
+
+   tools/crosslinks.cjs reads this file and writes a "Related chapters in other courses"
+   block into every chapter listed here. Edit this file, then run:
+
+     node tools/crosslinks.cjs apply     (rewrite the blocks)
+     node tools/crosslinks.cjs check     (fail if a block is stale or a reference is wrong)
+
+   Each topic is [label, [chapter, chapter, ...]]. A chapter is "<course>/<number>", where the
+   number is the file's prefix: "db/13" is databases/13-b-trees.html, "os/p7" is
+   os/p7-linux-shell-files.html. A chapter shows the topic's chapters from OTHER courses only,
+   so a topic needs chapters from at least two courses.
+
+   Keep a topic tight: one idea, the few chapters that really teach it. A chapter that only
+   mentions the idea in passing does not belong. */
+
+const COURSE = {
+  dsa: 'dsa', os: 'os', net: 'networks', db: 'databases', lld: 'lld',
+  sd: 'system-design', dist: 'distributed-systems', ops: 'cloud-devops', ml: 'ml-ai-systems',
+};
+
+const TOPICS = [
+  /* ---------- foundations ---------- */
+  ['Big-O and counting steps', ['dsa/p8', 'dsa/02', 'sd/p7']],
+  ['Choosing a data structure', ['dsa/p5', 'sd/p7']],
+  ['Bits, bytes, hex and byte order', ['dsa/47', 'os/p5', 'net/p1', 'net/p2']],
+  ['Powers of two and units', ['dsa/p7', 'os/p5', 'sd/p8']],
+  ['Integer overflow and floating point', ['dsa/p2', 'os/p5', 'db/p4', 'lld/p6', 'ml/p8']],
+  ['The stack, the heap and pointers', ['dsa/p6', 'os/p1', 'os/16', 'lld/p1']],
+  ['The call stack', ['dsa/11', 'os/p3']],
+  ['Arrays, strings and structs in C and C++', ['dsa/p4', 'os/p2']],
+  ['Compiling and linking', ['dsa/p1', 'os/p6']],
+  ['Latency numbers and the memory hierarchy', ['dsa/03', 'os/p4', 'db/p3', 'sd/p1', 'sd/p8', 'ml/p8']],
+  ['Estimation and sizing arithmetic', ['net/p8', 'db/p8', 'sd/p8', 'dist/p4', 'ml/p8']],
+  ['Hash tables and hashing', ['dsa/09', 'db/15', 'sd/p7', 'dist/p6']],
+  ['JSON, YAML and other data formats', ['db/p5', 'sd/p5', 'dist/p3', 'ops/p4']],
+  ['Time and clocks in code', ['db/p4', 'lld/28', 'dist/p5']],
+  ['Probability and expectation', ['dsa/46', 'ml/p5']],
+  ['Python basics, and Python in use', ['net/p5', 'db/p6', 'ml/p1']],
+  ['State machines', ['os/04', 'net/08', 'lld/18', 'sd/35']],
+  ['Turning requirements into a design', ['lld/02', 'sd/01', 'ml/01']],
+
+  /* ---------- operating systems meets everything else ---------- */
+  ['What an operating system does', ['os/01', 'sd/p1']],
+  ['The Linux shell', ['os/p7', 'os/41', 'ops/p1', 'ops/p2']],
+  ['Processes and threads', ['os/03', 'os/05', 'sd/p2', 'ops/p6']],
+  ['Race conditions and locks', ['os/17', 'os/18', 'lld/22', 'sd/p2', 'dist/p1']],
+  ['Memory visibility and happens-before', ['os/25', 'lld/22', 'dist/p1']],
+  ['Producer–consumer and bounded queues', ['os/19', 'os/21', 'lld/23', 'lld/34']],
+  ['Thread pools and how to size them', ['os/27', 'db/27', 'lld/23', 'lld/39']],
+  ['Deadlock', ['dsa/27', 'os/22', 'db/24', 'lld/22']],
+  ['Semaphores', ['os/20', 'lld/39']],
+  ['Many connections on few threads: event loops', ['os/28', 'os/29', 'os/42', 'os/44', 'net/21', 'sd/p2', 'dist/p1']],
+  ['Lightweight threads: goroutines and virtual threads', ['os/45', 'lld/23']],
+  ['Sockets and file descriptors', ['os/09', 'os/10', 'net/p3', 'net/p5']],
+  ['From the network card to the socket', ['os/06', 'os/35', 'os/42', 'net/34']],
+  ['System calls and strace', ['os/p8', 'os/02', 'os/37', 'net/37']],
+  ['How containers work, and how to run them', ['os/34', 'os/46', 'sd/21', 'ops/07', 'ops/08']],
+  ['Virtual machines', ['os/33', 'ops/02', 'ops/03']],
+  ['Memory limits and the OOM killer', ['os/14', 'os/48', 'sd/21', 'ops/12']],
+  ['File systems and kinds of storage', ['os/23', 'lld/36', 'sd/09', 'dist/46', 'ops/04', 'ops/15']],
+  ['Durability: the page cache, fsync and the write-ahead log', ['os/24', 'os/31', 'os/43', 'db/10', 'db/20', 'lld/37']],
+  ['The page cache and the database buffer pool', ['os/31', 'os/43', 'db/p3', 'db/12']],
+  ['Eviction: LRU, Clock and friends', ['dsa/51', 'os/15', 'db/12', 'lld/31', 'sd/06']],
+  ['CPU scheduling and job scheduling', ['dsa/15', 'os/07', 'os/08', 'lld/35', 'sd/38']],
+  ['Percentiles and tail latency', ['os/38', 'net/33', 'net/38', 'sd/p8', 'sd/04', 'ops/24']],
+  ['Queues, overload and backpressure', ['os/27', 'net/12', 'lld/23', 'lld/34', 'sd/p2', 'sd/04', 'dist/04', 'ops/39']],
+
+  /* ---------- networking ---------- */
+  ['Networking in one pass', ['net/p7', 'net/01', 'sd/p4', 'sd/02', 'ops/p5']],
+  ['One request, end to end', ['net/41', 'net/38', 'sd/p3', 'sd/01', 'ops/p5']],
+  ['DNS', ['net/10', 'net/27', 'net/45', 'sd/p4', 'sd/02', 'ops/p5']],
+  ['TCP and UDP', ['net/07', 'net/08', 'net/11', 'net/13', 'sd/p4', 'sd/02']],
+  ['HTTP', ['net/15', 'net/16', 'net/18', 'sd/p5', 'sd/02', 'ops/p8']],
+  ['TLS, certificates and mTLS', ['net/17', 'net/32', 'sd/02', 'sd/11', 'ops/p5', 'ops/14', 'ops/27']],
+  ['REST, gRPC and Protobuf', ['net/22', 'sd/03', 'dist/p3', 'dist/03']],
+  ['RPC timeouts and deadlines', ['net/22', 'lld/25', 'dist/p2', 'dist/03']],
+  ['Real-time: polling, SSE, WebSockets and WebRTC', ['net/21', 'net/42', 'sd/03', 'sd/28']],
+  ['Load balancing', ['net/24', 'net/46', 'sd/05', 'ops/14', 'ops/33']],
+  ['Proxies, gateways and the service mesh', ['net/23', 'net/32', 'sd/15', 'ops/27', 'ml/39']],
+  ['CDNs and edge caching', ['net/26', 'net/43', 'sd/06', 'sd/32']],
+  ['Rate limiting', ['net/36', 'lld/32', 'sd/15']],
+  ['DDoS and abuse', ['net/08', 'net/36', 'net/45', 'sd/11']],
+  ['Kubernetes networking', ['net/31', 'net/32', 'ops/12', 'ops/14', 'ops/27']],
+  ['Cloud networks: subnets, routes, NAT and firewalls', ['net/04', 'net/05', 'net/09', 'net/29', 'net/35', 'ops/05']],
+  ['Service discovery', ['net/31', 'sd/15', 'dist/31', 'ops/12']],
+  ['Debugging a network problem', ['net/p4', 'net/p6', 'net/06', 'net/37', 'net/48', 'ops/p1', 'ops/p5']],
+  ['Inside a data centre', ['net/30', 'sd/p1', 'ops/02']],
+  ['Control plane and data plane', ['net/39', 'ops/11', 'ops/44']],
+  ['Shortest paths and routing', ['dsa/29', 'dsa/30', 'net/05', 'net/25', 'sd/12']],
+  ['Tries and prefix matching', ['dsa/21', 'net/05', 'sd/31']],
+
+  /* ---------- databases ---------- */
+  ['SQL and the relational model', ['db/p1', 'db/p2', 'db/01', 'db/03', 'sd/p6', 'sd/07']],
+  ['Indexes', ['dsa/20', 'db/09', 'db/13', 'db/15', 'sd/p6', 'sd/07']],
+  ['B-trees and LSM trees', ['dsa/20', 'db/13', 'db/14', 'db/47', 'sd/07', 'sd/39', 'dist/45']],
+  ['Bloom filters and sketches', ['db/14', 'sd/20', 'sd/30']],
+  ['Transactions, ACID and isolation', ['db/10', 'db/21', 'db/23', 'lld/26', 'lld/37', 'sd/p6', 'sd/07']],
+  ['Consistency: isolation levels versus consistency models', ['db/21', 'sd/13', 'dist/10', 'dist/11']],
+  ['Slow queries and query plans', ['db/17', 'db/37', 'db/42', 'sd/07']],
+  ['ORMs, repositories and the N+1 problem', ['db/p6', 'db/38', 'lld/26', 'sd/07']],
+  ['Connection pools', ['os/43', 'net/23', 'db/27', 'lld/39', 'sd/07']],
+  ['Pagination', ['db/02', 'sd/03']],
+  ['Schema design and domain modelling', ['db/07', 'db/41', 'lld/06', 'lld/27']],
+  ['Booking without double-booking', ['db/08', 'db/22', 'db/41', 'lld/42', 'sd/36']],
+  ['Replication', ['db/25', 'sd/08', 'dist/09', 'dist/14', 'ops/33']],
+  ['Failover and split brain', ['net/46', 'db/25', 'db/44', 'dist/13', 'dist/48']],
+  ['Partitioning and sharding', ['db/26', 'db/45', 'sd/08', 'sd/40', 'dist/20']],
+  ['Consistent hashing', ['sd/08', 'sd/39', 'dist/p6', 'dist/19']],
+  ['Generating unique IDs', ['db/p1', 'db/46', 'sd/17', 'sd/26']],
+  ['NoSQL and choosing a database', ['db/30', 'sd/07', 'dist/26', 'dist/45']],
+  ['Caching and invalidation', ['net/15', 'db/33', 'lld/31', 'sd/06']],
+  ['Full-text search and inverted indexes', ['db/31', 'sd/10', 'sd/31', 'ml/42']],
+  ['Vector search and embeddings', ['db/32', 'sd/10', 'ml/p3', 'ml/15', 'ml/20', 'ml/21', 'ml/46']],
+  ['Sorting and merging at scale', ['dsa/08', 'db/18', 'dist/47']],
+  ['Time-series data and metrics storage', ['db/29', 'sd/10', 'sd/41', 'ops/21']],
+  ['Geospatial indexes', ['db/15', 'sd/10', 'sd/35']],
+  ['Graphs: algorithms and graph data', ['dsa/25', 'db/30', 'sd/12']],
+  ['Column stores, warehouses and batch processing', ['db/28', 'db/48', 'sd/18', 'dist/47', 'ml/28']],
+  ['Stream processing: event time, windows and late data', ['sd/18', 'dist/30', 'ml/28']],
+  ['Schema changes and migrations without downtime', ['db/34', 'sd/08', 'ops/42']],
+  ['Backups and disaster recovery', ['db/35', 'sd/22', 'ops/04', 'ops/32']],
+  ['Top-K and heavy hitters', ['dsa/15', 'db/06', 'sd/20', 'sd/31']],
+  ['Compression and encoding', ['dsa/36', 'net/16', 'db/28', 'db/29']],
+  ['Fingerprints and content hashing', ['dsa/50', 'sd/30', 'sd/33', 'dist/24']],
+
+  /* ---------- distributed systems ---------- */
+  ['CAP and PACELC', ['db/36', 'sd/13', 'dist/10']],
+  ['Clocks and ordering events', ['db/36', 'sd/13', 'sd/28', 'dist/06', 'dist/07', 'dist/08', 'dist/35']],
+  ['Consensus: Paxos and Raft', ['db/36', 'sd/13', 'dist/16', 'dist/17', 'dist/18', 'ops/11']],
+  ['Leader election, leases and fencing tokens', ['sd/17', 'sd/38', 'dist/13', 'dist/31', 'dist/32']],
+  ['Quorums and Dynamo-style stores', ['sd/08', 'sd/39', 'dist/12', 'dist/26', 'dist/42']],
+  ['Vector clocks and conflicting writes', ['sd/39', 'dist/08', 'dist/26']],
+  ['Gossip and failure detection', ['sd/20', 'dist/05', 'dist/23']],
+  ['Merkle trees', ['sd/20', 'sd/39', 'dist/24']],
+  ['CRDTs and collaborative editing', ['lld/38', 'sd/33', 'sd/34', 'dist/25']],
+  ['Two-phase commit and distributed transactions', ['db/36', 'sd/13', 'dist/21', 'dist/41']],
+  ['Sagas', ['sd/15', 'dist/22']],
+  ['The outbox, change data capture and dual writes', ['sd/17', 'dist/22', 'dist/28', 'ops/42']],
+  ['Event sourcing, CQRS and logs as the source of truth', ['db/33', 'lld/27', 'sd/17', 'dist/15']],
+  ['Delivery guarantees and exactly-once', ['sd/14', 'sd/18', 'sd/37', 'sd/40', 'dist/28', 'ml/28']],
+  ['Retries, backoff and idempotency', ['net/46', 'lld/25', 'sd/03', 'sd/16', 'dist/04', 'ops/p8']],
+  ['Timeouts, circuit breakers and bulkheads', ['net/32', 'lld/25', 'sd/16', 'dist/p2']],
+  ['Message queues and Kafka', ['lld/34', 'sd/14', 'sd/29', 'dist/29', 'dist/43']],
+  ['Publish–subscribe and the Observer pattern', ['lld/16', 'lld/34', 'sd/14', 'dist/31']],
+  ['Microservices and breaking up a monolith', ['lld/12', 'sd/15', 'dist/01', 'ops/47']],
+  ['Testing concurrent and distributed code', ['lld/28', 'sd/19', 'dist/37', 'dist/38']],
+  ['Chaos engineering and fault injection', ['sd/19', 'sd/22', 'dist/37', 'ops/34']],
+  ['Availability and the nines', ['sd/16', 'dist/p4', 'ops/24']],
+  ['Multi-region design', ['net/26', 'net/27', 'sd/22', 'dist/35', 'dist/41', 'ops/33']],
+  ['Object storage and distributed file systems', ['sd/09', 'dist/46', 'ops/04']],
+  ['MapReduce, Spark and checkpointing big jobs', ['sd/18', 'dist/27', 'dist/47', 'ml/25']],
+
+  /* ---------- cloud and operations ---------- */
+  ['Kubernetes', ['sd/21', 'dist/44', 'ops/11', 'ops/12']],
+  ['CI/CD and deployment strategies', ['sd/21', 'ops/10', 'ops/17', 'ops/18', 'ops/41', 'ml/32', 'ml/33']],
+  ['Platform teams and golden paths', ['ops/35', 'ml/39']],
+  ['Supply-chain attacks', ['ops/29', 'ops/48', 'ml/36']],
+  ['Feature flags and staged rollouts', ['lld/24', 'ops/17', 'ops/45', 'ml/33']],
+  ['Infrastructure as code', ['dsa/26', 'sd/21', 'ops/19', 'ops/20']],
+  ['Serverless', ['sd/21', 'sd/24', 'ops/26']],
+  ['Scaling out and autoscaling', ['sd/04', 'sd/21', 'ops/03', 'ops/25']],
+  ['Capacity planning', ['sd/04', 'sd/24', 'ops/39', 'ml/26', 'ml/38']],
+  ['Cost engineering', ['db/48', 'sd/24', 'ops/31', 'ops/46', 'ml/27', 'ml/38']],
+  ['Metrics, logs and traces', ['os/37', 'lld/33', 'sd/16', 'sd/41', 'dist/36', 'ops/21', 'ops/22', 'ops/23', 'ml/34']],
+  ['SLOs, alerting and incident response', ['sd/16', 'sd/41', 'ops/01', 'ops/24', 'ops/37', 'ops/38']],
+  ['Real outages, taken apart', ['os/48', 'net/44', 'net/45', 'db/44', 'dist/48', 'ops/43', 'ops/44', 'ops/45']],
+  ['Authentication, authorisation and least privilege', ['os/36', 'sd/11', 'ops/06', 'ops/36', 'ops/p7']],
+  ['Configuration and secrets', ['lld/24', 'sd/11', 'ops/13', 'ops/28']],
+  ['Attacks and their defences', ['os/36', 'os/47', 'net/03', 'net/36', 'db/p6', 'sd/11', 'ops/29', 'ml/36']],
+
+  /* ---------- machine learning ---------- */
+  ['ML platforms: leakage, skew, evaluation and drift', ['sd/23', 'ml/01', 'ml/03', 'ml/07', 'ml/29', 'ml/32', 'ml/34']],
+  ['Serving LLMs', ['sd/42', 'ml/14', 'ml/26', 'ml/39', 'ml/45']],
+  ['Feeds, ranking and recommendations', ['sd/27', 'ml/30', 'ml/41']],
+  ['Ads: counting clicks and predicting them', ['sd/40', 'ml/43']],
+  ['Payments and fraud', ['sd/37', 'ml/44']],
+  ['Hardware: CPUs, GPUs and memory', ['os/p4', 'os/32', 'sd/p1', 'ml/p8', 'ml/10']],
+
+  /* ---------- the same system, designed at two levels ---------- */
+  ['Ride hailing: the classes and the architecture', ['lld/46', 'sd/35']],
+  ['Ticket booking: the classes and the architecture', ['lld/42', 'sd/36']],
+  ['A key-value store, from one node to a cluster', ['db/47', 'lld/37', 'sd/39', 'dist/42']],
+  ['A job scheduler: the classes and the architecture', ['lld/35', 'sd/38']],
+  ['Chat at scale', ['net/21', 'db/45', 'sd/28']],
+  ['Video streaming', ['net/43', 'sd/32']],
+
+  /* ---------- interviews ---------- */
+  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40']],
+];
+
+module.exports = { COURSE, TOPICS };

@@ -65,7 +65,9 @@ for (const file of pageFiles) {
   // strip <script>/<style> out of the markup we replay
   const html = bodyInner.replace(RE_SCRIPT, '').replace(RE_STYLE, '')
     // Rewrite before JSON serialization, where attribute quotes become escaped.
-    .split('href="../index.html"').join('href="https://captainblue793.github.io/palak-engineering-atlas/"');
+    .split('href="../index.html"').join('href="https://captainblue793.github.io/palak-engineering-atlas/"')
+    // Other courses are not in this bundle either: send cross-course links to the live site.
+    .replace(/href="\.\.\/([a-z-]+)\/(?=[^"]*\.html)/g, 'href="https://captainblue793.github.io/palak-engineering-atlas/$1/');
 
   pages[file] = { title, chapter, styles, html, scripts };
 }
