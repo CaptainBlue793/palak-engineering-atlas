@@ -9,4 +9,4 @@ Code: Python with NumPy, pandas and scikit-learn. Runtime namespace (planned): `
   courses. Overlap with ML & AI Systems Ch 2–7 is linked, not repeated.
 - Needs a shared change: add `indexVar: 'MLF_INDEX'`, `first: 'p1-python-for-data.html'` and
   `dist: 'ml-fundamentals-course.html'` to the `ml-fundamentals` stub in `assets/atlas.js` before scaffolding.
-- Next: owner reviews the plan; then the course shell (Step 2).
+- P1 Python for Data Work: notebook hidden-state simulator (four cells run in any order, kernel state, stale variables, comparison with a fresh run); venv/conda/uv table; Pimentel et al. 2019 notebook study
