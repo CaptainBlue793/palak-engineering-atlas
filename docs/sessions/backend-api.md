@@ -14,3 +14,4 @@ Code: Python with FastAPI and Pydantic, PostgreSQL, Redis, pytest and curl. Runt
 - P2 Async Python & the Event Loop: coroutines, the event loop, blocking calls, FastAPI's def thread pool, CPU-bound work; event-loop timeline simulator with measured uvicorn figures.
 - P3 curl, HTTPie & the Browser Dev Tools: curl flags, reading -v, JSON vs form bodies, redirects, -f exit codes, HTTPie, the network tab; simulator of 60 real curl runs against FastAPI.
 - P4 JSON, Schemas & Serialisation: JSON types, numbers and money, dates and nulls, JSON Schema, serialising models, Unicode; Pydantic validation lab of 196 real FastAPI responses (strict mode rejects every date and decimal under FastAPI).
+- P5 SQL for Application Developers: CRUD with row counts and RETURNING, joins and N+1 (measured 41x), indexes and column order, parameters and injection, reading plans; query-plan lab of 25 real SQLite runs on 500k rows.
