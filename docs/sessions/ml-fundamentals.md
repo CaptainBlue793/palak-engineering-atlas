@@ -10,3 +10,4 @@ Code: Python with NumPy, pandas and scikit-learn. Runtime namespace (planned): `
 - Needs a shared change: add `indexVar: 'MLF_INDEX'`, `first: 'p1-python-for-data.html'` and
   `dist: 'ml-fundamentals-course.html'` to the `ml-fundamentals` stub in `assets/atlas.js` before scaffolding.
 - P1 Python for Data Work: notebook hidden-state simulator (four cells run in any order, kernel state, stale variables, comparison with a fresh run); venv/conda/uv table; Pimentel et al. 2019 notebook study
+- P2 NumPy Arrays & Vectorisation: broadcasting explorer (two typed shapes, right-aligned rule table, stretched-cell grids, NumPy's exact error, the (n,) vs (n,1) bug preset); measured loop 80 ms vs (x*x).sum 3.5 ms vs np.dot 0.2 ms; views vs copies
