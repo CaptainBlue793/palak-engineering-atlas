@@ -3,37 +3,278 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>How a Request Reaches Your Code</title>
+<title>How a Request Reaches Your Code · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Prerequisite 8 of Backend & API. DNS, TCP, TLS, load balancers, reverse proxies, the ASGI server and the framework stack: the path of one request, with every stage timed on a real FastAPI service.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rp-ctl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 18px; }
+  @media (max-width:800px) { .rp-ctl { grid-template-columns:1fr; } }
+  .rp-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .rp-wf { margin-top:14px; display:grid; gap:5px; }
+  .rp-row { display:grid; grid-template-columns:210px minmax(0,1fr) 80px; gap:10px; align-items:center; font-size:13px; }
+  @media (max-width:700px) { .rp-row { grid-template-columns:118px minmax(0,1fr) 64px; font-size:12px; } }
+  .rp-row .lab { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .rp-row .lab small { color:var(--muted); }
+  .rp-row .trk { position:relative; height:14px; }
+  .rp-row .bar { position:absolute; top:0; height:14px; border-radius:4px; min-width:2px; }
+  .rp-row .val { font-family:var(--mono); text-align:right; }
+  .rp-row.zero { opacity:.45; }
+  .rp-key { font-size:12px; color:var(--muted); margin-top:6px; }
+  .rp-key i { display:inline-block; width:10px; height:10px; border-radius:3px; margin:0 4px 0 10px; vertical-align:-1px; }
+  .rp-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="0.8">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 8</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 40 min</span></div>
     <h1>How a Request Reaches Your <span class="grad">Code</span></h1>
-    <p class="lead">DNS, TCP, TLS, load balancer, reverse proxy, ASGI server, framework, handler: the path of one request.</p>
+    <p class="lead">When someone calls <code>GET https://api.example.com/items</code>, your handler is the last stop of a long trip. The client looks up an address, opens a connection, negotiates encryption, and sends the request to a load balancer, which passes it to a reverse proxy, which passes it to the process running your Python. Inside that process, an ASGI server parses the bytes and hands them to FastAPI, which runs middleware, finds the route, resolves dependencies, validates the input, calls your function, and turns the result back into bytes.</p>
+    <p class="lead">Each layer adds time, and each is a place where things go wrong: a timeout set too low, a header the proxy dropped, a client address that is really the load balancer's. This page walks the path, and the lab times every stage on a real FastAPI service running behind a real (if small) proxy, with and without TLS.</p>
+    <ul class="objectives">
+      <li><span>Describe each hop from client to handler and what it does</span></li>
+      <li><span>Explain why new connections, and TLS in particular, are expensive, and how reuse helps</span></li>
+      <li><span>Know what a reverse proxy adds, including forwarded headers</span></li>
+      <li><span>Explain ASGI, uvicorn and worker processes</span></li>
+      <li><span>Name the stages inside FastAPI and see where the time goes</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The event loop and FastAPI's thread pool:</b> <a href="p2-async-python.html">Prerequisite 2</a>.</li>
+        <li><b>Reading curl timings and the network tab:</b> <a href="p3-curl-and-http-tools.html">Prerequisite 3</a>. For DNS, TCP and TLS in depth, see the Networking course.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>DNS and TCP, briefly</li>
-    <li>TLS termination</li>
-    <li>Reverse proxies</li>
-    <li>ASGI servers and workers</li>
-    <li>The framework stack</li>
-  </ol>
+  <h2>DNS and TCP, briefly</h2>
+  <p><b>DNS</b> turns <code>api.example.com</code> into an IP address. Answers are cached, by the operating system and by resolvers along the way, for as long as the record's TTL allows, so most lookups cost nothing, but a cold lookup costs at least one round trip to a resolver. Then <b>TCP</b> opens a connection with a three-way handshake, which costs one round trip before any data flows. On a laptop that is a fraction of a millisecond; between continents it is 100 ms or more.</p>
+  <p>Names can surprise you even locally. Measured on Windows, a plain <code>curl http://localhost:8041/</code> took <b>205 ms</b> to connect, while <code>127.0.0.1</code> took under a millisecond: <code>localhost</code> resolved to the IPv6 address <code>::1</code> first, nothing was listening there because uvicorn binds to IPv4 by default, and curl waited before falling back. A slow first request with a fast second is often a resolution or connection problem, not your code.</p>
+
+  <h2>TLS termination</h2>
+  <p>HTTPS wraps HTTP in <b>TLS</b>, which needs a <b>handshake</b> on each new connection: the client and server agree on keys, and the server proves its identity with its certificate. TLS 1.3 needs one extra round trip; TLS 1.2 needed two. The handshake also costs CPU for the key exchange and signature: measured on this laptop, over loopback with no network delay at all, it added about <b>11 ms</b> per new connection.</p>
+  <p>In most deployments, TLS is <b>terminated</b> at the edge: the load balancer or reverse proxy holds the certificate, decrypts the request and forwards plain HTTP, or a fresh internal TLS connection, to your service. Your code then sees <code>http</code>, not <code>https</code>, so the proxy reports the original scheme and client in headers (below). Terminating at the edge centralises certificates and renewal, and it means the proxy sees every request in plaintext, which is why it is one of the most sensitive components you run.</p>
+
+  <h2>Load balancers and reverse proxies</h2>
+  <p>A <b>load balancer</b> spreads requests across several copies of your service and stops sending to copies that fail health checks. A <b>reverse proxy</b>, such as nginx, Envoy, Caddy or Traefik, often in the same role, sits in front of a service and adds: TLS termination, routing by host and path, compression, request size and rate limits, buffering of slow clients so your workers are not tied up by them, and timeouts. Cloud load balancers, API gateways (<a href="35-gateways-bff.html">Chapter 35</a>) and Kubernetes ingress controllers are all variations on the same idea.</p>
+  <p>Because the proxy opens its own connection to your service, the TCP peer your service sees is the proxy, not the user. Proxies pass the original details in headers: <code>X-Forwarded-For</code> (the client's IP), <code>X-Forwarded-Proto</code> (http or https) and <code>X-Forwarded-Host</code>, or the standard <code>Forwarded</code> header. Only trust these from your own proxy, since any client can send them: uvicorn reads them only when started with <code>--proxy-headers</code> and only from the addresses in <code>--forwarded-allow-ips</code>. Get this wrong and rate limits, audit logs and IP allowlists all act on an address the attacker chose.</p>
+<pre class="code"><span class="c"># the service behind a proxy at 10.0.0.5: trust its forwarded headers, nobody else's</span>
+uvicorn app:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips 10.0.0.5</pre>
+
+  <h2>ASGI servers and workers</h2>
+  <p>FastAPI does not read sockets itself. An <b>ASGI server</b>, usually uvicorn (Hypercorn and Granian are alternatives), accepts connections, parses HTTP, and calls your application as an ASGI callable: <code>await app(scope, receive, send)</code>, where <code>scope</code> describes the request (method, path, headers, client), <code>receive</code> yields the body and <code>send</code> writes the response. That interface is all the lab's timing wrapper needed: it is a few lines of ASGI that stamps the time on entry and adds a header when the response starts.</p>
+  <p>One uvicorn process runs one event loop on one CPU core. To use more cores, run several <b>worker processes</b>: <code>uvicorn app:app --workers 4</code>, or Gunicorn managing uvicorn workers, or, common in containers, one process per container and more containers. Workers share nothing in memory, so anything that must be shared, such as sessions, caches and rate-limit counters, belongs in a database or Redis (<a href="18-caching.html">Chapter 18</a>).</p>
+
+  <h2>The framework stack</h2>
+  <p>Inside the application, a request passes through middleware (outermost first: added last runs first), then routing, which matches the path and method, then dependency resolution and request validation, then your handler, then response-model validation and JSON serialisation, and back out through the middleware. The lab's service reports the first four stages to the client in a <code>Server-Timing</code> header, which browsers show in the network tab's timing view:</p>
+<pre class="code">server-timing: routing;dur=0.378, deps;dur=0.392, handler;dur=0.003, serialise;dur=0.440</pre>
+
+  <h2>Simulator: one request, every stage</h2>
+  <p>Each combination was measured with curl against a real FastAPI service, either directly or through a reverse proxy, with or without TLS, on a new or a reused connection, returning 1 item or 1,000. The stages inside the service come from its <code>Server-Timing</code> header. Everything ran on one laptop, so the network itself is free; use <b>network distance</b> to add a modelled round-trip time to each step that waits on the network.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Request waterfall</span><span class="p-tag">Measured + model</span></div>
+    <div class="panel-body">
+      <div class="rp-ctl">
+        <div>
+          <div class="rp-l">Path</div><div class="seg" id="rpH"><button class="active" data-v="direct">client → uvicorn</button><button data-v="proxy">client → proxy → uvicorn</button></div>
+          <div class="rp-l" style="margin-top:10px">Encryption</div><div class="seg" id="rpT"><button class="active" data-v="1">HTTPS</button><button data-v="0">plain HTTP</button></div>
+        </div>
+        <div>
+          <div class="rp-l">Connection</div><div class="seg" id="rpR"><button class="active" data-v="0">new</button><button data-v="1">reused (keep-alive)</button></div>
+          <div class="rp-l" style="margin-top:10px">Response</div><div class="seg" id="rpN"><button class="active" data-v="1">1 item</button><button data-v="1000">1,000 items</button></div>
+          <div class="rp-l" style="margin-top:10px">Network distance (modelled)</div><div class="seg" id="rpD"><button class="active" data-v="0">same machine</button><button data-v="0.5">same data centre</button><button data-v="15">same country</button><button data-v="90">another continent</button></div>
+        </div>
+      </div>
+      <div class="rp-wf" id="rpWf"></div>
+      <div class="rp-key"><i style="background:var(--accent-2)"></i>network and connection<i style="background:var(--amber)"></i>proxy<i style="background:var(--pink)"></i>server outside FastAPI<i style="background:var(--accent)"></i>inside FastAPI<i style="background:var(--muted)"></i>download</div>
+      <div class="stats" id="rpStats"></div>
+      <div class="rp-why" id="rpWhy"></div>
+    </div>
+    <div class="panel-foot">Measured with curl 8.21 on Windows against uvicorn 0.54.0 and FastAPI 0.142.2 on Python 3.11.17, medians of 35 requests after 5 warm-up requests. The proxy is a 30-line Starlette app forwarding with httpx over a kept-alive pool; nginx or Envoy, written in C and C++, add much less. TLS used a 2048-bit RSA certificate. The network distance is a model, added on top: one round trip each for the TCP handshake, the TLS 1.3 handshake and the request, plus TCP slow start for large responses (an initial window of 10 packets, doubling each round trip).</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li>Start with the defaults, a new HTTPS connection: the TLS handshake is most of the time, and FastAPI's part is about a millisecond. Switch to a <b>reused</b> connection: the handshake disappears entirely.</li>
+    <li>Set the distance to <b>another continent</b>, new connection: three round trips before the first byte. Reuse the connection and it is one. This is why clients should keep connections open and why APIs put servers close to users.</li>
+    <li>Add the <b>proxy</b>. It adds a couple of milliseconds here, because it is written in Python; the larger point is the hop itself, with its own connection pool and timeouts.</li>
+    <li>Ask for <b>1,000 items</b>: serialisation grows, and at a distance, the 70 KB download needs extra round trips while TCP's window grows. Pagination (<a href="08-pagination-filtering.html">Chapter 8</a>) and compression both help.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Layer</th><th>Typical tools</th><th>Adds</th><th>Common failure</th></tr></thead>
+      <tbody>
+        <tr><td><b>DNS</b></td><td>Route 53, Cloud DNS, Cloudflare</td><td>A lookup per TTL</td><td>Stale records after a move; TTLs too long to fail over</td></tr>
+        <tr><td><b>Load balancer</b></td><td>AWS ALB/NLB, Google Cloud LB</td><td>Health checks, spreading load, often TLS</td><td>Health check that passes while the app is broken</td></tr>
+        <tr><td><b>Reverse proxy</b></td><td>nginx, Envoy, Caddy, Traefik</td><td>Routing, limits, buffering, timeouts</td><td>Timeouts shorter than the app's; dropped or trusted-too-much headers</td></tr>
+        <tr><td><b>ASGI server</b></td><td>uvicorn, Hypercorn, Granian</td><td>HTTP parsing, workers, keep-alive</td><td>Too few workers; event loop blocked</td></tr>
+        <tr><td><b>Framework</b></td><td>FastAPI on Starlette</td><td>Middleware, routing, validation, serialisation</td><td>Heavy middleware or huge responses on every request</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>DNS, TCP, TLS</b> find the address, connect, encrypt</li>
+      <li data-k="step"><b>Load balancer</b> picks a healthy instance</li>
+      <li data-k="step"><b>Reverse proxy</b> limits, routing, forwarded headers</li>
+      <li data-k="step"><b>uvicorn</b> parses HTTP, calls the ASGI app</li>
+      <li data-k="step"><b>FastAPI</b> middleware, routing, dependencies, validation</li>
+      <li data-k="end"><b>Your handler</b> then serialisation, back the same way</li>
+    </ol>
+    <figcaption><b>The path of one request.</b> Everything before your handler is shared by every endpoint, so its cost and its failures show up everywhere at once.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🩸</div>
+    <div class="body"><div class="title">Use case: Cloudbleed, 2017</div><p>In February 2017, Tavis Ormandy of Google's Project Zero noticed corrupted web pages coming through Cloudflare, which acts as a reverse proxy for millions of websites: they contained fragments of other people's requests, including cookies, authentication tokens and private messages. The cause was a bug in an HTML parser that Cloudflare's edge servers ran on some responses to rewrite them on the fly: in certain malformed pages, a pointer check ran past the end of a buffer, and the proxy copied whatever was next in its memory into the response. Because Cloudflare terminated TLS for all of those sites, that memory held other customers' traffic in plaintext. At its peak about 1 in every 3.3 million requests leaked, and some leaked pages had been cached by search engines, which Cloudflare then worked with to purge. The fix was quick; the lesson lasts. The proxy layer is shared infrastructure that sees everything, so its bugs are everyone's bugs, and every feature you turn on at that layer runs on every request.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Trusting <code>X-Forwarded-For</code> from anyone,</b> so clients choose their own IP address.</li>
+      <li><b>Timeouts that do not line up:</b> a proxy giving up at 30 seconds while the app keeps working for 60, or retrying a request the app already processed.</li>
+      <li><b>Opening a new connection per request</b> to another service, paying DNS, TCP and TLS every time; reuse one client (<code>httpx.AsyncClient</code>) for the process.</li>
+      <li><b>Generating absolute URLs from the scheme the app sees,</b> producing <code>http://</code> links behind a TLS-terminating proxy.</li>
+      <li><b>Running one worker on a many-core machine,</b> or keeping per-process state that other workers cannot see.</li>
+      <li><b>Health checks that only prove the process is alive,</b> not that it can reach its database.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What happens between a user's browser sending a request and your FastAPI handler running?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The browser resolves the domain name with DNS, opens a TCP connection and does a TLS handshake, unless it can reuse an existing connection. The request reaches a load balancer, which picks a healthy instance of the service, usually through a reverse proxy that terminates TLS, applies limits and routing, and adds forwarded headers with the client's real address and scheme. The proxy forwards the request to uvicorn, the ASGI server, which parses the HTTP and calls the FastAPI app. FastAPI runs the middleware, matches the route, resolves dependencies and validates the input against the models, and only then calls the handler. The return value is validated against the response model, serialised to JSON, and travels back the same way.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your service's p99 latency is 400 ms, but your traces show the handler takes 20 ms. Where would you look?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The other 380 ms is outside the handler, so I would measure each layer separately. First, compare the latency the load balancer or proxy records with what the app records: a big gap means queueing before the app, such as all workers busy, a blocked event loop, or the proxy's own connection limits. Within the app, middleware, dependency resolution, validation and serialisation of large responses all happen outside the handler; a Server-Timing header or tracing spans around those show it. On the client side, look at whether connections are reused: new TLS connections from distant clients cost several round trips each, and large responses need several more while TCP's window grows. Then fix the biggest piece: more workers or unblocking the loop for queueing, keep-alive and connection pooling for handshakes, pagination and compression for large bodies, and servers or a CDN closer to users for distance.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A request passes DNS, TCP, TLS, a load balancer, a reverse proxy and an ASGI server before FastAPI sees it.</li>
+      <li>New connections cost round trips and CPU; reusing connections removes most of that.</li>
+      <li>TLS usually terminates at the edge; the proxy forwards the client's details in headers that you must only trust from it.</li>
+      <li>uvicorn calls your app through ASGI; scale across cores with worker processes that share nothing.</li>
+      <li>Inside FastAPI, middleware, routing, dependencies, validation and serialisation all run around your handler.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Your service runs behind a TLS-terminating proxy. What does <code>request.url.scheme</code> show without proxy-header handling?</p>
+      <div class="opts">
+        <button class="opt">https, always</button>
+        <button class="opt">Whatever the client sent in the Host header</button>
+        <button class="opt">http, because the proxy connects over plain HTTP</button>
+        <button class="opt">An error</button>
+      </div>
+      <div class="explain">The proxy reports the original scheme in X-Forwarded-Proto; uvicorn applies it with --proxy-headers from trusted addresses.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why should a service only trust <code>X-Forwarded-For</code> from its own proxy?</p>
+      <div class="opts">
+        <button class="opt">Any client can send the header, choosing whatever IP address it likes</button>
+        <button class="opt">The header is encrypted</button>
+        <button class="opt">Other proxies use a different format</button>
+        <button class="opt">It slows down requests</button>
+      </div>
+      <div class="explain">Rate limits, logs and IP allowlists would otherwise use an address the attacker picked.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A client 90 ms away opens a new HTTPS connection (TLS 1.3) for each request. Roughly how many round trips before the first response byte?</p>
+      <div class="opts">
+        <button class="opt">One</button>
+        <button class="opt">Two</button>
+        <button class="opt">Five</button>
+        <button class="opt">Three: TCP, TLS, then the request</button>
+      </div>
+      <div class="explain">About 270 ms of waiting before any server time. With a reused connection, only the request's round trip remains.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does running uvicorn with <code>--workers 4</code> do?</p>
+      <div class="opts">
+        <button class="opt">Four threads share one event loop</button>
+        <button class="opt">Four separate processes, each with its own event loop and memory</button>
+        <button class="opt">Four event loops in one process, sharing memory</button>
+        <button class="opt">Handles four requests at a time in total</button>
+      </div>
+      <div class="explain">Processes share nothing in memory, so shared state goes in a database or Redis.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In the lab, which stage inside FastAPI grew most when the response went from 1 item to 1,000?</p>
+      <div class="opts">
+        <button class="opt">Routing</button>
+        <button class="opt">Dependencies</button>
+        <button class="opt">Serialisation</button>
+        <button class="opt">The handler</button>
+      </div>
+      <div class="explain">Each item is validated against the response model and turned into JSON; the handler only sliced a list.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"r":{"direct|0|0|1":{"dns_ms":0.058,"connect_ms":0.724,"tls_done_ms":0.0,"pretransfer_ms":0.837,"ttfb_ms":2.882,"total_ms":3.176,"bytes":70,"new_connections":1,"stages":{"routing":0.378,"deps":0.392,"handler":0.003,"serialise":0.44}},"direct|0|0|1000":{"dns_ms":0.054,"connect_ms":0.667,"tls_done_ms":0.0,"pretransfer_ms":0.783,"ttfb_ms":3.184,"total_ms":3.561,"bytes":72881,"new_connections":1,"stages":{"routing":0.349,"deps":0.391,"handler":0.009,"serialise":1.089}},"direct|0|1|1":{"dns_ms":0.0,"connect_ms":0.0,"tls_done_ms":0.0,"pretransfer_ms":0.087,"ttfb_ms":1.338,"total_ms":1.549,"bytes":70,"new_connections":0,"stages":{"routing":0.302,"deps":0.312,"handler":0.003,"serialise":0.415}},"direct|0|1|1000":{"dns_ms":0.0,"connect_ms":0.0,"tls_done_ms":0.0,"pretransfer_ms":0.085,"ttfb_ms":2.039,"total_ms":2.285,"bytes":72881,"new_connections":0,"stages":{"routing":0.302,"deps":0.331,"handler":0.006,"serialise":0.931}},"direct|1|0|1":{"dns_ms":0.054,"connect_ms":0.674,"tls_done_ms":11.672,"pretransfer_ms":11.784,"ttfb_ms":13.427,"total_ms":13.677,"bytes":70,"new_connections":1,"stages":{"routing":0.381,"deps":0.39,"handler":0.003,"serialise":0.431}},"direct|1|0|1000":{"dns_ms":0.051,"connect_ms":0.663,"tls_done_ms":11.667,"pretransfer_ms":11.779,"ttfb_ms":13.814,"total_ms":14.197,"bytes":72881,"new_connections":1,"stages":{"routing":0.372,"deps":0.389,"handler":0.009,"serialise":0.91}},"direct|1|1|1":{"dns_ms":0.0,"connect_ms":0.0,"tls_done_ms":0.0,"pretransfer_ms":0.093,"ttfb_ms":1.504,"total_ms":1.723,"bytes":70,"new_connections":0,"stages":{"routing":0.294,"deps":0.323,"handler":0.003,"serialise":0.426}},"direct|1|1|1000":{"dns_ms":0.0,"connect_ms":0.0,"tls_done_ms":0.0,"pretransfer_ms":0.096,"ttfb_ms":2.066,"total_ms":2.388,"bytes":72881,"new_connections":0,"stages":{"routing":0.284,"deps":0.32,"handler":0.006,"serialise":0.951}},"proxy|0|0|1":{"dns_ms":0.047,"connect_ms":0.666,"tls_done_ms":0.0,"pretransfer_ms":0.773,"ttfb_ms":4.461,"total_ms":4.817,"bytes":70,"new_connections":1,"stages":{"routing":0.338,"deps":0.348,"handler":0.003,"serialise":0.457,"proxy":3.054}},"proxy|0|0|1000":{"dns_ms":0.054,"connect_ms":0.666,"tls_done_ms":0.0,"pretransfer_ms":0.768,"ttfb_ms":5.156,"total_ms":5.578,"bytes":72881,"new_connections":1,"stages":{"routing":0.33,"deps":0.329,"handler":0.009,"serialise":0.908,"proxy":3.57}},"proxy|0|1|1":{"dns_ms":0.0,"connect_ms":0.0,"tls_done_ms":0.0,"pretransfer_ms":0.085,"ttfb_ms":3.021,"total_ms":3.307,"bytes":70,"new_connections":0,"stages":{"routing":0.246,"deps":0.269,"handler":0.003,"serialise":0.411,"proxy":2.636}},"proxy|0|1|1000":{"dns_ms":0.0,"connect_ms":0.0,"tls_done_ms":0.0,"pretransfer_ms":0.089,"ttfb_ms":3.812,"total_ms":4.131,"bytes":72881,"new_connections":0,"stages":{"routing":0.269,"deps":0.31,"handler":0.006,"serialise":0.914,"proxy":3.417}},"proxy|1|0|1":{"dns_ms":0.057,"connect_ms":0.712,"tls_done_ms":11.701,"pretransfer_ms":11.826,"ttfb_ms":15.111,"total_ms":15.436,"bytes":70,"new_connections":1,"stages":{"routing":0.314,"deps":0.317,"handler":0.003,"serialise":0.419,"proxy":2.908}},"proxy|1|0|1000":{"dns_ms":0.051,"connect_ms":0.709,"tls_done_ms":11.835,"pretransfer_ms":11.956,"ttfb_ms":15.952,"total_ms":16.471,"bytes":72881,"new_connections":1,"stages":{"routing":0.308,"deps":0.304,"handler":0.008,"serialise":0.875,"proxy":3.464}},"proxy|1|1|1":{"dns_ms":0.0,"connect_ms":0.0,"tls_done_ms":0.0,"pretransfer_ms":0.098,"ttfb_ms":3.033,"total_ms":3.321,"bytes":70,"new_connections":0,"stages":{"routing":0.246,"deps":0.287,"handler":0.003,"serialise":0.387,"proxy":2.572}},"proxy|1|1|1000":{"dns_ms":0.0,"connect_ms":0.0,"tls_done_ms":0.0,"pretransfer_ms":0.102,"ttfb_ms":3.981,"total_ms":4.345,"bytes":72881,"new_connections":0,"stages":{"routing":0.294,"deps":0.299,"handler":0.006,"serialise":0.883,"proxy":3.451}}}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const fmt = (ms) => ms < 0.005 ? '0' : ms < 0.01 ? '&lt; 0.01' : ms < 1 ? ms.toFixed(2) : ms < 10 ? ms.toFixed(1) : Math.round(ms).toString();
+  // extra round trips TCP slow start needs for a body, starting at 10 packets of 1460 bytes and doubling
+  function flights(bytes) { let sent = 0, w = 10 * 1460, f = 0; while (sent < bytes) { sent += w; w *= 2; f++; } return Math.max(0, f - 1); }
+  function draw() {
+    const h = v('#rpH'), t = v('#rpT'), r = v('#rpR'), n = v('#rpN'), rtt = +v('#rpD'), m = D.r[`${h}|${t}|${r}|${n}`];
+    const st = m.stages, inner = st.routing + st.deps + st.handler + st.serialise;
+    const proxyOwn = h === 'proxy' ? Math.max(0, st.proxy - inner) : 0;
+    const tcp = m.connect_ms - m.dns_ms, tls = t === '1' && m.tls_done_ms ? m.tls_done_ms - m.connect_ms : 0;
+    const serverWait = m.ttfb_ms - m.pretransfer_ms;               // request sent → first byte back
+    const outside = Math.max(0, serverWait - inner - proxyOwn);    // uvicorn parsing, curl, loopback
+    const dl = m.total_ms - m.ttfb_ms;
+    const newConn = r === '0', rttTcp = newConn ? rtt : 0, rttTls = newConn && t === '1' ? rtt : 0, rttReq = rtt, rttSlow = rtt * flights(m.bytes);
+    const rows = [
+      ['DNS lookup', 'resolve the name', m.dns_ms, 'var(--accent-2)'],
+      ['TCP handshake', newConn ? 'connect' : 'reused', tcp + rttTcp, 'var(--accent-2)'],
+      ['TLS handshake', t === '1' ? (newConn ? 'keys and certificate' : 'reused') : 'plain HTTP', tls + rttTls, 'var(--accent-2)'],
+      ['Request on the wire', 'one round trip', rttReq + (m.pretransfer_ms - m.connect_ms - (t === '1' && m.tls_done_ms ? m.tls_done_ms - m.connect_ms : 0)), 'var(--accent-2)'],
+      ['Proxy', h === 'proxy' ? 'its own work and hop' : 'no proxy', proxyOwn, 'var(--amber)'],
+      ['uvicorn and the rest', 'HTTP parsing, ASGI', outside, 'var(--pink)'],
+      ['Routing', 'middleware, path, query', st.routing, 'var(--accent)'],
+      ['Dependencies', 'and request validation', st.deps, 'var(--accent)'],
+      ['Handler', 'your code', st.handler, 'var(--accent)'],
+      ['Serialisation', 'response model, JSON', st.serialise, 'var(--accent)'],
+      ['Download', (m.bytes / 1000).toFixed(1) + ' KB', dl + rttSlow, 'var(--muted)'],
+    ];
+    const total = rows.reduce((a, x) => a + Math.max(0, x[2]), 0);
+    let at = 0;
+    $('#rpWf').innerHTML = rows.map(([lab, sub, ms, col]) => { const w = Math.max(0, ms); const html = `<div class="rp-row ${w < 0.005 ? 'zero' : ''}"><span class="lab">${lab} <small>${sub}</small></span><span class="trk"><span class="bar" style="left:${(at / total * 100).toFixed(2)}%;width:${Math.max(0.3, w / total * 100).toFixed(2)}%;background:${col}"></span></span><span class="val">${fmt(w)} ms</span></div>`; at += w; return html; }).join('');
+    const net = rows.slice(0, 4).reduce((a, x) => a + Math.max(0, x[2]), 0) + Math.max(0, rows[10][2]);
+    $('#rpStats').innerHTML = `<div class="stat"><div class="k">Total</div><div class="v">${fmt(total)} ms</div></div><div class="stat"><div class="k">Inside FastAPI</div><div class="v">${fmt(inner)} ms</div></div><div class="stat ${net / total > 0.5 ? 'warn' : ''}"><div class="k">Network and connection</div><div class="v">${Math.round(net / total * 100)}%</div></div><div class="stat"><div class="k">New connections</div><div class="v">${m.new_connections}</div></div>`;
+    let why;
+    if (newConn && t === '1' && rtt === 0) why = `<b>The TLS handshake took ${fmt(tls)} ms, against ${fmt(inner)} ms for everything FastAPI did.</b> With no network delay at all, that is pure CPU: key exchange and the certificate signature. Reuse the connection and it is gone.`;
+    else if (newConn && rtt > 0) why = `<b>${t === '1' ? 3 : 2} round trips of ${rtt} ms before the first byte</b> (TCP${t === '1' ? ', TLS' : ''} and the request), ${fmt((t === '1' ? 3 : 2) * rtt)} ms of waiting before your code matters. ${rtt >= 15 ? 'Reusing the connection cuts it to one round trip; serving users from nearby cuts the round trip itself.' : ''}`;
+    else if (!newConn && rtt > 0) why = `<b>A reused connection pays one round trip, ${rtt} ms, for the request itself.</b> ${n === '1000' ? `The ${(m.bytes / 1000).toFixed(0)} KB response needs ${flights(m.bytes)} more while TCP's window grows.` : 'No TCP or TLS handshake.'}`;
+    else if (h === 'proxy') why = `<b>The proxy added about ${fmt(proxyOwn)} ms of its own:</b> receiving the request, opening or reusing an upstream connection, and copying the response. A production proxy in C does this in well under a millisecond, but every hop is also another set of timeouts and limits to configure.`;
+    else if (n === '1000') why = `<b>Serialisation took ${fmt(st.serialise)} ms for 1,000 items, against about 0.4 ms for one:</b> each item is validated against the response model and written as JSON. The handler itself took ${fmt(st.handler)} ms.`;
+    else why = `<b>On a ${newConn ? "new" : "reused"} local connection, the whole request took ${fmt(total)} ms,</b> and FastAPI's routing, dependencies, validation and serialisation were ${fmt(inner)} ms of it. The handler itself was ${fmt(st.handler)} ms.`;
+    $('#rpWhy').innerHTML = why;
+    $('#rpWhy').dataset.x = JSON.stringify({ h, t, r, n, rtt, total: +total.toFixed(3), inner: +inner.toFixed(3) });
+  }
+  ['#rpH', '#rpT', '#rpR', '#rpN', '#rpD'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
