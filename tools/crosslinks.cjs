@@ -98,6 +98,8 @@ for (const dir of order) {
   for (const ch of chapters[dir]) {
     const p = path.join(ROOT, dir, ch.file);
     const src = fs.readFileSync(p, 'utf8');
+    // A placeholder page (a lesson not written yet) has no takeaways to anchor a block; skip it.
+    if (/<!-- [a-z]+:placeholder -->/.test(src)) continue;
     const eol = src.includes('\r\n') ? '\r\n' : '\n';
     const bare = src.replace(BLOCK, '');
     const at = bare.match(ANCHOR);

@@ -17,7 +17,7 @@
 
 const COURSE = {
   dsa: 'dsa', os: 'os', net: 'networks', db: 'databases', lld: 'lld',
-  sd: 'system-design', dist: 'distributed-systems', ops: 'cloud-devops', ml: 'ml-ai-systems',
+  sd: 'system-design', dist: 'distributed-systems', ops: 'cloud-devops', ml: 'ml-ai-systems', mlf: 'ml-fundamentals',
 };
 
 const TOPICS = [
@@ -36,8 +36,8 @@ const TOPICS = [
   ['Hash tables and hashing', ['dsa/09', 'db/15', 'sd/p7', 'dist/p6']],
   ['JSON, YAML and other data formats', ['db/p5', 'sd/p5', 'dist/p3', 'ops/p4']],
   ['Time and clocks in code', ['db/p4', 'lld/28', 'dist/p5']],
-  ['Probability and expectation', ['dsa/46', 'ml/p5']],
-  ['Python basics, and Python in use', ['net/p5', 'db/p6', 'ml/p1']],
+  ['Probability and expectation', ['dsa/46', 'ml/p5', 'mlf/p6']],
+  ['Python basics, and Python in use', ['net/p5', 'db/p6', 'ml/p1', 'mlf/p1']],
   ['State machines', ['os/04', 'net/08', 'lld/18', 'sd/35']],
   ['Turning requirements into a design', ['lld/02', 'sd/01', 'ml/01']],
 
@@ -171,9 +171,14 @@ const TOPICS = [
   ['Attacks and their defences', ['os/36', 'os/47', 'net/03', 'net/36', 'db/p6', 'sd/11', 'ops/29', 'ml/36']],
 
   /* ---------- machine learning ---------- */
-  ['ML platforms: leakage, skew, evaluation and drift', ['sd/23', 'ml/01', 'ml/03', 'ml/07', 'ml/29', 'ml/32', 'ml/34']],
+  ['ML platforms: leakage, skew, evaluation and drift', ['sd/23', 'ml/01', 'ml/03', 'ml/07', 'ml/29', 'ml/32', 'ml/34', 'mlf/37', 'mlf/39']],
+  ['Gradient descent', ['mlf/05', 'ml/05']],
+  ['Classical ML: linear models, trees and ensembles', ['mlf/04', 'mlf/07', 'mlf/17', 'mlf/19', 'ml/06']],
+  ['Evaluating and comparing models', ['mlf/08', 'mlf/13', 'mlf/36', 'ml/07']],
+  ['Features and data quality', ['mlf/14', 'mlf/15', 'mlf/16', 'ml/03', 'ml/04']],
+  ['Linear algebra for machine learning', ['mlf/p4', 'ml/02']],
   ['Serving LLMs', ['sd/42', 'ml/14', 'ml/26', 'ml/39', 'ml/45']],
-  ['Feeds, ranking and recommendations', ['sd/27', 'ml/30', 'ml/41']],
+  ['Feeds, ranking and recommendations', ['sd/27', 'ml/30', 'ml/41', 'mlf/31']],
   ['Ads: counting clicks and predicting them', ['sd/40', 'ml/43']],
   ['Payments and fraud', ['sd/37', 'ml/44']],
   ['Hardware: CPUs, GPUs and memory', ['os/p4', 'os/32', 'sd/p1', 'ml/p8', 'ml/10']],
@@ -187,7 +192,7 @@ const TOPICS = [
   ['Video streaming', ['net/43', 'sd/32']],
 
   /* ---------- interviews ---------- */
-  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40']],
+  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40', 'mlf/40']],
 ];
 
 module.exports = { COURSE, TOPICS };
