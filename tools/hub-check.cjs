@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /* Headless check of the Atlas home page.
-     node tools/hub-check.cjs [--width 1440] [--height 2600] [--theme light|dark] [--shot out.png]
+     node tools/hub-check.cjs [--width 1440] [--height 2600] [--theme light|dark] [--tab ml] [--shot out.png]
+   --tab opens that tab for the screenshot (the checks themselves visit every tab).
    Copies index.html to .hub-check.html with a probe injected into <head>. The probe seeds
    localStorage with a fixture and, once the chapter indexes have loaded, writes a JSON summary into
    <pre id="hub-probe">. Chrome's --dump-dom returns the DOM; the checks run on that summary. */
@@ -12,6 +13,7 @@ const ROOT = path.resolve(__dirname, '..');
 const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf('--' + k); return i < 0 ? d : args[i + 1]; };
 const WIDTH = +opt('width', 1440), HEIGHT = +opt('height', 2600), THEME = opt('theme', 'light'), SHOT = opt('shot', null);
+const TAB = opt('tab', null);
 
 const CHROME = [process.env.CHROME,
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -30,6 +32,9 @@ function chapters(c) {
 // (removing `soon`) needs no change here.
 const REG = require('./registry.cjs');
 const LIVE = REG.COURSES.filter((c) => !c.soon), SOON = REG.COURSES.filter((c) => c.soon);
+const COURSE_TABS = REG.TABS.filter((t) => !t.paths);
+// Cards appear tab by tab, each tab keeping registry order.
+const CARD_ORDER = COURSE_TABS.flatMap((t) => REG.COURSES.filter((c) => c.tab === t.id).map((c) => c.id));
 const COMPLETE = REG.byId('lld').soon ? LIVE[LIVE.length - 1] : REG.byId('lld');   // one released course marked complete
 const PARTIAL = LIVE.find((c) => c !== COMPLETE);                                   // one with 3 chapters read
 const STALE = SOON[0];                                                              // progress saved for an unreleased course
@@ -42,6 +47,7 @@ const FIXTURE = {
   [COMPLETE.store + '-done']: JSON.stringify(COMPLETE_ALL),
 };
 if (STALE) FIXTURE[STALE.store + '-done'] = '[1,2,3,4,5]';   // must be ignored everywhere
+if (TAB) FIXTURE['atlas-tab'] = JSON.stringify(TAB);          // the tab last chosen, reopened on load
 
 const PROBE = `<script>
 localStorage.clear();
@@ -61,12 +67,14 @@ window.addEventListener('load', function () { whenIndexed(function () {
     opt: ch.classList.contains('opt'), done: ch.classList.contains('done'),
     fg: cs.color, k1: cs.getPropertyValue('--k1').trim(), k2: cs.getPropertyValue('--k2').trim(),
     text: ch.textContent.replace(/[ \\t\\n]+/g, ' ').trim() }; };
-  var grid = document.getElementById('pathGrid');
   var s = {
-    cards: q('#courseGrid article.course').map(function (a) { return { id: a.dataset.course, soon: a.classList.contains('soon'), links: q('a[href]', a).length, k1: getComputedStyle(a).getPropertyValue('--k1').trim() }; }),
+    cards: q('.tab-panel article.course').map(function (a) { return { id: a.dataset.course, tab: a.closest('.tab-panel').id.replace('panel-', ''),
+      soon: a.classList.contains('soon'), links: q('a[href]', a).length, k1: getComputedStyle(a).getPropertyValue('--k1').trim() }; }),
+    tabs: q('#tabList [role=tab]').map(function (b) { return { id: b.dataset.tab, selected: b.getAttribute('aria-selected') === 'true',
+      controls: b.getAttribute('aria-controls'), dots: q('.tab-dots i', b).length, soonDots: q('.tab-dots i.soon', b).length }; }),
+    openPanels: q('.tab-panel').filter(function (p) { return !p.hidden; }).map(function (p) { return p.id; }),
     featured: q('#pathFeatured .pchip').map(chip),
     paths: q('#pathGrid .path').map(function (p) { return { id: p.dataset.path, chips: q('.pchip', p).map(chip), prog: ((p.querySelector('.pprog') || {}).textContent || '').trim() }; }),
-    pathsHidden: grid ? grid.hidden : true,
     progTxt: document.getElementById('progTxt').textContent,
     mosaic: q('#mosaic .mgroup').map(function (g) { var nm = g.querySelector('.nm'), ct = g.querySelector('.ct');
       return { name: nm ? nm.textContent : '', soon: g.classList.contains('soon'), links: q('a[href]', g).length,
@@ -88,6 +96,19 @@ window.addEventListener('load', function () { whenIndexed(function () {
     })(),
     stats: q('#stats .stat').map(function (x) { return q('b, span', x).map(function (e) { return e.textContent; }).join(' '); }),
   };
+  // Visit every tab by clicking it, then try the arrow keys, then go back to the tab the page opened on.
+  var open = function () { return q('.tab-panel').filter(function (p) { return !p.hidden; }).map(function (p) { return p.id; }); };
+  var startTab = (q('#tabList [aria-selected=true]')[0] || { dataset: {} }).dataset.tab;
+  s.tour = q('#tabList [role=tab]').map(function (b) {
+    b.click();
+    return { id: b.dataset.tab, open: open(), scrollW: document.documentElement.scrollWidth };
+  });
+  var firstTab = q('#tabList [role=tab]')[0];
+  firstTab.click();
+  firstTab.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+  s.afterArrow = { selected: (q('#tabList [aria-selected=true]')[0] || { dataset: {} }).dataset.tab, open: open(),
+    focused: document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.tab : null };
+  if (startTab) document.getElementById('tab-' + startTab).click();
   var pre = document.createElement('pre'); pre.id = 'hub-probe'; pre.hidden = true; pre.textContent = JSON.stringify(s);
   document.body.appendChild(pre);
   if (window.parent !== window) window.parent.postMessage(pre.textContent, '*');   // phone-width runs (see FRAME)
@@ -135,7 +156,8 @@ function check(name, ok, detail) {
 }
 
 const isSoon = (id) => SOON.some((c) => c.id === id);
-const WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve'];
+const WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve',
+  'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty'];
 const word = (n) => WORDS[n] || String(n);
 // The same rule as atlas.js pathProgress: released required steps complete, plus unreleased ones counted.
 function expectedProg(p) {
@@ -147,18 +169,17 @@ function expectedProg(p) {
 
 function checks(s) {
   console.log('courses (' + WIDTH + 'px, ' + THEME + ')');
-  check('every course card, in registry order', eq(s.cards.map((c) => c.id), REG.COURSES.map((c) => c.id)), s.cards.map((c) => c.id));
+  check('every course names a tab that exists', REG.COURSES.every((c) => COURSE_TABS.some((t) => t.id === c.tab)),
+    REG.COURSES.filter((c) => !COURSE_TABS.some((t) => t.id === c.tab)).map((c) => c.id));
+  check('every course card, tab by tab, in registry order', eq(s.cards.map((c) => c.id), CARD_ORDER), s.cards.map((c) => c.id));
+  check('each card sits in its own tab', s.cards.every((c) => REG.byId(c.id).tab === c.tab), s.cards.map((c) => [c.id, c.tab]));
   check('unreleased courses are "coming soon"', eq(s.cards.filter((c) => c.soon).map((c) => c.id), SOON.map((c) => c.id)));
   check('coming-soon cards have no links', s.cards.filter((c) => c.soon).every((c) => c.links === 0), s.cards);
   check('released cards keep their links', s.cards.filter((c) => !c.soon).every((c) => c.links >= 3), s.cards);
   check('combined progress counts released courses only', s.progTxt === (3 + COMPLETE_ALL.length) + ' of ' + TOTAL + ' chapters read', s.progTxt);
-  check('tracker lists every course in order', eq(s.mosaic.map((g) => g.name), REG.COURSES.map((c) => c.title)), s.mosaic.map((g) => g.name));
-  const soonRows = s.mosaic.filter((g) => g.soon);
-  check('upcoming rows are marked "Soon"', soonRows.length === SOON.length && soonRows.every((g) => g.ct === 'Soon'), soonRows);
-  check('upcoming rows have no links and one ghost square per planned chapter',
-    soonRows.every((g, i) => g.links === 0 && g.squares === SOON[i].chapters), soonRows.map((g) => [g.name, g.links, g.squares]));
-  check('stale progress never fills an upcoming row' + (STALE ? ' (' + STALE.store + '-done is set)' : ''), soonRows.every((g) => g.done === 0), soonRows.map((g) => g.done));
-  check('released rows are unchanged', s.mosaic.filter((g) => !g.soon).every((g) => g.links === g.squares + 1), s.mosaic.filter((g) => !g.soon));
+  // Planned courses appear only as cards in their tab, so stale progress saved for one has nowhere to show.
+  check('tracker lists released courses only, in order', eq(s.mosaic.map((g) => g.name), LIVE.map((c) => c.title)), s.mosaic.map((g) => g.name));
+  check('released rows link every square', s.mosaic.every((g) => g.links === g.squares + 1), s.mosaic);
   // Laptop and wider: one line of squares per course, all rows the same square size, big enough to click.
   // Phones wrap (64 squares on one 390 px line would be ~4 px each).
   if (WIDTH >= 1280) {
@@ -172,10 +193,24 @@ function checks(s) {
   const last = REG.COURSES[REG.COURSES.length - 1], k1 = (s.cards.find((c) => c.id === last.id) || {}).k1 || '';
   check('theme colours: ' + last.title + ' uses its ' + THEME + ' pair', k1.toLowerCase() === (THEME === 'dark' ? last.d1 : last.c1), k1);
   check('viewport is ' + WIDTH + 'px wide (±24 px of window chrome)', Math.abs(s.innerW - WIDTH) <= 24, s.innerW);
-  check('no horizontal scroll', s.scrollW <= s.innerW, [s.scrollW, s.innerW]);
+  check('no horizontal scroll on any tab', s.scrollW <= s.innerW && s.tour.every((t) => t.scrollW <= s.innerW),
+    s.tour.map((t) => [t.id, t.scrollW, s.innerW]));
+
+  console.log('tabs');
+  check('tabs in order, learning paths last', eq(s.tabs.map((t) => t.id), REG.TABS.map((t) => t.id)) && REG.TABS[REG.TABS.length - 1].paths,
+    s.tabs.map((t) => t.id));
+  const startTab = TAB || REG.TABS[0].id;
+  check('the page opens on ' + startTab + (TAB ? ' (the tab last chosen)' : ' (nothing saved)'),
+    eq(s.tabs.filter((t) => t.selected).map((t) => t.id), [startTab]) && eq(s.openPanels, ['panel-' + startTab]), [s.tabs.filter((t) => t.selected), s.openPanels]);
+  check('each tab controls its own panel', s.tabs.every((t) => t.controls === 'panel-' + t.id), s.tabs);
+  check('clicking a tab shows its panel and hides the rest', s.tour.every((t) => eq(t.open, ['panel-' + t.id])), s.tour);
+  check('arrow keys move to the next tab and focus it',
+    s.afterArrow.selected === REG.TABS[1].id && s.afterArrow.focused === REG.TABS[1].id && eq(s.afterArrow.open, ['panel-' + REG.TABS[1].id]), s.afterArrow);
+  const dotsWrong = COURSE_TABS.filter((t) => { const g = s.tabs.find((x) => x.id === t.id) || {}, list = REG.COURSES.filter((c) => c.tab === t.id);
+    return g.dots !== list.length || g.soonDots !== list.filter((c) => c.soon).length; }).map((t) => t.id);
+  check('each course tab shows one dot per course, rings for planned ones', dotsWrong.length === 0, dotsWrong);
 
   console.log('paths');
-  check('paths section is visible', !s.pathsHidden);
   check('featured path is the complete order', eq(s.featured.map((c) => c.id), REG.FEATURED.steps), s.featured.map((c) => c.id));
   check('featured: released steps link, unreleased ones are faded spans',
     s.featured.every((c) => c.link === !isSoon(c.id) && c.soon === isSoon(c.id)), s.featured);
@@ -198,7 +233,9 @@ function checks(s) {
 
   // Chip states must be in the text, not only in fading and dashes, so screen readers announce them.
   const F = Object.fromEntries(s.featured.map((c) => [c.id, c.text]));
-  if (STALE) check('unreleased chips say "coming soon"', /\(coming soon\)/.test(F[STALE.id] || ''), F[STALE.id]);
+  // Only when some path names a planned course (none do while the paths list released courses only).
+  const soonChip = s.featured.concat(s.paths.flatMap((p) => p.chips)).find((c) => isSoon(c.id));
+  if (soonChip) check('unreleased chips say "coming soon"', /\(coming soon\)/.test(soonChip.text), soonChip.text);
   check('completed chips say "complete"', /\(complete\)/.test(F[COMPLETE.id] || ''), F[COMPLETE.id]);
   const optChip = s.paths.flatMap((p) => p.chips).find((c) => c.opt);
   check('optional chips say "optional"', optChip && /\(optional/.test(optChip.text), optChip && optChip.text);

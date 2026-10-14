@@ -42,6 +42,9 @@ worktree and branch. This file is the shared recipe. The plan of record is
 owner as a table grouped by level and get approval or changes before writing anything.
 
 - Keep the P1 slug unless the owner asks; `assets/atlas.js` points `first` at it (a shared file).
+- The planned courses on the home page are "coming soon" stubs in `assets/atlas.js` (id, tab, title, mark,
+  blurb, topics, colours, store, dir). Before `node tools/new-course.cjs <id>`, add `indexVar`, `first` and `dist`
+  to the stub, and `lang` if it has none.
 - After edits: `node <folder>/tools/scaffold.cjs --registry` rewrites the registry in `assets/app.js` and creates
   placeholder pages for new slugs. Delete placeholder files for slugs you removed or renamed.
 - Chapter numbers are progress keys once published, so don't renumber after release.

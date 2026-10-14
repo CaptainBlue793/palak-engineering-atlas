@@ -113,6 +113,8 @@ Re-run that after editing any chapter in that course, and commit the `dist/` fil
 Everything on the hub is derived from the `COURSES` array at the top of `assets/atlas.js`.
 Drop the course folder next to the others (use a url-safe slug) and add one object — cards,
 progress, the mosaic, search, filters, study-tool links and the hero counts all pick it up.
+Its `tab` field puts the card in one of the home page's subject tabs (`TABS`, just below);
+a course marked `soon: true` shows there as a "Coming soon" card and nowhere else.
 Optionally add it to a track in `PATHS` just below. The full field list is documented in that
 file's header comment.
 

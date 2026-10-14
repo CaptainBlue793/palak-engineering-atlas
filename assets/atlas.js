@@ -10,6 +10,7 @@
    search, reset) is derived from this array.
 
      id        unique slug, used by FEATURED and PATHS
+     tab       which home-page tab the card sits in: an id from TABS below
      title     course name as it should appear
      mark      inner SVG of the course's logo, drawn on a 24x24 viewBox
                (stroked paths; it inherits the course's two colours)
@@ -22,8 +23,11 @@
      d1 / d2   the same two colours for dark mode
      short     short name for path chips ("LLD", "OS")
      lang      optional: the course's code language, shown on "Coming soon" cards
-     soon      true while the course is being written: the card is muted and
-               unlinked, and the course is left out of progress, search and tools
+     soon      true while the course is planned or being written: the card is
+               muted and unlinked, and the course is left out of progress, the
+               tracker, search and tools. A "soon" course needs only id, tab,
+               title, short, mark, blurb, topics, colours, store and dir; lang is
+               optional, and chapters/hours are shown only once they are set.
      store     localStorage prefix -> `<store>-done`, `<store>-theme`
      indexVar  global that assets/study-data.js defines (e.g. SD_INDEX)
      dir       the course's folder, next to this file (use a url-safe slug)
@@ -38,6 +42,7 @@
   var COURSES = [
     {
       id: 'dsa',
+      tab: 'cs',
       title: 'DSA',
       // A binary tree — the structure half the course is built on.
       mark: '<circle cx="12" cy="4.3" r="2.1"/><circle cx="6.2" cy="11.7" r="2.1"/><circle cx="17.8" cy="11.7" r="2.1"/>' +
@@ -62,6 +67,7 @@
     },
     {
       id: 'os',
+      tab: 'cs',
       title: 'OS & Concurrency',
       short: 'OS',
       // A CPU die with its pins: the thing the operating system shares out.
@@ -83,6 +89,7 @@
     },
     {
       id: 'networks',
+      tab: 'cs',
       title: 'Computer Networks',
       short: 'Networks',
       // Three hosts and the links between them.
@@ -104,6 +111,7 @@
     },
     {
       id: 'databases',
+      tab: 'cs',
       title: 'Database Internals & SQL',
       short: 'Databases',
       // A stacked disk: rows at rest.
@@ -125,6 +133,7 @@
     },
     {
       id: 'lld',
+      tab: 'systems',
       title: 'Low-Level Design',
       // A UML class box composed with a second class — the unit every design here is drawn in.
       mark: '<rect x="3" y="2.5" width="12" height="11" rx="1.6"/><path d="M3 6.2h12M3 9.8h12"/>' +
@@ -148,7 +157,24 @@
       release: null,
     },
     {
+      id: 'backend-api',
+      tab: 'systems',
+      title: 'Backend & API',
+      short: 'Backend & API',
+      // A request arrow inside a pair of braces: the service and the contract it exposes.
+      mark: '<path d="M8 3.5c-2 0-3 1-3 3v2.2c0 1.4-.9 2.6-2.5 3.3 1.6.7 2.5 1.9 2.5 3.3v2.2c0 2 1 3 3 3"/>' +
+            '<path d="M16 3.5c2 0 3 1 3 3v2.2c0 1.4.9 2.6 2.5 3.3-1.6.7-2.5 1.9-2.5 3.3v2.2c0 2-1 3-3 3"/>' +
+            '<path d="M9 12h6M12.6 9.6 15 12l-2.4 2.4"/>',
+      blurb: 'Building the service itself: HTTP and API design, REST and gRPC, authentication, validation, pagination, idempotency, rate limiting and background jobs, then testing and shipping it.',
+      topics: ['HTTP & REST', 'gRPC', 'Auth', 'Idempotency', 'Rate limiting', 'Background jobs'],
+      c1: '#047857', c2: '#0369a1', d1: '#34d399', d2: '#38bdf8',
+      soon: true,
+      store: 'api',
+      dir: 'backend-api',
+    },
+    {
       id: 'system-design',
+      tab: 'systems',
       title: 'System Design',
       // A tier fanning out across two services — the shape of every design here.
       mark: '<rect x="3" y="3" width="18" height="4.5" rx="1.5"/>' +
@@ -174,6 +200,7 @@
     },
     {
       id: 'distributed-systems',
+      tab: 'systems',
       title: 'Distributed Systems',
       short: 'Distributed',
       // Four replicas in a ring, agreeing on one value in the middle.
@@ -196,6 +223,7 @@
     },
     {
       id: 'cloud-devops',
+      tab: 'systems',
       title: 'Cloud & DevOps',
       short: 'Cloud & DevOps',
       // The build → deploy → operate loop.
@@ -215,7 +243,89 @@
       release: null,
     },
     {
+      id: 'ml-fundamentals',
+      tab: 'ml',
+      title: 'ML Fundamentals',
+      short: 'ML Fundamentals',
+      // Points scattered around a fitted line.
+      mark: '<path d="M3.5 3v17.5H21"/><path d="M6.5 17.5 19.5 6"/>' +
+            '<circle cx="8.5" cy="12.5" r="1.4"/><circle cx="11.5" cy="16" r="1.4"/><circle cx="13.5" cy="9.5" r="1.4"/><circle cx="17.5" cy="11.5" r="1.4"/>',
+      blurb: 'Machine learning before neural networks: regression, classification, trees and ensembles, clustering, feature engineering and honest evaluation, with the maths in the prerequisites.',
+      topics: ['Regression', 'Trees & ensembles', 'Clustering', 'Evaluation'],
+      lang: 'Python + scikit-learn',
+      c1: '#0369a1', c2: '#0d9488', d1: '#38bdf8', d2: '#2dd4bf',
+      soon: true,
+      store: 'mlf',
+      dir: 'ml-fundamentals',
+    },
+    {
+      id: 'deep-learning',
+      tab: 'ml',
+      title: 'Deep Learning',
+      short: 'Deep Learning',
+      // Three layers of a small network.
+      mark: '<circle cx="4" cy="7" r="1.9"/><circle cx="4" cy="17" r="1.9"/>' +
+            '<circle cx="12" cy="4" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="12" cy="20" r="1.9"/><circle cx="20" cy="12" r="1.9"/>' +
+            '<path d="M5.8 6.3l4.4-1.6M5.7 8.1l4.6 3M5.7 15.9l4.6-3M5.8 17.7l4.4 1.6M13.5 5.4l5 5.1M13.9 12h4.2M13.5 18.6l5-5.1"/>',
+      blurb: 'Neural networks from the ground up: backpropagation, optimisers and initialisation, CNNs, sequence models and attention, ending with a transformer built from scratch.',
+      topics: ['Backprop', 'Optimisers', 'CNNs', 'Transformers'],
+      lang: 'Python + PyTorch',
+      c1: '#7c3aed', c2: '#c026d3', d1: '#a78bfa', d2: '#e879f9',
+      soon: true,
+      store: 'dl',
+      dir: 'deep-learning',
+    },
+    {
+      id: 'computer-vision',
+      tab: 'ml',
+      title: 'Computer Vision',
+      short: 'CV',
+      // An eye inside a camera's focus brackets.
+      mark: '<path d="M3 7V3h4M17 3h4v4M21 17v4h-4M7 21H3v-4"/>' +
+            '<path d="M5.5 12s2.6-4.2 6.5-4.2 6.5 4.2 6.5 4.2-2.6 4.2-6.5 4.2S5.5 12 5.5 12z"/><circle cx="12" cy="12" r="2"/>',
+      blurb: 'Teaching models to see: convolutions in depth, detection and segmentation, vision transformers, self-supervised learning and diffusion models.',
+      topics: ['Detection', 'Segmentation', 'Vision transformers', 'Diffusion'],
+      lang: 'Python + PyTorch',
+      c1: '#ea580c', c2: '#db2777', d1: '#fb923c', d2: '#f472b6',
+      soon: true,
+      store: 'cv',
+      dir: 'computer-vision',
+    },
+    {
+      id: 'nlp',
+      tab: 'ml',
+      title: 'NLP',
+      short: 'NLP',
+      // A speech bubble with two lines of text.
+      mark: '<path d="M4 4.5h16A1.5 1.5 0 0 1 21.5 6v9.5A1.5 1.5 0 0 1 20 17h-9.5L6 20.5V17H4a1.5 1.5 0 0 1-1.5-1.5V6A1.5 1.5 0 0 1 4 4.5z"/>' +
+            '<path d="M7 9.2h10M7 12.6h6"/>',
+      blurb: 'Text as data, up to encoder models: tokenisation, embeddings, sequence-to-sequence models and attention, BERT, named-entity recognition, translation and retrieval.',
+      topics: ['Tokenisation', 'Embeddings', 'BERT', 'Translation'],
+      lang: 'Python + PyTorch',
+      c1: '#4d7c0f', c2: '#0f766e', d1: '#a3e635', d2: '#2dd4bf',
+      soon: true,
+      store: 'nlp',
+      dir: 'nlp',
+    },
+    {
+      id: 'llms',
+      tab: 'ml',
+      title: 'LLMs',
+      short: 'LLMs',
+      // Two tokens and the dashed slot for the next one the model predicts.
+      mark: '<rect x="2" y="8.5" width="5.4" height="7" rx="1.4"/><rect x="9.3" y="8.5" width="5.4" height="7" rx="1.4"/>' +
+            '<rect x="16.6" y="8.5" width="5.4" height="7" rx="1.4" stroke-dasharray="2.2 1.8"/><path d="M14.7 4.5h4.6v2.2"/>',
+      blurb: 'How large language models are made: pretraining and scaling laws, fine-tuning and PEFT, alignment, decoding, quantisation and evaluation.',
+      topics: ['Pretraining', 'Fine-tuning & PEFT', 'Alignment', 'Decoding'],
+      lang: 'Python + PyTorch',
+      c1: '#4338ca', c2: '#0891b2', d1: '#818cf8', d2: '#22d3ee',
+      soon: true,
+      store: 'llm',
+      dir: 'llms',
+    },
+    {
       id: 'ml-ai-systems',
+      tab: 'ml',
       title: 'ML & AI Systems',
       // A loss curve descending to its minimum — what "learning" actually is.
       mark: '<path d="M3.5 3v15.5h17"/>' +
@@ -238,6 +348,68 @@
       dist: 'ml-ai-systems-course.html',
       release: null,
     },
+    {
+      id: 'rag',
+      tab: 'agents',
+      title: 'RAG',
+      short: 'RAG',
+      // A document and the lens that finds the right part of it.
+      mark: '<path d="M13 2.5H6A1.5 1.5 0 0 0 4.5 4v16A1.5 1.5 0 0 0 6 21.5h5"/><path d="M13 2.5 18 7.5v2M13 2.5v5h5"/>' +
+            '<path d="M7.5 10.5h5M7.5 13.5h3"/><circle cx="16.3" cy="15.8" r="3.2"/><path d="M18.6 18.1l2.9 2.9"/>',
+      blurb: 'Grounding a model in your own data: chunking, embeddings and vector indexes, hybrid search, reranking, query rewriting and evaluating what comes back.',
+      topics: ['Chunking', 'Vector indexes', 'Hybrid search', 'Reranking'],
+      lang: 'Python',
+      c1: '#b45309', c2: '#15803d', d1: '#fbbf24', d2: '#4ade80',
+      soon: true,
+      store: 'rag',
+      dir: 'rag',
+    },
+    {
+      id: 'single-agent',
+      tab: 'agents',
+      title: 'Single Agent',
+      short: 'Single Agent',
+      // One model at the centre of its think, act, observe loop.
+      mark: '<circle cx="12" cy="12" r="2.8"/><path d="M12 3.5a8.5 8.5 0 1 1-8.1 5.9"/><path d="M3.4 4.4l.5 5 5-.5"/>',
+      blurb: 'One model with tools: prompting and context engineering, tool calling, planning, memory, sandboxing, and evaluating an agent that acts on its own.',
+      topics: ['Tool calling', 'Planning', 'Memory', 'Agent evals'],
+      lang: 'Python',
+      c1: '#be123c', c2: '#7c3aed', d1: '#fb7185', d2: '#a78bfa',
+      soon: true,
+      store: 'agent',
+      dir: 'single-agent',
+    },
+    {
+      id: 'multi-agent',
+      tab: 'agents',
+      title: 'Multi-Agent Systems',
+      short: 'Multi-Agent',
+      // An orchestrator handing work to three agents.
+      mark: '<rect x="8.5" y="2.5" width="7" height="5.5" rx="1.5"/>' +
+            '<circle cx="4.5" cy="18.5" r="2.4"/><circle cx="12" cy="18.5" r="2.4"/><circle cx="19.5" cy="18.5" r="2.4"/>' +
+            '<path d="M12 8v8.1M10 8 5.6 16.3M14 8l4.4 8.3"/>',
+      blurb: 'Several agents working together: orchestration patterns, hand-offs, shared state, agent protocols, coordination failures, cost and evaluation.',
+      topics: ['Orchestration', 'Hand-offs', 'Protocols', 'Failure modes'],
+      lang: 'Python',
+      c1: '#1d4ed8', c2: '#9333ea', d1: '#60a5fa', d2: '#c084fc',
+      soon: true,
+      store: 'mas',
+      dir: 'multi-agent',
+    },
+  ];
+
+  /* The home-page tabs, in order. Each course names its tab with `tab`; the cards in a tab
+     keep the order of COURSES above. The last tab holds the learning paths, not courses. */
+  var TABS = [
+    { id: 'cs', title: 'CS Fundamentals',
+      blurb: 'The four subjects everything else assumes: algorithms, the machine, the network and storage.' },
+    { id: 'systems', title: 'Systems & Infra',
+      blurb: 'Design at class and system level, the service itself, then consensus, scale and running it all in production.' },
+    { id: 'ml', title: 'AI/ML',
+      blurb: 'How models learn: ML fundamentals, then deep learning, then a specialisation (vision, language or LLMs), then the systems that train and serve them.' },
+    { id: 'agents', title: 'Agents',
+      blurb: 'Building on top of a model: retrieval first, then one agent with tools, then many agents working together.' },
+    { id: 'paths', title: 'Learning paths', paths: true },
   ];
 
   /* Released courses drive progress, search and tools; "soon" courses only get a muted card. */
@@ -351,10 +523,13 @@
     el.setAttribute('style', tintVars(c));
     el.dataset.course = c.id;
     if (c.soon) {
+      // A planned course may not have a size yet: show only what is known.
+      var meta = [c.chapters && '~' + c.chapters + ' chapters', c.hours && '~' + c.hours + ' h', c.lang && esc(c.lang)]
+        .filter(Boolean).join(' · ');
       el.innerHTML =
         '<div class="c-no">' + String(i + 1).padStart(2, '0') + '</div>' +
         '<div class="c-head"><span class="ic">' + markSvg(c, 36) + '</span><h3><span class="nm">' + esc(c.title) + '</span></h3></div>' +
-        '<div class="c-meta">~' + c.chapters + ' chapters · ~' + c.hours + ' h' + (c.lang ? ' · ' + esc(c.lang) : '') + '</div>' +
+        (meta ? '<div class="c-meta">' + meta + '</div>' : '') +
         '<p class="soon-blurb">' + esc(c.blurb) + '</p>' +
         '<div class="soon-foot"><span class="soon-badge">Coming soon</span>' +
         '<span class="soon-topics">' + c.topics.slice(0, 4).map(esc).join(' · ') + '</span></div>';
@@ -440,7 +615,9 @@
   }
 
   /* ---------------------------------------------------------
-     The mosaic: one square per chapter, 150 in total.
+     The mosaic: one square per chapter of every released course.
+     Planned courses live in their tabs only, so the tracker stays
+     the height of the hero however many are on the way.
      --------------------------------------------------------- */
   function chapterAt(c, n) {
     if (!c.data) return null;
@@ -450,15 +627,8 @@
 
   function renderMosaic() {
     // Every row gets as many columns as the longest course, so squares match across rows.
-    $('#mosaic').style.setProperty('--cols', Math.max.apply(null, LIVE.map(countOf).concat(SOON.map(function (c) { return c.chapters; }))));
-    $('#mosaic').innerHTML = COURSES.map(function (c) {
-      // Upcoming courses: one faded square per planned chapter, never filled, never counted.
-      if (c.soon) {
-        return '<div class="mgroup tint soon" style="' + tintVars(c) + '" role="group" aria-label="' + esc(c.title) + ', coming soon">' +
-          '<div class="gh"><span class="nm">' + esc(c.title) + '</span>' +
-          '<span class="rule"></span><span class="ct">Soon</span></div>' +
-          '<div class="mosaic" aria-hidden="true">' + new Array(c.chapters + 1).join('<i></i>') + '</div></div>';
-      }
+    $('#mosaic').style.setProperty('--cols', Math.max.apply(null, LIVE.map(countOf)));
+    $('#mosaic').innerHTML = LIVE.map(function (c) {
       var total = countOf(c), d = doneOf(c), next = nextChapter(c), sq = '';
       var chapters = c.data ? c.data.slice().sort(function (a, b) { return a.n - b.n; }) :
         Array.from({ length: total }, function (_, i) { return { n: i + 1 }; });
@@ -531,7 +701,8 @@
      course (removing `soon`) needs no copy change. */
   function renderLead() {
     var el = $('#leadCount'); if (!el) return;
-    var W = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve'];
+    var W = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve',
+      'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty'];
     var w = function (n) { return W[n] || String(n); };
     var all = w(COURSES.length);
     el.textContent = all.charAt(0).toUpperCase() + all.slice(1) + ' courses' +
@@ -761,10 +932,71 @@
   }
 
   /* ---------------------------------------------------------
+     Tabs: one per subject area, plus the learning paths
+     --------------------------------------------------------- */
+  function inTab(t) { return COURSES.filter(function (c) { return c.tab === t.id; }); }
+
+  /* Each course tab shows one dot per course: filled when released, a ring while on the way. */
+  function tabButton(t) {
+    var list = inTab(t), soon = list.filter(function (c) { return c.soon; }).length, out = list.length - soon;
+    var dots = t.paths ? '' : '<span class="tab-dots" aria-hidden="true">' + list.map(function (c) {
+      return '<i class="tint' + (c.soon ? ' soon' : '') + '" style="' + tintVars(c) + '"></i>';
+    }).join('') + '</span>';
+    var said = t.paths ? PATHS.length + 1 + ' routes' :
+      [out && out + (out === 1 ? ' course' : ' courses'), soon && soon + ' coming soon'].filter(Boolean).join(', ');
+    return '<button type="button" class="tab' + (t.paths ? ' tab-paths' : '') + '" role="tab" id="tab-' + t.id + '" ' +
+      'aria-controls="panel-' + t.id + '" aria-selected="false" tabindex="-1" data-tab="' + t.id + '">' +
+      (t.paths ? '<span aria-hidden="true">🧭</span>' : '') +
+      '<span class="tab-nm">' + esc(t.title) + '</span>' + dots +
+      '<span class="sr-only">, ' + said + '</span></button>';
+  }
+
+  function renderTabs() {
+    $('#tabList').innerHTML = TABS.map(tabButton).join('');
+    // Course panels go in front of the static learning-paths panel.
+    var paths = $('#panel-paths');
+    TABS.filter(function (t) { return !t.paths; }).forEach(function (t) {
+      var panel = document.createElement('section');
+      panel.className = 'tab-panel';
+      panel.id = 'panel-' + t.id;
+      panel.setAttribute('role', 'tabpanel');
+      panel.setAttribute('aria-labelledby', 'tab-' + t.id);
+      panel.tabIndex = 0;
+      panel.hidden = true;
+      panel.innerHTML = '<p class="sec-sub">' + esc(t.blurb) + '</p><div class="courses"></div>';
+      var grid = $('.courses', panel);
+      inTab(t).forEach(function (c, i) { c.el = courseCard(c, i); grid.appendChild(c.el); });
+      paths.parentNode.insertBefore(panel, paths);
+    });
+  }
+
+  function isTab(id) { return TABS.some(function (t) { return t.id === id; }); }
+
+  function selectTab(id, focus) {
+    TABS.forEach(function (t) {
+      var on = t.id === id, b = $('#tab-' + t.id);
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+      b.tabIndex = on ? 0 : -1;
+      $('#panel-' + t.id).hidden = !on;
+    });
+    if (focus) $('#tab-' + id).focus();
+    LS.set('atlas-tab', id);
+  }
+
+  /* A link to #ml, #paths and so on opens that tab and scrolls to the tab bar. */
+  function tabFromHash() {
+    var id = location.hash.slice(1);
+    if (!isTab(id)) return false;
+    selectTab(id);
+    $('#courses').scrollIntoView();
+    return true;
+  }
+
+  /* ---------------------------------------------------------
      Boot
      --------------------------------------------------------- */
-  var grid = $('#courseGrid');
-  COURSES.forEach(function (c, i) { c.el = courseCard(c, i); grid.appendChild(c.el); });
+  renderTabs();
+  if (!tabFromHash()) { var saved = LS.get('atlas-tab', null); selectTab(isTab(saved) ? saved : TABS[0].id); }
   COURSES.forEach(paintCard);
   paintProgress();
   renderStatic();
@@ -774,6 +1006,23 @@
   $('#themeBtn').addEventListener('click', function () { setTheme(currentTheme() === 'dark' ? 'light' : 'dark'); });
 
   document.querySelectorAll('[data-search]').forEach(function (b) { b.addEventListener('click', openPal); });
+
+  $('#tabList').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-tab]'); if (!b) return;
+    selectTab(b.dataset.tab);
+    // Drop a tab hash (#paths) so a reload reopens the tab last chosen, not the one linked to.
+    if (isTab(location.hash.slice(1))) history.replaceState(null, '', location.pathname + location.search);
+  });
+  // Arrow keys move between tabs (and open them), as in any tab list.
+  $('#tabList').addEventListener('keydown', function (e) {
+    var b = e.target.closest('[data-tab]'); if (!b) return;
+    var ids = TABS.map(function (t) { return t.id; }), i = ids.indexOf(b.dataset.tab);
+    var j = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: ids.length - 1 }[e.key];
+    if (j === undefined) return;
+    e.preventDefault();
+    selectTab(ids[(j + ids.length) % ids.length], true);
+  });
+  window.addEventListener('hashchange', tabFromHash);
 
   $('#pal').addEventListener('click', function (e) { if (e.target === $('#pal')) closePal(); });
   $('#palInput').addEventListener('input', runSearch);
