@@ -256,7 +256,11 @@
       c1: '#0369a1', c2: '#0d9488', d1: '#38bdf8', d2: '#2dd4bf',
       soon: true,
       store: 'mlf',
+      indexVar: 'MLF_INDEX',
       dir: 'ml-fundamentals',
+      first: 'p1-python-for-data.html',
+      dist: 'ml-fundamentals-course.html',
+      release: null,
     },
     {
       id: 'deep-learning',
