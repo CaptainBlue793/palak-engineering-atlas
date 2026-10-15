@@ -3,37 +3,281 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Vector Databases &amp; Metadata Filters</title>
+<title>Vector Databases &amp; Metadata Filters · RAG by Palak Deb Patra</title>
+<meta name="description" content="Chapter 9 of RAG. What a vector database adds to an index, metadata, and why pre-filtering, post-filtering and filtering during the graph walk give different results, measured on 83,118 real embeddings with filters from 16% down to 0.16% of the data.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('rag-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .vf-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .vf-chart { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:8px 10px; }
+  .vf-chart svg { width:100%; height:auto; display:block; }
+  .vf-chart text { font-family:var(--mono); font-size:11px; fill:var(--muted); }
+  .vf-key { display:flex; flex-wrap:wrap; gap:6px 14px; font-size:12px; color:var(--muted); margin:6px 2px 0; }
+  .vf-key i { display:inline-block; width:14px; height:3px; border-radius:2px; vertical-align:middle; margin-right:5px; }
+  .vf-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="9">
-<!-- rag:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 9</span><span class="pill">Beginner</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Vector Databases &amp; Metadata <span class="grad">Filters</span></h1>
-    <p class="lead">What a vector database adds to an index, and why filtering before or after the search changes the results.</p>
+    <h1>Vector Databases &amp; <span class="grad">Metadata Filters</span></h1>
+    <p class="lead">An index such as HNSW answers one question: which vectors are closest to this one? Real RAG queries nearly always add conditions. Only this customer's documents. Only English. Only policies in force after 2024. Only the course the student is reading. A <b>vector database</b> keeps metadata beside each vector and combines conditions with similarity. How it combines them decides whether a filtered search returns the right ten results, three results, or none.</p>
+    <p class="lead">This chapter explains what a database adds to an index, then measures the three ways of filtering on the 83,118 Atlas sentence embeddings from Chapters 7 and 8. Each sentence is tagged with its course and chapter, giving filters that keep from 16% of the data down to 0.16%.</p>
+    <ul class="objectives">
+      <li><span>Explain what a vector database adds to a vector index</span></li>
+      <li><span>Design metadata for the filters a RAG system needs</span></li>
+      <li><span>Explain pre-filtering, post-filtering and filtering during the search</span></li>
+      <li><span>Predict how filter selectivity changes recall and latency</span></li>
+      <li><span>Choose a store for a given workload</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>HNSW and exact search:</b> <a href="07-hnsw.html">Chapter 7</a> and <a href="06-exact-vector-search.html">Chapter 6</a>.</li>
+        <li><b>Indexes and query planning in ordinary databases:</b> Databases <a href="../databases/09-indexes-first-look.html">Chapter 9</a> helps but is optional.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Index vs database</li>
-    <li>Metadata</li>
-    <li>Pre-filtering</li>
-    <li>Post-filtering</li>
-    <li>Choosing a store</li>
-  </ol>
+  <h2>Index vs database</h2>
+  <p>faiss and hnswlib are <b>indexes</b>: they hold vectors and integer ids in memory and answer nearest-neighbour queries. A <b>vector database</b> wraps an index with what an application needs around it:</p>
+  <ul>
+    <li>Storage of the original text and metadata.</li>
+    <li>Inserts, updates and deletes that become searchable without a rebuild.</li>
+    <li>Persistence and backups, and replication and sharding.</li>
+    <li>Access control.</li>
+    <li>Filtering on metadata, which this chapter is about.</li>
+  </ul>
+  <p>That can be a dedicated product, a search engine with vector fields, or an ordinary relational database with a vector extension such as pgvector for PostgreSQL.</p>
+
+  <h2>Metadata</h2>
+  <p>Each chunk should carry the fields that queries will filter or display on:</p>
+  <ul>
+    <li>The source document id, title and URL, for citations.</li>
+    <li>The tenant or owner and the access groups, for permissions (Chapter 23).</li>
+    <li>Language, document type and product.</li>
+    <li>Created and updated dates.</li>
+    <li>The position within the document, for fetching neighbours (Chapter 24).</li>
+  </ul>
+  <p>Store filterable fields as typed values, not inside the text, and index the ones queries filter on, as you would in any database. A filter's <b>selectivity</b> is the share of vectors it keeps. As the lab shows, selectivity decides which filtering strategy works.</p>
+<pre class="code"><span class="c">-- pgvector: similarity plus a metadata condition in one SQL query</span>
+<span class="k">SELECT</span> id, text <span class="k">FROM</span> chunks
+<span class="k">WHERE</span> course = <span class="s">'databases'</span> <span class="k">AND</span> lang = <span class="s">'en'</span>
+<span class="k">ORDER BY</span> embedding &lt;=&gt; :query_vector      <span class="c">-- cosine distance</span>
+<span class="k">LIMIT</span> <span class="m">10</span>;</pre>
+
+  <h2>Pre-filtering</h2>
+  <p><b>Pre-filtering</b> finds the matching vectors first, using an ordinary index on the metadata, and then searches only those. With exact search over the matches, recall is perfect by construction, and the cost is proportional to the number of matches. That makes it the cheapest option for selective filters and the most expensive for broad ones. Pre-filtering an approximate index is harder, because the graph or lists were built over all the vectors, and that is what the third strategy addresses.</p>
+
+  <h2>Post-filtering</h2>
+  <p><b>Post-filtering</b> searches the whole index for the top k′ and then throws away the results that fail the filter. It is simple and works with any index, but if the filter keeps 10% of the data, a top 10 contains about one match on average. You must over-fetch, asking for 100 or 1,000 to keep 10, and for selective filters no reasonable k′ is enough. The third strategy, used by most modern vector databases, applies the filter <b>during</b> the graph walk. The search still moves through non-matching nodes to navigate, but only matching ones can enter the result list. It keeps recall high, at the price of exploring more of the graph when matches are rare.</p>
+
+  <h2>Simulator: three ways to filter</h2>
+  <p>Every query from Chapter 7 (1,000 of them) was run with each filter. For the course filters, every query is restricted to that course. For the chapter filter, each query gets a randomly chosen chapter of the 613, which keeps about 136 sentences. The truth is the exact top 10 among the matching sentences. The HNSW index is Chapter 7's (M 16, ef_construction 200), and filtering during the walk used hnswlib's filter argument with ef_search 100.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">How does each strategy cope as the filter narrows?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="vf-l">Filter (share of the 83,118 sentences it keeps)</div>
+      <div class="seg" id="vfF"><button data-v="DSA">DSA · 16%</button><button data-v="ML &amp; AI Systems">ML &amp; AI Systems · 11%</button><button data-v="System Design">System Design · 11%</button><button data-v="Cloud &amp; DevOps">Cloud &amp; DevOps · 10%</button><button data-v="Distributed Systems">Distributed Systems · 10%</button><button class="active" data-v="Databases">Databases · 8%</button><button data-v="Networks">Networks · 8%</button><button data-v="Operating Systems">Operating Systems · 8%</button><button data-v="Low-Level Design">Low-Level Design · 7%</button><button data-v="ML Fundamentals">ML Fundamentals · 5%</button><button data-v="Backend &amp; API">Backend &amp; API · 5%</button><button data-v="RAG (so far)">RAG (so far) · 1%</button><button data-v="One chapter">One chapter · 0.16%</button></div>
+      <div class="vf-l">Strategy</div>
+      <div class="seg" id="vfS"><button data-v="Pre-filter, exact">Pre-filter, exact</button><button data-v="Post-filter top 10">Post-filter top 10</button><button class="active" data-v="Post-filter top 100">Post-filter top 100</button><button data-v="Post-filter top 1000">Post-filter top 1,000</button><button data-v="Filter during HNSW search">Filter during the walk</button></div>
+      <div class="stats" id="vfStats"></div>
+      <div class="vf-chart" id="vfChart"></div>
+      <div class="vf-key"><span><i style="background:var(--text)"></i>Pre-filter, exact</span><span><i style="background:var(--red)"></i>Post top 10</span><span><i style="background:var(--amber)"></i>Post top 100</span><span><i style="background:var(--accent-2)"></i>Post top 1,000</span><span><i style="background:var(--pink)"></i>During the walk</span></div>
+      <div class="vf-why" id="vfWhy"></div>
+    </div>
+    <div class="panel-foot">hnswlib 0.8.0, one query at a time on one thread. Pre-filter scores the matching vectors with NumPy. Filtering during the walk calls a Python function for every node it checks, which inflates its latency; databases do this check in compiled code, so read its latency for its trend, not its size. The RAG filter covers the chapters of this course written when the lab ran.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>DSA (16%), post-filter top 10</b>: recall 0.14, and 96% of queries got fewer than 10 results. Most of the top 10 belonged to other courses.</li>
+    <li><b>Post-filter top 100 → top 1,000</b> on a course filter: recall rises to about 0.97, but over-fetching 1,000 costs about 3.2 ms, about eight times the latency of fetching 100.</li>
+    <li><b>One chapter (0.16%)</b>: post-filtering fails at every k′ (0.16 at top 1,000). Filtering during the walk still reaches 1.00, but explores far more of the graph (53 ms). Pre-filtering just scores the ~136 matches exactly in 0.04 ms.</li>
+    <li><b>Walk the filter seg from DSA to one chapter</b> with "Filter during the walk": recall stays near 1, while latency grows as matches thin out.</li>
+  </ul>
+
+  <h2>Choosing a store</h2>
+  <p>The lab gives the rule most query planners use. Use pre-filtering with exact search when the filter is selective enough that the matches are few, filtering during the walk for everything broader, and post-filtering only with generous over-fetch for broad filters. For tenants that are always filtered on, separate collections or partitions per tenant avoid the problem altogether. When choosing a store, weigh the following against your data size and team:</p>
+  <ul>
+    <li>Filtered-search support, and how it handles selective filters.</li>
+    <li>Update and delete behaviour.</li>
+    <li>Hybrid keyword search (Chapter 12).</li>
+    <li>Operations: backups, scaling and monitoring.</li>
+    <li>Whether you already run it.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Option</th><th>Good at</th><th>Watch out for</th><th>Fits</th></tr></thead>
+      <tbody>
+        <tr><td><b>Library (faiss, hnswlib)</b></td><td>Speed, control, no server</td><td>You build storage, updates, filters and persistence</td><td>Prototypes, offline jobs, embedded search</td></tr>
+        <tr><td><b>Relational + vector extension (pgvector)</b></td><td>One database, SQL filters, transactions, joins</td><td>Selective filters with approximate indexes; very large scale</td><td>Teams already on PostgreSQL, up to tens of millions of vectors</td></tr>
+        <tr><td><b>Search engine with vectors (Elasticsearch, OpenSearch)</b></td><td>Keyword and vector together, mature filtering and operations</td><td>Memory use, cluster tuning</td><td>Hybrid search over documents</td></tr>
+        <tr><td><b>Dedicated vector database</b></td><td>Filtered ANN, quantisation, scaling built in</td><td>Another system to run or pay for</td><td>Large or fast-growing vector workloads</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Estimate</b> how many vectors the filter keeps</li>
+      <li data-k="step"><b>Few?</b> Pre-filter and search them exactly</li>
+      <li data-k="step"><b>Many?</b> Filter during the graph walk</li>
+      <li data-k="step"><b>Always the same field?</b> Partition by it</li>
+      <li data-k="end"><b>Check</b> recall against exact filtered search</li>
+    </ol>
+    <figcaption><b>Picking a filtering strategy.</b> Selectivity decides.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🗄️</div>
+    <div class="body"><div class="title">Use case: filtered search in pgvector and its peers</div><p>pgvector adds vector columns and HNSW and IVF indexes to PostgreSQL. Early versions filtered an approximate index search after the fact. The HNSW scan returned ef_search candidates (40 by default) and PostgreSQL then applied the WHERE clause, so a filter that kept 10% of rows left about four results on average. That is the post-filtering failure measured above. Version 0.8.0 in 2024 added iterative index scans, which keep scanning the index until enough rows pass the filter. PostgreSQL's planner can also choose a plain index on the metadata and an exact scan when the filter is selective, which is pre-filtering. Dedicated stores took the in-graph route: Qdrant adds extra graph links for indexed payload fields so filtered walks stay connected, and the ACORN method (SIGMOD 2024) for predicate-agnostic filtered HNSW search was adopted by Weaviate. The common thread is the trade-off in this lab: selectivity decides which strategy is right, and the database's planner needs to know it.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Post-filtering a small top k</b> and getting fewer results than asked for.</li>
+      <li><b>Testing filters only on broad values.</b></li>
+      <li><b>Putting filter fields inside the text</b> instead of typed metadata.</li>
+      <li><b>Leaving metadata fields unindexed.</b></li>
+      <li><b>Filtering permissions in the application after retrieval</b> (Chapter 23).</li>
+      <li><b>Choosing a dedicated vector database</b> before the existing database has been tried.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the difference between pre-filtering and post-filtering in vector search?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Post-filtering runs the nearest-neighbour search over everything and then drops results that fail the metadata condition, so if the filter keeps 10% of the data, a top 10 holds about one match. You must over-fetch, and very selective filters still come back short. Pre-filtering applies the condition first and searches only the matching vectors, which is exact and cheap when there are few matches but expensive for broad filters. Most vector databases also filter during the graph walk, checking the condition as the search moves, which keeps recall high for most selectivities.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Users of a multi-tenant RAG product complain that small customers get fewer and worse answers than large ones. What is going on, and how do you fix it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The tenant filter is very selective for small customers. If the store post-filters an approximate search, most of the top candidates belong to other tenants and are dropped, so small tenants get a few, poorer results; large tenants pass the filter often and are fine. Confirm by measuring recall against exact filtered search per tenant size. Fixes: a store that filters during the walk or switches to exact search over the tenant's vectors when they are few; larger over-fetch as a stopgap; or partitions or collections per tenant, often a separate small index for small tenants and shared indexes with filtering for large ones. Keep the tenant check in the store, not after retrieval, so documents from other tenants never reach the prompt.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A vector database adds storage, updates, metadata and filtering to an index.</li>
+      <li>Post-filtering a top 10 leaves about selectivity × 10 results; over-fetch or avoid it.</li>
+      <li>Filtering during the graph walk keeps recall high but slows as matches thin out.</li>
+      <li>For very selective filters, exact search over the matches is fastest and perfect.</li>
+      <li>Measure filtered recall per selectivity, not just on broad filters.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A filter keeps 10% of the vectors. With post-filtering of a top 10, about how many results survive?</p>
+      <div class="opts">
+        <button class="opt">10</button>
+        <button class="opt">5</button>
+        <button class="opt">1</button>
+        <button class="opt">0, always</button>
+      </div>
+      <div class="explain">10 × 0.1; the lab saw recall of about 0.1 for course filters.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Which strategy was fastest and exact for the one-chapter filter (0.16% of the data)?</p>
+      <div class="opts">
+        <button class="opt">Pre-filtering, then exact search over the matches</button>
+        <button class="opt">Post-filtering a top 1,000</button>
+        <button class="opt">Filtering during the walk</button>
+        <button class="opt">Post-filtering a top 10</button>
+      </div>
+      <div class="explain">About 136 vectors are cheap to score exactly.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does filtering during the HNSW walk cost as filters become more selective?</p>
+      <div class="opts">
+        <button class="opt">Recall collapses</button>
+        <button class="opt">Memory doubles</button>
+        <button class="opt">Nothing</button>
+        <button class="opt">Latency, because the search explores more nodes to find enough matches</button>
+      </div>
+      <div class="explain">Recall stayed near 1 while latency grew.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does a vector database add to a vector index such as hnswlib?</p>
+      <div class="opts">
+        <button class="opt">Better embeddings</button>
+        <button class="opt">Storage, metadata, updates, persistence and filtering</button>
+        <button class="opt">Exact search only</button>
+        <button class="opt">A language model</button>
+      </div>
+      <div class="explain">The index finds neighbours; the database manages everything around them.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Small tenants in a multi-tenant RAG app get fewer results than large ones. What is the most likely cause?</p>
+      <div class="opts">
+        <button class="opt">Their documents are shorter</button>
+        <button class="opt">The embedding model is biased</button>
+        <button class="opt">The tenant filter is applied after an approximate search, which is very selective for small tenants</button>
+        <button class="opt">They ask harder questions</button>
+      </div>
+      <div class="explain">Post-filtering fails worst when few vectors match.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = RAG;
+  const D = {"filters":{"DSA":{"selectivity":0.15585,"matches":12954,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":5.229},"Post-filter top 10":{"recall":0.143,"short":0.965,"ms":0.371},"Post-filter top 100":{"recall":0.5598,"short":0.517,"ms":0.397},"Post-filter top 1000":{"recall":0.9672,"short":0.03,"ms":3.473},"Filter during HNSW search":{"recall":0.9793,"short":0.0,"ms":3.823}}},"ML & AI Systems":{"selectivity":0.11105,"matches":9230,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":3.646},"Post-filter top 10":{"recall":0.0774,"short":1.0,"ms":0.368},"Post-filter top 100":{"recall":0.5701,"short":0.583,"ms":0.388},"Post-filter top 1000":{"recall":0.9852,"short":0.002,"ms":3.199},"Filter during HNSW search":{"recall":0.9888,"short":0.0,"ms":4.01}}},"System Design":{"selectivity":0.10877,"matches":9041,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":3.582},"Post-filter top 10":{"recall":0.1035,"short":1.0,"ms":0.372},"Post-filter top 100":{"recall":0.6766,"short":0.554,"ms":0.39},"Post-filter top 1000":{"recall":0.9798,"short":0.0,"ms":3.285},"Filter during HNSW search":{"recall":0.986,"short":0.0,"ms":4.501}}},"Cloud & DevOps":{"selectivity":0.10373,"matches":8622,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":3.76},"Post-filter top 10":{"recall":0.1171,"short":0.988,"ms":0.425},"Post-filter top 100":{"recall":0.5805,"short":0.617,"ms":0.439},"Post-filter top 1000":{"recall":0.9763,"short":0.022,"ms":3.501},"Filter during HNSW search":{"recall":0.9922,"short":0.0,"ms":4.631}}},"Distributed Systems":{"selectivity":0.09915,"matches":8241,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":3.378},"Post-filter top 10":{"recall":0.1328,"short":0.991,"ms":0.379},"Post-filter top 100":{"recall":0.6126,"short":0.595,"ms":0.394},"Post-filter top 1000":{"recall":0.9863,"short":0.002,"ms":3.221},"Filter during HNSW search":{"recall":0.9936,"short":0.0,"ms":4.569}}},"Databases":{"selectivity":0.08008,"matches":6656,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":2.975},"Post-filter top 10":{"recall":0.1155,"short":0.991,"ms":0.386},"Post-filter top 100":{"recall":0.5781,"short":0.67,"ms":0.414},"Post-filter top 1000":{"recall":0.9876,"short":0.002,"ms":3.21},"Filter during HNSW search":{"recall":0.9944,"short":0.0,"ms":4.637}}},"Networks":{"selectivity":0.07985,"matches":6637,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":2.534},"Post-filter top 10":{"recall":0.0558,"short":1.0,"ms":0.361},"Post-filter top 100":{"recall":0.4221,"short":0.811,"ms":0.388},"Post-filter top 1000":{"recall":0.9651,"short":0.027,"ms":3.114},"Filter during HNSW search":{"recall":0.9926,"short":0.0,"ms":6.009}}},"Operating Systems":{"selectivity":0.07841,"matches":6517,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":2.507},"Post-filter top 10":{"recall":0.0448,"short":1.0,"ms":0.364},"Post-filter top 100":{"recall":0.4119,"short":0.797,"ms":0.373},"Post-filter top 1000":{"recall":0.971,"short":0.008,"ms":3.155},"Filter during HNSW search":{"recall":0.9894,"short":0.0,"ms":5.117}}},"Low-Level Design":{"selectivity":0.06712,"matches":5579,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":2.075},"Post-filter top 10":{"recall":0.0433,"short":1.0,"ms":0.358},"Post-filter top 100":{"recall":0.4239,"short":0.815,"ms":0.387},"Post-filter top 1000":{"recall":0.967,"short":0.003,"ms":3.292},"Filter during HNSW search":{"recall":0.9916,"short":0.0,"ms":5.754}}},"ML Fundamentals":{"selectivity":0.05398,"matches":4487,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":1.615},"Post-filter top 10":{"recall":0.0428,"short":1.0,"ms":0.364},"Post-filter top 100":{"recall":0.3331,"short":0.815,"ms":0.377},"Post-filter top 1000":{"recall":0.879,"short":0.153,"ms":3.135},"Filter during HNSW search":{"recall":0.9936,"short":0.0,"ms":8.049}}},"Backend & API":{"selectivity":0.05069,"matches":4213,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":1.489},"Post-filter top 10":{"recall":0.1145,"short":0.997,"ms":0.355},"Post-filter top 100":{"recall":0.4784,"short":0.746,"ms":0.374},"Post-filter top 1000":{"recall":0.9651,"short":0.042,"ms":3.101},"Filter during HNSW search":{"recall":0.9961,"short":0.0,"ms":6.775}}},"RAG (so far)":{"selectivity":0.01132,"matches":941,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":0.305},"Post-filter top 10":{"recall":0.0082,"short":1.0,"ms":0.37},"Post-filter top 100":{"recall":0.1166,"short":0.974,"ms":0.395},"Post-filter top 1000":{"recall":0.7656,"short":0.384,"ms":3.142},"Filter during HNSW search":{"recall":0.9995,"short":0.0,"ms":15.303}}},"One chapter":{"selectivity":0.00163,"matches":136,"methods":{"Pre-filter, exact":{"recall":1.0,"short":0.0,"ms":0.039},"Post-filter top 10":{"recall":0.0011,"short":1.0,"ms":0.351},"Post-filter top 100":{"recall":0.0177,"short":0.998,"ms":0.39},"Post-filter top 1000":{"recall":0.1565,"short":0.976,"ms":3.126},"Filter during HNSW search":{"recall":1.0,"short":0.0,"ms":53.347}}}}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const COL = { 'Pre-filter, exact': 'var(--text)', 'Post-filter top 10': 'var(--red)', 'Post-filter top 100': 'var(--amber)', 'Post-filter top 1000': 'var(--accent-2)', 'Filter during HNSW search': 'var(--pink)' };
+  const names = Object.keys(D.filters).sort((a, b) => D.filters[b].selectivity - D.filters[a].selectivity);
+  function chart(fsel, ssel) {
+    const W = 640, H = 330, L = 46, R = 12, T = 10, Bh = 140, gap = 40;
+    const lx = (s) => Math.log10(s), x0 = lx(0.001), x1 = lx(0.25);
+    const x = (s) => L + (W - L - R) * (lx(s) - x0) / (x1 - x0);
+    const yr = (r) => T + Bh * (1 - r), ly = (ms) => Math.log10(ms), m0 = ly(0.02), m1 = ly(100);
+    const yl = (ms) => T + Bh + gap + Bh * (1 - (ly(ms) - m0) / (m1 - m0));
+    let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Recall and latency against filter selectivity">`;
+    for (const g of [0, 0.5, 1]) s += `<line x1="${L}" x2="${W - R}" y1="${yr(g)}" y2="${yr(g)}" stroke="var(--border)"/><text x="${L - 6}" y="${yr(g) + 4}" text-anchor="end">${g}</text>`;
+    for (const g of [0.1, 1, 10, 100]) s += `<line x1="${L}" x2="${W - R}" y1="${yl(g)}" y2="${yl(g)}" stroke="var(--border)"/><text x="${L - 6}" y="${yl(g) + 4}" text-anchor="end">${g}</text>`;
+    s += `<text x="${L}" y="${T + 12}">recall@10</text><text x="${L}" y="${T + Bh + gap + 12}">ms per query (log)</text>`;
+    for (const p of [0.002, 0.01, 0.05, 0.2]) s += `<text x="${x(p)}" y="${H - 4}" text-anchor="middle">${p * 100}%</text>`;
+    const fx = x(D.filters[fsel].selectivity);
+    s += `<line x1="${fx}" x2="${fx}" y1="${T}" y2="${T + 2 * Bh + gap}" stroke="var(--accent)" stroke-dasharray="3 3"/>`;
+    for (const m of Object.keys(COL)) {
+      const pts = names.map(n => [D.filters[n].selectivity, D.filters[n].methods[m]]);
+      const w = m === ssel ? 3 : 1.4;
+      s += `<polyline fill="none" stroke="${COL[m]}" stroke-width="${w}" points="${pts.map(([sv, r]) => x(sv) + ',' + yr(r.recall)).join(' ')}"/>`;
+      s += `<polyline fill="none" stroke="${COL[m]}" stroke-width="${w}" points="${pts.map(([sv, r]) => x(sv) + ',' + yl(Math.max(0.02, r.ms))).join(' ')}"/>`;
+    }
+    const r = D.filters[fsel].methods[ssel];
+    s += `<circle cx="${fx}" cy="${yr(r.recall)}" r="6" fill="${COL[ssel]}" stroke="var(--surface)" stroke-width="2"/><circle cx="${fx}" cy="${yl(Math.max(0.02, r.ms))}" r="6" fill="${COL[ssel]}" stroke="var(--surface)" stroke-width="2"/>`;
+    return s + '</svg>';
+  }
+  function draw() {
+    const f = v('#vfF'), m = v('#vfS'), F = D.filters[f], r = F.methods[m];
+    $('#vfStats').innerHTML = `<div class="stat ${r.recall >= 0.95 ? 'good' : 'warn'}"><div class="k">Recall@10</div><div class="v">${r.recall.toFixed(3)}</div></div>` +
+      `<div class="stat ${r.short <= 0.05 ? 'good' : 'warn'}"><div class="k">Queries with &lt; 10 results</div><div class="v">${(100 * r.short).toFixed(0)}%</div></div>` +
+      `<div class="stat"><div class="k">Latency per query</div><div class="v">${r.ms < 0.1 ? r.ms.toFixed(2) : r.ms.toFixed(1)} ms</div></div>` +
+      `<div class="stat"><div class="k">Matching sentences</div><div class="v">${F.matches.toLocaleString('en-GB')}</div></div>`;
+    $('#vfChart').innerHTML = chart(f, m);
+    let why = `<b>${m === 'Filter during HNSW search' ? 'Filtering during the walk' : m.replace('1000', '1,000')} with a filter keeping ${(100 * F.selectivity).toFixed(F.selectivity < 0.01 ? 2 : 1)}%: recall@10 ${r.recall.toFixed(3)}.</b> `;
+    if (m === 'Pre-filter, exact') why += `Scoring all ${F.matches.toLocaleString('en-GB')} matches exactly is perfect by construction; its cost grows with the number of matches, so it is cheapest for the narrowest filters.`;
+    else if (m.startsWith('Post')) why += r.recall < 0.9 ? `${(() => { const k = +m.split(' ').pop(), e = F.selectivity * k; return (e < 1 ? 'Fewer than one' : 'Only about ' + e.toFixed(1)) + ' of the ' + k.toLocaleString('en-GB') + ' nearest sentences'; })()} can be expected to pass this filter, so the top 10 cannot be filled from them.` : 'Over-fetching enough candidates works for a broad filter, at the latency of a large k.';
+    else why += r.ms > 10 ? 'Recall holds, but with matches this rare the walk checks many non-matching nodes before it finds ten; exact search over the matches is faster here.' : 'Non-matching nodes still guide the walk, but only matches enter the result list, so recall stays high.';
+    $('#vfWhy').innerHTML = why;
+    $('#vfWhy').dataset.x = JSON.stringify({ f, m, recall: r.recall, ms: r.ms });
+  }
+  for (const id of ['#vfF', '#vfS']) $(id).addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
