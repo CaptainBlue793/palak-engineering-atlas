@@ -3,37 +3,269 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Background Jobs &amp; Task Queues</title>
+<title>Background Jobs &amp; Task Queues · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 20 of Backend & API. What to move out of the request, queues and workers, retries and backoff, poison messages and scheduling, with a real job queue measured through four experiments.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .bj-ctl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 18px; }
+  @media (max-width:800px) { .bj-ctl { grid-template-columns:1fr; } }
+  .bj-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .bj-v { display:none; }
+  .bj-v.on { display:block; }
+  .bj-log { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-family:var(--mono); font-size:12px; line-height:1.55; max-height:260px; overflow:auto; }
+  .bj-log .t { display:block; font-family:var(--font); font-size:10.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); margin-bottom:4px; }
+  .bj-log .bad { color:var(--red); } .bj-log .ok { color:var(--green); } .bj-log .warn { color:var(--amber); }
+  .bj-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="20">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 20</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Background Jobs &amp; Task <span class="grad">Queues</span></h1>
-    <p class="lead">Moving slow work out of the request: queues, workers, retries with backoff and poison messages.</p>
+    <p class="lead">Some work does not belong in the request. Sending a welcome email, resizing a photo, generating an invoice PDF, syncing with a CRM: the user does not need to wait for any of it, and much of it depends on other services that are slow or occasionally down. Put such work in a <b>queue</b>, answer the request immediately, and let <b>workers</b> process jobs in the background, retrying when something fails.</p>
+    <p class="lead">Queues bring their own failure modes: jobs that fail for ever, retries that hammer a struggling provider, and jobs that run twice when a worker dies. The lab builds a small queue on SQLite, with leases, retries and a dead-letter state, and runs four experiments on it.</p>
+    <ul class="objectives">
+      <li><span>Decide what to move out of the request path</span></li>
+      <li><span>Explain queues, workers, leases and at-least-once delivery</span></li>
+      <li><span>Retry with exponential backoff and jitter</span></li>
+      <li><span>Contain poison messages with attempt limits and a dead-letter queue</span></li>
+      <li><span>Schedule recurring work, and make every job idempotent</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Idempotency and safe retries:</b> <a href="15-idempotency.html">Chapter 15</a>.</li>
+        <li><b>External calls outside transactions:</b> <a href="17-transactions-in-apps.html">Chapter 17</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>What to move out of the request</li>
-    <li>Queues and workers</li>
-    <li>Retries and backoff</li>
-    <li>Poison messages</li>
-    <li>Scheduling and cron</li>
-  </ol>
+  <h2>What to move out of the request</h2>
+  <p>Move work to a background job when the client does not need its result to continue, when it is slow (more than a few hundred milliseconds), when it calls a service that may be down, or when it is heavy and would tie up web workers (<a href="p2-async-python.html">Prerequisite 2</a>). Typical candidates: emails and notifications, image and video processing, exports and reports, webhooks to customers (<a href="21-webhooks.html">Chapter 21</a>), search indexing, and anything batch-shaped. Keep in the request what the client must know now: whether the order was accepted, whether the card was charged. For long work the client does want, return <b>202 Accepted</b> with a job resource to poll (<a href="04-rest-resource-design.html">Chapter 4</a>).</p>
+
+  <h2>Queues and workers</h2>
+  <p>A <b>queue</b> stores jobs durably; <b>workers</b>, separate processes that can be scaled independently of the web tier, take jobs and run them. In Python, common choices are Celery, RQ, Dramatiq and arq with Redis or RabbitMQ as the broker; managed queues such as Amazon SQS or Google Cloud Tasks; or, for modest volumes, a table in the database you already have, which is what the lab uses. Whatever the technology, the core mechanism is the same: a worker <b>claims</b> a job with a <b>lease</b> (visibility timeout) so no other worker takes it; if the worker finishes, it marks the job done; if it dies, the lease expires and another worker takes the job. That makes delivery <b>at least once</b>: a job can run twice, so every job must be idempotent.</p>
+<pre class="code">def claim(con, lease):
+    """Atomically take the oldest runnable job: queued and due, or running with an expired lease (its worker died)."""
+    now = time.time()
+    return con.execute("""UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = ?
+                          WHERE id = (SELECT id FROM jobs
+                                      WHERE (status = 'queued' AND run_at &lt;= ?) OR (status = 'running' AND locked_until &lt; ?)
+                                      ORDER BY run_at, id LIMIT 1)
+                          RETURNING id, kind, payload, attempts""", (now + lease, now, now)).fetchone()</pre>
+
+  <h2>Simulator: a job queue under stress</h2>
+  <p>Four experiments with the queue above and real worker threads. Pick an experiment, then a variant.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Jobs, workers and failures</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="bj-ctl">
+        <div><div class="bj-l">Experiment</div><div class="seg" id="bjE"><button class="active" data-v="request">the request path</button><button data-v="flaky">a flaky provider</button><button data-v="poison">a poison message</button><button data-v="crash">a worker dies</button></div></div>
+        <div>
+          <div class="bj-l">Variant</div>
+          <div class="bj-v on" data-e="request"><div class="seg" id="bjVrequest"><button class="active" data-v="inline">send email inline</button><button data-v="queued">enqueue, 4 workers send</button></div></div>
+          <div class="bj-v" data-e="flaky"><div class="seg" id="bjVflaky"><button class="active" data-v="no retries">no retries</button><button data-v="3 immediate retries">3 immediate retries</button><button data-v="backoff with jitter">backoff with jitter</button></div></div>
+          <div class="bj-v" data-e="poison"><div class="seg" id="bjVpoison"><button class="active" data-v="retry forever">retry forever</button><button data-v="5 attempts, then dead-letter">5 attempts, then dead-letter</button></div></div>
+          <div class="bj-v" data-e="crash"><div class="seg" id="bjVcrash"><button class="active" data-v="plain handler">plain handler</button><button data-v="idempotent handler">idempotent handler</button></div></div>
+        </div>
+      </div>
+      <div class="bj-log" id="bjLog"></div>
+      <div class="stats" id="bjStats"></div>
+      <div class="bj-why" id="bjWhy"></div>
+    </div>
+    <div class="panel-foot">The request experiment used uvicorn and FastAPI with 60 signups from 10 concurrent clients; the email provider call is 300 ms. The others ran worker threads against the SQLite queue: 100 emails with a provider that fails 30% of calls at random and everything for 2 seconds; 30 image jobs, one of them a file that can never be decoded, with 4 seconds of running time; and 20 receipts, where a worker dies after sending receipt 1006 but before marking the job done, with a 1-second lease.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>the request path</b>: inline, every signup waits for the email provider; queued, the response returns as soon as the job is written, and the emails follow a few seconds later.</li>
+    <li><b>a flaky provider</b> with <b>3 immediate retries</b>: three times the calls and almost no extra deliveries, because the retries arrive during the outage. <b>Backoff with jitter</b> spreads them out and outlasts it.</li>
+    <li><b>a poison message</b>: retried for ever, one broken file eats most of a worker for the whole run. With a limit, it moves to the dead-letter state after 5 attempts, with its error, for a person to look at.</li>
+    <li><b>a worker dies</b>: the job's lease expires and another worker runs it again, so receipt 1006 is sent twice. The <b>idempotent handler</b> records a key before sending, and the second run finds it and does nothing.</li>
+  </ul>
+
+  <h2>Retries and backoff</h2>
+  <p>Most job failures are transient: a timeout, a 503, a rate limit. Retry them, but not immediately: a provider that is struggling or down for two minutes will not recover in the next 50 milliseconds, and immediate retries from every worker multiply the load on it. Use <b>exponential backoff</b> (wait roughly 1, 2, 4, 8 seconds…, capped) with <b>jitter</b> (randomise each wait, so failures that happened together do not retry together), honour <code>Retry-After</code> when the provider sends one, and limit the total attempts or time. Distinguish permanent failures, such as a 400 for an invalid address, and do not retry those at all.</p>
+<pre class="code">def fail(con, jid, attempts, error, max_attempts, backoff):
+    if max_attempts is not None and attempts &gt;= max_attempts:
+        con.execute("UPDATE jobs SET status = 'dead', last_error = ? WHERE id = ?", (error, jid))   # dead-letter: kept for a human
+        return "dead"
+    delay = backoff(attempts)
+    con.execute("UPDATE jobs SET status = 'queued', run_at = ?, last_error = ? WHERE id = ?", (time.time() + delay, error, jid))
+    return "retry in %.2fs" % delay
+
+
+def exp_backoff(base=0.1, cap=2.0):
+    # "full jitter": a random delay between 0 and base * 2^attempt, capped
+    return lambda attempts: random.uniform(0, min(cap, base * 2 ** attempts))</pre>
+
+  <h2>Poison messages</h2>
+  <p>A <b>poison message</b> is a job that can never succeed: a corrupt file, a payload from an old code version, a bug triggered by one customer's data. Without a limit it is retried for ever, wasting workers and, in queues that preserve order, blocking everything behind it. Give every job a maximum number of attempts; after the last, move it to a <b>dead-letter queue</b> (or state) with its last error, alert on the dead-letter count, and give operators a way to inspect, fix and requeue or discard.</p>
+
+  <h2>Scheduling and cron</h2>
+  <p>Recurring work, nightly reports, hourly syncs, expiring old sessions, is scheduled by a single scheduler (Celery beat, a Kubernetes CronJob, the cloud provider's scheduler) that <i>enqueues</i> jobs, so the work runs on ordinary workers with ordinary retries. Make sure only one scheduler runs, or that duplicate schedules are harmless; write scheduled jobs to process "everything due since the last successful run", not "everything from the last hour", so a missed run catches up; and set alerts on jobs that have not succeeded for longer than expected.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Option</th><th>Good for</th><th>Delivery</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td><b>Database table as a queue</b></td><td>Modest volumes; jobs created in the same transaction as data</td><td>At least once, with leases</td><td>Polling load; use <code>FOR UPDATE SKIP LOCKED</code> in PostgreSQL</td></tr>
+        <tr><td><b>Celery / RQ / Dramatiq + Redis or RabbitMQ</b></td><td>General Python background work</td><td>At least once (configure acks late)</td><td>Visibility timeouts shorter than job duration</td></tr>
+        <tr><td><b>Managed queue (SQS, Cloud Tasks)</b></td><td>No broker to run; scaling</td><td>At least once; FIFO options</td><td>Message size limits; per-message costs</td></tr>
+        <tr><td><b>FastAPI BackgroundTasks</b></td><td>Tiny, best-effort work after the response</td><td>At most once: lost if the process dies</td><td>Not a queue: no retries, no persistence</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Enqueue</b> in the same transaction as the data, then 202 or 201</li>
+      <li data-k="step"><b>Claim with a lease</b> one worker at a time</li>
+      <li data-k="step"><b>Run idempotently</b> safe to repeat after a crash</li>
+      <li data-k="step"><b>Fail?</b> transient: backoff with jitter; permanent: stop</li>
+      <li data-k="end"><b>Too many attempts</b> dead-letter, alert, inspect</li>
+    </ol>
+    <figcaption><b>A job's life.</b> At-least-once delivery plus idempotent handlers gives effectively-once results.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">📨</div>
+    <div class="body"><div class="title">Use case: retry storms and the AWS guidance on jitter</div><p>In 2015 Marc Brooker of AWS published "Exponential Backoff And Jitter" on the AWS Architecture Blog, with simulations of many clients competing for one contended resource. Plain exponential backoff spread the retries out in time but kept them clustered: clients that failed together retried together, at 1, 2, 4 seconds, colliding again each time. Adding randomness, in particular "full jitter", picking each wait uniformly between zero and the exponential cap, cut both the total work done and the time to complete dramatically. The same reasoning appears in AWS's later Builders' Library article "Timeouts, retries, and backoff with jitter", which also warns that retries at several layers of a system multiply each other; with three layers each making three attempts, for example, one failing call becomes 27. The lab's flaky-provider experiment is a small version: immediate retries tripled the calls during an outage and delivered almost nothing more, while jittered backoff outlasted the outage. The queue in this chapter uses full jitter for exactly this reason.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Slow or unreliable calls in the request path</b> that could be jobs.</li>
+      <li><b>Non-idempotent jobs</b> on an at-least-once queue.</li>
+      <li><b>Immediate retries, or no jitter,</b> against a struggling dependency.</li>
+      <li><b>No attempt limit and no dead-letter queue.</b></li>
+      <li><b>Leases shorter than the job's run time,</b> so healthy jobs are taken by a second worker.</li>
+      <li><b>Enqueuing before the database commit,</b> so workers look for data that does not exist yet, or that is rolled back (<a href="30-outbox-events.html">Chapter 30</a>).</li>
+      <li><b>Treating FastAPI's BackgroundTasks as a durable queue.</b></li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why would you send a welcome email from a background job instead of inside the signup request?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The user does not need to wait for the email to be sent before they can continue, and sending it means calling an external provider, which can be slow or temporarily down. Inside the request, that adds hundreds of milliseconds to every signup and, if the provider fails, either fails the signup or loses the email. As a background job, the request only records the job and returns quickly; a worker sends the email, and if the provider is down, the job is retried later with backoff. The job must be idempotent, for example keyed by user ID and email type, because a worker crash can cause it to run twice.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A nightly job generates invoices and emails them. Last night it sent some customers two invoices and others none. How do you investigate and redesign it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Duplicates suggest at-least-once redelivery without idempotency, for example a lease or visibility timeout shorter than the job took, so a second worker picked it up, or the scheduler running twice. Missing invoices suggest jobs that failed without retry, died without a lease expiring, or a run that selected "the last 24 hours" and missed a window. I would check the job records and logs for those customers. The redesign: the scheduler enqueues one job per customer per billing period, with an idempotency key such as <code>invoice:{customer}:{period}</code> enforced by a unique constraint on the invoices table, so generating and recording an invoice happens once whatever the delivery count; emailing is a separate job keyed the same way, with its own retries and backoff. Select work by "billing periods not yet invoiced" rather than by time window, so missed runs catch up. Leases longer than the worst-case job time, a dead-letter queue with alerts, and a daily reconciliation that counts customers versus invoices sent.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Move slow, unreliable or non-essential work out of the request into durable jobs.</li>
+      <li>Workers claim jobs with leases; delivery is at least once, so jobs must be idempotent.</li>
+      <li>Retry transient failures with exponential backoff and full jitter; never retry permanent ones.</li>
+      <li>Cap attempts and dead-letter poison messages, with alerts.</li>
+      <li>Schedulers enqueue jobs; select work by what is due, so missed runs catch up.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why must jobs on most queues be idempotent?</p>
+      <div class="opts">
+        <button class="opt">Queues reorder jobs</button>
+        <button class="opt">Delivery is at least once: a job can run again after a worker crash or an expired lease</button>
+        <button class="opt">Jobs are always retried twice</button>
+        <button class="opt">It makes jobs faster</button>
+      </div>
+      <div class="explain">Measured: a worker died after sending receipt 1006, and the redelivered job sent it again.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A provider is down for two minutes. What retry policy works best?</p>
+      <div class="opts">
+        <button class="opt">Retry immediately, three times</button>
+        <button class="opt">Never retry</button>
+        <button class="opt">Retry every 100 ms until it works</button>
+        <button class="opt">Exponential backoff with jitter, with a cap on attempts or time</button>
+      </div>
+      <div class="explain">Immediate retries tripled the calls and added almost no deliveries in the lab.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What is a dead-letter queue for?</p>
+      <div class="opts">
+        <button class="opt">Holding jobs that exhausted their attempts, with their errors, for inspection</button>
+        <button class="opt">Deleting old jobs</button>
+        <button class="opt">Jobs scheduled for the future</button>
+        <button class="opt">High-priority jobs</button>
+      </div>
+      <div class="explain">Without it, a poison message is retried for ever; measured, 61 attempts in 4 seconds.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What is FastAPI's BackgroundTasks unsuitable for?</p>
+      <div class="opts">
+        <button class="opt">Writing a log line after a response</button>
+        <button class="opt">Anything that runs after the response</button>
+        <button class="opt">Work that must not be lost if the process dies, or needs retries</button>
+        <button class="opt">Sync functions</button>
+      </div>
+      <div class="explain">It runs in the same process after the response, with no persistence and no retries.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What is full jitter?</p>
+      <div class="opts">
+        <button class="opt">Retrying at exactly 1, 2, 4, 8 seconds</button>
+        <button class="opt">Waiting a random time between zero and the exponential cap before each retry</button>
+        <button class="opt">Adding one second to every retry</button>
+        <button class="opt">Retrying on a random worker</button>
+      </div>
+      <div class="explain">It breaks up retries from clients that failed together.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = API;
+  const D = {"request":{"inline":{"p50":334,"p99":375,"wall_s":2.06},"queued":{"p50":53,"p99":106,"wall_s":0.36,"emails_sent":60,"lag_p50":2.63,"lag_max":4.64,"workers":4}},"flaky":{"no retries":{"delivered":29,"dead":71,"provider_calls":100,"secs":0.68,"log":[[0.029,1,1,1,"done"],[0.035,3,2,1,"done"],[0.044,2,3,1,"timeout talking to provider: dead"],[0.051,0,4,1,"done"],[0.054,1,5,1,"timeout talking to provider: dead"],[0.06,3,6,1,"done"],[0.066,2,7,1,"done"],[0.074,0,8,1,"timeout talking to provider: dead"],[0.077,1,9,1,"done"],[0.084,3,10,1,"done"],[0.091,2,11,1,"timeout talking to provider: dead"],[0.097,0,12,1,"done"],[0.107,1,13,1,"done"],[0.113,3,14,1,"done"],[0.114,2,15,1,"done"],[0.127,0,16,1,"timeout talking to provider: dead"],[0.129,1,17,1,"timeout talking to provider: dead"],[0.137,2,18,1,"timeout talking to provider: dead"],[0.142,3,19,1,"done"],[0.149,0,20,1,"done"],[0.153,1,21,1,"done"],[0.161,2,22,1,"done"],[0.165,3,23,1,"done"],[0.173,0,24,1,"done"],[0.176,1,25,1,"timeout talking to provider: dead"],[0.184,2,26,1,"timeout talking to provider: dead"],[0.188,3,27,1,"done"],[0.196,0,28,1,"done"],[0.199,1,29,1,"done"],[0.207,2,30,1,"timeout talking to provider: dead"],[0.212,3,31,1,"timeout talking to provider: dead"],[0.22,0,32,1,"timeout talking to provider: dead"],[0.23,2,34,1,"done"],[0.236,3,35,1,"timeout talking to provider: dead"],[0.243,0,36,1,"done"],[0.254,2,37,1,"done"],[0.26,1,33,1,"timeout talking to provider: dead"],[0.266,3,38,1,"timeout talking to provider: dead"],[0.273,0,39,1,"done"],[0.277,2,40,1,"done"]]},"3 immediate retries":{"delivered":28,"dead":72,"provider_calls":316,"secs":1.99,"log":[[0.03,0,1,1,"done"],[0.039,2,2,1,"done"],[0.045,1,3,1,"timeout talking to provider: retry in 0.00s"],[0.052,3,4,1,"done"],[0.06,0,5,1,"timeout talking to provider: retry in 0.00s"],[0.068,2,6,1,"done"],[0.074,1,7,1,"done"],[0.081,3,8,1,"timeout talking to provider: retry in 0.00s"],[0.088,0,9,1,"done"],[0.095,2,10,1,"done"],[0.105,1,11,1,"timeout talking to provider: retry in 0.00s"],[0.111,0,13,1,"done"],[0.126,2,14,1,"done"],[0.13,3,12,1,"done"],[0.137,1,15,1,"done"],[0.144,0,16,1,"timeout talking to provider: retry in 0.00s"],[0.15,2,17,1,"timeout talking to provider: retry in 0.00s"],[0.158,3,18,1,"timeout talking to provider: retry in 0.00s"],[0.165,1,19,1,"done"],[0.173,2,21,1,"done"],[0.178,0,20,1,"done"],[0.181,3,22,1,"done"],[0.188,1,23,1,"done"],[0.196,2,24,1,"done"],[0.201,0,25,1,"timeout talking to provider: retry in 0.00s"],[0.205,3,26,1,"timeout talking to provider: retry in 0.00s"],[0.21,1,27,1,"done"],[0.219,2,28,1,"done"],[0.223,0,29,1,"done"],[0.228,3,30,1,"timeout talking to provider: retry in 0.00s"],[0.234,1,31,1,"timeout talking to provider: retry in 0.00s"],[0.243,2,32,1,"timeout talking to provider: retry in 0.00s"],[0.246,0,33,1,"timeout talking to provider: retry in 0.00s"],[0.251,3,34,1,"done"],[0.261,1,35,1,"timeout talking to provider: retry in 0.00s"],[0.265,2,36,1,"done"],[0.27,0,37,1,"done"],[0.274,3,38,1,"timeout talking to provider: retry in 0.00s"],[0.285,1,39,1,"done"],[0.288,2,40,1,"done"]]},"backoff with jitter":{"delivered":98,"dead":2,"provider_calls":449,"secs":7.85,"log":[[0.029,1,1,1,"done"],[0.034,0,2,1,"done"],[0.039,3,3,1,"timeout talking to provider: retry in 0.07s"],[0.052,2,4,1,"done"],[0.057,0,6,1,"done"],[0.061,1,5,1,"timeout talking to provider: retry in 0.00s"],[0.071,3,7,1,"done"],[0.083,0,9,1,"done"],[0.087,1,10,1,"done"],[0.088,2,8,1,"timeout talking to provider: retry in 0.19s"],[0.103,3,11,1,"timeout talking to provider: retry in 0.16s"],[0.106,0,12,1,"done"],[0.112,2,13,1,"done"],[0.117,1,14,1,"done"],[0.126,3,15,1,"done"],[0.129,0,16,1,"timeout talking to provider: retry in 0.03s"],[0.135,2,17,1,"timeout talking to provider: retry in 0.10s"],[0.14,1,18,1,"timeout talking to provider: retry in 0.00s"],[0.149,3,19,1,"done"],[0.153,0,20,1,"done"],[0.158,2,21,1,"done"],[0.164,1,22,1,"done"],[0.172,3,23,1,"done"],[0.176,0,24,1,"done"],[0.181,2,25,1,"timeout talking to provider: retry in 0.18s"],[0.187,1,26,1,"timeout talking to provider: retry in 0.03s"],[0.195,3,27,1,"done"],[0.198,0,28,1,"done"],[0.204,2,29,1,"done"],[0.21,1,30,1,"timeout talking to provider: retry in 0.14s"],[0.218,3,31,1,"timeout talking to provider: retry in 0.09s"],[0.221,0,32,1,"timeout talking to provider: retry in 0.13s"],[0.228,2,33,1,"timeout talking to provider: retry in 0.11s"],[0.233,1,34,1,"done"],[0.241,3,35,1,"timeout talking to provider: retry in 0.05s"],[0.245,0,36,1,"done"],[0.251,2,37,1,"done"],[0.256,1,38,1,"timeout talking to provider: retry in 0.09s"],[0.265,3,39,1,"done"],[0.268,0,40,1,"done"]]}},"poison":{"retry forever":{"poison_status":"queued","poison_attempts":61,"error":"cannot decode broken.heic","others_done":29,"secs":4.06,"worker_time_on_poison_s":3.05,"log":[[0.118,1,4,1,"cannot decode broken.heic: retry in 0.00s"],[0.866,0,4,2,"cannot decode broken.heic: retry in 0.00s"],[0.92,0,4,3,"cannot decode broken.heic: retry in 0.00s"],[0.974,0,4,4,"cannot decode broken.heic: retry in 0.00s"],[1.028,0,4,5,"cannot decode broken.heic: retry in 0.00s"],[1.082,0,4,6,"cannot decode broken.heic: retry in 0.00s"],[1.137,0,4,7,"cannot decode broken.heic: retry in 0.00s"],[1.191,0,4,8,"cannot decode broken.heic: retry in 0.00s"],[1.244,0,4,9,"cannot decode broken.heic: retry in 0.00s"],[1.299,0,4,10,"cannot decode broken.heic: retry in 0.00s"],[1.352,0,4,11,"cannot decode broken.heic: retry in 0.00s"],[1.406,0,4,12,"cannot decode broken.heic: retry in 0.00s"]]},"5 attempts, then dead-letter":{"poison_status":"dead","poison_attempts":5,"error":"cannot decode broken.heic","others_done":29,"secs":1.07,"worker_time_on_poison_s":0.25,"log":[[0.118,1,4,1,"cannot decode broken.heic: retry in 0.00s"],[0.875,0,4,2,"cannot decode broken.heic: retry in 0.00s"],[0.929,0,4,3,"cannot decode broken.heic: retry in 0.00s"],[0.984,0,4,4,"cannot decode broken.heic: retry in 0.00s"],[1.037,0,4,5,"cannot decode broken.heic: dead"]]}},"crash":{"plain handler":{"emails":21,"duplicates":1,"dup_keys":["receipt:1006"],"secs":1.13,"log":[[0.103,0,7,1,"worker died"],[1.115,2,7,2,"done"]]},"idempotent handler":{"emails":20,"duplicates":0,"dup_keys":[],"secs":1.13,"log":[[0.112,1,7,1,"worker died"],[1.083,2,7,2,"done"]]}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  function line(l) { const cls = /done/.test(l[4]) ? 'ok' : /dead|died/.test(l[4]) ? 'bad' : 'warn'; return `t=${l[0].toFixed(2)}s  worker ${l[1]}  job ${l[2]}  attempt ${l[3]}: <span class="${cls}">${esc(l[4])}</span>`; }
+  function draw() {
+    const e = v('#bjE');
+    $$('.bj-v').forEach((el) => el.classList.toggle('on', el.dataset.e === e));
+    const k = v('#bjV' + e), r = D[e][k];
+    let log = '', stats = '', why = '';
+    if (e === 'request') {
+      log = `<span class="t">60 signups, 10 at a time</span>POST /signup → p50 ${r.p50} ms, p99 ${r.p99} ms; all 60 answered after ${r.wall_s} s` + (r.emails_sent ? `<br>${r.emails_sent} welcome emails sent by ${r.workers} workers; median ${r.lag_p50} s after signup, latest ${r.lag_max} s` : '<br>each request sent its own email before answering');
+      stats = `<div class="stat ${r.p50 > 200 ? 'warn' : 'good'}"><div class="k">Signup p50</div><div class="v">${r.p50} ms</div></div><div class="stat"><div class="k">Signup p99</div><div class="v">${r.p99} ms</div></div><div class="stat"><div class="k">Email delay</div><div class="v">${r.lag_p50 ? r.lag_p50 + ' s (median)' : 'none'}</div></div>`;
+      why = k === 'inline' ? `<b>Every signup waited for the email provider: median ${r.p50} ms.</b> If the provider slowed down or failed, so would signups.` : `<b>Signups answered in ${r.p50} ms</b>, the time to write one row. Four workers sent the 60 emails in the background, a median ${r.lag_p50} s later, a delay nobody notices for a welcome email.`;
+    } else if (e === 'flaky') {
+      log = `<span class="t">First events</span>` + r.log.slice(0, 18).map(line).join('<br>');
+      stats = `<div class="stat ${r.delivered < 90 ? 'warn' : 'good'}"><div class="k">Delivered</div><div class="v">${r.delivered} of 100</div></div><div class="stat"><div class="k">Provider calls</div><div class="v">${r.provider_calls}</div></div><div class="stat ${r.dead ? 'warn' : ''}"><div class="k">Dead-lettered</div><div class="v">${r.dead}</div></div>`;
+      why = { 'no retries': `<b>Only ${r.delivered} of 100 delivered.</b> Every failure was final, the random ones and the whole outage.`, '3 immediate retries': `<b>${r.provider_calls} calls for ${r.delivered} deliveries.</b> Retrying at once meant all the retries landed inside the 2-second outage: three times the load on a provider that was already down, for no gain.`, 'backoff with jitter': `<b>${r.delivered} of 100 delivered.</b> Waits that grew and were randomised carried the retries past the outage, without every worker retrying at the same instant. ${r.dead ? r.dead + ' jobs used all 8 attempts and were dead-lettered.' : ''}` }[k];
+    } else if (e === 'poison') {
+      log = `<span class="t">Job 4 (broken.heic), first attempts</span>` + r.log.map(line).join('<br>');
+      stats = `<div class="stat ${r.poison_status === 'dead' ? 'good' : 'warn'}"><div class="k">Poison job</div><div class="v">${r.poison_status}</div></div><div class="stat"><div class="k">Its attempts</div><div class="v">${r.poison_attempts}</div></div><div class="stat"><div class="k">Worker time spent on it</div><div class="v">${r.worker_time_on_poison_s} s</div></div><div class="stat"><div class="k">Other jobs done</div><div class="v">${r.others_done} of 29</div></div>`;
+      why = k === 'retry forever' ? `<b>${r.poison_attempts} attempts in 4 seconds, and still queued.</b> The other jobs finished, but from then on one of the two workers spent its time failing on the same file. With a backlog, or a queue that keeps order, this blocks real work.` : `<b>Five attempts, then dead.</b> The job was set aside with its error, "${esc(r.error)}", for a person to look at, and both workers went back to useful work.`;
+    } else {
+      log = `<span class="t">Job 7 (receipt for order 1006)</span>` + r.log.map(line).join('<br>');
+      stats = `<div class="stat"><div class="k">Receipts sent</div><div class="v">${r.emails}</div></div><div class="stat ${r.duplicates ? 'warn' : 'good'}"><div class="k">Duplicates</div><div class="v">${r.duplicates}</div></div>`;
+      why = k === 'plain handler' ? `<b>The customer for order 1006 got two receipts.</b> The worker sent the email and died before marking the job done; a second later its lease expired and another worker ran the job again. At-least-once delivery working as designed, without idempotency.` : `<b>Twenty receipts, no duplicates.</b> The handler inserted <code>receipt:1006</code> into a table with a unique key before sending; when the job ran again, the insert failed and the handler reported success without sending.`;
+    }
+    $('#bjLog').innerHTML = log; $('#bjStats').innerHTML = stats; $('#bjWhy').innerHTML = why;
+    $('#bjWhy').dataset.x = JSON.stringify({ e, k });
+  }
+  ['#bjE', '#bjVrequest', '#bjVflaky', '#bjVpoison', '#bjVcrash'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
