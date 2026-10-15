@@ -10,3 +10,4 @@ Code: Python with sentence-transformers, faiss, hnswlib and a local model served
 - Registry stub completed in `assets/atlas.js` (`indexVar: 'RAG_INDEX'`, `first`, `dist`; still `soon`) and the shell scaffolded with `tools/new-course.cjs`.
 - Course shell: home page (4 × 6 dependency map, Python retrieval code-style strip), glossary (74 terms), mock interview (22 problems, Clarify / Data / Retrieval / Generation / Evaluate / Wrap-up phases, 8-row rubric), flashcards, README.
 - Needs a shared change at release: add `rag-` (and later `agent-`, `mas-`) to the account-sync allow-lists in `assets/account.js` and `api/src/index.js`, then a Worker redeploy.
+- P1 Python for AI Engineering: environments and pinned versions, dataclasses for chunks and hits, httpx calls to a model server, JSON Lines; reproducibility simulator (20 processes each: tied ranking gave all 6 orders, unseeded 8-question sample gave recall@2 0.75-1.0; fixed: 1 output each; full set 0.917)
