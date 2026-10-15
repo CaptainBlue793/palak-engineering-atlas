@@ -58,3 +58,11 @@ Code: Python with FastAPI and Pydantic, PostgreSQL, Redis, pytest and curl. Runt
 - Ch 38 Public APIs & SDKs: one task (50 charges, then total) by a naive client, a retrying client without idempotency keys and an SDK, against no faults, 15% 429s, and 10% 503s plus 8% lost responses; retrying client made 53 charges, SDK exactly 50 with 3 user lines and a deprecation warning
 - Ch 39 Debugging Production: four incidents before/after: missing index (SCAN, p99 43 -> 0.4 ms), connection leaked on an error path (pool of 5 exhausted in 1 s, 0 timeouts with a context manager), unbounded cache (+207 MB, tracemalloc names the line; 3.8 MB bounded), retry storm (1600/s sent, 0 successes after a 1 s slowdown; backoff + 10% budget recovers)
 - Ch 40 Interview Playbook: answer builder with eight backend questions (orders API, retry-safe payments, mobile auth, p99 doubled, rate limiting, reliable emails, N+1, take-home), each point linked to its chapter; design framework and round-by-round table
+
+## 2026-10-15 — release
+- Owner asked for P1–P8 and Ch 1–40, then the release and merge ("Ok, do these"), with the case studies (Ch 41–48) left as placeholders for the later all-courses pass.
+- Registry: `soon` removed, 56 lessons and 39 hours (the plan's 2,365 minutes, case studies included). Totals now 11 live courses, 620 chapters (532 main + 88 prerequisites), ~447 hours. README row (between LLD and System Design, the registry order), totals, mosaic count and folder tree updated. The README's "~9,300" search-entry figure was already out of date before this course and is left for the owner.
+- Role paths: Backend & API joins "Backend engineer" after Databases, Networks and OS, before LLD and System Design.
+- Cross-links: `api` added to the topic map and joined to 33 existing topics; 164 chapters' blocks rewritten across all eleven courses. Bundles rebuilt for Backend & API (first commit of its bundle) and the ten other courses (one-line diffs).
+- Checks: content audit 0 errors (620 chapters), bundle check, crosslinks check (0 errors), palette check, hub check (light, dark, 390 px) all pass; full sweep of P1–P8 and Ch 1–40 at 1100 px and 390 px: 0 to check.
+- Ch 33 was rewritten as a defensive chapter (a security regression suite with each control present and missing) after the first draft was stopped.
