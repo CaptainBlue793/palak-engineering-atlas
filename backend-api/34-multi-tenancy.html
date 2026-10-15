@@ -3,37 +3,279 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Multi-Tenancy</title>
+<title>Multi-Tenancy · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 34 of Backend & API. Tenancy models, row-level isolation, tenant context in requests, noisy neighbours and per-tenant limits, with tenant leaks and a 600-request-a-second neighbour measured.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .mt-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .mt-v { display:none; } .mt-v.on { display:block; }
+  .mt-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-family:var(--mono); font-size:12.5px; line-height:1.7; overflow-x:auto; }
+  .mt-box .bad { color:var(--red); font-weight:700; } .mt-box .ok { color:var(--green); font-weight:700; } .mt-box .dim { color:var(--muted); }
+  .mt-row { display:grid; grid-template-columns:minmax(150px, 34%) 1fr auto; gap:10px; align-items:baseline; border-bottom:1px dashed var(--border); padding:3px 0; }
+  .mt-row:last-child { border-bottom:0; }
+  .mt-tl { display:grid; grid-template-columns:70px 1fr 92px; gap:6px 10px; align-items:center; margin-top:4px; }
+  .mt-tl .tr { height:14px; background:var(--surface); border-radius:4px; position:relative; }
+  .mt-tl .br { position:absolute; left:0; top:2px; bottom:2px; border-radius:3px; min-width:2px; }
+  .mt-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="34">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 34</span><span class="pill">Advanced</span><span class="pill">⏱ 40 min</span></div>
-    <h1><span class="grad">Multi-Tenancy</span></h1>
-    <p class="lead">Serving many customers from one service: tenant isolation in the database, in caches and in limits.</p>
+    <h1>Multi-<span class="grad">Tenancy</span></h1>
+    <p class="lead">A business-to-business service usually serves many customer organisations, called <b>tenants</b>, from one deployment. Sharing is what makes it affordable: one codebase, one fleet, one database to run. It also creates the two problems this chapter is about. <b>Isolation</b>: one tenant must never see another's data, even through a forgotten filter or a concurrency bug. <b>Fairness</b>: one tenant's traffic spike must not become every tenant's outage.</p>
+    <p class="lead">The lab measures both: five ordinary handlers checked for cross-tenant leaks with manual filters and with an automatic ORM filter, 400 concurrent requests with two ways of holding the current tenant, and a shared worker pool where one tenant sends 600 requests a second while another sends 20.</p>
+    <ul class="objectives">
+      <li><span>Choose a tenancy model: shared tables, schema per tenant or database per tenant</span></li>
+      <li><span>Enforce row-level isolation centrally, in the ORM and in the database</span></li>
+      <li><span>Carry tenant context safely through async code</span></li>
+      <li><span>Recognise noisy neighbours and choose a fairness policy</span></li>
+      <li><span>Apply per-tenant limits and quotas</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Object-level authorisation:</b> <a href="33-api-security.html">Chapter 33</a>.</li>
+        <li><b>SQLAlchemy sessions and queries:</b> <a href="07-orms-and-migrations.html">Chapter 7</a>.</li>
+        <li><b>Rate limiting algorithms:</b> <a href="19-rate-limiting.html">Chapter 19</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Tenancy models</li>
-    <li>Row-level isolation</li>
-    <li>Tenant context in requests</li>
-    <li>Noisy neighbours</li>
-    <li>Per-tenant limits</li>
-  </ol>
+  <h2>Tenancy models</h2>
+  <p>There are three common ways to store many tenants' data. <b>Shared tables</b> (pool model): every table has a <code>tenant_id</code> column and all tenants' rows sit side by side. It is the cheapest to run and to migrate (one schema), scales to many thousands of small tenants, and puts all the isolation burden on your code. <b>Schema per tenant</b> (PostgreSQL schemas, or one SQL Server schema each): the same tables repeated per tenant in one database; queries are naturally scoped by setting the search path, but migrations run once per tenant and thousands of schemas strain catalogue and tooling. <b>Database per tenant</b> (silo model): the strongest isolation, per-tenant backups, restores and encryption keys, and the easiest story for regulated customers, at the highest cost per tenant and with fleet-wide migrations to orchestrate. Many products mix them: shared tables for most tenants, dedicated databases for the largest or most regulated.</p>
+
+  <h2>Row-level isolation</h2>
+  <p>In the shared model, every query must include <code>tenant_id = current tenant</code>. Relying on each developer to remember is how leaks happen. Enforce it in layers. In the application, an ORM hook that adds the tenant filter to every query on a tenant-scoped model; SQLAlchemy's <code>with_loader_criteria</code> in a <code>do_orm_execute</code> event does this, and refuses to run if no tenant is set. In the database, PostgreSQL <b>row-level security</b> (RLS): a policy such as <code>USING (tenant_id = current_setting('app.tenant_id')::int)</code>, with the application setting <code>app.tenant_id</code> at the start of each transaction (<code>SET LOCAL</code>) and connecting as a role that cannot bypass RLS. RLS applies to raw SQL, reporting queries and anything else that reaches the table, which an ORM hook cannot.</p>
+<pre class="code"><span class="f">@event.listens_for</span>(Session, <span class="s">"do_orm_execute"</span>)
+<span class="k">def</span> <span class="f">tenant_filter</span>(state):
+    <span class="k">if</span> state.is_select <span class="k">and not</span> state.is_column_load <span class="k">and not</span> state.is_relationship_load:
+        tid = current_tenant.<span class="f">get</span>()
+        <span class="k">if</span> tid <span class="k">is None</span>:
+            <span class="k">raise</span> <span class="f">RuntimeError</span>(<span class="s">"query without a tenant"</span>)                   <span class="c"># fail closed</span>
+        state.statement = state.statement.<span class="f">options</span>(<span class="f">with_loader_criteria</span>(
+            TenantScoped, <span class="k">lambda</span> cls: cls.tenant_id == tid, include_aliases=<span class="k">True</span>))</pre>
+  <p>Also add <code>tenant_id</code> to unique constraints and to the leading column of indexes (<code>(tenant_id, created_at)</code>), so uniqueness is per tenant and every tenant's queries stay fast; and include it in cache keys, object-storage paths, search indexes and queue messages, which no database feature protects.</p>
+
+  <h2>Tenant context in requests</h2>
+  <p>The current tenant should come from the verified credential, a claim in the token or the API key's owner, never from a header or path the client can change freely. Once known, it has to be available to code deep in the request: the ORM hook, the cache wrapper, the logger. In async Python that means a <code>contextvars.ContextVar</code>, set in middleware or a dependency and reset afterwards; each task gets its own copy. A module-level variable or a thread-local is shared by every request the event loop is interleaving, so the tenant one request set can be read by another request's code after any <code>await</code>. Background jobs must carry the tenant ID in the message and set the context before doing any work.</p>
+
+  <h2>Simulator: leaks and neighbours</h2>
+  <p>Two experiments. <b>Isolation</b>: two tenants share SQLite tables of projects and invoices. Five handlers were written as a team might: three remember the tenant filter, one forgets it, one uses raw SQL. They ran with manual filters only and again with the automatic ORM filter; then 400 concurrent requests from the two tenants ran through FastAPI with the tenant held in a module global and in a context variable. <b>Neighbours</b>: 8 worker threads, each request 20 ms of work, so capacity is 400 a second; for 3 seconds the "big" tenant sends 600 a second (a bulk import) and the "small" tenant 20 a second, under four scheduling policies.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Is each tenant protected from the others?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="mt-l">Experiment</div>
+      <div class="seg" id="mtS"><button class="active" data-v="iso">isolation</button><button data-v="nb">noisy neighbour</button></div>
+      <div class="mt-v on" id="mtIso">
+        <div class="mt-l">Design</div>
+        <div class="seg" id="mtD"><button class="active" data-v="manual">manual filters</button><button data-v="automatic">automatic ORM filter</button><button data-v="global">tenant in a global</button><button data-v="contextvar">tenant in a ContextVar</button></div>
+      </div>
+      <div class="mt-v" id="mtNb">
+        <div class="mt-l">Scheduling policy</div>
+        <div class="seg" id="mtP"><button class="active" data-v="fifo">shared queue</button><button data-v="cap">per-tenant cap (4 of 8)</button><button data-v="fair">fair queueing</button><button data-v="rate_limit">per-tenant rate limit</button></div>
+      </div>
+      <div class="mt-box" id="mtOut"></div>
+      <div class="stats" id="mtStats"></div>
+      <div class="mt-why" id="mtWhy"></div>
+    </div>
+    <div class="panel-foot">Isolation: SQLAlchemy 2.1.4 on SQLite; handler results compared with the correct answer for tenant 1; the context test used FastAPI through httpx's ASGI transport with a random await of up to 4 ms inside each handler. Neighbours: Python threads with a 20 ms <code>time.sleep</code> per request and arrivals on a fixed schedule; latency is from arrival to completion. The rate limit gives the big tenant 250 a second with a burst of 100.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>manual filters</b>: the forgotten filter made tenant 1's monthly total include tenant 2's invoices, three times the right figure, with nothing to show it was wrong. The raw SQL export returned both tenants' rows.</li>
+    <li><b>automatic ORM filter</b>: the forgotten filter no longer matters, but the raw SQL still leaks, because ORM hooks only see ORM queries. That gap is what database row-level security closes.</li>
+    <li><b>tenant in a global</b>: exactly half of 400 concurrent requests got the other tenant's projects. The code is correct in every single-request test.</li>
+    <li><b>noisy neighbour, shared queue</b>: the small tenant waited as long as the big one, nearly 0.9 s at the median, for its own 20 ms requests.</li>
+    <li><b>per-tenant cap</b>: the small tenant is perfect, but half the workers sat idle while the big tenant's backlog grew to over 6 seconds. <b>Fair queueing</b> protects the small tenant just as well and wastes nothing.</li>
+  </ul>
+
+  <h2>Noisy neighbours</h2>
+  <p>In shared infrastructure, one tenant's load lands on resources every tenant needs: worker slots, database connections, CPU, cache memory, queue throughput. A single customer's bulk import, a runaway integration retrying in a loop, or a heavy report can make the service slow for everyone, even though each tenant's own traffic is modest. Defences, roughly in order of cost: <b>per-tenant rate limits and quotas</b> at the edge; <b>fair scheduling</b> of shared queues and worker pools, giving each tenant a turn rather than serving strictly in arrival order; <b>separate lanes</b> for heavy work (a bulk-import queue with its own workers, a reporting replica); per-tenant <b>concurrency caps</b> where some slots must stay free; and, for the largest tenants, dedicated capacity or their own database. Watch per-tenant metrics (requests, errors, latency, queue depth) so you can see who the noisy neighbour is; Chapter 31 warned against tenant IDs as metric labels in general, but a bounded "top tenants" breakdown or logs and traces carrying the tenant make this tractable.</p>
+
+  <h2>Per-tenant limits</h2>
+  <p>Limits are part of the product as well as protection. Express them per tenant and per plan: requests per second with a burst, concurrent requests, records stored, file storage, jobs in flight, seats. Return 429 with <code>Retry-After</code> for rate limits and a clear 4xx error that names the quota for hard limits, and expose current usage in an API and the dashboard so customers can see a limit coming. Keep the counters where every instance can see them (Redis, Chapter 19), and make limits configurable per tenant so sales can raise one without a deploy.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Model</th><th>Isolation</th><th>Cost per tenant</th><th>Migrations</th><th>Fits</th></tr></thead>
+      <tbody>
+        <tr><td><b>Shared tables + tenant_id</b></td><td>Application and RLS</td><td>Lowest</td><td>Once</td><td>Many small tenants</td></tr>
+        <tr><td><b>Schema per tenant</b></td><td>Search path; easy to scope</td><td>Low</td><td>Once per tenant</td><td>Hundreds of mid-sized tenants</td></tr>
+        <tr><td><b>Database per tenant</b></td><td>Strongest; separate backups and keys</td><td>Highest</td><td>Across a fleet</td><td>Large or regulated tenants</td></tr>
+        <tr><td><b>Hybrid</b></td><td>Per tier</td><td>Matches the plan</td><td>Both paths</td><td>Most mature B2B products</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Identify the tenant</b> from the verified token or key</li>
+      <li data-k="step"><b>Set context</b> a ContextVar, and SET LOCAL for RLS</li>
+      <li data-k="step"><b>Admit fairly</b> per-tenant limits and fair queues</li>
+      <li data-k="step"><b>Query scoped</b> ORM filter plus row-level security</li>
+      <li data-k="end"><b>Everything else scoped</b> cache keys, files, jobs, logs</li>
+    </ol>
+    <figcaption><b>One tenant per request, everywhere.</b> Each layer assumes the one before it might be wrong.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🏢</div>
+    <div class="body"><div class="title">Use case: Salesforce's multitenant architecture</div><p>Salesforce built one of the earliest and largest multi-tenant platforms, and has described its design publicly in a widely read architecture white paper. All customer organisations share the same application servers and the same database tables; every row carries an organisation ID, and the platform's query layer adds it to every query, so customer code cannot leave it out. Customers can define their own objects and fields, but rather than altering the shared schema for each, Salesforce stores customisations as metadata and maps them onto generic shared data tables. To keep one organisation from harming the others, the platform enforces "governor limits": per-transaction caps on queries, records retrieved, CPU time and callouts, plus daily API request allowances per organisation, and code that exceeds them is stopped with an error. The two ideas in this chapter appear at platform scale: isolation enforced below the application code, and explicit per-tenant limits as part of the product contract.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Taking the tenant from a client-supplied header</b> rather than the verified credential.</li>
+      <li><b>Relying on every query to remember</b> <code>tenant_id</code>.</li>
+      <li><b>Holding the tenant in a global or thread-local</b> in async code.</li>
+      <li><b>Forgetting the tenant in cache keys,</b> file paths, search indexes and job payloads.</li>
+      <li><b>Unique constraints without tenant_id,</b> so one tenant's value blocks another's.</li>
+      <li><b>One shared queue for all tenants,</b> served strictly first in, first out.</li>
+      <li><b>Limits only for the whole service,</b> none per tenant.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you keep tenants' data apart in a shared database?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Every tenant-owned table has a tenant_id, and the current tenant comes from the verified token, held in a context variable for the request. I enforce the filter centrally rather than trusting each query: an ORM hook that adds tenant_id to every query on tenant-scoped models and fails if no tenant is set, and PostgreSQL row-level security as a second layer that also covers raw SQL, with the app setting the tenant per transaction and connecting as a role that cannot bypass RLS. I put tenant_id first in indexes and in unique constraints, scope caches, files and jobs by tenant too, and keep tests that try to read another tenant's data through every endpoint.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your largest customer's nightly import makes the API slow for everyone. What do you do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First confirm it with per-tenant metrics: their request rate, the shared queue's depth and other tenants' latency during the import. Short term, apply a per-tenant rate limit or concurrency cap for that kind of traffic and switch shared queues to fair scheduling, so other tenants get a turn even while the import is queued. Then give bulk work its own lane: a bulk import API that accepts a file and processes it with separate workers and connection limits, ideally off-peak, with progress reporting. Make the limits part of the plan, visible in the dashboard and returned with 429 and Retry-After. If the customer is large enough, move them to dedicated capacity or their own database. Finally, alert on per-tenant saturation so the next noisy neighbour is caught before customers complain.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Pick a tenancy model per tier; shared tables are cheapest and need the strongest enforcement.</li>
+      <li>Enforce tenant filters centrally in the ORM and again with database row-level security.</li>
+      <li>Take the tenant from the verified credential and hold it in a ContextVar, never a global.</li>
+      <li>Scope caches, files, search and jobs by tenant too.</li>
+      <li>Fair queueing and per-tenant limits stop one tenant's spike from becoming everyone's outage.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">With an automatic ORM tenant filter in place, which query can still leak across tenants?</p>
+      <div class="opts">
+        <button class="opt">A select that forgot the tenant filter</button>
+        <button class="opt">A lookup by primary key</button>
+        <button class="opt">A raw SQL statement that bypasses the ORM</button>
+        <button class="opt">A join between two tenant-scoped tables</button>
+      </div>
+      <div class="explain">Measured: the raw SQL export still returned both tenants' rows; row-level security in the database covers it.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why did a module-level tenant variable give 200 of 400 concurrent requests the wrong tenant's data?</p>
+      <div class="opts">
+        <button class="opt">The event loop interleaves requests, so after an await one request reads the tenant another set</button>
+        <button class="opt">The database mixed up the rows</button>
+        <button class="opt">The tokens were invalid</button>
+        <button class="opt">The variable was not initialised</button>
+      </div>
+      <div class="explain">A ContextVar gives each request's task its own value: 0 wrong.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Where should the current tenant come from?</p>
+      <div class="opts">
+        <button class="opt">An <code>X-Tenant</code> header sent by the client</button>
+        <button class="opt">The request's IP address</button>
+        <button class="opt">A query parameter</button>
+        <button class="opt">The verified credential: a token claim or the API key's owner</button>
+      </div>
+      <div class="explain">Anything the client can set freely can be set to another tenant.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A per-tenant cap of 4 of 8 workers protected the small tenant. What was its cost?</p>
+      <div class="opts">
+        <button class="opt">The small tenant got slower</button>
+        <button class="opt">Idle workers while the big tenant's backlog grew past 6 seconds</button>
+        <button class="opt">More database connections</button>
+        <button class="opt">Requests were rejected</button>
+      </div>
+      <div class="explain">Fair queueing protected the small tenant equally well while using every worker.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why should <code>tenant_id</code> lead composite indexes such as <code>(tenant_id, created_at)</code>?</p>
+      <div class="opts">
+        <button class="opt">It makes rows smaller</button>
+        <button class="opt">It is required by row-level security</button>
+        <button class="opt">Every query filters by tenant first, so the index serves each tenant's queries directly</button>
+        <button class="opt">It sorts tenants alphabetically</button>
+      </div>
+      <div class="explain">And unique constraints should include it, so uniqueness is per tenant.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"handlers":{"manual":[{"handler":"list_projects","tenant1_got":["T1 project 0","T1 project 1","T1 project 2","T1 project 3","T1 project 4"],"leak":false,"expected":["T1 project 0","T1 project 1","T1 project 2","T1 project 3","T1 project 4"]},{"handler":"get_project(other tenant's id)","tenant1_got":[],"leak":false,"expected":"[]"},{"handler":"search","tenant1_got":25,"leak":false,"expected":25},{"handler":"monthly_total","tenant1_got":82500,"leak":true,"expected":27500},{"handler":"export_raw","tenant1_got":"35 rows","leak":true,"expected":[10,20,30,40,50]}],"automatic":[{"handler":"list_projects","tenant1_got":["T1 project 0","T1 project 1","T1 project 2","T1 project 3","T1 project 4"],"leak":false,"expected":["T1 project 0","T1 project 1","T1 project 2","T1 project 3","T1 project 4"]},{"handler":"get_project(other tenant's id)","tenant1_got":[],"leak":false,"expected":"[]"},{"handler":"search","tenant1_got":25,"leak":false,"expected":25},{"handler":"monthly_total","tenant1_got":27500,"leak":false,"expected":27500},{"handler":"export_raw","tenant1_got":"35 rows","leak":true,"expected":[10,20,30,40,50]}]},"context":{"global":{"requests":400,"wrong_tenant":200,"examples":[{"asked_as":1,"got":["T2 project 0","T2 project 1"]},{"asked_as":1,"got":["T2 project 0","T2 project 1"]},{"asked_as":1,"got":["T2 project 0","T2 project 1"]}]},"contextvar":{"requests":400,"wrong_tenant":0,"examples":[]}},"nb":{"policies":{"fifo":{"big":{"sent":1800,"served":1800,"rejected":0,"p50":889.8,"p99":1745.4,"max":1762.8},"small":{"sent":60,"served":60,"rejected":0,"p50":892.4,"p99":1730.0,"max":1730.0}},"cap":{"big":{"sent":1800,"served":1800,"rejected":0,"p50":3107.5,"p99":6152.7,"max":6209.0},"small":{"sent":60,"served":60,"rejected":0,"p50":20.7,"p99":21.2,"max":21.2}},"fair":{"big":{"sent":1800,"served":1800,"rejected":0,"p50":935.7,"p99":1745.3,"max":1766.6},"small":{"sent":60,"served":60,"rejected":0,"p50":23.1,"p99":31.3,"max":31.3}},"rate_limit":{"big":{"sent":1800,"served":849,"rejected":951,"p50":21.0,"p99":177.2,"max":183.8},"small":{"sent":60,"served":60,"rejected":0,"p50":21.0,"p99":175.3,"max":175.3}}},"workers":8,"work_ms":20.0,"secs":3.0,"rates":{"big":600,"small":20}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const fmt = (x) => Array.isArray(x) ? (x.length ? x.join(', ') : '[]') : String(x);
+  function iso(d) {
+    if (d === 'manual' || d === 'automatic') {
+      const rows = D.handlers[d], leaks = rows.filter(r => r.leak).length;
+      const out = `<div class="dim">tenant 1 calls each handler; expected vs got</div>` + rows.map(r =>
+        `<div class="mt-row"><span>${esc(r.handler)}</span><span>${esc(fmt(r.tenant1_got))}${r.leak ? ` <span class="dim">(expected ${esc(fmt(r.expected))})</span>` : ''}</span><span class="${r.leak ? 'bad' : 'ok'}">${r.leak ? 'LEAK' : 'ok'}</span></div>`).join('');
+      const why = d === 'manual'
+        ? `<b>${leaks} of ${rows.length} handlers leaked.</b> <code>monthly_total</code> forgot the filter and returned the sum over both tenants; <code>export_raw</code> is hand-written SQL without it. Both look like ordinary numbers and lists to the caller.`
+        : `<b>${leaks} of ${rows.length} handlers leaked.</b> The ORM hook added the tenant filter to <code>monthly_total</code> automatically, so the forgotten filter is harmless. <code>export_raw</code> still leaks: it never goes through the ORM. In PostgreSQL, a row-level security policy would filter it as well.`;
+      return { out, why, stats: [['Handlers leaking', `${leaks} of ${rows.length}`, leaks ? 'warn' : 'good'], ['Enforced by', d === 'manual' ? 'each developer' : 'the ORM hook', d === 'manual' ? 'warn' : 'good']], x: { d, leaks } };
+    }
+    const r = D.context[d];
+    const out = `<div class="dim">${r.requests} concurrent requests, alternating tenant 1 and tenant 2</div>` +
+      (r.examples.length ? r.examples.map(e => `<div class="bad">asked as tenant ${e.asked_as}, got: ${esc(e.got.join(', '))}, …</div>`).join('') : `<div class="ok">every response contained only the caller's own projects</div>`);
+    const why = d === 'global'
+      ? `<b>${r.wrong_tenant} of ${r.requests} responses belonged to the other tenant.</b> Middleware wrote the tenant into a module-level variable; while one request awaited, another overwrote it, and the first then queried as the second tenant. Every single-request test passes.`
+      : `<b>All ${r.requests} responses were correct.</b> Each request runs in its own task with its own copy of the context variable, so interleaving at every await cannot mix tenants.`;
+    return { out, why, stats: [['Wrong-tenant responses', `${r.wrong_tenant} of ${r.requests}`, r.wrong_tenant ? 'warn' : 'good']], x: { d, wrong: r.wrong_tenant } };
+  }
+  function nb(p) {
+    const r = D.nb.policies[p];
+    const max = Math.max(...Object.values(D.nb.policies).flatMap(x => [x.big.p99, x.small.p99]));
+    const bar = (val, col) => `<div class="tr"><div class="br" style="width:${100 * val / max}%;background:${col}"></div></div>`;
+    const line = (name, t, col) => `<div class="mt-tl"><span>${name}</span>${bar(t.p99, col)}<span>p99 ${Math.round(t.p99)} ms</span></div>`;
+    const out = `<div class="dim">capacity 400/s · big sends 600/s · small sends 20/s · 3 s</div>` +
+      line('big', r.big, 'var(--amber)') + line('small', r.small, 'var(--accent)') +
+      `<div class="dim" style="margin-top:6px">big: served ${r.big.served} of ${r.big.sent}${r.big.rejected ? `, rejected ${r.big.rejected} (429)` : ''}, p50 ${Math.round(r.big.p50)} ms · small: served ${r.small.served} of ${r.small.sent}, p50 ${Math.round(r.small.p50)} ms</div>`;
+    const why = {
+      fifo: `<b>The small tenant suffers as much as the big one:</b> median ${Math.round(r.small.p50)} ms for requests that take 20 ms, because each of its requests waits behind every queued import request. From its point of view the service is down.`,
+      cap: `<b>The small tenant is unaffected (p99 ${Math.round(r.small.p99)} ms), but capacity is wasted.</b> The big tenant may use only 4 workers, so it is served at 200/s while the other 4 workers wait for small requests that rarely come; its backlog reaches ${(r.big.max / 1000).toFixed(1)} s.`,
+      fair: `<b>The small tenant gets ${Math.round(r.small.p50)} ms at the median and the big tenant loses nothing</b> compared with the shared queue. Round-robin between tenants with waiting work gives each a turn while keeping every worker busy: it is work-conserving.`,
+      rate_limit: `<b>${r.big.rejected} of the big tenant's requests were rejected with 429,</b> so the queue never grew past what a burst of 100 allows; both tenants see p99 around ${Math.round(r.small.p99)} ms. The big tenant must back off and retry, which is the point of a limit: it is the contract, not just protection.`,
+    }[p];
+    return { out, why, stats: [['Small tenant p99', Math.round(r.small.p99) + ' ms', r.small.p99 < 100 ? 'good' : 'warn'], ['Big tenant p99', Math.round(r.big.p99) + ' ms', r.big.p99 < 1000 ? 'good' : 'warn'], ['Big tenant rejected', String(r.big.rejected), r.big.rejected ? 'warn' : 'good']], x: { p, small: r.small.p99 } };
+  }
+  function draw() {
+    const s = v('#mtS');
+    $('#mtIso').classList.toggle('on', s === 'iso'); $('#mtNb').classList.toggle('on', s === 'nb');
+    const r = s === 'iso' ? iso(v('#mtD')) : nb(v('#mtP'));
+    $('#mtOut').innerHTML = r.out;
+    $('#mtStats').innerHTML = r.stats.map(([k, val, c]) => `<div class="stat ${c}"><div class="k">${k}</div><div class="v">${val}</div></div>`).join('');
+    $('#mtWhy').innerHTML = r.why;
+    $('#mtWhy').dataset.x = JSON.stringify(Object.assign({ s }, r.x));
+  }
+  for (const id of ['#mtS', '#mtD', '#mtP']) $(id).addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
