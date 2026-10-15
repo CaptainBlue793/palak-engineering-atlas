@@ -3,37 +3,230 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>The Outbox Pattern &amp; Reliable Events</title>
+<title>The Outbox Pattern &amp; Reliable Events · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 30 of Backend & API. The dual-write problem, the transactional outbox, relaying it, idempotent consumers and change data capture, with 500 orders and injected crashes measured for each design.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ob-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .ob-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-family:var(--mono); font-size:12.5px; line-height:1.65; }
+  .ob-box .bad { color:var(--red); font-weight:700; } .ob-box .ok { color:var(--green); font-weight:700; } .ob-box .warn { color:var(--amber); font-weight:700; }
+  .ob-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="30">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 30</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>The Outbox Pattern &amp; Reliable <span class="grad">Events</span></h1>
-    <p class="lead">Updating the database and publishing an event without losing either: the dual-write problem and the outbox.</p>
+    <p class="lead">When an order is placed, other parts of the system need to know: the warehouse must ship it, the email service must confirm it, analytics must count it. The natural design is to save the order and then publish an "order placed" event to a message broker. That is two writes to two systems, and no transaction spans both. A crash between them, or a rollback after the publish, and the database and the events disagree for good: an order that never ships, or a shipment for an order that does not exist.</p>
+    <p class="lead">This chapter explains the dual-write problem and its standard solution, the transactional outbox, together with relaying, idempotent consumers and change data capture. The lab runs 500 orders through four designs with crashes injected at the dangerous moments, and counts what went wrong.</p>
+    <ul class="objectives">
+      <li><span>Explain why writing to a database and a broker cannot be atomic</span></li>
+      <li><span>Implement a transactional outbox</span></li>
+      <li><span>Relay outbox rows to a broker reliably, in order</span></li>
+      <li><span>Make consumers idempotent, because relays deliver at least once</span></li>
+      <li><span>Know when change data capture is the better relay</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Transactions and external calls:</b> <a href="17-transactions-in-apps.html">Chapter 17</a>.</li>
+        <li><b>Queues, at-least-once delivery and idempotent jobs:</b> <a href="20-background-jobs.html">Chapter 20</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The dual-write problem</li>
-    <li>Transactional outbox</li>
-    <li>Relaying the outbox</li>
-    <li>Idempotent consumers</li>
-    <li>Change data capture</li>
-  </ol>
+  <h2>The dual-write problem</h2>
+  <p>A database transaction makes its own writes atomic; it cannot include a write to Kafka, RabbitMQ, SQS, another service or an email provider. So any code that writes to the database and to a broker has a gap, and each order of operations fails in its own way. <b>Commit, then publish</b>: if the process dies, is redeployed, or the broker is down after the commit, the event is lost and nothing downstream ever hears about the order. <b>Publish, then commit</b>: if anything later in the transaction fails, the event describes something that never happened. Distributed transactions (two-phase commit) exist, but most brokers and cloud services do not support them, and they couple every system's availability together. The lab shows both failure modes.</p>
+
+  <h2>Transactional outbox</h2>
+  <p>The fix is to stop writing to two systems in the request. Write the event as a row in an <b>outbox</b> table, in the <i>same</i> database transaction as the business change. Either both commit or neither does: no lost events, no phantom events. A separate process, the <b>relay</b>, then reads the outbox and publishes to the broker.</p>
+<pre class="code"><span class="k">def</span> <span class="f">place_order</span>(session, order_in) -&gt; Order:
+    <span class="k">with</span> session.<span class="f">begin</span>():                                    <span class="c"># one transaction</span>
+        order = Order(id=new_id(<span class="s">"ord"</span>), total_cents=order_in.total_cents, ...)
+        session.<span class="f">add</span>(order)
+        session.<span class="f">add</span>(OutboxEvent(id=uuid4(), topic=<span class="s">"orders"</span>, type=<span class="s">"order.placed"</span>,
+                                aggregate_id=order.id, payload=OrderPlaced.<span class="f">from_order</span>(order).<span class="f">model_dump_json</span>()))
+    <span class="k">return</span> order                                                   <span class="c"># no broker call here at all</span></pre>
+
+  <h2>Relaying the outbox</h2>
+  <p>The relay polls for unsent rows in order, publishes each, then marks it sent (or deletes it). It can crash between publishing and marking, so after a restart it publishes that row again: the outbox gives <b>at-least-once</b> delivery, never at-most-once. Details that matter: publish rows for the same aggregate (the same order) in commit order, so consumers do not see "shipped" before "placed"; in PostgreSQL, claim batches with <code>SELECT ... FOR UPDATE SKIP LOCKED</code> so several relay instances do not send the same rows; keep each event's ID stable so duplicates can be recognised; delete or archive sent rows so the table stays small; and alert when the oldest unsent row is too old, which means the relay or the broker is stuck.</p>
+
+  <h2>Simulator: 500 orders, four designs</h2>
+  <p>Orders are written to one SQLite database; events go to a second database standing in for the broker, so, as with a real broker, no transaction can span both. Across 500 orders, the process crashes right after committing 5% of the time, and 5% of orders fail late in their transaction (a stock check, say) and roll back. In the outbox designs, the relay also dies between publishing and marking a row 3% of the time. A consumer then ships an order for every event it receives.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Do the orders and the events agree?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ob-l">Design</div>
+      <div class="seg" id="obD"><button class="active" data-v="after_commit">commit, then publish</button><button data-v="before_commit">publish, then commit</button><button data-v="outbox">transactional outbox</button><button data-v="outbox_idem">outbox + idempotent consumer</button></div>
+      <div class="ob-box" id="obOut"></div>
+      <div class="stats" id="obStats"></div>
+      <div class="ob-why" id="obWhy"></div>
+    </div>
+    <div class="panel-foot">Python's sqlite3 with two separate database files; the same seeded sequence of crashes and failures for every design. "Committed orders" are rows in the orders table after the run; "lost" means committed but never shipped; "phantom" means shipped but not in the orders table.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>commit, then publish</b>: every crash after a commit left an order in the database that the warehouse never heard about. No error was logged anywhere it would be noticed.</li>
+    <li><b>publish, then commit</b>: no events lost, but every late failure had already published its event, so the warehouse shipped orders that were rolled back.</li>
+    <li><b>transactional outbox</b>: nothing lost and nothing invented, but a few orders were shipped twice: the relay published them, died before marking them sent, and published them again after restarting.</li>
+    <li><b>+ idempotent consumer</b>: the consumer records each event ID it has handled and skips repeats. Every committed order shipped exactly once.</li>
+  </ul>
+
+  <h2>Idempotent consumers</h2>
+  <p>Because the relay, the broker and the consumer's own retries all deliver at least once, every consumer must cope with duplicates. Record each handled event ID in a table with a unique constraint, in the <b>same transaction</b> as the consumer's own changes (an "inbox"), and skip IDs already present; or make the operation naturally idempotent, such as "set order status to shipped" rather than "increment shipments". Together, an outbox on the producer and an inbox on the consumer give effectively-once processing over at-least-once delivery, the same combination as Chapter 20's jobs.</p>
+
+  <h2>Change data capture</h2>
+  <p>Instead of polling, a relay can read the database's own change log, PostgreSQL's write-ahead log or MySQL's binlog, and turn committed changes into events. This is <b>change data capture</b> (CDC), and Debezium is the best-known open-source implementation. Pointed at the outbox table, CDC gives low latency and no polling load while keeping the explicit, versioned event design of the outbox. Pointed at ordinary business tables, it streams every change without application code, but couples consumers to your internal schema, so most teams prefer CDC on an outbox.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Design</th><th>Lost events</th><th>Phantom events</th><th>Duplicates</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><b>Commit, then publish</b></td><td>On crash or broker outage</td><td>No</td><td>If you retry</td><td>Looks simplest</td></tr>
+        <tr><td><b>Publish, then commit</b></td><td>No</td><td>On rollback</td><td>If you retry</td><td>Looks simplest</td></tr>
+        <tr><td><b>Two-phase commit</b></td><td>No</td><td>No</td><td>No</td><td>Rarely supported; couples availability</td></tr>
+        <tr><td><b>Outbox + polling relay</b></td><td>No</td><td>No</td><td>Yes, rarely</td><td>A table and a relay process; some latency</td></tr>
+        <tr><td><b>Outbox + CDC (Debezium)</b></td><td>No</td><td>No</td><td>Yes, rarely</td><td>CDC infrastructure; low latency</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>One transaction</b> order row + outbox row</li>
+      <li data-k="step"><b>Relay</b> reads unsent rows in order (poll or CDC)</li>
+      <li data-k="step"><b>Publish</b> to the broker with a stable event ID</li>
+      <li data-k="step"><b>Mark sent</b> a crash here means a duplicate later</li>
+      <li data-k="end"><b>Consumer</b> skips event IDs it has handled</li>
+    </ol>
+    <figcaption><b>Reliable events from a database change.</b> No step writes to two systems at once, and duplicates are expected and absorbed.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">📤</div>
+    <div class="body"><div class="title">Use case: Debezium's outbox event router</div><p>The outbox pattern became mainstream partly through tooling. In 2019 Gunnar Morling of Red Hat, then lead of the Debezium project, published "Reliable Microservices Data Exchange With the Outbox Pattern" on the Debezium blog. It laid out the problem this chapter measures, services that update their database and send messages to Kafka and end up inconsistent when one of the two fails, and showed the outbox as the answer: write events to an outbox table in the same transaction, and let Debezium read the committed inserts from the database's transaction log and route them to Kafka topics, with the outbox row's ID as the event ID and its aggregate ID as the message key, so all events for one order stay in order on one partition. Debezium shipped an "outbox event router" to do exactly that. The approach is now common across languages and stacks, and the pieces are the ones in this chapter: one local transaction, a relay reading only committed data, stable IDs, per-aggregate ordering, and consumers that tolerate repeats.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Publishing to a broker inside a request,</b> before or after the commit.</li>
+      <li><b>An outbox row written in a different transaction</b> from the change it describes.</li>
+      <li><b>Consumers that assume exactly-once delivery.</b></li>
+      <li><b>Relays that publish out of order</b> for the same aggregate.</li>
+      <li><b>Several relay instances</b> claiming the same rows without locking.</li>
+      <li><b>An outbox that is never cleaned up,</b> or a stuck relay that nobody alerts on.</li>
+      <li><b>Events that expose internal table structure</b> instead of a designed, versioned schema.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the transactional outbox pattern and what problem does it solve?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>When a service changes its database and also needs to publish an event, those are two writes to two systems with no shared transaction, so one can succeed while the other fails: commit then crash, and the event is lost; publish then roll back, and the event describes something that never happened. The outbox pattern writes the event as a row in an outbox table inside the same database transaction as the change, so they commit or fail together. A separate relay reads committed outbox rows and publishes them to the broker, marking them sent. The relay can crash between publishing and marking, so delivery is at least once, and consumers must be idempotent, typically by recording processed event IDs.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Orders, payments and shipping are separate services. Design how "order placed" leads to payment and shipping reliably.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The orders service writes the order and an <code>order.placed</code> outbox row in one transaction, and a relay, polling with SKIP LOCKED or Debezium CDC, publishes to a topic keyed by order ID so events for one order stay ordered. The payments service consumes it, records the event ID in an inbox table in the same transaction as creating the payment attempt, calls the provider with an idempotency key derived from the order, and writes <code>payment.succeeded</code> or <code>payment.failed</code> to its own outbox. Orders consumes those to update status, shipping consumes <code>payment.succeeded</code> the same way. Each step is local, idempotent and retried; failures become compensating events such as refunds or cancellations rather than distributed rollbacks (a saga). I would monitor outbox age and consumer lag per topic, dead-letter poison messages with alerts, and run a daily reconciliation that compares orders, payments and shipments.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Writing to a database and a broker is two writes; no ordering of them is safe on its own.</li>
+      <li>Write events to an outbox table in the same transaction as the change.</li>
+      <li>A relay publishes committed rows, in order per aggregate, at least once.</li>
+      <li>Consumers deduplicate by event ID in the same transaction as their own changes.</li>
+      <li>CDC on the outbox table gives low-latency relaying without polling.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A service commits an order, then crashes before publishing the event. What happens downstream?</p>
+      <div class="opts">
+        <button class="opt">The event is published on restart automatically</button>
+        <button class="opt">The order is rolled back</button>
+        <button class="opt">Nothing: the order exists, and no consumer ever hears about it</button>
+        <button class="opt">The broker detects the gap</button>
+      </div>
+      <div class="explain">Measured: 26 of 500 orders lost this way.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What makes the outbox pattern atomic?</p>
+      <div class="opts">
+        <button class="opt">The event row is written in the same database transaction as the business change</button>
+        <button class="opt">The broker supports transactions</button>
+        <button class="opt">The relay retries</button>
+        <button class="opt">Two-phase commit</button>
+      </div>
+      <div class="explain">Both commit or neither does; the broker is written later from committed data.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why can the outbox relay deliver an event twice?</p>
+      <div class="opts">
+        <button class="opt">The outbox row is written twice</button>
+        <button class="opt">Brokers duplicate messages on purpose</button>
+        <button class="opt">The consumer retries</button>
+        <button class="opt">It can crash after publishing but before marking the row sent, and publishes it again after restarting</button>
+      </div>
+      <div class="explain">Measured: 7 duplicates from 8 relay crashes; an idempotent consumer absorbed them all.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How should a consumer make its processing idempotent?</p>
+      <div class="opts">
+        <button class="opt">Process each message as fast as possible</button>
+        <button class="opt">Record each event ID with a unique constraint, in the same transaction as its own changes, and skip repeats</button>
+        <button class="opt">Delete messages after reading</button>
+        <button class="opt">Ask the producer not to send duplicates</button>
+      </div>
+      <div class="explain">An inbox table; or operations that are naturally idempotent.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does change data capture read?</p>
+      <div class="opts">
+        <button class="opt">The application's logs</button>
+        <button class="opt">HTTP requests</button>
+        <button class="opt">The database's own change log, such as PostgreSQL's write-ahead log</button>
+        <button class="opt">The broker's topics</button>
+      </div>
+      <div class="explain">Debezium turns committed changes, typically to an outbox table, into events.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"r":{"after_commit":{"attempted":500,"committed":469,"messages":443,"lost":26,"phantom":0,"shipped_twice":0,"examples":{"lost":["ord_0001","ord_0011","ord_0043"],"phantom":[],"dup":[]},"relay":{"published":0,"relay_crashes":0},"failures":57},"before_commit":{"attempted":500,"committed":469,"messages":500,"lost":0,"phantom":31,"shipped_twice":0,"examples":{"lost":[],"phantom":["ord_0067","ord_0085","ord_0089"],"dup":[]},"relay":{"published":0,"relay_crashes":0},"failures":31},"outbox":{"attempted":500,"committed":469,"messages":477,"lost":0,"phantom":0,"shipped_twice":7,"examples":{"lost":[],"phantom":[],"dup":["ord_0000","ord_0016","ord_0103"]},"relay":{"published":477,"relay_crashes":8},"failures":57},"outbox_idem":{"attempted":500,"committed":469,"messages":477,"lost":0,"phantom":0,"shipped_twice":0,"examples":{"lost":[],"phantom":[],"dup":[]},"relay":{"published":477,"relay_crashes":8},"failures":57}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  function draw() {
+    const d = v('#obD'), r = D.r[d];
+    const ex = r.examples;
+    $('#obOut').innerHTML = `orders attempted: 500   committed: ${r.committed}   events in the broker: ${r.messages}${r.relay.published ? `   (relay published ${r.relay.published}, crashed ${r.relay.relay_crashes} times)` : ''}<br>` +
+      `<span class="${r.lost ? 'bad' : 'ok'}">lost (committed, never shipped): ${r.lost}</span>${ex.lost.length ? '  e.g. ' + esc(ex.lost.join(', ')) : ''}<br>` +
+      `<span class="${r.phantom ? 'bad' : 'ok'}">phantom (shipped, never committed): ${r.phantom}</span>${ex.phantom.length ? '  e.g. ' + esc(ex.phantom.join(', ')) : ''}<br>` +
+      `<span class="${r.shipped_twice ? 'warn' : 'ok'}">shipped twice: ${r.shipped_twice}</span>${ex.dup.length ? '  e.g. ' + esc(ex.dup.join(', ')) : ''}`;
+    const wrong = r.lost + r.phantom + r.shipped_twice;
+    $('#obStats').innerHTML = `<div class="stat ${r.lost ? 'warn' : 'good'}"><div class="k">Lost events</div><div class="v">${r.lost}</div></div><div class="stat ${r.phantom ? 'warn' : 'good'}"><div class="k">Phantom events</div><div class="v">${r.phantom}</div></div><div class="stat ${r.shipped_twice ? 'warn' : 'good'}"><div class="k">Shipped twice</div><div class="v">${r.shipped_twice}</div></div><div class="stat ${wrong ? 'warn' : 'good'}"><div class="k">Orders handled wrongly</div><div class="v">${wrong} of ${r.committed}</div></div>`;
+    $('#obWhy').innerHTML = { after_commit: `<b>${r.lost} committed orders were never shipped.</b> Each one crashed in the instant between the database commit and the publish. The order is in the database, the customer was charged, and no system downstream knows it exists.`, before_commit: `<b>${r.phantom} orders shipped that do not exist.</b> The event went out first; then the stock check failed and the order rolled back. The broker cannot take the event back.`, outbox: `<b>Nothing lost, nothing invented; ${r.shipped_twice} orders shipped twice.</b> Every event committed with its order. The relay crashed ${r.relay.relay_crashes} times between publishing and marking a row sent, so after restarting it published those rows again: at-least-once delivery.`, outbox_idem: `<b>Every committed order shipped exactly once.</b> The same ${r.messages} messages arrived, duplicates included, but the consumer remembered each event ID and skipped the repeats.` }[d];
+    $('#obWhy').dataset.x = JSON.stringify({ d, wrong });
+  }
+  $('#obD').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
