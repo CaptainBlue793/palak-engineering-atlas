@@ -3,37 +3,254 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Indexing Pipelines &amp; Updates</title>
+<title>Indexing Pipelines &amp; Updates · RAG by Palak Deb Patra</title>
+<meta name="description" content="Chapter 22 of RAG. Ingestion jobs, change detection, deduplication, deletes and re-embedding, measured on real edits from the Atlas's own git history and on in-place HNSW updates.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('rag-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ix-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ix-rows { margin-top:12px; display:grid; gap:6px; }
+  .ix-row { display:grid; grid-template-columns:minmax(0,13rem) minmax(0,1fr); gap:10px; align-items:center; padding:6px 10px; border-radius:10px; border:1px solid var(--border); background:var(--surface-2); font-size:13px; }
+  .ix-row.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .ix-row .nm { font-weight:600; }
+  .ix-bar { position:relative; height:20px; border-radius:6px; background:var(--surface); overflow:hidden; }
+  .ix-bar i { position:absolute; inset:0 auto 0 0; border-radius:6px; background:var(--pink); opacity:.75; }
+  .ix-bar span { position:relative; padding-left:6px; font-family:var(--mono); font-size:11px; line-height:20px; color:var(--text); }
+  .ix-ex { margin-top:12px; display:grid; gap:6px; font-size:13px; }
+  .ix-ex div { border:1px solid var(--border); border-radius:10px; padding:8px 12px; background:var(--surface-2); }
+  .ix-ex .k { font-size:11px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }
+  .ix-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:560px) { .ix-row { grid-template-columns:minmax(0,1fr); } }
+</style>
 </head>
 <body data-chapter="22">
-<!-- rag:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 22</span><span class="pill">Intermediate</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Indexing Pipelines &amp; <span class="grad">Updates</span></h1>
-    <p class="lead">Ingesting, deduplicating and re-indexing documents as they change, without stale or duplicated chunks.</p>
+    <h1>Indexing Pipelines <span class="grad">&amp; Updates</span></h1>
+    <p class="lead">A demo indexes its documents once. A real system's documents change every day: pages edited, files deleted, new ones added, permissions revised. The indexing pipeline has to keep the index matching the source without re-embedding everything each time, leaving stale chunks behind, or serving a half-updated index. Most of that comes down to two questions. What actually changed? And how do you change the index to match?</p>
+    <p class="lead">This chapter answers both with real edits. It replays four commits from 13 October 2026, when this Atlas's own chapters were revised in bulk, through an extractor and two chunkers, and counts how many chunks each edit really changed. It then measures adding and deleting vectors in a live HNSW index against rebuilding it.</p>
+    <ul class="objectives">
+      <li><span>Design an ingestion job: fetch, extract, chunk, embed, write</span></li>
+      <li><span>Detect changes with content hashes at file and chunk level</span></li>
+      <li><span>Explain how the chunking strategy decides the cost of an edit</span></li>
+      <li><span>Handle deletes and in-place updates in a vector index</span></li>
+      <li><span>Plan a full re-embedding when the model changes</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Extraction and chunking:</b> <a href="03-loading-documents.html">Chapter 3</a> and <a href="04-chunking.html">Chapter 4</a>.</li>
+        <li><b>HNSW:</b> <a href="07-hnsw.html">Chapter 7</a>.</li>
+        <li><b>Hashing:</b> any hash function; SHA-256 here.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Ingestion jobs</li>
-    <li>Change detection</li>
-    <li>Deduplication</li>
-    <li>Deletes</li>
-    <li>Re-embedding a corpus</li>
-  </ol>
+  <h2>Ingestion jobs</h2>
+  <p>An ingestion job runs the same stages for every source:</p>
+  <ul>
+    <li>list what exists;</li>
+    <li>fetch what changed;</li>
+    <li>extract clean text;</li>
+    <li>chunk it;</li>
+    <li>embed the chunks;</li>
+    <li>write vectors and metadata, keyed by document and chunk id.</li>
+  </ul>
+  <p>Make each stage idempotent, so a crashed run can simply be repeated. Record per document the source version, the content hash, the chunker and embedding-model versions, and the time indexed. Run it on a schedule or on change events (webhooks, a database's change stream), and alert when a source stops updating.</p>
+<pre class="code"><span class="k">for</span> doc <span class="k">in</span> source.<span class="f">changed_since</span>(last_run):
+    text = <span class="f">extract</span>(doc)
+    <span class="k">if</span> <span class="f">sha256</span>(text) == state[doc.id].text_hash: <span class="k">continue</span>      <span class="c"># edit outside the indexed text: nothing to do</span>
+    new = {<span class="f">sha256</span>(c): c <span class="k">for</span> c <span class="k">in</span> <span class="f">chunk</span>(text)}
+    old = state[doc.id].chunk_hashes
+    index.<span class="f">delete</span>([chunk_id(doc, h) <span class="k">for</span> h <span class="k">in</span> old - new.<span class="f">keys</span>()])
+    index.<span class="f">upsert</span>([(chunk_id(doc, h), <span class="f">embed</span>(new[h]), meta(doc)) <span class="k">for</span> h <span class="k">in</span> new.<span class="f">keys</span>() - old])</pre>
+
+  <h2>Change detection</h2>
+  <p>Timestamps say a file was touched; hashes say whether its content changed. Hash at two levels. A <b>file hash</b> of the extracted text skips files whose edits fall outside the indexed text. The lab's first commit reworded quiz options in 50 chapters, and the extractor ignores quizzes, so not one chunk needed re-embedding. A <b>chunk hash</b> then re-embeds only the chunks whose text differs. How many differ depends on the chunker.</p>
+
+  <h2>Simulator: four real edits, two chunkers</h2>
+  <p>Each commit's changed chapters were extracted before and after with Chapter 4's extractor. Each version was chunked two ways: fixed 200-word windows, and recursive chunks that follow sections and paragraphs up to 200 words. A chunk needs embedding if its SHA-256 hash did not exist before the edit. The whole corpus at the time was 508 chapters: 6,368 fixed chunks or 8,164 recursive ones.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">How much does an edit really cost to re-index?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ix-l">Edit (a real commit)</div>
+      <div class="seg" id="ixE"><button data-v="35122f5">Quiz options reworded</button><button class="active" data-v="027d159">Long sentences split</button><button data-v="e9c3689">Paragraphs broken up</button><button data-v="7c40ede">Repetition removed</button></div>
+      <div class="ix-l">Chunker</div>
+      <div class="seg" id="ixK"><button data-v="fixed">Fixed 200-word windows</button><button class="active" data-v="recursive">Recursive (sections, paragraphs)</button></div>
+      <div class="stats" id="ixStats"></div>
+      <div class="ix-rows" id="ixRows"></div>
+      <div class="ix-ex" id="ixEx"></div>
+      <div class="ix-why" id="ixWhy"></div>
+    </div>
+    <div class="panel-foot">Commits from the Atlas repository, 13 October 2026. Extraction keeps headings, paragraphs, lists, tables and code, and skips quizzes, simulator panels and navigation, as in Chapter 4. "Re-embed changed files" re-embeds every chunk of any file whose extracted text changed.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>Quiz rewording</b>: 50 files changed in git, 0 in the index. A file-level hash of the extracted text skips them all.</li>
+    <li><b>Sentence splitting, fixed vs recursive</b>: 1,412 of 3,001 fixed chunks changed, against 380 of 3,833 recursive ones. Splitting "A, and B" into "A. B" changes word counts slightly, and every later fixed window shifts.</li>
+    <li><b>Paragraph breaks, fixed vs recursive</b>: the reverse. Fixed windows barely changed (37 (1%)) because the words did not, while recursive chunks (468 (12%)) follow paragraphs, so new breaks moved their boundaries.</li>
+    <li><b>Removing repeated teaching</b>: deletions shift fixed windows too (306 (31%) against 114 (9%)).</li>
+  </ul>
+
+  <h2>Deduplication</h2>
+  <p>Documents arrive more than once: the same PDF in two folders, a page and its print view, a section quoted in another chapter. Hash extracted documents and chunks, and keep one copy, recording every place it appears so permissions and citations stay right (Chapter 23). Near-duplicates need a similarity check, such as MinHash on shingles at indexing time, or embedding similarity at query time (Chapter 16).</p>
+
+  <h2>Deletes</h2>
+  <p>A deleted source document must disappear from the index, or the system will cite pages that no longer exist, or worse, ones a user is no longer allowed to see (Chapter 39). Key chunks by document id so a delete can find them. Graph indexes usually <b>mark</b> deleted vectors and skip them at query time, then clean up by rebuilding or reusing the slots. The lab measured this on Chapter 7's 83,118 sentence vectors:</p>
+  <ul>
+    <li><b>Adding</b> 5,000 vectors to a live HNSW index took 1.7 s, against 23 s to rebuild with them.</li>
+    <li><b>Marking</b> 8,312 (10%) deleted took 0.01 s.</li>
+    <li><b>Recall@10</b> against exact search on the remaining vectors was 0.991, the same as a freshly rebuilt index (0.990).</li>
+  </ul>
+  <p>Marked vectors still use memory, so schedule rebuilds when deletes pile up.</p>
+
+  <h2>Re-embedding a corpus</h2>
+  <p>A new embedding model makes every stored vector incomparable with new queries, so the whole corpus must be re-embedded. Old and new vectors cannot be mixed. Build the new index alongside the old one and switch reads with an alias when it is complete and evaluated: a blue/green swap. Store the model name and version with every vector. Budget the job from the measured throughput: Chapter 5 embedded about 9,400 documents (SciFact plus the Atlas sections) in 29 seconds in half precision on a laptop GPU, so a corpus a thousand times larger needs most of a day on that hardware. Keep the chunk text so you never need to re-extract.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Edit</th><th>Files changed (git)</th><th>Files whose text changed</th><th>Fixed: chunks to embed</th><th>Recursive: chunks to embed</th></tr></thead>
+      <tbody><tr><td><b>ML &amp; AI Systems quizzes reworded</b> <span class="small">(35122f5)</span></td><td>50</td><td>0</td><td>0</td><td>0</td></tr><tr><td><b>343 longest sentences split</b> <span class="small">(027d159)</span></td><td>231</td><td>231</td><td>1,412 (47%)</td><td>380 (10%)</td></tr><tr><td><b>Dense openings and paragraphs broken up</b> <span class="small">(e9c3689)</span></td><td>235</td><td>235</td><td>37 (1%)</td><td>468 (12%)</td></tr><tr><td><b>Repeated teaching removed</b> <span class="small">(7c40ede)</span></td><td>57</td><td>57</td><td>306 (31%)</td><td>114 (9%)</td></tr></tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>List</b> changed documents</li>
+      <li data-k="step"><b>Extract</b>, hash the text, skip if unchanged</li>
+      <li data-k="step"><b>Chunk</b>, hash each chunk</li>
+      <li data-k="step"><b>Embed</b> only new hashes; delete vanished ones</li>
+      <li data-k="end"><b>Record</b> versions; rebuild when deletes pile up</li>
+    </ol>
+    <figcaption><b>An incremental indexing run.</b> Hashes decide the work; ids make deletes possible.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🔄</div>
+    <div class="body"><div class="title">Use case: index aliases and zero-downtime reindexing</div><p>Search engines solved the "rebuild without downtime" problem long before RAG. Elasticsearch and OpenSearch let an application read and write through an <b>alias</b>, a name that points at one or more real indexes. To change mappings or re-process every document, operators build a new index in the background (the reindex API copies and transforms documents), check it, and then move the alias in one atomic step. The old index stays for rollback. Vector databases adopted the same pattern for changing the embedding model, where no in-place update is possible: Qdrant and Weaviate offer collection aliases for exactly this. The lab's numbers show why both paths exist. Small edits are cheap in place, while a new model means a rebuild that must not interrupt reads.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Re-embedding every file on every run.</b></li>
+      <li><b>Chunk ids that are just positions.</b></li>
+      <li><b>No delete path.</b></li>
+      <li><b>Mixing vectors from two embedding models.</b></li>
+      <li><b>Hashing raw files instead of extracted text.</b></li>
+      <li><b>Never rebuilding after many deletes.</b></li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you keep a RAG index up to date as documents change?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Run an incremental ingestion job: find documents changed since the last run, extract their text and compare its hash with the stored one, skipping documents whose indexed text did not change. For changed ones, chunk and hash each chunk, embed only chunks whose hash is new, and delete chunks whose hash vanished. Key everything by document and chunk id so deletes and updates can find their vectors, and record the model and chunker versions. Graph indexes mark deletes and need periodic rebuilds; a new embedding model needs a full rebuild in a parallel index, swapped in with an alias.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> After a routine content edit, your nightly job re-embedded almost half the corpus. Why, and how would you fix it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Probably fixed-size chunking: windows of N words or tokens mean any insertion or deletion shifts every later window in the document, so every chunk after the edit gets a new hash. In testing, splitting long sentences across 231 chapters changed 47% of fixed-window chunks but 10% of section-and-paragraph chunks. Switch to structure-aware chunking so edits stay local, add a document-level hash of the extracted text so edits outside it are skipped, and check the extractor is deterministic. Then confirm chunk ids are content-derived rather than positional, so unchanged chunks keep their vectors.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Hash extracted text per document and per chunk; embed only new hashes.</li>
+      <li>The chunker decides how far an edit ripples: fixed windows shift, structure-aware chunks stay local.</li>
+      <li>Key chunks by document id so deletes and updates can find them.</li>
+      <li>HNSW handles adds and marked deletes in place cheaply; rebuild periodically.</li>
+      <li>A new embedding model means a full rebuild beside the old index, then an alias swap.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why did rewording quiz options in 50 chapters need no re-embedding?</p>
+      <div class="opts">
+        <button class="opt">The edits were too small to matter</button>
+        <button class="opt">The extractor skips quizzes, so the extracted text and its hash were unchanged</button>
+        <button class="opt">The index was rebuilt anyway</button>
+        <button class="opt">Quizzes are embedded separately</button>
+      </div>
+      <div class="explain">Hash what you index, not the raw file.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why did splitting sentences change far more fixed-window chunks than recursive ones?</p>
+      <div class="opts">
+        <button class="opt">Fixed windows are longer</button>
+        <button class="opt">Recursive chunking ignores punctuation</button>
+        <button class="opt">Fixed windows are embedded twice</button>
+        <button class="opt">Any change in word count shifts every later fixed window</button>
+      </div>
+      <div class="explain">Structure-aware chunks keep edits local.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What must happen when the embedding model changes?</p>
+      <div class="opts">
+        <button class="opt">Re-embed the whole corpus into a new index and switch reads when it is ready</button>
+        <button class="opt">Re-embed only new documents</button>
+        <button class="opt">Nothing; vectors are compatible</button>
+        <button class="opt">Normalise the old vectors</button>
+      </div>
+      <div class="explain">Vectors from different models are not comparable.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How do graph indexes such as HNSW usually handle deletes?</p>
+      <div class="opts">
+        <button class="opt">They rebuild immediately</button>
+        <button class="opt">They cannot delete</button>
+        <button class="opt">They mark vectors deleted and skip them, cleaning up in a later rebuild</button>
+        <button class="opt">They set the vector to zero</button>
+      </div>
+      <div class="explain">Marked vectors still use memory until the rebuild.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why key chunks by document id and content hash rather than by position?</p>
+      <div class="opts">
+        <button class="opt">It makes search faster</button>
+        <button class="opt">So unchanged chunks keep their vectors and deleted documents' chunks can be found and removed</button>
+        <button class="opt">It saves memory</button>
+        <button class="opt">Vector databases require it</button>
+      </div>
+      <div class="explain">Positional ids change whenever anything above them changes.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = RAG;
+  const D = {"commits":{"35122f5":{"label":"ML & AI Systems quizzes reworded","files_changed":50,"text_changed":0,"fixed":{"chunks_in_files":0,"new":0,"gone":0},"recursive":{"chunks_in_files":0,"new":0,"gone":0},"examples":[]},"027d159":{"label":"343 longest sentences split","files_changed":231,"text_changed":231,"fixed":{"chunks_in_files":3001,"new":1412,"gone":1410},"recursive":{"chunks_in_files":3833,"new":380,"gone":376},"examples":[{"file":"cloud-devops/02-cloud-fundamentals.html","before":"A cloud provider rents out computers, storage and networks that you control through an API and pay for by the hour or the gigabyte. Before any single service makes sense you need four ideas that apply to all of them: where things physically run (regions and availability zones), how much of the stack","after":"A cloud provider rents out computers, storage and networks that you control through an API and pay for by the hour or the gigabyte. Before any single service makes sense you need four ideas that apply to all of them. The first is where things physically run (regions and availability zones). The seco"},{"file":"cloud-devops/03-compute.html","before":"Netflix runs on AWS and has written publicly about two choices that match this chapter. First, every deployment is a baked image. Their open-source tool Aminator, released in 2013, takes a base image and an application package and produces an AMI, and a release means new autoscaling groups of instan","after":"Netflix runs on AWS and has written publicly about two choices that match this chapter. First, every deployment is a baked image. Their open-source tool Aminator, released in 2013, takes a base image and an application package and produces an AMI, and a release means new autoscaling groups of instan"},{"file":"cloud-devops/04-storage.html","before":"Volumes can grow and cannot shrink, so grow in steps. A managed database ( a PaaS , such as RDS or Cloud SQL) sits on the same kind of volume and does these steps for you, along with scheduled snapshots and a transaction log that lets you restore to any second within a retention period you choose. T","after":"Volumes can grow and cannot shrink, so grow in steps. A managed database ( a PaaS , such as RDS or Cloud SQL) sits on the same kind of volume and does these steps for you. It adds scheduled snapshots and a transaction log that lets you restore to any second within a retention period you choose. Two "}]},"e9c3689":{"label":"Dense openings and paragraphs broken up","files_changed":235,"text_changed":235,"fixed":{"chunks_in_files":3109,"new":37,"gone":37},"recursive":{"chunks_in_files":3948,"new":468,"gone":471},"examples":[{"file":"cloud-devops/07-containers-docker.html","before":"A container packages a program with everything it needs to run, so that the thing tested on a laptop is byte for byte the thing running in production. It is the unit that every later chapter deploys: pipelines build container images, registries store them, Kubernetes schedules them. This chapter is ","after":"A container packages a program with everything it needs to run, so that the thing tested on a laptop is byte for byte the thing running in production. It is the unit that every later chapter deploys: pipelines build container images, registries store them, Kubernetes schedules them. This chapter is "},{"file":"cloud-devops/08-dockerfiles.html","before":"A Dockerfile is the recipe for an image, and the difference between a careless one and a careful one is large. It decides whether a build takes ten seconds or two minutes on every commit, and whether the image is 250 MB or 1.9 GB. It decides whether the process runs as root or as nobody, and whether","after":"A Dockerfile is the recipe for an image, and the difference between a careless one and a careful one is large. It decides whether a build takes ten seconds or two minutes on every commit, and whether the image is 250 MB or 1.9 GB. It decides whether the process runs as root or as nobody, and whether"},{"file":"cloud-devops/09-registries.html","before":"An image built on a pipeline's machine is useless until the servers that will run it can fetch it. A registry is where images are stored and served, and the name you use to fetch one matters more than it looks. A tag such as web:latest is a label that can be moved to a different image at any time. A","after":"An image built on a pipeline's machine is useless until the servers that will run it can fetch it. A registry is where images are stored and served, and the name you use to fetch one matters more than it looks. A tag such as web:latest is a label that can be moved to a different image at any time."}]},"7c40ede":{"label":"Repeated teaching removed","files_changed":57,"text_changed":57,"fixed":{"chunks_in_files":986,"new":306,"gone":317},"recursive":{"chunks_in_files":1256,"new":114,"gone":126},"examples":[{"file":"dsa/14-queues-deques.html","before":"A preview of Chapter 29. When every edge costs either 0 or 1, you do not need Dijkstra's heap. Push 0-cost neighbours to the front and 1-cost neighbours to the back . A 0-cost neighbour is the same distance as the current node, so it belongs at the front; a 1-cost one belongs a layer later, at the b","after":"When every edge costs either 0 or 1, you do not need Dijkstra's heap. Push 0-cost neighbours to the front and 1-cost neighbours to the back . A 0-cost neighbour is the same distance as the current node, so it belongs at the front; a 1-cost one belongs a layer later, at the back. The deque then stays"},{"file":"dsa/37-divide-conquer.html","before":"Use matrix exponentiation on any linear recurrence","after":"Explain why a matrix power needs only about log n multiplications"},{"file":"dsa/49-geometry-random.html","before":"The problem: find the k-th smallest value (the median, for example) without sorting everything. Sorting does more work than you need, because it puts every element in its place. You only care about one position. Quickselect uses quicksort's partition step: choose a pivot, then move smaller values to","after":"Quickselect finds the k-th smallest value (the median, for example) without sorting everything. It partitions around a pivot, sees which side k is on, and throws the other side away. Chapter 37 has the code, a trace and a visualiser. This section is about the one line that makes it safe: the random "}]}},"corpus":{"fixed":6368,"recursive":8164,"files":508}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  function draw() {
+    const e = v('#ixE'), k = v('#ixK'), C = D.commits[e], X = C[k], tot = D.corpus[k];
+    const pctFiles = C.text_changed ? X.new / X.chunks_in_files : 0;
+    $('#ixStats').innerHTML = `<div class="stat"><div class="k">Files changed · text changed</div><div class="v">${C.files_changed} · ${C.text_changed}</div></div>` +
+      `<div class="stat ${X.new / tot < 0.05 ? 'good' : 'warn'}"><div class="k">Chunks to embed</div><div class="v">${X.new.toLocaleString('en-GB')}</div></div>` +
+      `<div class="stat"><div class="k">Of chunks in the edited files</div><div class="v">${(100 * pctFiles).toFixed(0)}%</div></div>` +
+      `<div class="stat"><div class="k">Chunks to delete</div><div class="v">${X.gone.toLocaleString('en-GB')}</div></div>`;
+    const opts = [['Rebuild everything', tot], ['Re-embed changed files', X.chunks_in_files], ['Re-embed changed chunks', X.new]];
+    $('#ixRows').innerHTML = opts.map(([n, c], i) => `<div class="ix-row${i === 2 ? ' sel' : ''}"><span class="nm">${n}</span><div class="ix-bar"><i style="width:${(100 * c / tot).toFixed(1)}%"></i><span>${c.toLocaleString('en-GB')} chunks · ${(100 * c / tot).toFixed(1)}% of the corpus</span></div></div>`).join('');
+    const ex = C.examples[0];
+    $('#ixEx').innerHTML = ex ? `<div><span class="k">Before · ${esc(ex.file)}</span><br>${esc(ex.before)}${ex.before.length >= 300 ? '…' : ''}</div><div><span class="k">After</span><br>${esc(ex.after)}${ex.after.length >= 300 ? '…' : ''}</div>` : '<div>No indexed text changed: every edit in this commit was in parts the extractor skips.</div>';
+    $('#ixWhy').innerHTML = `<b>${esc(C.label)}, ${k === 'fixed' ? 'fixed windows' : 'recursive chunks'}: ${X.new.toLocaleString('en-GB')} of ${tot.toLocaleString('en-GB')} chunks need embedding (${(100 * X.new / tot).toFixed(1)}%).</b> ` +
+      (!C.text_changed ? 'File-level hashing of the extracted text skips the whole commit.' : k === 'fixed' ? 'Fixed windows shift whenever the word count changes, so one edit can re-key every later chunk in its file.' : 'Structure-aware chunks change only where the edit falls, unless the edit moves paragraph or section boundaries.');
+    $('#ixWhy').dataset.x = JSON.stringify({ e, k, n: X.new });
+  }
+  for (const id of ['#ixE', '#ixK']) $(id).addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
