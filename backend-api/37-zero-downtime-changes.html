@@ -3,37 +3,276 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Zero-Downtime Changes</title>
+<title>Zero-Downtime Changes · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 37 of Backend & API. Expand and contract, backfills, renaming a column safely, feature flags and rolling back data changes, with a live column rename and a million-row backfill measured.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .zd-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .zd-v { display:none; } .zd-v.on { display:block; }
+  .zd-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-family:var(--mono); font-size:12.5px; line-height:1.7; overflow-x:auto; }
+  .zd-box .bad { color:var(--red); font-weight:700; } .zd-box .ok { color:var(--green); font-weight:700; } .zd-box .dim { color:var(--muted); }
+  .zd-ev { display:grid; grid-template-columns:58px 1fr; gap:8px; }
+  .zd-bars { display:grid; grid-template-columns:120px 1fr 86px; gap:6px 10px; align-items:center; margin-top:6px; }
+  .zd-bars .tr { height:14px; background:var(--surface); border-radius:4px; position:relative; }
+  .zd-bars .br { position:absolute; left:0; top:2px; bottom:2px; border-radius:3px; background:var(--accent); min-width:2px; }
+  .zd-bars .br.hot { background:var(--amber); }
+  .zd-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="37">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 37</span><span class="pill">Expert</span><span class="pill">⏱ 45 min</span></div>
     <h1>Zero-Downtime <span class="grad">Changes</span></h1>
-    <p class="lead">Expand and contract: changing schemas, payloads and behaviour while old and new code run side by side.</p>
+    <p class="lead">Chapter 36 made deploys of code safe. The harder part is changing what code and data agree on: renaming a column, changing a field's type, splitting a table, changing an API response. During a rolling deploy, old and new versions of your service run side by side against the same database, so a change that is correct for the new version alone can break the old one, or let the two quietly disagree about the data.</p>
+    <p class="lead">This chapter covers the technique that makes such changes safe, expand and contract, with backfills, a column rename done properly, feature flags and what to do when a data change goes wrong. The lab renames a column under live traffic three ways and backfills a million rows in one statement and in batches, while another writer keeps working.</p>
+    <ul class="objectives">
+      <li><span>Split a breaking change into expand, migrate and contract steps</span></li>
+      <li><span>Backfill data in batches without blocking live writes</span></li>
+      <li><span>Rename a column with old and new code running at once</span></li>
+      <li><span>Use feature flags to separate deploying code from releasing behaviour</span></li>
+      <li><span>Plan how to undo a data change before making it</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Rolling deploys and migrations at deploy time:</b> <a href="36-deploying-services.html">Chapter 36</a>.</li>
+        <li><b>Alembic migrations:</b> <a href="07-orms-and-migrations.html">Chapter 7</a>.</li>
+        <li><b>Additive API changes and versioning:</b> <a href="13-api-versioning.html">Chapter 13</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Expand and contract</li>
-    <li>Backfills</li>
-    <li>Renaming a column safely</li>
-    <li>Feature flags</li>
-    <li>Rolling back data changes</li>
-  </ol>
+  <h2>Expand and contract</h2>
+  <p>Any change that old code cannot tolerate is done in phases, each deployed and verified before the next, so that every adjacent pair of versions works together. <b>Expand</b>: add the new structure alongside the old (a new column, table or field), nullable and unused, so nothing breaks. <b>Migrate</b>: ship code that writes to both, backfill existing data into the new structure, then switch reads to the new one. <b>Contract</b>: once no running code reads or writes the old structure, remove it. The same pattern, also called parallel change, applies to API fields (add the new one, migrate clients, deprecate and remove the old, Chapter 13), message schemas and configuration. It costs several deploys instead of one; in exchange, every step can be rolled back on its own.</p>
+
+  <h2>Backfills</h2>
+  <p>A backfill fills the new structure for existing rows. Written as one <code>UPDATE ... SET new = old</code>, it is a single transaction over the whole table: on PostgreSQL it locks every row it touches until it commits, bloats the table and the write-ahead log, and can delay replicas; on SQLite it blocks every other writer. Run it instead as a separate job in <b>batches</b> keyed by primary key, a few thousand rows per transaction with a short pause between them, idempotent (<code>WHERE new IS NULL</code>) so it can be stopped and resumed, and with progress logged. Watch database load and replication lag while it runs, and throttle if they climb.</p>
+<pre class="code"><span class="k">def</span> <span class="f">backfill_display_name</span>(engine, batch=5000, pause=0.05):
+    last = 0
+    <span class="k">while True</span>:
+        <span class="k">with</span> engine.<span class="f">begin</span>() <span class="k">as</span> conn:                                   <span class="c"># one short transaction per batch</span>
+            ids = conn.<span class="f">scalars</span>(<span class="f">text</span>(<span class="s">"SELECT id FROM customers WHERE id > :last ORDER BY id LIMIT :n"</span>),
+                                {<span class="s">"last"</span>: last, <span class="s">"n"</span>: batch}).<span class="f">all</span>()
+            <span class="k">if not</span> ids:
+                <span class="k">return</span>
+            conn.<span class="f">execute</span>(<span class="f">text</span>(<span class="s">"UPDATE customers SET display_name = fullname "</span>
+                              <span class="s">"WHERE id BETWEEN :lo AND :hi AND display_name IS NULL"</span>), {<span class="s">"lo"</span>: ids[0], <span class="s">"hi"</span>: ids[-1]})
+        last = ids[-1]
+        log.<span class="f">info</span>(<span class="s">"backfill progress"</span>, extra={<span class="s">"fields"</span>: {<span class="s">"last_id"</span>: last}})
+        time.<span class="f">sleep</span>(pause)                                                  <span class="c"># leave room for live traffic</span></pre>
+
+  <h2>Renaming a column safely</h2>
+  <p>Renaming <code>customers.fullname</code> to <code>display_name</code> looks like one line of SQL. Under a rolling deploy it is five steps. (1) Add <code>display_name</code>, nullable. (2) Keep the two columns in sync for every write, from either version: a database trigger, or a release of the old code that writes both. (3) Backfill existing rows in batches. (4) Deploy code that reads and writes <code>display_name</code>, still writing <code>fullname</code> too. (5) Once no instance of the old code is left, stop writing <code>fullname</code>, then drop it in a later deploy. Step 2 is the one most often missed: without it, any write the old version makes after the backfill leaves <code>display_name</code> out of date, and the new version reads stale data with no error at all.</p>
+
+  <h2>Simulator: a rename and a backfill under load</h2>
+  <p><b>Rename</b>: two app instances read and update 200 frequently used customers in a SQLite database, 30% writes. One second in, the migration runs; then instance a switches to v2, and a second later instance b does. Every read is compared with the most recent write, so stale reads are counted as well as errors. Three strategies: rename the column in one migration; expand and backfill without keeping the columns in sync; and expand with a sync trigger. <b>Backfill</b>: copying a column across a million rows while another connection inserts a row every 5 ms, in one statement and in batches of 50,000, 5,000 and 1,000.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Do old and new code survive the change?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="zd-l">Experiment</div>
+      <div class="seg" id="zdE"><button class="active" data-v="rename">rename a column</button><button data-v="backfill">backfill a million rows</button></div>
+      <div class="zd-v on" id="zdRen">
+        <div class="zd-l">Strategy</div>
+        <div class="seg" id="zdS"><button class="active" data-v="big_bang">rename in one migration</button><button data-v="expand_nosync">expand, no sync</button><button data-v="expand_sync">expand + sync trigger</button></div>
+      </div>
+      <div class="zd-v" id="zdBf">
+        <div class="zd-l">Rows per transaction</div>
+        <div class="seg" id="zdB"><button class="active" data-v="all">all in one</button><button data-v="50000">50,000</button><button data-v="5000">5,000</button><button data-v="1000">1,000</button></div>
+      </div>
+      <div class="zd-box" id="zdOut"></div>
+      <div class="stats" id="zdStats"></div>
+      <div class="zd-why" id="zdWhy"></div>
+    </div>
+    <div class="panel-foot">Python's sqlite3 in WAL mode. Rename: two threads standing in for two instances, each switching from v1 to v2 at the times shown; v2 reads <code>COALESCE(display_name, fullname)</code> in the expand strategies. Backfill: 1,000,000 rows; the other writer's latency is its own insert's duration; SQLite allows one writer at a time, so a long transaction blocks every other write, as row locks would for the rows touched in PostgreSQL.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>rename in one migration</b>: from the moment the migration ran until the last instance switched, every v1 read and write failed with "no such column: fullname". With a rollback, the old code would fail just the same against the renamed column.</li>
+    <li><b>expand, no sync</b>: no errors at all, which is what makes it dangerous. Writes by v1 after the backfill updated only <code>fullname</code>, so v2 kept reading the old <code>display_name</code>.</li>
+    <li><b>expand + sync trigger</b>: no errors and no stale reads, through the whole rollout and the final contract step.</li>
+    <li><b>backfill</b>: one statement held the write lock for its whole duration, and the live writer's slowest insert waited that long. Batches capped the wait per batch, at the price of a longer total.</li>
+  </ul>
+
+  <h2>Feature flags</h2>
+  <p>A feature flag is a runtime switch, read from a flag service or configuration, that decides whether new behaviour runs. It separates <b>deploying</b> code from <b>releasing</b> behaviour: code ships dark, then the flag is turned on for staff, then 1%, 10% and 100% of users or tenants, and off again in seconds if metrics worsen, without a deploy. Flags make expand and contract easier too ("read from the new column" can be a flag). Keep them disciplined: give each flag an owner and an expiry, evaluate it once per request so a user sees consistent behaviour, default to the safe value when the flag service is unreachable, and delete flags once fully released, because stale flags are exactly what woke the dead code in Knight Capital's deployment (Chapter 36).</p>
+<pre class="code"><span class="k">if</span> flags.<span class="f">enabled</span>(<span class="s">"pricing.new-tax-engine"</span>, tenant=tenant.id, default=<span class="k">False</span>):
+    total = new_tax_engine.<span class="f">quote</span>(cart)
+<span class="k">else</span>:
+    total = legacy_tax.<span class="f">quote</span>(cart)</pre>
+
+  <h2>Rolling back data changes</h2>
+  <p>Code can be rolled back; data usually cannot. Before a data change, decide how you would undo it. Keep the old structure until the new one is proven (the contract step waits for days, not minutes). Make transformations reversible, or record what you changed: a backfill that overwrites values should write the old value somewhere first. For destructive operations, take a backup or snapshot and test restoring it. Prefer <b>roll forward</b> for bugs that wrote bad data: fix the code, then run a corrective job, because restoring a backup also discards every good write since it was taken. And remember side effects outside your database, such as emails sent and events published, which no rollback reaches.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Change</th><th>Unsafe in one step because</th><th>Expand</th><th>Migrate</th><th>Contract</th></tr></thead>
+      <tbody>
+        <tr><td><b>Rename a column</b></td><td>Old code reads the old name</td><td>Add new column; sync writes</td><td>Backfill; read new</td><td>Stop writing old; drop it</td></tr>
+        <tr><td><b>Change a column's type</b></td><td>Old code writes the old type</td><td>Add typed column</td><td>Dual-write; backfill; switch reads</td><td>Drop old column</td></tr>
+        <tr><td><b>Make a column NOT NULL</b></td><td>Old code inserts without it</td><td>Code always sets it</td><td>Backfill nulls; add constraint as NOT VALID, then validate</td><td>Rely on the constraint</td></tr>
+        <tr><td><b>Remove an API field</b></td><td>Clients still read it</td><td>Add the replacement</td><td>Migrate clients; deprecate (Chapter 38)</td><td>Remove after the sunset date</td></tr>
+        <tr><td><b>Split a table</b></td><td>Old code reads the joined shape</td><td>Create new table</td><td>Dual-write; backfill; switch reads</td><td>Drop old columns</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Expand</b> add the new structure; nothing uses it</li>
+      <li data-k="step"><b>Sync writes</b> trigger or dual-write from every version</li>
+      <li data-k="step"><b>Backfill</b> in batches, resumable, throttled</li>
+      <li data-k="step"><b>Switch reads</b> behind a flag; verify</li>
+      <li data-k="end"><b>Contract</b> after no old code remains; drop the old</li>
+    </ol>
+    <figcaption><b>Every step is its own deploy.</b> Each pair of neighbouring versions works with the same schema.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🐙</div>
+    <div class="body"><div class="title">Use case: GitHub's gh-ost for online schema changes</div><p>GitHub runs very large MySQL tables, and in 2016 it open-sourced gh-ost, its tool for changing their schema without downtime. Altering a large table directly in MySQL could lock it or take hours, and earlier online-change tools copied rows into a new table while keeping it in sync with triggers, which added load to the busiest tables. gh-ost applies the ideas in this chapter at the level of a whole table. It creates a "ghost" copy with the new schema, copies existing rows in small batches that it throttles automatically when replication lag or load rises, and keeps the copy in sync by reading the database's binary log rather than with triggers. Only when the copy has caught up does it swap the tables, in a brief, controlled cut-over that operators can postpone, and the whole migration can be paused or abandoned at any time with nothing lost. Expand (a new table), backfill in throttled batches, keep in sync, then cut over and contract: the same sequence, built so engineers could change production tables during working hours.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Renaming or dropping a column</b> in the same deploy as the code change.</li>
+      <li><b>Backfilling without syncing new writes,</b> leaving silently stale data.</li>
+      <li><b>One giant UPDATE</b> instead of throttled, resumable batches.</li>
+      <li><b>Contracting too early,</b> before every instance, job and client has moved.</li>
+      <li><b>Feature flags that never get removed.</b></li>
+      <li><b>Overwriting data</b> with no record of the old values.</li>
+      <li><b>Assuming a rollback undoes data changes</b> and side effects.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you rename a database column without downtime?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Not in one step, because during a rolling deploy the old code still uses the old name. I expand first: add the new column as nullable. Then I make every write keep the two in sync, with a trigger or by releasing a version of the old code that writes both, and backfill existing rows in small batches. Next I deploy code that reads the new column and still writes both. Once no old code is running, I stop writing the old column and, in a later deploy, drop it. Each step is deployed and verified separately and can be rolled back on its own; skipping the sync step is the classic mistake, because it causes stale data without any error.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You must change <code>orders.amount</code> from a float in pounds to an integer in pence on a 400-million-row table, with no downtime. Plan it.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Expand: add <code>amount_pence BIGINT NULL</code>, which is a metadata-only change in PostgreSQL. Sync: deploy code that writes both columns on every insert and update, converting with explicit rounding, and add a trigger as a safety net for other writers. Backfill: a resumable job in batches of a few thousand by primary key, with a pause and throttling on replication lag and database CPU, recording rows whose float values do not convert cleanly for review. Verify: a reconciliation query comparing the two columns over all rows. Switch reads behind a feature flag, per endpoint, watching errors and totals. Then add the NOT NULL constraint as NOT VALID and validate it separately, stop writing the float column, wait through a release cycle, and drop it. API responses keep their old field until clients migrate. At every step the previous version still works, and the old column stays until I am sure.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>During a rollout, old and new code share the database: every step must work for both.</li>
+      <li>Expand, sync and backfill, switch reads, then contract, each as its own deploy.</li>
+      <li>Keep old and new structures in sync for every writer, or reads go silently stale.</li>
+      <li>Backfill in small, resumable, throttled batches.</li>
+      <li>Feature flags release behaviour without deploys; plan how to undo data changes before making them.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A migration renames a column in one step during a rolling deploy. What happens?</p>
+      <div class="opts">
+        <button class="opt">Nothing, because the migration is fast</button>
+        <button class="opt">Only the new code fails</button>
+        <button class="opt">Old instances fail every query that uses the old name until they are replaced</button>
+        <button class="opt">The database renames it back</button>
+      </div>
+      <div class="explain">Measured: every v1 read and write failed with "no such column" until the last instance switched.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Expand and backfill, but no sync between the columns. What goes wrong?</p>
+      <div class="opts">
+        <button class="opt">Old code's writes after the backfill never reach the new column, so the new code reads stale data</button>
+        <button class="opt">The backfill fails</button>
+        <button class="opt">The old code crashes</button>
+        <button class="opt">Nothing</button>
+      </div>
+      <div class="explain">Measured: hundreds of stale reads and no errors at all.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why backfill in batches rather than one UPDATE?</p>
+      <div class="opts">
+        <button class="opt">It finishes sooner</button>
+        <button class="opt">Batches use less disk</button>
+        <button class="opt">SQL forbids large updates</button>
+        <button class="opt">Each short transaction holds locks briefly, so live writes are not blocked for the whole backfill</button>
+      </div>
+      <div class="explain">Batches took longer in total but kept the live writer's waits short.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does a feature flag separate?</p>
+      <div class="opts">
+        <button class="opt">Development from testing</button>
+        <button class="opt">Deploying code from releasing its behaviour</button>
+        <button class="opt">Reads from writes</button>
+        <button class="opt">Tenants from each other</button>
+      </div>
+      <div class="explain">Ship dark, turn on gradually, turn off in seconds; then delete the flag.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A bug wrote incorrect totals for six hours. Why is "fix and run a corrective job" usually better than restoring last night's backup?</p>
+      <div class="opts">
+        <button class="opt">Backups are unreliable</button>
+        <button class="opt">Restores are slow</button>
+        <button class="opt">A restore also discards every correct write made since the backup</button>
+        <button class="opt">Corrective jobs need no testing</button>
+      </div>
+      <div class="explain">Roll forward when you can; keep backups for when you cannot.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"rename":{"big_bang":{"v1_err":771,"v2_err":0,"stale":0,"reads":1225,"writes":524,"examples":[{"version":"v1","error":"no such column: fullname"}],"timeline":[[1.0,"migration: rename fullname to display_name"],[1.5,"instance a now runs v2"],[2.5,"instance b now runs v2"]]},"expand_nosync":{"v1_err":0,"v2_err":0,"stale":255,"reads":1717,"writes":723,"examples":[{"version":"v2","customer":63,"read":"Name 63.192879","latest":"Name 63.980592"},{"version":"v2","customer":185,"read":"Name 185.331422","latest":"Name 185.363424"}],"timeline":[[1.0,"migration: add display_name (nullable)"],[1.05,"backfill complete"],[1.55,"instance a now runs v2"],[2.55,"instance b now runs v2"],[3.56,"contract: drop fullname (after every instance runs v2)"]]},"expand_sync":{"v1_err":0,"v2_err":0,"stale":0,"reads":1713,"writes":721,"examples":[],"timeline":[[1.0,"migration: add display_name (nullable)"],[1.0,"migration: trigger copies fullname to display_name"],[1.05,"backfill complete"],[1.55,"instance a now runs v2"],[2.55,"instance b now runs v2"],[3.56,"contract: drop fullname (after every instance runs v2)"]]}},"backfill":{"all":{"batch":"all","batches":1,"secs":0.44,"writer_p50":1.13,"writer_p99":445.2,"writer_max":445.2,"writes":93},"50000":{"batch":50000,"batches":20,"secs":0.54,"writer_p50":1.12,"writer_p99":172.6,"writer_max":172.6,"writes":99},"5000":{"batch":5000,"batches":200,"secs":1.67,"writer_p50":1.14,"writer_p99":61.7,"writer_max":203.4,"writes":212},"1000":{"batch":1000,"batches":1000,"secs":7.14,"writer_p50":1.18,"writer_p99":65.2,"writer_max":142.7,"writes":677}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  function rename(s) {
+    const r = D.rename[s];
+    const ops = r.reads + r.writes + r.v1_err + r.v2_err;
+    let out = `<div class="dim">0.00 s  both instances run v1</div>` + r.timeline.map(([t, w]) => `<div class="zd-ev"><span class="dim">${t.toFixed(2)} s</span><span>${esc(w)}</span></div>`).join('');
+    out += r.examples.map(e => e.error ? `<div class="bad">${e.version}: ${esc(e.error)}</div>` : `<div class="bad">${e.version} read customer ${e.customer}: "${esc(e.read)}", latest write was "${esc(e.latest)}"</div>`).join('');
+    if (!r.examples.length) out += `<div class="ok">no errors and no stale reads</div>`;
+    const why = {
+      big_bang: `<b>${r.v1_err} operations by v1 failed.</b> The rename took effect instantly, and every v1 query still named <code>fullname</code>. Instance b kept failing until it was replaced; a rollback of the code would have left v1 facing the renamed column, failing the same way.`,
+      expand_nosync: `<b>No errors, but ${r.stale} of ${r.reads} reads returned an out-of-date name.</b> After the backfill, v1 kept updating only <code>fullname</code>; v2 read <code>display_name</code>, which was filled and therefore never fell back. Nothing alerted, and support would hear about it first.`,
+      expand_sync: `<b>No errors and no stale reads through the whole rollout.</b> The trigger copied every v1 write to <code>display_name</code>, v2 wrote both columns, and the old column was dropped only after both instances ran v2.`,
+    }[s];
+    return { out, why, stats: [['v1 errors', r.v1_err, r.v1_err ? 'warn' : 'good'], ['Stale reads', r.stale, r.stale ? 'warn' : 'good'], ['Operations', ops, '']], x: { s, err: r.v1_err, stale: r.stale } };
+  }
+  function backfill(b) {
+    const r = D.backfill[b], all = Object.values(D.backfill);
+    const max = Math.max(...all.map(x => x.writer_max));
+    const out = `<div class="dim">copy total_pence to total_cents on 1,000,000 rows; live writer inserts every 5 ms</div><div class="zd-bars">` +
+      all.map(x => `<span>${x.batch === 'all' ? 'one statement' : x.batch.toLocaleString('en-GB') + ' per txn'}</span><div class="tr"><div class="br ${x.batch === r.batch ? 'hot' : ''}" style="width:${100 * x.writer_p99 / max}%"></div></div><span>p99 ${x.writer_p99} ms</span>`).join('') + '</div>' +
+      `<div class="dim" style="margin-top:6px">selected: ${r.batches} transaction${r.batches > 1 ? 's' : ''}, ${r.secs} s in total; live writer p50 ${r.writer_p50} ms, p99 ${r.writer_p99} ms, slowest ${r.writer_max} ms</div>`;
+    const why = r.batch === 'all'
+      ? `<b>The live writer's slowest insert waited ${r.writer_max} ms</b>, the whole length of the backfill, because one transaction held the write lock throughout. On a production table with hundreds of millions of rows that is minutes of blocked writes, plus a huge transaction for replicas to apply.`
+      : `<b>Each transaction covers ${Number(r.batch).toLocaleString('en-GB')} rows, so the live writer's p99 fell to ${r.writer_p99} ms</b> (from ${D.backfill.all.writer_p99} ms with one statement). The total took ${r.secs} s instead of ${D.backfill.all.secs} s: smaller batches trade speed for less disruption. A few slower inserts remain, from SQLite's own write-ahead-log checkpoints.`;
+    return { out, why, stats: [['Backfill took', r.secs + ' s', ''], ['Live writer p99', r.writer_p99 + ' ms', r.writer_p99 < 100 ? 'good' : 'warn'], ['Slowest live write', r.writer_max + ' ms', r.writer_max < 250 ? 'good' : 'warn']], x: { b, p99: r.writer_p99 } };
+  }
+  function draw() {
+    const e = v('#zdE');
+    $('#zdRen').classList.toggle('on', e === 'rename'); $('#zdBf').classList.toggle('on', e === 'backfill');
+    const r = e === 'rename' ? rename(v('#zdS')) : backfill(v('#zdB'));
+    $('#zdOut').innerHTML = r.out;
+    $('#zdStats').innerHTML = r.stats.map(([k, val, c]) => `<div class="stat ${c}"><div class="k">${k}</div><div class="v">${val}</div></div>`).join('');
+    $('#zdWhy').innerHTML = r.why;
+    $('#zdWhy').dataset.x = JSON.stringify(Object.assign({ e }, r.x));
+  }
+  for (const id of ['#zdE', '#zdS', '#zdB']) $(id).addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
