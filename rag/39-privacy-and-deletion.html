@@ -3,37 +3,277 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Privacy, Retention &amp; Deletion</title>
+<title>Privacy, Retention &amp; Deletion · RAG by Palak Deb Patra</title>
+<meta name="description" content="Chapter 39 of RAG. Personal data in corpora, copies everywhere, deletion that works, embedding inversion and retention policies, measured with HNSW deletes, leftover embeddings and synthetic personal records.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('rag-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pv-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .pv-ex { margin-top:12px; display:grid; gap:6px; font-size:13px; }
+  .pv-ex div { border:1px solid var(--border); border-radius:10px; padding:7px 12px; background:var(--surface-2); }
+  .pv-ex .k { font-size:11px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }
+  .pv-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="39">
-<!-- rag:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 39</span><span class="pill">Expert</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Privacy, Retention &amp; <span class="grad">Deletion</span></h1>
-    <p class="lead">Personal data in indexes, deleting it everywhere it was copied, and what embeddings can leak.</p>
+    <h1>Privacy, Retention <span class="grad">&amp; Deletion</span></h1>
+    <p class="lead">Corpora contain people: names in tickets, email addresses in meeting notes, phone numbers in on-call rotas. A RAG system copies that text into several stores (chunk store, vector index, caches, logs, evaluation sets, backups), makes it searchable by meaning, and can quote it to anyone who asks the right question. When a person asks to be forgotten, or a retention period ends, deletion has to reach every copy. A deleted vector, it turns out, is not always gone.</p>
+    <p class="lead">This chapter measures three things on the lab's machine:</p>
+    <ul>
+      <li>what "delete" does to an HNSW index and its saved file;</li>
+      <li>how much a leftover embedding reveals about its text;</li>
+      <li>how easily a person's record is found by name, and what simple redaction leaves behind.</li>
+    </ul>
+    <ul class="objectives">
+      <li><span>Find personal data in a corpus before indexing it</span></li>
+      <li><span>List every place a RAG system copies text</span></li>
+      <li><span>Delete in a way that actually removes data, and prove it</span></li>
+      <li><span>Explain what embeddings can reveal</span></li>
+      <li><span>Set retention policies for indexes, caches and logs</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Deletes and rebuilds:</b> <a href="22-indexing-pipelines.html">Chapter 22</a>.</li>
+        <li><b>Permissions and canary tests:</b> <a href="23-permissions-and-tenancy.html">Chapter 23</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Personal data in corpora</li>
-    <li>Copies everywhere</li>
-    <li>Deletion that works</li>
-    <li>Embedding inversion</li>
-    <li>Retention policies</li>
-  </ol>
+  <h2>Personal data in corpora</h2>
+  <p>Before indexing, find out what personal data the sources contain and whether the RAG use is allowed for it. Detection combines several layers:</p>
+  <ul>
+    <li><b>Patterns</b> for structured identifiers: emails, phone numbers, card and account numbers.</li>
+    <li><b>Named-entity recognition</b> for names and addresses.</li>
+    <li><b>Source-level rules</b>: HR folders are not indexed for everyone.</li>
+  </ul>
+  <p>In the lab, 200 synthetic personal records were mixed into the Atlas chunks: support tickets, meeting notes, an on-call rota. Searching for a person by name returned their record in the top 5 87% of the time. A regex redactor removed every email and phone number, and every name was still there. Pattern matching alone is not redaction.</p>
+<pre class="code">EMAIL = re.<span class="f">compile</span>(<span class="s">r"[\w.+-]+@[\w-]+\.[\w.]+"</span>)
+PHONE = re.<span class="f">compile</span>(<span class="s">r"\+?\d[\d ()-]{7,}\d"</span>)
+text = EMAIL.<span class="f">sub</span>(<span class="s">"[email]"</span>, PHONE.<span class="f">sub</span>(<span class="s">"[phone]"</span>, text))       <span class="c"># catches structured identifiers only</span>
+<span class="c"># names, addresses and free-text descriptions need an NER model, and still a human-reviewed sample</span></pre>
+
+  <h2>Copies everywhere</h2>
+  <p>A single source paragraph typically ends up in many places:</p>
+  <ul>
+    <li>the extracted-text store;</li>
+    <li>chunks and their metadata;</li>
+    <li>vectors in the index;</li>
+    <li>the keyword index;</li>
+    <li>parent-section and summary stores (Chapter 24);</li>
+    <li>answer and retrieval caches (Chapter 28);</li>
+    <li>request logs and traces with retrieved context (Chapter 36);</li>
+    <li>evaluation sets (Chapter 21);</li>
+    <li>fine-tuning data (Chapter 33);</li>
+    <li>backups of all of the above.</li>
+  </ul>
+  <p>Keep a data map of these stores, each keyed by source document id. Deleting a document must be a single operation that fans out to every store and reports what it removed.</p>
+
+  <h2>Deletion that works</h2>
+  <p>Vector indexes are built for search, not erasure. In the lab, 1,000 of the Atlas's 83,118 sentence vectors were marked deleted in an HNSW index, which then never returned them in search (0% came back). But the saved index file still contained the bytes of 100% of them, and unmarking restored 100% of them exactly, to anyone holding the file. Marking hides data from queries; it does not remove it. Real deletion means:</p>
+  <ul>
+    <li>rebuilding or compacting the index;</li>
+    <li>overwriting or expiring old files and snapshots;</li>
+    <li>purging caches and logs;</li>
+    <li>checking afterwards, with a search for the deleted text and a scan of the stores for its id.</li>
+  </ul>
+
+  <h2>Simulator: what is left after "delete"</h2>
+  <p>Three measurements on the lab's machine: deleting from an hnswlib index and inspecting the saved file; identifying text from its embedding alone; and finding and redacting synthetic personal records. The records use invented names, example.com addresses and fictional phone numbers.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Is it really gone, and what does a vector give away?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="pv-l">Measurement</div>
+      <div class="seg" id="pvM"><button class="active" data-v="deletion">Deleting from HNSW</button><button data-v="inversion">A leftover embedding</button><button data-v="personal">Personal records</button></div>
+      <div class="stats" id="pvStats"></div>
+      <div class="pv-ex" id="pvEx"></div>
+      <div class="pv-why" id="pvWhy"></div>
+    </div>
+    <div class="panel-foot">hnswlib 0.8.0 (M 16, ef_construction 200), 83,118 bge-small sentence vectors, 1,000 marked deleted, index saved and reloaded. Embedding lookup: 500 sentences, their vectors perturbed slightly, matched against the whole corpus. Personal records: 200 synthetic records added to the 9,379 Atlas chunks; name searches use bge-small with its query prefix.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>Deleting from HNSW</b>: invisible to search, intact on disk.</li>
+    <li><b>A leftover embedding</b>: with the corpus as the candidate pool, every embedding identified its exact sentence. Even without the sentence in the pool, the nearest other sentence was often close in meaning (see the examples), and from the same chapter 34% of the time.</li>
+    <li><b>Personal records</b>: found by name 87% of the time; regex left 100% of names.</li>
+  </ul>
+
+  <h2>Embedding inversion</h2>
+  <p>Embeddings are not anonymised data. With access to the original texts, an embedding identifies its text by lookup, as the lab showed. Without them, research has shown that text can be reconstructed from embeddings alone, closely and sometimes exactly (see the use case). Treat stored vectors as the personal data they were computed from. Apply the same access control, deletion and retention as to the text, and do not send embeddings of sensitive text to third parties on the assumption that they are opaque.</p>
+
+  <h2>Retention policies</h2>
+  <p>Set a retention period for every store, tied to its purpose:</p>
+  <ul>
+    <li>index content lives as long as its source document;</li>
+    <li>answer caches for hours or days;</li>
+    <li>request logs with retrieved text for as short a time as debugging allows, then without the text;</li>
+    <li>evaluation sets reviewed for personal data before they are kept.</li>
+  </ul>
+  <p>Backups need expiry too, or deletion never completes. Automate retention and record what was deleted when, since regulations such as the GDPR's right to erasure expect you to show it.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Store</th><th>Holds</th><th>Delete by</th><th>Usual retention</th></tr></thead>
+      <tbody>
+        <tr><td><b>Extracted text and chunks</b></td><td>Source text</td><td>Document id</td><td>As long as the source</td></tr>
+        <tr><td><b>Vector index</b></td><td>Embeddings (recoverable meaning)</td><td>Id, then rebuild or compact</td><td>As long as the source</td></tr>
+        <tr><td><b>Keyword index</b></td><td>Terms and positions</td><td>Id, then merge segments</td><td>As long as the source</td></tr>
+        <tr><td><b>Answer and retrieval caches</b></td><td>Answers quoting sources</td><td>Purge by source id, or short TTL</td><td>Hours to days</td></tr>
+        <tr><td><b>Logs and traces</b></td><td>Questions, retrieved text, answers</td><td>Expiry; drop text early</td><td>Days to weeks</td></tr>
+        <tr><td><b>Evaluation and training sets</b></td><td>Questions and passages</td><td>Review and versioned removal</td><td>Reviewed periodically</td></tr>
+        <tr><td><b>Backups and snapshots</b></td><td>Everything</td><td>Expiry</td><td>Bounded, documented</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Receive</b> a deletion request for a source id</li>
+      <li data-k="step"><b>Fan out</b> to every store in the data map</li>
+      <li data-k="step"><b>Rebuild</b> or compact indexes; purge caches and logs</li>
+      <li data-k="step"><b>Verify</b>: search for the text, scan stores for the id</li>
+      <li data-k="end"><b>Record</b> what was removed, and let backups expire</li>
+    </ol>
+    <figcaption><b>Deletion that works.</b> Hiding from search is not erasure.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🗑️</div>
+    <div class="body"><div class="title">Use case: "Text Embeddings Reveal (Almost) As Much As Text"</div><p>In 2023 John Morris and colleagues at Cornell published Vec2Text at EMNLP. They trained a model to reconstruct text from its embedding, guessing a text, embedding the guess, comparing it with the target vector and correcting it over several rounds. For short inputs embedded with a popular open model, they recovered most texts exactly, and they recovered full names from embeddings of clinical notes. Their conclusion was that embeddings should be protected with the same care as the text they come from. The lab's simpler measurement points the same way: anyone with an embedding and a plausible pool of candidate texts can tell which text it was.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Treating "marked deleted" as deleted.</b></li>
+      <li><b>Forgetting caches, logs and evaluation sets.</b></li>
+      <li><b>Regex-only redaction.</b></li>
+      <li><b>Treating embeddings as anonymous.</b></li>
+      <li><b>Backups with no expiry.</b></li>
+      <li><b>Indexing first, asking later.</b></li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> A customer asks you to delete all their data from your RAG system. What do you do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Use a data map of every store that holds copies — extracted text, chunks, vector and keyword indexes, parent and summary stores, caches, logs and traces, evaluation and training sets, backups — all keyed by source document id. Trigger one deletion job that removes the customer's documents from each, rebuilds or compacts the vector index because marked deletes still leave the vectors on disk, purges caches and logs, and lets backups expire on a documented schedule. Then verify by searching for their content and scanning stores for their ids, and record what was removed and when.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A colleague argues embeddings are safe to share with a vendor because they are just numbers. How do you respond?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Embeddings encode meaning precisely enough to be matched back to their text: anyone with a candidate pool can identify the exact text by nearest-neighbour lookup, and research such as Vec2Text reconstructed short texts, including names, from embeddings alone. So they are personal data whenever their source text is. Treat them with the same contracts, access control, retention and deletion as the text. If sharing is necessary, share embeddings of redacted text, minimise what is sent, and get legal review.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Corpora contain people; detect personal data before indexing, with more than regex.</li>
+      <li>A RAG system copies text into many stores; deletion must reach all of them.</li>
+      <li>Marked deletes hide vectors from search but leave them on disk: rebuild and verify.</li>
+      <li>Embeddings reveal their text; protect them like the text.</li>
+      <li>Every store needs a retention period, backups included.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">After marking vectors deleted in an HNSW index, what remained in the saved file?</p>
+      <div class="opts">
+        <button class="opt">Nothing</button>
+        <button class="opt">Only their ids</button>
+        <button class="opt">The full vectors, restorable by unmarking</button>
+        <button class="opt">A compressed copy</button>
+      </div>
+      <div class="explain">Rebuild or compact to remove them.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What did a regex redactor leave in the synthetic personal records?</p>
+      <div class="opts">
+        <button class="opt">Every name</button>
+        <button class="opt">Every email address</button>
+        <button class="opt">Every phone number</button>
+        <button class="opt">Nothing</button>
+      </div>
+      <div class="explain">Names need entity recognition and review.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why should embeddings be treated as personal data?</p>
+      <div class="opts">
+        <button class="opt">They are large</button>
+        <button class="opt">They contain the original text verbatim</button>
+        <button class="opt">Regulations name vectors explicitly</button>
+        <button class="opt">They can be matched back to, or partly reconstructed into, their text</button>
+      </div>
+      <div class="explain">An embedding is a fingerprint of its text.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which store is most often forgotten in a deletion?</p>
+      <div class="opts">
+        <button class="opt">The vector index</button>
+        <button class="opt">Caches, logs, evaluation sets and backups</button>
+        <button class="opt">The source system</button>
+        <button class="opt">The chunk store</button>
+      </div>
+      <div class="explain">Keep a data map keyed by document id.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How do you prove a deletion worked?</p>
+      <div class="opts">
+        <button class="opt">Trust the API's response</button>
+        <button class="opt">Wait a week</button>
+        <button class="opt">Search for the deleted content and scan every store for its ids, then record the result</button>
+        <button class="opt">Restart the service</button>
+      </div>
+      <div class="explain">Verification is part of deletion.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = RAG;
+  const D = {"deletion":{"deleted":1000,"bytes_still_in_saved_file":1.0,"recoverable_by_unmarking":1.0,"returned_by_search":0.0,"file_mb":133.5},"inversion":{"targets":500,"pool":83118,"exact_sentence_top1":1.0,"same_chapter_top1":1.0,"exact_text_absent_same_chapter":0.338,"examples":[["Using a pod's address in configuration.","Connecting to pod IP addresses, or caching them."],["Publish the completion marker last and verify checksums on restore.","Treat everything written since the last successful sync as lost."],["Machine learning is for the cases where nobody can write the rule down, but plenty of examples exist.","Machine learning is rules the machine works out from examples ."],["For a cache cluster, a moved key is a miss.","In a cache, a key that moves is merely a miss: the new node fetches the value from the origin."],["Two details are easy to miss.","Two details make or break it."],["In multi-label classification each row can have any number of labels.","Multi-label problems need one decision per label, with sigmoid outputs, binary relevance or classifier chains."]]},"personal":{"records":200,"found_by_name_top5":0.87,"contacts_left_after_regex":0.0,"names_left_after_regex":1.0,"example":"Support ticket from Asha Rao (asha.rao0@example.com, +44 7000 020568): cannot reset password after the March update.","example_redacted":"Support ticket from Asha Rao ([email], [phone]): cannot reset password after the March update."}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  const pc = (x) => (100 * x).toFixed(0) + '%';
+  function draw() {
+    const m = v('#pvM');
+    if (m === 'deletion') {
+      const X = D.deletion;
+      $('#pvStats').innerHTML = `<div class="stat good"><div class="k">Returned by search</div><div class="v">${pc(X.returned_by_search)}</div></div><div class="stat warn"><div class="k">Bytes still in the saved file</div><div class="v">${pc(X.bytes_still_in_saved_file)}</div></div>` +
+        `<div class="stat warn"><div class="k">Restored by unmarking</div><div class="v">${pc(X.recoverable_by_unmarking)}</div></div><div class="stat"><div class="k">Vectors marked deleted</div><div class="v">${X.deleted.toLocaleString('en-GB')}</div></div>`;
+      $('#pvEx').innerHTML = '<div><span class="k">What "delete" did</span><br>mark_deleted(id) → search skips the vector → save_index() → the file still holds every deleted vector → load_index() + unmark_deleted(id) → the vector is back, unchanged.</div>';
+      $('#pvWhy').innerHTML = '<b>Marking hides; it does not erase.</b> Search behaved correctly, but anyone with a copy of the index file, a snapshot or a backup holds the deleted data. Rebuild or compact, then expire the old files.';
+    } else if (m === 'inversion') {
+      const X = D.inversion;
+      $('#pvStats').innerHTML = `<div class="stat warn"><div class="k">Exact sentence identified</div><div class="v">${pc(X.exact_sentence_top1)}</div></div><div class="stat"><div class="k">Pool of candidate texts</div><div class="v">${X.pool.toLocaleString('en-GB')}</div></div>` +
+        `<div class="stat"><div class="k">Text absent: same chapter</div><div class="v">${pc(X.exact_text_absent_same_chapter)}</div></div><div class="stat"><div class="k">Embeddings tested</div><div class="v">${X.targets}</div></div>`;
+      $('#pvEx').innerHTML = X.examples.slice(0, 4).map(([a, b]) => `<div><span class="k">Hidden sentence</span><br>${esc(a)}<br><span class="k">Nearest other sentence to its embedding</span><br>${esc(b)}</div>`).join('');
+      $('#pvWhy').innerHTML = '<b>An embedding is a fingerprint.</b> With a pool of candidate texts, lookup finds the exact one; without it, the nearest neighbours still say what it was about.';
+    } else {
+      const X = D.personal;
+      $('#pvStats').innerHTML = `<div class="stat warn"><div class="k">Record found by name (top 5)</div><div class="v">${pc(X.found_by_name_top5)}</div></div><div class="stat good"><div class="k">Emails and phones left after regex</div><div class="v">${pc(X.contacts_left_after_regex)}</div></div>` +
+        `<div class="stat warn"><div class="k">Names left after regex</div><div class="v">${pc(X.names_left_after_regex)}</div></div><div class="stat"><div class="k">Synthetic records</div><div class="v">${X.records}</div></div>`;
+      $('#pvEx').innerHTML = `<div><span class="k">Before</span><br>${esc(X.example)}</div><div><span class="k">After regex redaction</span><br>${esc(X.example_redacted)}</div>`;
+      $('#pvWhy').innerHTML = '<b>Semantic search makes people easy to find, and patterns only remove what has a pattern.</b> Names, roles and descriptions need entity recognition, review, and a decision about whether this data should be indexed at all.';
+    }
+    $('#pvWhy').dataset.x = JSON.stringify({ m });
+  }
+  $('#pvM').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
