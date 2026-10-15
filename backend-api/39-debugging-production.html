@@ -3,37 +3,294 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Debugging a Service in Production</title>
+<title>Debugging a Service in Production · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 39 of Backend & API. Starting from symptoms, slow endpoints, connection pool exhaustion, memory growth and retry storms, with four incidents reproduced and measured before and after their fixes.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .db-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .db-chart { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:8px 10px; }
+  .db-chart svg { width:100%; height:auto; display:block; }
+  .db-chart text { font-family:var(--mono); font-size:11px; fill:var(--muted); }
+  .db-key { display:flex; flex-wrap:wrap; gap:4px 14px; font-size:12px; color:var(--muted); margin:4px 4px 2px; }
+  .db-key b { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .db-ev { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-size:13.5px; display:grid; gap:4px; }
+  .db-ev div { display:grid; grid-template-columns:96px 1fr; gap:10px; }
+  .db-ev b { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .db-ev code { overflow-wrap:anywhere; }
+  .db-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="39">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 39</span><span class="pill">Expert</span><span class="pill">⏱ 45 min</span></div>
     <h1>Debugging a Service in <span class="grad">Production</span></h1>
-    <p class="lead">From an alert to a cause: slow endpoints, connection pool exhaustion, memory growth and retry storms.</p>
+    <p class="lead">Production problems rarely announce their cause. You get a symptom: p99 latency doubled, a wave of 500s, memory climbing until the container restarts, an outage that does not end when its trigger does. Debugging in production means going from symptom to cause with the evidence the system already produces, quickly and without making things worse, and fixing the immediate harm before the root cause.</p>
+    <p class="lead">This chapter gives a method and four of the most common culprits: slow endpoints, connection pool exhaustion, memory growth and retry storms. Each was reproduced for the lab and measured before and after its fix, together with the evidence that pointed to it.</p>
+    <ul class="objectives">
+      <li><span>Start from user-visible symptoms and narrow down methodically</span></li>
+      <li><span>Find a slow endpoint's cause with traces and query plans</span></li>
+      <li><span>Recognise connection pool exhaustion and the leak behind it</span></li>
+      <li><span>Find the line that allocates growing memory</span></li>
+      <li><span>Stop a retry storm and prevent the next one</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Logs, metrics and traces:</b> <a href="31-service-observability.html">Chapter 31</a>.</li>
+        <li><b>Saturation and bottlenecks:</b> <a href="32-performance.html">Chapter 32</a>.</li>
+        <li><b>Retries, backoff and circuit breakers:</b> <a href="29-resilience.html">Chapter 29</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Start from symptoms</li>
-    <li>Slow endpoints</li>
-    <li>Pool exhaustion</li>
-    <li>Memory growth</li>
-    <li>Retry storms</li>
-  </ol>
+  <h2>Start from symptoms</h2>
+  <p>Begin with what users experience, from the RED metrics: which routes, how much error rate or latency, since when. Then narrow the scope with three questions. <b>What changed?</b> A deploy, a config change, a feature flag, a traffic shift, a dependency's incident: check the change log first, because most incidents follow a change. <b>Where?</b> All instances or one, one region, one tenant, one endpoint, one kind of request. <b>Which resource?</b> Use the USE checklist (Chapter 32): CPU, memory, connection pools, threads, queues, database, downstream APIs. Mitigate as soon as you have a plausible cause, by rolling back, turning off a flag, shedding load or scaling out, and keep investigating afterwards. Write a timeline as you go; it becomes the post-incident review.</p>
+
+  <h2>Slow endpoints</h2>
+  <p>If one route's latency rose, open slow traces for it (Chapter 31) and compare them with normal ones: a single span that grew points to a dependency or a query; many more spans points to an N+1 loop; a long gap with no child spans points to CPU work or waiting for a pool. For a slow query, look at the plan (<code>EXPLAIN ANALYZE</code> in PostgreSQL, <code>EXPLAIN QUERY PLAN</code> in SQLite) and at the database's own statistics (<code>pg_stat_statements</code>). The classic causes are a missing index, a query that stopped using one after data grew or statistics went stale, and a lock held by something else.</p>
+
+  <h2>Pool exhaustion</h2>
+  <p>When every request needs a database connection and none are free, requests wait in the pool queue and then fail with a pool timeout, including requests that have nothing wrong with them. The signature is distinctive: many timeouts at once across all routes, the pool's checked-out count stuck at its maximum, and the database itself quiet. Causes: a connection leaked on an error path, a slow query or long transaction holding connections, a downstream HTTP call made while holding a connection (Chapter 17), or more concurrency than the pool size allows. Always acquire connections in a context manager, set pool and statement timeouts, and alert on pool wait time, not only on errors.</p>
+
+  <h2>Memory growth</h2>
+  <p>Memory that rises steadily with traffic and never falls, ending in an out-of-memory kill and restart, is usually an unbounded structure: a cache without a size limit, a list of "recent" items that is never trimmed, objects kept alive by a global registry, or a per-request object attached to something long-lived. Compare memory snapshots taken some time apart: Python's <code>tracemalloc</code> shows which lines allocated what grew, and tools such as memray and objgraph go further. Container restarts hide the problem until they become frequent, so alert on memory trend, not just on restarts.</p>
+<pre class="code"><span class="k">import</span> tracemalloc
+tracemalloc.<span class="f">start</span>()
+before = tracemalloc.<span class="f">take_snapshot</span>()
+<span class="c"># ... serve traffic for a while ...</span>
+after = tracemalloc.<span class="f">take_snapshot</span>()
+<span class="k">for</span> stat <span class="k">in</span> after.<span class="f">compare_to</span>(before, <span class="s">"lineno"</span>)[:5]:
+    <span class="f">print</span>(stat)                     <span class="c"># file:line, size_diff, count_diff: the lines whose allocations grew</span></pre>
+
+  <h2>Retry storms</h2>
+  <p>A brief slowdown makes some requests time out; clients retry; the retries add load, so more requests time out and are retried, and the system stays overloaded long after the original cause has gone. Worse, servers keep doing work for requests whose callers have already given up. This self-sustaining state is a <b>metastable failure</b>: the trigger is over, but the system cannot recover on its own. The signature is offered load several times higher than normal traffic with near-zero successes. To stop one, cut the amplified load: shed load at the edge, open circuit breakers, or disable retries with a flag. To prevent one: exponential backoff with jitter, a <b>retry budget</b> (retries limited to a fraction of normal requests), deadlines propagated so servers drop work nobody is waiting for, and bounded queues.</p>
+
+  <h2>Simulator: four incidents</h2>
+  <p>Each incident was reproduced and measured with the bug, then with the fix. <b>Slow endpoint</b>: a customer summary query against 400,000 orders. <b>Pool exhaustion</b>: four threads calling a handler 50 times a second through a pool of 5 connections (0.5 s pool timeout), where 3% of requests have invalid input and the handler leaks its connection on that error path. <b>Memory growth</b>: 60,000 report requests through a cache keyed by user and query string, where the query string includes a timestamp. <b>Retry storm</b>: 400 requests a second to 8 workers (capacity 800 a second) with a 100 ms client timeout, and the database slowing from 10 ms to 60 ms per request between 2 and 3 seconds.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">From symptom to cause</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="db-l">Incident</div>
+      <div class="seg" id="dbI"><button class="active" data-v="slow">slow endpoint</button><button data-v="pool">pool exhaustion</button><button data-v="memory">memory growth</button><button data-v="storm">retry storm</button></div>
+      <div class="db-l">Version</div>
+      <div class="seg" id="dbV"><button class="active" data-v="before">with the bug</button><button data-v="after">after the fix</button></div>
+      <div class="db-chart"><div id="dbChart"></div><div class="db-key" id="dbKey"></div></div>
+      <div class="db-ev" id="dbEv"></div>
+      <div class="stats" id="dbStats"></div>
+      <div class="db-why" id="dbWhy"></div>
+    </div>
+    <div class="panel-foot">Python 3.11 on Windows. Slow endpoint: SQLite, 200 queries for random customers. Pool: SQLAlchemy 2.1.4 QueuePool. Memory: process resident memory growth measured with psutil and the top growing line from <code>tracemalloc</code>. Retry storm: threads with real sleeps; servers still process requests whose clients have timed out; the fix uses exponential backoff with jitter and a retry budget of 10% of requests.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>slow endpoint</b>: the plan says <code>SCAN orders</code>: every request read the whole table. With an index it says <code>SEARCH ... USING INDEX</code>, and p99 fell about a hundredfold.</li>
+    <li><b>pool exhaustion</b>: five invalid requests leaked the five connections within the first second, and from then on every request failed, valid or not. The error that started it was a harmless 400.</li>
+    <li><b>memory growth</b>: memory grew in a straight line with requests, and <code>tracemalloc</code> named the exact line building the cached reports. Bounded at 1,000 entries, it stayed flat.</li>
+    <li><b>retry storm</b>: the slowdown lasted one second; the outage did not end. With backoff and a budget, the backlog cleared about a second after the slowdown ended.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Symptom</th><th>Likely cause</th><th>Evidence to check</th><th>Mitigate now</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><b>One route slow</b></td><td>Query plan, N+1, slow dependency</td><td>Slow traces; EXPLAIN; pg_stat_statements</td><td>Roll back; cache; timeout</td><td>Index, batch, fix the query</td></tr>
+        <tr><td><b>Timeouts on every route; database quiet</b></td><td>Pool exhausted</td><td>Pool checked-out at max; pool wait time</td><td>Restart instances; raise pool briefly</td><td>Context managers; timeouts; no I/O while holding</td></tr>
+        <tr><td><b>Memory rising, OOM restarts</b></td><td>Unbounded cache or registry</td><td>Memory trend; tracemalloc diff</td><td>Restart on a schedule</td><td>Bound it; fix the reference</td></tr>
+        <tr><td><b>Load several times normal, few successes</b></td><td>Retry storm</td><td>Requests per caller; retry counts</td><td>Shed load; disable retries</td><td>Backoff, jitter, budgets, deadlines</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Symptom</b> which routes, how bad, since when</li>
+      <li data-k="step"><b>What changed?</b> deploys, flags, traffic, dependencies</li>
+      <li data-k="step"><b>Narrow</b> where, and which resource is saturated</li>
+      <li data-k="step"><b>Mitigate</b> roll back, flag off, shed, scale</li>
+      <li data-k="end"><b>Root cause and review</b> fix, test, alert earlier</li>
+    </ol>
+    <figcaption><b>Stop the bleeding, then find out why.</b> A written timeline turns every incident into a review.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">☁️</div>
+    <div class="body"><div class="title">Use case: AWS us-east-1, December 2021</div><p>On 7 December 2021 an outage in Amazon Web Services' us-east-1 region affected many AWS services and the companies built on them for several hours. In its public summary, AWS explained that an automated activity to scale capacity of a service in its main network triggered unexpected behaviour from a large number of clients inside the internal network. The result was a large surge of connection activity that overwhelmed the networking devices between the internal network and the main AWS network, and the congestion caused more delays and errors, which caused clients to retry and so kept the congestion going. The retries also hurt the recovery: the same congestion made AWS's own monitoring data unavailable to the operators trying to find the problem. AWS said it was disabling the scaling activity that triggered the event until fixes were deployed, and changing clients so that their retries and back-off would not overwhelm the network again. It is the retry storm in this chapter at the scale of a cloud region: a short trigger, a feedback loop of retries, and a recovery that required removing load rather than waiting.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Investigating for hours</b> before trying the obvious mitigation, a rollback.</li>
+      <li><b>Changing several things at once,</b> so nobody knows which helped.</li>
+      <li><b>Raising pool sizes or timeouts</b> to hide a leak.</li>
+      <li><b>Treating restarts as a fix</b> for memory growth.</li>
+      <li><b>Immediate retries without budgets,</b> in clients you control.</li>
+      <li><b>Dashboards that share the failing dependency,</b> so they go dark during the incident.</li>
+      <li><b>No post-incident review,</b> or one that blames a person.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> All endpoints suddenly time out, but the database's CPU is low. What do you suspect?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Connection pool exhaustion. If every request needs a pooled connection and none are free, requests queue in the application and time out, while the database is idle because nothing reaches it. I would check the pool's checked-out count and wait time, look for what is holding connections, such as a leak on an error path, a long transaction, or a slow external call made while a connection is held, and see what changed recently. To mitigate I would roll back or restart instances; the fix is acquiring connections with context managers, keeping transactions short, and alerting on pool wait.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A dependency was slow for a minute an hour ago. It is healthy now, but your service is still failing. Walk through it.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>That is the shape of a metastable failure, usually a retry storm or a backlog that cannot drain. I would look at request rate compared with normal: if it is several times higher with few successes, retries are sustaining the overload, and queues are full of work for callers who have already given up. Mitigation is to remove load: shed at the edge, open circuit breakers, disable or cap retries with a flag, and drop queued work past its deadline; scaling up may help but often cannot outrun the amplification. Once it is stable, I would make sure retries use exponential backoff with jitter and a retry budget, deadlines are propagated so servers skip abandoned requests, queues are bounded, and there is an alert on the ratio of retries to first attempts.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Start from symptoms; ask what changed, where, and which resource is saturated.</li>
+      <li>Mitigate first, rolling back if in doubt, then find the root cause.</li>
+      <li>Slow routes: traces and query plans; pool exhaustion: checked-out at maximum, database quiet.</li>
+      <li>Memory growth: compare snapshots; bound every cache.</li>
+      <li>Retry storms outlast their trigger; backoff, jitter, budgets and deadlines prevent them.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A query plan says <code>SCAN orders</code> for a lookup by customer. What does that suggest?</p>
+      <div class="opts">
+        <button class="opt">The table is corrupt</button>
+        <button class="opt">There is no usable index, so every query reads the whole table</button>
+        <button class="opt">The query is cached</button>
+        <button class="opt">The pool is exhausted</button>
+      </div>
+      <div class="explain">Measured: an index took p99 from 43 ms to 0.4 ms.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">After five invalid requests, every request failed with a pool timeout. Why?</p>
+      <div class="opts">
+        <button class="opt">The database crashed</button>
+        <button class="opt">Invalid requests are slow</button>
+        <button class="opt">The pool timeout was too short</button>
+        <button class="opt">The error path leaked its connection, and five leaks used the whole pool</button>
+      </div>
+      <div class="explain">With a context manager, the same traffic had no pool timeouts at all.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Which tool tells you which line of Python allocated the memory that keeps growing?</p>
+      <div class="opts">
+        <button class="opt">tracemalloc, comparing two snapshots</button>
+        <button class="opt">cProfile</button>
+        <button class="opt">EXPLAIN</button>
+        <button class="opt">The container's restart count</button>
+      </div>
+      <div class="explain">It named the line building the cached reports: 157 MB of growth.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why did the service stay down after the one-second slowdown ended?</p>
+      <div class="opts">
+        <button class="opt">The database stayed slow</button>
+        <button class="opt">The workers crashed</button>
+        <button class="opt">Immediate retries quadrupled the load and servers kept working on abandoned requests</button>
+        <button class="opt">The timeout was too long</button>
+      </div>
+      <div class="explain">A metastable failure; backoff with a retry budget recovered about a second after the trigger ended.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">p99 doubled ten minutes after a deploy. What should usually come first?</p>
+      <div class="opts">
+        <button class="opt">A full root-cause analysis</button>
+        <button class="opt">Roll back, then investigate</button>
+        <button class="opt">Increase the number of instances</button>
+        <button class="opt">Wait to see if it recovers</button>
+      </div>
+      <div class="explain">Mitigate first; most incidents follow a change.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"slow":{"before":{"plan":"SCAN orders","p50":30.45,"p99":43.17,"series":[30.54,28.4,28.84,28.65,30.46,29.98,30.65,29.66,29.6,29.42,30.05,29.99,31.89,33.64,34.31,32.0,31.94,31.23,31.3,31.17,33.04,31.24,28.15,30.68,33.03,33.25,28.74,28.58,29.94,29.32,28.63,29.82,30.56,28.58,29.8,30.95,29.77,28.46,29.64,30.55,30.58,27.37,28.86,28.73,29.87,28.79,29.94,30.18,29.15,30.17,33.36,29.11,29.19,31.94,30.44,29.49,29.33,31.32,29.29,27.99,28.4,31.46,28.08,29.01,29.97,29.56,31.65,28.46,29.79,30.66,30.57,28.96,31.1,32.38,30.87,29.33,43.17,31.65,29.07,32.61,32.08,38.43,35.95,31.4,30.4,30.22,30.43,30.88,31.24,30.68,32.28,30.45,28.8,29.52,29.54,29.97,30.28,31.84,30.14,30.56,31.95,32.25,37.16,28.41,31.54,29.05,27.93,29.57,29.48,30.07,28.82,30.74,34.56,30.45,33.16,32.39,30.55,28.83,33.75,32.84]},"after":{"plan":"SEARCH orders USING INDEX ix_orders_customer (customer_id=?)","p50":0.17,"p99":0.43,"series":[0.43,0.26,0.3,0.27,0.25,0.25,0.25,0.15,0.19,0.18,0.17,0.17,0.17,0.22,0.16,0.17,0.12,0.16,0.15,0.17,0.15,0.16,0.16,0.2,0.16,0.16,0.23,0.16,0.17,0.16,0.18,0.16,0.14,0.14,0.18,0.17,0.14,0.15,0.15,0.17,0.14,0.21,0.18,0.17,0.18,0.17,0.15,0.16,0.15,0.17,0.18,0.19,0.14,0.21,0.17,0.15,0.17,0.17,0.14,0.17,0.16,0.17,0.12,0.15,0.19,0.15,0.15,0.14,0.12,0.16,0.15,0.17,0.15,0.15,0.13,0.15,0.18,0.29,0.19,0.2,0.14,0.15,0.15,0.14,0.14,0.15,0.18,0.2,0.2,0.14,0.13,0.19,0.2,0.12,0.14,0.14,0.16,0.17,0.14,0.14,0.14,0.16,0.18,0.17,0.13,0.16,0.18,0.14,0.15,0.17,0.14,0.16,0.15,0.16,0.12,0.14,0.18,0.18,0.14,0.15]}},"pool":{"before":{"seconds":[{"s":0,"ok":148,"bad_input":5,"pool_timeout":4,"checked_out":5},{"s":1,"ok":0,"bad_input":0,"pool_timeout":8,"checked_out":5},{"s":2,"ok":0,"bad_input":0,"pool_timeout":8,"checked_out":5},{"s":3,"ok":0,"bad_input":0,"pool_timeout":8,"checked_out":5},{"s":4,"ok":0,"bad_input":0,"pool_timeout":4,"checked_out":5},{"s":5,"ok":0,"bad_input":0,"pool_timeout":8,"checked_out":5}]},"after":{"seconds":[{"s":0,"ok":184,"bad_input":8,"pool_timeout":0,"checked_out":0},{"s":1,"ok":181,"bad_input":7,"pool_timeout":0,"checked_out":0},{"s":2,"ok":175,"bad_input":9,"pool_timeout":0,"checked_out":0},{"s":3,"ok":187,"bad_input":5,"pool_timeout":0,"checked_out":0},{"s":4,"ok":179,"bad_input":5,"pool_timeout":0,"checked_out":0},{"s":5,"ok":185,"bad_input":7,"pool_timeout":0,"checked_out":0}]}},"memory":{"before":{"series":[[5000,16.5],[10000,33.3],[15000,51.4],[20000,67.7],[25000,85.2],[30000,103.3],[35000,119.8],[40000,136.2],[45000,154.2],[50000,170.5],[55000,187.0],[60000,207.2]],"entries":60000,"top_line":"run.py:101","top_line_src":"body = (\"<tr><td>%s</td><td>%s</td></tr>\" % (user, params)) * 40","top_mb":157.5},"after":{"series":[[5000,3.6],[10000,3.6],[15000,3.8],[20000,3.8],[25000,3.8],[30000,3.8],[35000,3.8],[40000,3.8],[45000,3.8],[50000,3.8],[55000,3.8],[60000,3.8]],"entries":1000,"top_line":"run.py:101","top_line_src":"body = (\"<tr><td>%s</td><td>%s</td></tr>\" % (user, params)) * 40","top_mb":2.6}},"storm":{"before":{"series":[[0.0,400,384,0],[0.25,400,400,0],[0.5,400,400,0],[0.75,400,400,0],[1.0,400,400,0],[1.25,400,400,0],[1.5,400,400,0],[1.75,400,400,0],[2.0,644,52,244],[2.25,1480,0,1200],[2.5,1600,0,1600],[2.75,1600,0,1596],[3.0,1608,0,1612],[3.25,1600,0,1604],[3.5,1600,0,1596],[3.75,1596,0,1596],[4.0,1604,0,1604],[4.25,1552,0,1548],[4.5,1636,0,1640],[4.75,1612,0,1612],[5.0,1592,0,1592],[5.25,1608,0,1608],[5.5,1600,0,1604],[5.75,1592,0,1588],[6.0,1600,0,1600],[6.25,1600,0,1596],[6.5,1600,0,1604],[6.75,1604,0,1604],[7.0,1604,0,1604],[7.25,1600,0,1604],[7.5,1600,0,1596],[7.75,1596,0,1596]],"success_after_5s":0,"sent_after_5s":1600},"after":{"series":[[0.0,400,384,0],[0.25,400,400,0],[0.5,400,400,0],[0.75,400,400,0],[1.0,400,400,0],[1.25,400,400,0],[1.5,400,400,0],[1.75,400,400,0],[2.0,516,52,204],[2.25,672,0,764],[2.5,444,0,444],[2.75,440,0,444],[3.0,436,0,444],[3.25,440,0,436],[3.5,440,0,440],[3.75,436,0,440],[4.0,432,408,180],[4.25,400,400,0],[4.5,400,400,0],[4.75,400,400,0],[5.0,400,400,0],[5.25,400,400,0],[5.5,400,400,0],[5.75,400,400,0],[6.0,400,400,0],[6.25,400,400,0],[6.5,400,400,0],[6.75,400,400,0],[7.0,400,400,0],[7.25,400,400,0],[7.5,400,400,0],[7.75,400,400,0]],"success_after_5s":400,"sent_after_5s":400}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  function svg(xs, series, opts) {
+    const W = 640, H = 200, L = 46, R = 10, T = 10, B = 26;
+    const xmax = opts.xmax, ymax = opts.ymax;
+    const x = (a) => L + (W - L - R) * a / xmax, y = (b) => T + (H - T - B) * (1 - b / ymax);
+    let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(opts.label)}">`;
+    if (opts.shade) s += `<rect x="${x(opts.shade[0])}" y="${T}" width="${x(opts.shade[1]) - x(opts.shade[0])}" height="${H - T - B}" fill="var(--amber-soft)"/>`;
+    for (const g of [0, ymax / 2, ymax]) s += `<line x1="${L}" x2="${W - R}" y1="${y(g)}" y2="${y(g)}" stroke="var(--border)"/><text x="${L - 6}" y="${y(g) + 4}" text-anchor="end">${opts.fy(g)}</text>`;
+    for (const t of opts.xticks) s += `<text x="${x(t)}" y="${H - 8}" text-anchor="middle">${opts.fx(t)}</text>`;
+    for (const sr of series) {
+      if (sr.bars) {
+        const bw = Math.max(1.5, (W - L - R) / xs.length - 1.5);
+        sr.data.forEach((val, i) => { if (val) s += `<rect x="${x(xs[i]) - bw / 2 + (sr.off || 0) * bw / 2}" y="${y(val)}" width="${bw / (sr.half ? 2 : 1)}" height="${y(0) - y(val)}" fill="${sr.col}"/>`; });
+      } else {
+        s += `<polyline fill="none" stroke="${sr.col}" stroke-width="2.5" points="${sr.data.map((val, i) => x(xs[i]) + ',' + y(Math.min(val, ymax))).join(' ')}"/>`;
+      }
+    }
+    return s + '</svg>';
+  }
+  const key = (items) => items.map(([n, c]) => `<span><b style="background:${c}"></b>${n}</span>`).join('');
+  const ev = (rows) => rows.map(([k, val]) => `<div><b>${k}</b><span>${val}</span></div>`).join('');
+  function slow(ver) {
+    const r = D.slow[ver], o = D.slow.before;
+    const xs = r.series.map((_, i) => i);
+    return { chart: svg(xs, [{ bars: true, data: r.series, col: ver === 'before' ? 'var(--amber)' : 'var(--accent)' }], { xmax: xs.length, ymax: Math.max(...o.series), xticks: [0, 40, 80, 120], fx: (t) => '#' + t, fy: (g) => g.toFixed(0) + ' ms', label: 'Latency per request' }),
+      key: key([['query latency per request', ver === 'before' ? 'var(--amber)' : 'var(--accent)']]),
+      ev: ev([['Symptom', 'one route slow; p99 ' + r.p99 + ' ms'], ['Evidence', `<code>EXPLAIN QUERY PLAN</code>: <code>${esc(r.plan)}</code>`], ['Fix', ver === 'before' ? 'add an index on <code>orders(customer_id)</code>' : 'index added']]),
+      stats: [['p50', r.p50 + ' ms', ver === 'before' ? 'warn' : 'good'], ['p99', r.p99 + ' ms', ver === 'before' ? 'warn' : 'good']],
+      why: ver === 'before' ? `<b>Every request scanned all 400,000 orders:</b> p50 ${r.p50} ms, p99 ${r.p99} ms, for a query that returns one customer's totals. A trace would show one long database span; the plan says why.` : `<b>The index turned a scan into a search:</b> p50 ${r.p50} ms and p99 ${r.p99} ms, about ${Math.round(o.p99 / r.p99)} times faster at p99. On PostgreSQL, build such an index with <code>CREATE INDEX CONCURRENTLY</code> so it does not block writes.` };
+  }
+  function pool(ver) {
+    const s = D.pool[ver].seconds, xs = s.map(r => r.s + 0.5);
+    const ymax = Math.max(...D.pool.after.seconds.map(r => r.ok + r.bad_input));
+    const ok = s.reduce((a, r) => a + r.ok, 0), to = s.reduce((a, r) => a + r.pool_timeout, 0), bad = s.reduce((a, r) => a + r.bad_input, 0);
+    return { chart: svg(xs, [{ bars: true, half: true, data: s.map(r => r.ok), col: 'var(--accent)' }, { bars: true, half: true, off: 1, data: s.map(r => r.pool_timeout * 10), col: 'var(--red)' }], { xmax: 6, ymax, xticks: [0, 1, 2, 3, 4, 5, 6], fx: (t) => t + 's', fy: (g) => Math.round(g), label: 'Requests per second' }),
+      key: key([['successful requests per second', 'var(--accent)'], ['pool timeouts per second (×10 to be visible)', 'var(--red)']]),
+      ev: ev([['Symptom', ver === 'before' ? 'every route times out; database idle' : 'none'], ['Evidence', `pool checked-out: ${s[s.length - 1].checked_out} of 5 at the end`], ['Fix', ver === 'before' ? '<code>with engine.connect() as conn:</code> so every path returns the connection' : 'context manager on every path']]),
+      stats: [['Successful', ok, ver === 'before' ? 'warn' : 'good'], ['Pool timeouts', to, to ? 'warn' : 'good'], ['Invalid inputs', bad, '']],
+      why: ver === 'before' ? `<b>${ok} requests succeeded, all in the first second; then nothing but pool timeouts.</b> Each invalid request (a 400, harmless on its own) left its connection checked out; five of them took all five, and each later request waited 0.5 s and failed. Every route was down, and the database saw no load at all.` : `<b>${ok} successes and no pool timeouts.</b> The same ${bad} invalid requests still failed, as they should, but the context manager returned each connection, so the pool never ran dry.` };
+  }
+  function memory(ver) {
+    const r = D.memory[ver], xs = r.series.map(p => p[0]);
+    const ymax = Math.max(...D.memory.before.series.map(p => p[1]));
+    return { chart: svg(xs, [{ data: r.series.map(p => p[1]), col: ver === 'before' ? 'var(--amber)' : 'var(--accent)' }], { xmax: 60000, ymax, xticks: [0, 20000, 40000, 60000], fx: (t) => (t / 1000) + 'k', fy: (g) => g.toFixed(0) + ' MB', label: 'Memory growth against requests' }),
+      key: key([['resident memory growth vs requests served', ver === 'before' ? 'var(--amber)' : 'var(--accent)']]),
+      ev: ev([['Symptom', ver === 'before' ? 'memory rises with traffic; OOM restarts' : 'flat memory'], ['Evidence', `tracemalloc top growth: <code>${esc(r.top_line)}</code> +${r.top_mb} MB<br><code>${esc(r.top_line_src)}</code>`], ['Fix', ver === 'before' ? 'bound the cache (LRU, 1,000 entries) and drop the timestamp from the key' : 'bounded LRU']]),
+      stats: [['Growth after 60k', r.series[r.series.length - 1][1] + ' MB', ver === 'before' ? 'warn' : 'good'], ['Cache entries', r.entries.toLocaleString('en-GB'), ver === 'before' ? 'warn' : 'good']],
+      why: ver === 'before' ? `<b>Memory grew by ${r.series[r.series.length - 1][1]} MB over 60,000 requests, in a straight line.</b> Every request's key included a timestamp, so no entry was ever reused and none was ever evicted: ${r.entries.toLocaleString('en-GB')} entries. Comparing two tracemalloc snapshots named the line that built them.` : `<b>Flat at ${r.series[r.series.length - 1][1]} MB.</b> The cache holds at most 1,000 entries and evicts the least recently used. The deeper fix is the key: a timestamp in a cache key means the cache never hits.` };
+  }
+  function storm(ver) {
+    const r = D.storm[ver], xs = r.series.map(p => p[0] + 0.125);
+    const ymax = Math.max(...D.storm.before.series.map(p => p[1]));
+    return { chart: svg(xs, [{ data: r.series.map(p => p[1]), col: 'var(--amber)' }, { data: r.series.map(p => p[2]), col: 'var(--accent)' }], { xmax: 8, ymax, shade: [2, 3], xticks: [0, 2, 4, 6, 8], fx: (t) => t + 's', fy: (g) => Math.round(g) + '/s', label: 'Requests sent and succeeded per second' }),
+      key: key([['requests sent per second (incl. retries)', 'var(--amber)'], ['successful per second', 'var(--accent)'], ['database slow', 'var(--amber-soft)']]),
+      ev: ev([['Symptom', ver === 'before' ? 'outage outlasts its trigger' : 'brief dip, then normal'], ['Evidence', `after 5 s: ${r.sent_after_5s} requests/s sent against 400/s of real demand`], ['Fix', ver === 'before' ? 'backoff with jitter and a 10% retry budget (dropping work past its deadline would help further)' : 'backoff, jitter, retry budget']]),
+      stats: [['Successes/s after 5 s', r.success_after_5s, r.success_after_5s ? 'good' : 'warn'], ['Sent/s after 5 s', r.sent_after_5s, r.sent_after_5s > 500 ? 'warn' : 'good']],
+      why: ver === 'before' ? `<b>The database recovered at 3 s; the service never did.</b> Each timed-out request was retried at once, up to three times, so clients sent about ${r.sent_after_5s} requests a second for 400 a second of real demand, and the workers spent their time on requests whose callers had already given up. Not one request succeeded after 2.25 s.` : `<b>Back to 400 successes a second about a second after the slowdown ended.</b> Retries waited with growing, jittered delays and were capped at 10% of normal traffic, so load rose only modestly and the backlog drained.` };
+  }
+  function draw() {
+    const i = v('#dbI'), ver = v('#dbV');
+    const r = { slow, pool, memory, storm }[i](ver);
+    $('#dbChart').innerHTML = r.chart; $('#dbKey').innerHTML = r.key; $('#dbEv').innerHTML = r.ev;
+    $('#dbStats').innerHTML = r.stats.map(([k, val, c]) => `<div class="stat ${c}"><div class="k">${k}</div><div class="v">${val}</div></div>`).join('');
+    $('#dbWhy').innerHTML = r.why;
+    $('#dbWhy').dataset.x = JSON.stringify({ i, ver, s: r.stats.map(x => x[1]) });
+  }
+  $('#dbI').addEventListener('segchange', draw);
+  $('#dbV').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
