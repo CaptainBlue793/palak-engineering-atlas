@@ -3,37 +3,272 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Deploying a Service</title>
+<title>Deploying a Service · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 36 of Backend & API. A production container, liveness and readiness, graceful shutdown, migrations at deploy time and rollbacks, with a rolling deploy under load measured three ways.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .dp-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .dp-chart { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:8px 10px; }
+  .dp-chart svg { width:100%; height:auto; display:block; }
+  .dp-chart text { font-family:var(--mono); font-size:11px; fill:var(--muted); }
+  .dp-key { display:flex; flex-wrap:wrap; gap:4px 14px; font-size:12px; color:var(--muted); margin:4px 4px 2px; }
+  .dp-key b { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .dp-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="36">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 36</span><span class="pill">Advanced</span><span class="pill">⏱ 40 min</span></div>
     <h1>Deploying a <span class="grad">Service</span></h1>
-    <p class="lead">Containers, configuration, health and readiness checks, graceful shutdown and running migrations safely.</p>
+    <p class="lead">A deploy replaces running instances of your service with new ones while customers are using it. Done carelessly, every deploy is a small outage: requests cut off mid-flight, requests sent to instances that are not ready, and a schema change that the old code cannot handle. Done well, deploys are boring enough to run many times a day. The difference is a few specific behaviours in the service itself and in how the platform replaces it.</p>
+    <p class="lead">This chapter covers a production container image, liveness and readiness checks, graceful shutdown, migrations at deploy time and rollbacks. The lab runs a rolling deploy of two instances under steady load three ways and counts every failed request.</p>
+    <ul class="objectives">
+      <li><span>Build a small, safe production container for a Python service</span></li>
+      <li><span>Separate liveness from readiness and implement both</span></li>
+      <li><span>Shut down gracefully: stop taking work, finish in-flight requests, then exit</span></li>
+      <li><span>Run database migrations so old and new code both work</span></li>
+      <li><span>Roll back quickly, and know what a rollback cannot undo</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Configuration and environments:</b> <a href="p6-config-and-environments.html">P6</a>.</li>
+        <li><b>Migrations with Alembic:</b> <a href="07-orms-and-migrations.html">Chapter 7</a>.</li>
+        <li><b>Workers and the event loop:</b> <a href="28-async-services.html">Chapter 28</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>A production container</li>
-    <li>Health and readiness</li>
-    <li>Graceful shutdown</li>
-    <li>Migrations at deploy time</li>
-    <li>Rollbacks</li>
-  </ol>
+  <h2>A production container</h2>
+  <p>A good image is small, reproducible and runs as an unprivileged user. Use a slim official base pinned to a version, install dependencies from a lock file in their own layer so code changes do not reinstall them, copy only what the app needs, and run the server directly (not through a shell) so it receives signals. Configuration comes from the environment, secrets from the platform's secret store, and logs go to standard output as JSON (Chapter 31). Scan the image in CI and rebuild it regularly for base-image security fixes.</p>
+<pre class="code"><span class="k">FROM</span> python:3.12-slim <span class="k">AS</span> base
+<span class="k">ENV</span> PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+<span class="k">WORKDIR</span> /app
+<span class="k">COPY</span> requirements.lock .
+<span class="k">RUN</span> pip install --no-cache-dir -r requirements.lock         <span class="c"># cached until the lock file changes</span>
+<span class="k">COPY</span> app/ app/
+<span class="k">RUN</span> useradd --uid 10001 --no-create-home appuser
+<span class="k">USER</span> 10001                                                  <span class="c"># never run as root</span>
+<span class="k">EXPOSE</span> 8000
+<span class="k">CMD</span> [<span class="s">"uvicorn"</span>, <span class="s">"app.main:app"</span>, <span class="s">"--host"</span>, <span class="s">"0.0.0.0"</span>, <span class="s">"--port"</span>, <span class="s">"8000"</span>, <span class="s">"--timeout-graceful-shutdown"</span>, <span class="s">"20"</span>]</pre>
+
+  <h2>Health and readiness</h2>
+  <p>Platforms ask two different questions, and mixing them up causes outages. <b>Liveness</b>: is this process healthy, or should it be restarted? Answer it cheaply and locally, from the process itself; if a liveness check calls the database, a database blip restarts every instance at once. <b>Readiness</b>: should this instance receive traffic right now? It is false while the instance warms up (loading configuration, filling caches, opening pools), true when it can serve, and false again as soon as it starts shutting down. Kubernetes has a third, the <b>startup</b> probe, for slow-starting apps. Load balancers route only to ready instances; the deploy moves on only when new instances are ready.</p>
+<pre class="code"><span class="f">@app.get</span>(<span class="s">"/live"</span>)
+<span class="k">def</span> <span class="f">live</span>():
+    <span class="k">return</span> {<span class="s">"ok"</span>: <span class="k">True</span>}                                              <span class="c"># the process answers: that is all</span>
+
+<span class="f">@app.get</span>(<span class="s">"/ready"</span>)
+<span class="k">def</span> <span class="f">ready</span>(response: Response):
+    <span class="k">if not</span> state.warm <span class="k">or</span> state.draining:
+        response.status_code = 503
+    <span class="k">return</span> {<span class="s">"warm"</span>: state.warm, <span class="s">"draining"</span>: state.draining}</pre>
+
+  <h2>Graceful shutdown</h2>
+  <p>When the platform stops an instance it sends SIGTERM, waits a grace period, then kills it. A graceful shutdown uses that window: fail readiness so the load balancer stops sending new requests, keep serving for a moment while that change propagates (in Kubernetes, a short <code>preStop</code> sleep), then stop accepting connections, let in-flight requests finish, close pools and flush telemetry, and exit. Uvicorn does the middle part on SIGTERM, bounded by <code>--timeout-graceful-shutdown</code>; the readiness flip and the delay before it are yours to add. Long-running work does not belong in requests at all: background jobs (Chapter 20) must be resumable, because some shutdown will always interrupt one.</p>
+
+  <h2>Simulator: a rolling deploy under load</h2>
+  <p>Two instances of a FastAPI service each take 1.5 seconds to warm up after starting, during which they answer 503. Eight client threads send a steady stream of 50 ms requests, spread over the instances by a load balancer. The deploy replaces version 1 with version 2 one instance at a time, three ways. <b>Hard kill</b>: kill the process, start the new one, move on when its port is open. <b>Graceful</b>: trigger uvicorn's graceful shutdown, start the new one, move on when its port is open; the load balancer has no health checks. <b>Graceful + readiness</b>: fail readiness first, let the balancer (checking <code>/ready</code> every 100 ms) remove the instance, then shut down gracefully, and move on only when the new instance is ready.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Did anyone notice the deploy?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="dp-l">Deploy method</div>
+      <div class="seg" id="dpM"><button class="active" data-v="kill">hard kill</button><button data-v="graceful">graceful shutdown</button><button data-v="graceful_ready">graceful + readiness</button></div>
+      <div class="dp-chart"><div id="dpChart"></div>
+        <div class="dp-key"><span><b style="background:var(--muted)"></b>served by v1</span><span><b style="background:var(--accent)"></b>served by v2</span><span><b style="background:var(--red)"></b>failed</span><span><b style="background:var(--amber-soft);border:1px solid var(--amber)"></b>deploy in progress</span></div>
+      </div>
+      <div class="stats" id="dpStats"></div>
+      <div class="dp-why" id="dpWhy"></div>
+    </div>
+    <div class="panel-foot">FastAPI 0.142.2 on uvicorn, two instances on one machine; graceful shutdown triggered through uvicorn's <code>should_exit</code>, the same path SIGTERM takes on Linux (on Windows, terminating a process is always a hard kill). Bars are requests completed in each 100 ms. Failed-request counts depend on how fast clients retry, so compare the failure windows too. On Windows a connection to a closed local port is retried for about two seconds before failing (on Linux it is refused at once), which shows here as gaps with no completed requests.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>hard kill</b>: requests in progress at the moment of the kill were cut off, and then the new instance, reachable but still warming up, answered 503 to everything sent to it.</li>
+    <li><b>graceful shutdown</b>: no request was cut off, but there were even more 503s. Moving on as soon as a port opens meant the second instance was taken down while the first was still warming, so for a while neither could serve.</li>
+    <li><b>graceful + readiness</b>: zero failures. Traffic shifted from v1 to v2 one instance at a time. The deploy took longer, because it waited for each new instance to be ready: that wait is the point.</li>
+  </ul>
+
+  <h2>Migrations at deploy time</h2>
+  <p>During a rolling deploy, old and new versions of the code run at the same time against the same database, so every schema change must work with both. That rules out renaming or dropping a column that the old code still reads, in one step; Chapter 37 covers the expand-and-contract sequence that makes such changes safe. Run migrations as their own step before the new code rolls out (a CI job or a one-off Kubernetes Job), not on application start-up, where several instances race to migrate at once. Keep each migration small and fast: on large PostgreSQL tables add columns as nullable or with constant defaults, create indexes <code>CONCURRENTLY</code>, set a <code>lock_timeout</code> so a migration that cannot get its lock fails instead of queueing every query behind it, and backfill data in batches outside the migration.</p>
+
+  <h2>Rollbacks</h2>
+  <p>A rollback redeploys the previous version, and should be one command or button, rehearsed. Make it cheap by keeping images immutable and tagged by commit, deploying gradually (a canary instance or a small percentage of traffic first, watching error rate and latency, Chapter 31), and stopping automatically when they get worse. Know what a rollback cannot undo: data the new version wrote in a new format, messages it published, emails it sent and migrations that dropped something. That is why schema changes are additive and separately deployed, and why risky behaviour goes behind a feature flag that can be turned off without a deploy.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Deploy method</th><th>In-flight requests</th><th>Not-ready instances get traffic</th><th>Deploy time</th><th>Needs</th></tr></thead>
+      <tbody>
+        <tr><td><b>Hard kill</b></td><td>Cut off</td><td>Yes</td><td>Short</td><td>Nothing; costs errors</td></tr>
+        <tr><td><b>Graceful shutdown only</b></td><td>Finish</td><td>Yes</td><td>Short</td><td>SIGTERM handling</td></tr>
+        <tr><td><b>Graceful + readiness</b></td><td>Finish</td><td>No</td><td>Longer</td><td>Readiness endpoint; balancer health checks</td></tr>
+        <tr><td><b>Blue-green</b></td><td>Finish on the old set</td><td>No</td><td>Switch is instant</td><td>Double capacity during the switch</td></tr>
+        <tr><td><b>Canary</b></td><td>Finish</td><td>No</td><td>Longest</td><td>Metrics and automatic halt</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Migrate</b> additive schema change, its own step</li>
+      <li data-k="step"><b>Start new</b> warm up; readiness false until able to serve</li>
+      <li data-k="step"><b>Shift traffic</b> canary first; watch errors and latency</li>
+      <li data-k="step"><b>Drain old</b> readiness false, finish in-flight, exit</li>
+      <li data-k="end"><b>Roll back or finish</b> one command; contract the schema later</li>
+    </ol>
+    <figcaption><b>A deploy nobody notices.</b> Every step keeps at least one ready instance serving.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🚢</div>
+    <div class="body"><div class="title">Use case: Knight Capital's deployment, 2012</div><p>On 1 August 2012 Knight Capital, then one of the largest traders in US equities, lost more than $460 million in roughly 45 minutes, according to the US Securities and Exchange Commission's later order, which describes the cause. New code for a retail trading programme was deployed to eight servers by hand, and one server was missed. The new release reused a configuration flag that had once activated an old, long-unused function called Power Peg; on the server still running old code, the flag woke that function up, and it sent millions of orders into the market. There was no automated, verified deployment, no check that all servers ran the same version, and no quick, rehearsed way to stop or roll back; early responses even made it worse by removing the new code from the correct servers. The lessons are this chapter's: deploy the same immutable artefact everywhere by automation, verify what is running, remove dead code instead of leaving it behind flags, and be able to stop a bad release in minutes.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Liveness checks that call the database,</b> so a blip restarts every instance.</li>
+      <li><b>No readiness check,</b> or treating "port open" as ready.</li>
+      <li><b>Ignoring SIGTERM,</b> or starting the server through a shell that does not pass it on.</li>
+      <li><b>Running migrations on application start-up</b> from every instance.</li>
+      <li><b>Destructive schema changes</b> in the same deploy as the code that stops using them.</li>
+      <li><b>Mutable image tags</b> such as <code>latest</code> in production.</li>
+      <li><b>A rollback procedure</b> nobody has ever run.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the difference between a liveness check and a readiness check?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Liveness asks whether the process should be restarted: it should be a cheap check that the process itself is responsive, with no calls to dependencies, otherwise a database problem restarts every instance at once. Readiness asks whether the instance should receive traffic now: it is false while the instance warms up, true when it can serve, and false again when it starts shutting down, so the load balancer stops sending it requests. During a deploy, the platform only moves on when new instances are ready, and drains old ones by failing their readiness before stopping them.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Every deploy of your service causes a burst of 502 and 503 errors. How do you get to zero?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First find which phase the errors come from with logs and load-balancer metrics: requests cut off on old instances, or requests sent to new instances before they are ready. For the old instances: handle SIGTERM by failing readiness immediately, wait a few seconds for the balancer to notice (a preStop sleep in Kubernetes), then stop accepting connections, finish in-flight requests within a grace period longer than the slowest normal request, and exit; make sure the server process actually receives the signal. For the new ones: a readiness endpoint that is false until caches and pools are warm, and a rollout that waits for it, with maxUnavailable at zero and enough surge capacity. Check keep-alive timeouts too, so the balancer does not reuse connections the app is closing. Then canary each deploy and alert if error rate rises, and keep migrations backward compatible so old and new versions can share the database.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Ship a small, pinned, non-root image that receives signals directly.</li>
+      <li>Liveness is local and cheap; readiness says whether to send traffic now.</li>
+      <li>On SIGTERM, fail readiness, finish in-flight work, then exit.</li>
+      <li>Migrate as a separate, backward-compatible step before rolling out code.</li>
+      <li>Deploy gradually and keep a rehearsed one-step rollback; know what it cannot undo.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why should a liveness check not query the database?</p>
+      <div class="opts">
+        <button class="opt">Database queries are too slow for health checks</button>
+        <button class="opt">Liveness checks cannot open connections</button>
+        <button class="opt">A database problem would make every instance fail liveness and be restarted at once</button>
+        <button class="opt">It would leak credentials</button>
+      </div>
+      <div class="explain">Dependencies belong in readiness, if anywhere; liveness only asks whether the process works.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">In the lab, graceful shutdown alone still produced many 503s. Why?</p>
+      <div class="opts">
+        <button class="opt">The deploy moved on when a port opened, so new instances got traffic while warming up and both could be down at once</button>
+        <button class="opt">Graceful shutdown drops requests</button>
+        <button class="opt">The load balancer was too slow</button>
+        <button class="opt">Version 2 had a bug</button>
+      </div>
+      <div class="explain">Waiting for readiness removed every failure.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What should a service do first when it receives SIGTERM?</p>
+      <div class="opts">
+        <button class="opt">Exit immediately</button>
+        <button class="opt">Close the database pool</button>
+        <button class="opt">Reject all requests with 503</button>
+        <button class="opt">Fail readiness so no new requests are routed to it, then finish in-flight ones</button>
+      </div>
+      <div class="explain">Then stop accepting connections, finish work, flush telemetry and exit.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Where should database migrations run in a rolling deploy?</p>
+      <div class="opts">
+        <button class="opt">On start-up of every new instance</button>
+        <button class="opt">As a separate step before the new code rolls out, and compatible with the old code</button>
+        <button class="opt">After all instances are replaced</button>
+        <button class="opt">Manually, at night</button>
+      </div>
+      <div class="explain">Old and new code share the database during the rollout.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which of these can a code rollback not undo?</p>
+      <div class="opts">
+        <button class="opt">A new log format</button>
+        <button class="opt">A changed timeout setting</button>
+        <button class="opt">Emails the new version sent and data it wrote in a new format</button>
+        <button class="opt">A new HTTP route</button>
+      </div>
+      <div class="explain">Side effects outlive the code; use additive changes and feature flags for risky behaviour.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"kill":{"requests":384,"errors":128,"stalled":0,"error_seconds":1.0,"by_type":{"connection dropped mid-request":10,"503 warming up":118},"deploy_s":1.8,"deploy_start":1.01,"deploy_end":2.81,"bins":[[0.0,16,0,0],[0.1,16,0,0],[0.2,16,0,0],[0.3,16,0,0],[0.4,8,0,0],[0.5,16,0,0],[0.6,16,0,0],[0.7,16,0,0],[0.8,16,0,0],[0.9,12,0,4],[1.0,4,0,8],[2.0,8,0,0],[2.1,7,0,31],[2.2,0,0,4],[3.2,0,16,8],[3.3,0,12,14],[3.4,0,13,12],[3.5,0,16,15],[3.6,0,16,16],[3.7,0,16,16]]},"graceful":{"requests":1383,"errors":1078,"stalled":0,"error_seconds":1.9,"by_type":{"503 warming up":1078},"deploy_s":2.23,"deploy_start":1.0,"deploy_end":3.24,"bins":[[0.0,16,0,0],[0.1,16,0,0],[0.2,16,0,0],[0.3,16,0,0],[0.4,8,0,0],[0.5,16,0,0],[0.6,16,0,0],[0.7,16,0,0],[0.8,16,0,0],[0.9,16,0,0],[1.0,12,0,4],[1.1,0,0,4],[2.1,0,0,8],[2.6,0,0,51],[2.7,0,0,156],[2.8,0,0,163],[2.9,0,0,128],[3.0,0,0,156],[3.1,0,0,144],[3.2,0,0,134],[3.3,0,16,18],[3.4,0,16,16],[3.5,0,16,16],[3.6,0,16,16],[3.7,0,10,11],[3.8,0,14,13],[3.9,0,16,16],[4.0,0,16,16],[4.1,0,16,8],[4.2,0,5,0]]},"graceful_ready":{"requests":1146,"errors":0,"stalled":0,"error_seconds":0.0,"by_type":{},"deploy_s":5.56,"deploy_start":1.0,"deploy_end":6.56,"bins":[[0.0,16,0,0],[0.1,16,0,0],[0.2,16,0,0],[0.3,15,0,0],[0.4,10,0,0],[0.5,15,0,0],[0.6,16,0,0],[0.7,16,0,0],[0.8,16,0,0],[0.9,16,0,0],[1.0,16,0,0],[1.1,16,0,0],[1.2,16,0,0],[1.3,16,0,0],[1.4,14,0,0],[1.5,10,0,0],[1.6,16,0,0],[1.7,16,0,0],[1.8,16,0,0],[1.9,16,0,0],[2.0,16,0,0],[2.1,16,0,0],[2.2,16,0,0],[2.3,16,0,0],[2.4,10,0,0],[2.5,14,0,0],[2.6,16,0,0],[2.7,16,0,0],[2.8,16,0,0],[2.9,16,0,0],[3.0,16,0,0],[3.1,16,0,0],[3.2,16,0,0],[3.3,11,0,0],[3.4,13,0,0],[3.5,16,0,0],[3.6,16,0,0],[3.7,16,0,0],[3.8,0,16,0],[3.9,0,15,0],[4.0,0,16,0],[4.1,0,16,0],[4.2,0,11,0],[4.3,0,14,0],[4.4,0,16,0],[4.5,0,16,0],[4.6,0,16,0],[4.7,0,16,0],[4.8,0,16,0],[4.9,0,16,0],[5.0,0,16,0],[5.1,0,16,0],[5.2,0,16,0],[5.3,0,12,0],[5.4,0,12,0],[5.5,0,16,0],[5.6,0,16,0],[5.7,0,16,0],[5.8,0,16,0],[5.9,0,16,0],[6.0,0,16,0],[6.1,0,15,0],[6.2,0,15,0],[6.3,0,13,0],[6.4,0,13,0],[6.5,0,16,0],[6.6,0,16,0],[6.7,0,16,0],[6.8,0,14,0],[6.9,0,13,0],[7.0,0,15,0],[7.1,0,16,0],[7.2,0,16,0],[7.3,0,14,0],[7.4,0,16,0],[7.5,0,10,0]]}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  function chart(r) {
+    const W = 640, H = 190, L = 34, R = 10, T = 10, B = 26;
+    const tmax = Math.max(...Object.values(D).map(x => x.bins[x.bins.length - 1][0])) + 0.1;
+    const ymax = Math.max(...Object.values(D).flatMap(x => x.bins.map(b => b[1] + b[2] + b[3])));
+    const x = (t) => L + (W - L - R) * t / tmax, y = (n) => T + (H - T - B) * (1 - n / ymax), bw = (W - L - R) / (tmax * 10) - 1;
+    let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Requests per 100 ms during the deploy">`;
+    s += `<rect x="${x(r.deploy_start)}" y="${T}" width="${x(r.deploy_end) - x(r.deploy_start)}" height="${H - T - B}" fill="var(--amber-soft)" stroke="var(--amber)" stroke-dasharray="3 3"/>`;
+    for (let t = 0; t <= tmax; t += 1) s += `<text x="${x(t)}" y="${H - 8}" text-anchor="middle">${t}s</text>`;
+    s += `<text x="${L - 6}" y="${y(ymax) + 9}" text-anchor="end">${ymax}</text><text x="${L - 6}" y="${y(0)}" text-anchor="end">0</text>`;
+    for (const [t, a, b, e] of r.bins) {
+      let base = 0;
+      for (const [n, col] of [[a, 'var(--muted)'], [b, 'var(--accent)'], [e, 'var(--red)']]) {
+        if (n) s += `<rect x="${x(t)}" y="${y(base + n)}" width="${Math.max(1, bw)}" height="${y(base) - y(base + n)}" fill="${col}"/>`;
+        base += n;
+      }
+    }
+    return s + '</svg>';
+  }
+  function draw() {
+    const m = v('#dpM'), r = D[m];
+    $('#dpChart').innerHTML = chart(r);
+    const dropped = r.by_type['connection dropped mid-request'] || 0, warm = r.by_type['503 warming up'] || 0;
+    const okAt = new Map(r.bins.map(b => [Math.round(b[0] * 10), b[1] + b[2]]));
+    let gap = 0, run = 0;
+    for (let k = Math.round(r.bins[0][0] * 10); k <= Math.round(r.bins[r.bins.length - 1][0] * 10); k++) { if (!(okAt.get(k) > 0)) { run++; gap = Math.max(gap, run); } else run = 0; }
+    gap = gap / 10;
+    $('#dpStats').innerHTML = `<div class="stat ${r.errors ? 'warn' : 'good'}"><div class="k">Failed requests</div><div class="v">${r.errors} of ${r.requests}</div></div>` +
+      `<div class="stat ${r.error_seconds ? 'warn' : 'good'}"><div class="k">Time with failures</div><div class="v">${r.error_seconds} s</div></div>` +
+      `<div class="stat ${gap >= 0.3 ? 'warn' : 'good'}"><div class="k">Longest with no success</div><div class="v">${gap.toFixed(1)} s</div></div>` +
+      `<div class="stat ${dropped ? 'warn' : 'good'}"><div class="k">Cut off mid-request</div><div class="v">${dropped}</div></div>` +
+      `<div class="stat"><div class="k">Deploy took</div><div class="v">${r.deploy_s} s</div></div>`;
+    $('#dpWhy').innerHTML = {
+      kill: `<b>${dropped} requests were cut off mid-flight and ${warm} got 503 from instances still warming up.</b> Killing the process ends every connection on it, and because the balancer has no health checks it kept sending traffic to the new instance as soon as its port opened, ${(r.error_seconds).toFixed(1)} s of failures in all.`,
+      graceful: `<b>Nothing was cut off, but ${warm} requests got 503.</b> Uvicorn finished in-flight requests before exiting, so shutdown was clean; the problem is start-up. The deploy treated an open port as ready and took the second instance down while the first was still warming, so for a while no instance could serve: for ${gap.toFixed(1)} s not one request succeeded, while clients' connections to the closed port hung before failing.`,
+      graceful_ready: `<b>Zero failed requests out of ${r.requests}.</b> Each old instance failed readiness first, so the balancer stopped routing to it before it shut down; each new instance received traffic only once its readiness check passed. The deploy took ${r.deploy_s} s instead of about 2, because it waited for each new instance to warm up.`,
+    }[m];
+    $('#dpWhy').dataset.x = JSON.stringify({ m, errors: r.errors, dropped, window: r.error_seconds, gap });
+  }
+  $('#dpM').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
