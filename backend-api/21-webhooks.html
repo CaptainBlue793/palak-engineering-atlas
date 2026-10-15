@@ -3,37 +3,247 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Webhooks</title>
+<title>Webhooks · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 21 of Backend & API. Push versus poll, delivery and retries, signing payloads with HMAC, replay protection and receiving webhooks safely, with real signed deliveries sent to three receivers.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .wh-ctl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 18px; }
+  @media (max-width:800px) { .wh-ctl { grid-template-columns:1fr; } }
+  .wh-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .wh-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-family:var(--mono); font-size:12px; line-height:1.55; word-break:break-all; }
+  .wh-box .t { display:block; font-family:var(--font); font-size:10.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); margin-bottom:4px; }
+  .wh-box .ok { color:var(--green); font-weight:700; } .wh-box .bad { color:var(--red); font-weight:700; }
+  .wh-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="21">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 21</span><span class="pill">Intermediate</span><span class="pill">⏱ 40 min</span></div>
     <h1><span class="grad">Webhooks</span></h1>
-    <p class="lead">Calling other people's servers: delivery, retries, signatures, replay protection and receiving them safely.</p>
+    <p class="lead">A <b>webhook</b> is an API call in reverse: instead of a client asking "has the payment succeeded yet?" every few seconds, the service that knows calls the client's URL the moment it happens. Payment providers, Git hosts, messaging platforms and shops all use them, and sooner or later your service will both send and receive them.</p>
+    <p class="lead">The mechanism is just an HTTP POST, and that is the problem. Anyone on the internet can POST to a URL, deliveries fail and get retried, events arrive twice or out of order, and a slow receiver makes the sender give up. This chapter covers delivery, signatures, replay protection and receiving safely. The lab sends real signed deliveries, genuine and malicious, to three receivers.</p>
+    <ul class="objectives">
+      <li><span>Choose between webhooks and polling</span></li>
+      <li><span>Deliver webhooks reliably with retries and backoff</span></li>
+      <li><span>Sign payloads with HMAC and verify the raw body</span></li>
+      <li><span>Reject replays with timestamps and deduplicate by event ID</span></li>
+      <li><span>Receive webhooks quickly and process them asynchronously</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Idempotency and retries:</b> <a href="15-idempotency.html">Chapter 15</a>; <b>background jobs and backoff:</b> <a href="20-background-jobs.html">Chapter 20</a>.</li>
+        <li><b>Secrets:</b> <a href="p6-config-and-environments.html">Prerequisite 6</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Push vs poll</li>
-    <li>Delivery and retries</li>
-    <li>Signing payloads</li>
-    <li>Replay protection</li>
-    <li>Receiving webhooks</li>
-  </ol>
+  <h2>Push versus poll</h2>
+  <p>Polling, a client asking repeatedly, is simple and needs nothing from the client but outgoing requests; but most polls return nothing new, and changes are seen only at the next poll. Webhooks deliver changes immediately and only when they happen, but the client must run a public HTTPS endpoint, handle retries and duplicates, and cope with missed deliveries. The robust design offers both: webhooks for speed, and a list endpoint, ideally a cursor-paginated feed of events (<a href="08-pagination-filtering.html">Chapter 8</a>), so clients can catch up after downtime and reconcile. Many providers send "thin" webhooks containing just the event type and an ID, and let the receiver fetch the current state through the API, which also sidesteps out-of-order delivery.</p>
+
+  <h2>Delivery and retries</h2>
+  <p>On the sending side, a webhook is a background job (<a href="20-background-jobs.html">Chapter 20</a>): record the event in the same transaction as the change, then deliver it from a worker. Treat any 2xx response as success and anything else, including timeouts, as failure; retry with exponential backoff and jitter over hours or days (Stripe, for example, retries for up to three days in live mode); give each event a stable ID that stays the same across retries; disable endpoints that fail for too long and tell their owners; and let customers see delivery attempts and replay events from a dashboard. Delivery is at least once, so every receiver must expect duplicates.</p>
+
+  <h2>Signing payloads</h2>
+  <p>A receiver needs to know a request really came from the sender and was not altered. The standard answer is an <b>HMAC signature</b>: the sender and receiver share a secret per endpoint; the sender computes HMAC-SHA256 of a timestamp and the exact body bytes, and sends it in a header; the receiver recomputes it over the bytes it received and compares in constant time. The lab's sender uses a <code>t=&lt;timestamp&gt;,v1=&lt;hex&gt;</code> header in the style of Stripe's:</p>
+<pre class="code">def sign(raw: bytes, ts: int, secret: bytes = SECRET) -&gt; str:
+    mac = hmac.new(secret, b"%d." % ts + raw, hashlib.sha256).hexdigest()
+    return "t=%d,v1=%s" % (ts, mac)
+
+<span class="c"># what was sent</span>
+Webhook-Signature: t=1792034720,v1=886f7bb5b75a9ff8d6eccbfc2ea35066eab63120578515f56ce59de07a942d91
+{&quot;id&quot;:&quot;evt_1QX2&quot;,&quot;type&quot;:&quot;payment.succeeded&quot;,&quot;data&quot;:{&quot;order_id&quot;:&quot;ord_8812&quot;,&quot;amount_cents&quot;:4999,&quot;currency&quot;:&quot;gbp&quot;}}</pre>
+  <p>Verify the <b>raw body</b>, not a parsed and re-encoded copy: JSON libraries change whitespace, key order and number formats, so re-serialising produces different bytes and a different signature. The lab's second receiver makes exactly this mistake.</p>
+
+  <h2>Simulator: six deliveries, three receivers</h2>
+  <p>A <code>payment.succeeded</code> event for order <code>ord_8812</code> is delivered in six ways: genuine; with the amount edited to 1 pence but the original signature; signed with a guessed secret; a genuine delivery captured ten minutes ago and replayed; the same event delivered twice by a retrying sender; and with no signature. The <b>trusting</b> receiver just parses the JSON; the <b>re-serialising</b> receiver verifies a signature over <code>json.dumps</code> of the parsed body; the <b>proper</b> receiver verifies the raw bytes, checks the timestamp against a 5-minute tolerance and deduplicates by event ID.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Who does the receiver believe?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="wh-ctl">
+        <div><div class="wh-l">Receiver</div><div class="seg" id="whK"><button class="active" data-v="trusting">trusting</button><button data-v="reserialised">verifies re-serialised JSON</button><button data-v="proper">verifies raw body + timestamp + dedupe</button></div></div>
+        <div><div class="wh-l">Delivery</div><div class="seg" id="whS"><button data-v="genuine">genuine</button><button class="active" data-v="tampered">amount edited</button><button data-v="forged">forged signature</button><button data-v="stale">replayed after 10 min</button><button data-v="duplicate">delivered twice</button><button data-v="unsigned">no signature</button></div></div>
+      </div>
+      <div class="wh-box" id="whOut"></div>
+      <div class="stats" id="whStats"></div>
+      <div class="wh-why" id="whWhy"></div>
+    </div>
+    <div class="panel-foot">Receivers are FastAPI apps called through <code>TestClient</code>; "processed" counts how many times the receiver acted on the event, such as marking the order paid. The signing code is above; the receivers are in the code below the lab.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>trusting</b> receiver: every delivery is processed, including the one claiming a £0.01 payment and the unsigned one. Anyone who learns the URL can mark orders as paid.</li>
+    <li><b>verifies re-serialised JSON</b>: everything is rejected, including the <b>genuine</b> delivery. The sender wrote compact JSON; <code>json.dumps</code> adds spaces after commas and colons, so the bytes, and the HMAC, differ. Secure by accident, broken in practice.</li>
+    <li><b>proper</b>: the genuine delivery is processed; edits and forgeries fail the signature; the ten-minute-old replay passes the signature but fails the timestamp check; the duplicate is acknowledged with 200, so the sender stops retrying, but processed only once.</li>
+  </ul>
+
+  <h2>Replay protection</h2>
+  <p>A valid signed request can be captured, from a log, a proxy or a compromised network, and sent again. Two defences work together. The <b>timestamp</b> is inside the signed material, so it cannot be changed; reject deliveries whose timestamp is more than a few minutes from now. Within that window, <b>deduplicate</b> by event ID: record processed IDs with a unique constraint, and answer duplicates with 200 without acting. Deduplication also handles the sender's own legitimate retries.</p>
+
+  <h2>Receiving webhooks</h2>
+  <p>Senders wait only a few seconds for a response. A receiver that does its work inline, generating an invoice or calling other services, will time out, the sender will retry, and the work will run again. Measured with a real sender that waits 1 second and retries up to four times, against a receiver whose work takes 1.5 seconds:</p>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Receiver</th><th>Events</th><th>Deliveries the sender made</th><th>Times the work ran</th><th>What the sender saw</th></tr></thead>
+      <tbody>
+        <tr><td><b>Work done inline</b></td><td>5</td><td>20</td><td>20</td><td>Timeouts on every attempt</td></tr>
+        <tr><td><b>Acknowledge, then work in the background (deduplicated)</b></td><td>5</td><td>5</td><td>5</td><td>200 in about 30 ms</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>So: verify the signature, record the event (deduplicated) or enqueue a job, return 2xx at once, and process asynchronously. Handle events in any order, for example by ignoring an older state change that arrives after a newer one, or by fetching the current state from the API. Keep each endpoint's secret in a secret store and support two secrets at once so it can be rotated, and never log full payloads or signatures.</p>
+<pre class="code"># inside the proper receiver, with raw = await request.body()
+try:
+    ts, sig = parse_sig(webhook_signature or "")
+except Exception:
+    raise HTTPException(400, "missing or malformed signature header")
+expected = hmac.new(SECRET, b"%d." % ts + raw, hashlib.sha256).hexdigest()
+if not hmac.compare_digest(expected, sig):     # constant-time comparison
+    raise HTTPException(400, "bad signature")
+if abs(time.time() - ts) &gt; TOLERANCE:
+    raise HTTPException(400, "timestamp outside tolerance")
+event = json.loads(raw)
+if event["id"] in seen:                         # in production: a unique key in the database
+    return {"received": True, "duplicate": True}
+seen.add(event["id"])</pre>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Event happens</b> recorded with a stable ID</li>
+      <li data-k="step"><b>Sender signs</b> HMAC(secret, timestamp + raw body)</li>
+      <li data-k="step"><b>Receiver verifies</b> raw bytes, constant time, timestamp window</li>
+      <li data-k="step"><b>Dedupe and enqueue</b> unique event ID; reply 2xx fast</li>
+      <li data-k="end"><b>Process later</b> idempotent, order-tolerant</li>
+    </ol>
+    <figcaption><b>A webhook delivered and received safely.</b> Retries on the sender's side and deduplication on the receiver's side make at-least-once delivery harmless.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🪝</div>
+    <div class="body"><div class="title">Use case: the Standard Webhooks specification</div><p>For years every provider signed webhooks its own way: different header names, different signed material, hex in one place and base64 in another, with or without a timestamp. Receivers wrote and maintained a verifier per provider, and many got at least one of them wrong, typically by verifying a re-serialised body or skipping the timestamp. In late 2023 a group of companies that send webhooks at scale, led by the webhook-delivery company Svix and joined by contributors from firms such as Zapier, Twilio, ngrok, Supabase and Kong, published Standard Webhooks, an open specification with reference libraries in many languages. It fixes the choices this chapter describes: a <code>webhook-id</code> header for deduplication, a <code>webhook-timestamp</code> for replay protection, and a <code>webhook-signature</code> carrying an HMAC-SHA256 over the ID, the timestamp and the raw body, with support for several signatures at once so secrets can be rotated. If you are designing webhooks today, following it means your customers can verify your deliveries with an existing library instead of writing their own.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Unverified webhook endpoints</b> that act on anything posted to them.</li>
+      <li><b>Verifying a re-serialised body</b> instead of the raw bytes.</li>
+      <li><b>Comparing signatures with <code>==</code></b> instead of a constant-time comparison.</li>
+      <li><b>No timestamp check or deduplication,</b> so replays and retries are processed again.</li>
+      <li><b>Doing slow work before responding,</b> causing timeouts and retries.</li>
+      <li><b>Assuming events arrive in order.</b></li>
+      <li><b>Sending webhooks from the request path</b> instead of a queue with retries.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How do you know a webhook really came from the provider?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The provider and I share a secret for my endpoint. When it sends a webhook, it computes an HMAC-SHA256 of the timestamp and the exact body bytes with that secret and puts it in a header. My endpoint reads the raw body before parsing it, recomputes the HMAC with the same secret, and compares the two in constant time; if they differ, the request was not from the provider or was altered, and I reject it. Because the timestamp is part of the signed data, I also reject deliveries older than a few minutes, and I deduplicate by event ID so a captured or retried delivery is not processed twice.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Design the webhook system for your platform's customers.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>When something happens, the change and an event row are written in one transaction (an outbox, <a href="30-outbox-events.html">Chapter 30</a>), each event with a stable ID. A dispatcher creates one delivery per subscribed endpoint and workers send them as background jobs, signed following Standard Webhooks: ID, timestamp and HMAC-SHA256 of the raw body, with per-endpoint secrets that can be rotated with an overlap. Short timeouts, any 2xx is success, retries with exponential backoff and jitter for up to a few days, per-endpoint concurrency limits so one slow customer cannot block others, and automatic disabling with an email after prolonged failure. Customers get a dashboard of attempts with responses, manual replay, a test-event button, and an events list endpoint with cursors to reconcile. Payloads are thin or versioned so evolving them does not break receivers, and the sender only connects to public addresses, to avoid being used to probe internal networks.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Webhooks push changes immediately; pair them with a list or events endpoint for catch-up.</li>
+      <li>Send from a queue with stable event IDs and backoff retries; delivery is at least once.</li>
+      <li>Sign with HMAC over the timestamp and raw body; verify raw bytes in constant time.</li>
+      <li>Reject stale timestamps and deduplicate by event ID.</li>
+      <li>Acknowledge quickly and process asynchronously, tolerating any order.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why did the receiver that verified <code>json.dumps(parsed_body)</code> reject the genuine webhook?</p>
+      <div class="opts">
+        <button class="opt">The secret was wrong</button>
+        <button class="opt">The timestamp was old</button>
+        <button class="opt">Re-encoding changed the bytes (spaces, ordering), so the HMAC differed</button>
+        <button class="opt">JSON cannot be signed</button>
+      </div>
+      <div class="explain">Always verify the raw request body.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What stops a captured, validly signed delivery from being replayed a week later?</p>
+      <div class="opts">
+        <button class="opt">A signed timestamp checked against a tolerance window</button>
+        <button class="opt">HTTPS</button>
+        <button class="opt">The HMAC algorithm</button>
+        <button class="opt">Rate limiting</button>
+      </div>
+      <div class="explain">Within the window, deduplication by event ID catches the rest.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">The same event arrives twice because the sender retried. What should the receiver return the second time?</p>
+      <div class="opts">
+        <button class="opt">409, so the sender knows</button>
+        <button class="opt">400</button>
+        <button class="opt">Nothing; close the connection</button>
+        <button class="opt">200, without processing it again</button>
+      </div>
+      <div class="explain">Any non-2xx would make the sender keep retrying.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In the lab, a receiver doing 1.5 s of work inline against a sender with a 1 s timeout ran the work how many times for 5 events?</p>
+      <div class="opts">
+        <button class="opt">5</button>
+        <button class="opt">20: every retry ran it again</button>
+        <button class="opt">0</button>
+        <button class="opt">10</button>
+      </div>
+      <div class="explain">Acknowledging immediately and processing in the background brought it to 5.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why compare signatures with <code>hmac.compare_digest</code> rather than <code>==</code>?</p>
+      <div class="opts">
+        <button class="opt">It is faster</button>
+        <button class="opt">It handles base64</button>
+        <button class="opt">It takes the same time however many characters match, so timing does not leak the correct signature</button>
+        <button class="opt">== does not work on strings</button>
+      </div>
+      <div class="explain">Ordinary comparison stops at the first difference.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"r":{"trusting|genuine":{"responses":[[200,"{\"received\":true}"]],"processed":1},"trusting|tampered":{"responses":[[200,"{\"received\":true}"]],"processed":1},"trusting|forged":{"responses":[[200,"{\"received\":true}"]],"processed":1},"trusting|stale":{"responses":[[200,"{\"received\":true}"]],"processed":1},"trusting|duplicate":{"responses":[[200,"{\"received\":true}"],[200,"{\"received\":true}"]],"processed":2},"trusting|unsigned":{"responses":[[200,"{\"received\":true}"]],"processed":1},"reserialised|genuine":{"responses":[[400,"{\"detail\":\"bad signature\"}"]],"processed":0},"reserialised|tampered":{"responses":[[400,"{\"detail\":\"bad signature\"}"]],"processed":0},"reserialised|forged":{"responses":[[400,"{\"detail\":\"bad signature\"}"]],"processed":0},"reserialised|stale":{"responses":[[400,"{\"detail\":\"bad signature\"}"]],"processed":0},"reserialised|duplicate":{"responses":[[400,"{\"detail\":\"bad signature\"}"],[400,"{\"detail\":\"bad signature\"}"]],"processed":0},"reserialised|unsigned":{"responses":[[400,"{\"detail\":\"bad signature\"}"]],"processed":0},"proper|genuine":{"responses":[[200,"{\"received\":true}"]],"processed":1},"proper|tampered":{"responses":[[400,"{\"detail\":\"bad signature\"}"]],"processed":0},"proper|forged":{"responses":[[400,"{\"detail\":\"bad signature\"}"]],"processed":0},"proper|stale":{"responses":[[400,"{\"detail\":\"timestamp outside tolerance\"}"]],"processed":0},"proper|duplicate":{"responses":[[200,"{\"received\":true}"],[200,"{\"received\":true,\"duplicate\":true}"]],"processed":1},"proper|unsigned":{"responses":[[400,"{\"detail\":\"missing or malformed signature header\"}"]],"processed":0}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const SHOULD = { genuine: 1, tampered: 0, forged: 0, stale: 0, duplicate: 1, unsigned: 0 };
+  function draw() {
+    const k = v('#whK'), s = v('#whS'), r = D.r[`${k}|${s}`];
+    $('#whOut').innerHTML = `<span class="t">Receiver's responses</span>` + r.responses.map(([st, body], i) => `delivery ${i + 1}: <span class="${st < 300 ? 'ok' : 'bad'}">${st}</span> ${esc(body)}`).join('<br>');
+    const right = r.processed === SHOULD[s];
+    $('#whStats').innerHTML = `<div class="stat"><div class="k">Times processed</div><div class="v">${r.processed}</div></div><div class="stat"><div class="k">Should be</div><div class="v">${SHOULD[s]}</div></div><div class="stat ${right ? 'good' : 'warn'}"><div class="k">Verdict</div><div class="v">${right ? 'correct' : SHOULD[s] > r.processed ? 'lost a real event' : 'fooled'}</div></div>`;
+    let why;
+    if (k === 'trusting') why = s === 'genuine' ? `<b>Processed, correctly, but only by luck:</b> this receiver would have processed anything.` : s === 'duplicate' ? `<b>Processed twice.</b> The sender retried, and nothing recognised the event ID, so the order was marked paid twice, or a second confirmation email went out.` : `<b>Fooled.</b> With no verification, an edited, forged, replayed or unsigned request looks exactly like a real one.`;
+    else if (k === 'reserialised') why = `<b>Rejected${s === 'genuine' || s === 'duplicate' ? ', including a genuine event' : ''}.</b> The receiver verified <code>json.dumps</code> of the parsed body, which adds spaces after commas and colons, so its bytes never match what was signed. Every real payment notification is lost, and the sender keeps retrying.`;
+    else why = { genuine: `<b>Verified and processed.</b> The HMAC over the timestamp and raw bytes matched, the timestamp is current, and the event ID is new.`, tampered: `<b>Rejected: bad signature.</b> The signature covers the exact bytes; changing the amount changed the HMAC.`, forged: `<b>Rejected: bad signature.</b> Without the shared secret, nobody can produce a valid HMAC.`, stale: `<b>Rejected: timestamp outside tolerance.</b> The signature is genuine, it was simply captured ten minutes ago. The timestamp is inside the signed material, so it cannot be updated.`, duplicate: `<b>Acknowledged twice, processed once.</b> The second delivery's event ID was already recorded, so the receiver answered 200, which stops the sender retrying, and did nothing.`, unsigned: `<b>Rejected: missing signature header.</b>` }[s];
+    $('#whWhy').innerHTML = why;
+    $('#whWhy').dataset.x = JSON.stringify({ k, s, processed: r.processed, right });
+  }
+  ['#whK', '#whS'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
