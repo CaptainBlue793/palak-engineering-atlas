@@ -3,37 +3,277 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Performance: Profiling &amp; Load Testing</title>
+<title>Performance: Profiling &amp; Load Testing · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 32 of Backend & API. Profiling a slow handler with cProfile, load testing a FastAPI service with closed and open workloads, percentiles and tails, Little's law, and finding the bottleneck as it moves from the connection pool to the CPU.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pf-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .pf-chart { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:8px 10px; }
+  .pf-chart svg { width:100%; height:auto; display:block; }
+  .pf-chart text { font-family:var(--mono); font-size:11px; fill:var(--muted); }
+  .pf-break { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-family:var(--mono); font-size:12.5px; }
+  .pf-bar { display:flex; height:18px; border-radius:5px; overflow:hidden; margin:6px 0; background:var(--surface); }
+  .pf-bar i { display:block; height:100%; }
+  .pf-key { display:flex; flex-wrap:wrap; gap:4px 14px; font-size:12px; color:var(--muted); }
+  .pf-key b { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .pf-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="32">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 32</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Performance: <span class="grad">Profiling &amp; Load Testing</span></h1>
-    <p class="lead">Finding where time goes, load testing honestly, and reading latency percentiles under rising load.</p>
+    <h1>Performance: Profiling &amp; <span class="grad">Load Testing</span></h1>
+    <p class="lead">Performance work goes wrong in two predictable ways: optimising code that was never the slow part, and believing a service can handle a load that nobody has actually sent it. The cure for both is measurement. A <b>profiler</b> tells you where one request spends its time. A <b>load test</b> tells you how the whole service behaves as traffic rises: how much it can serve, how latency grows, and which resource runs out first.</p>
+    <p class="lead">This chapter profiles a slow report endpoint and makes it 23 times faster in two steps, then load-tests a FastAPI service from 1 to 128 concurrent users in three configurations, and follows the bottleneck as it moves from the database connection pool to the CPU.</p>
+    <ul class="objectives">
+      <li><span>Profile a request and fix the top item first</span></li>
+      <li><span>Choose and configure a load-testing tool, closed or open model</span></li>
+      <li><span>Read latency as percentiles and explain why tails matter</span></li>
+      <li><span>Use Little's law to relate concurrency, throughput and latency</span></li>
+      <li><span>Find the saturated resource, fix it, and find the next one</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Connection pools:</b> <a href="06-database-access.html">Chapter 6</a>.</li>
+        <li><b>The event loop, workers and overload:</b> <a href="28-async-services.html">Chapter 28</a>.</li>
+        <li><b>Latency histograms and percentiles in production:</b> <a href="31-service-observability.html">Chapter 31</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Profiling a request</li>
-    <li>Load-testing tools</li>
-    <li>Percentiles and tails</li>
-    <li>Little's law</li>
-    <li>Finding the bottleneck</li>
-  </ol>
+  <h2>Profiling a request</h2>
+  <p>A profiler records where a program spends its time, function by function. Python ships one, <code>cProfile</code>; it is deterministic, hooking every call, which makes it precise about call counts but adds overhead to code with many small calls. Sampling profilers such as py-spy, pyinstrument and Scalene instead look at the stack many times a second; they are cheap enough to attach to a live production process (py-spy can, by process ID, without restarting it). Read a profile in two columns: <b>tottime</b>, time inside the function itself, finds hot code; <b>cumtime</b>, including everything it calls, finds the expensive path. Then fix the top item and profile again, because the second item is now the first.</p>
+  <p>The handler below builds a report of 5,000 orders: it loads them, fetches each order's customer, works out VAT with <code>Decimal</code>, reformats the date with a regular expression and returns JSON. It took 407 ms. Its profile, sorted by tottime:</p>
+<pre class="code"><span class="c">  ncalls  tottime  function                                  (cProfile, 452 ms profiled)</span>
+    5001  328.7 ms  sqlite3.Connection.execute               <span class="c"># 73% of the time: one query per order</span>
+       1   56.6 ms  report_v1
+    5000   26.2 ms  sqlite3.Cursor.fetchone
+    5000    7.2 ms  re.Pattern.match
+       1    6.0 ms  json encoder iterencode
+    5000    5.4 ms  re._compile                              <span class="c"># the regex is looked up on every row</span></pre>
+  <p>The answer was not "Python is slow" or "JSON is slow": 5,001 calls to <code>execute</code>, the N+1 query pattern from Chapter 7, took almost three quarters of the time. Replacing it with one <code>JOIN</code> brought the handler to <b>27.5 ms</b>, 15 times faster. Profiled again, the top items were now the loop itself, JSON encoding (6.8 ms) and fetching rows (5.8 ms), with <code>Decimal</code> and the per-row regex below them. Doing VAT in integer pence and slicing the date string brought it to <b>17.7 ms</b>; all three versions were checked to produce byte-identical output. Note too that cProfile reported 40.8 ms for the 27.5 ms version: tracing every call inflated it by half, so compare profiles with profiles and wall-clock times with wall-clock times.</p>
+
+  <h2>Load-testing tools</h2>
+  <p>A load generator sends many requests and records how the service copes. Common choices are <b>k6</b> (JavaScript scripts, good reports), <b>Locust</b> (Python users), <b>Gatling</b>, <b>wrk</b> and <b>wrk2</b>, <b>vegeta</b> and <b>oha</b> (fast command-line tools). Two things matter more than the brand. First, the generator must not be the bottleneck: the Python client first written for this lab managed only about 220 requests per second, so it was replaced by a small Node.js generator that reached 3,705 a second against a trivial endpoint. Second, choose the workload <b>model</b>. In a <b>closed</b> model a fixed number of virtual users each send a request, wait for the reply and send the next, so the service can never receive more than that many requests at once. In an <b>open</b> model requests arrive on a schedule, say 100 a second, whether or not earlier ones have finished, which is how independent users on the internet behave. Test against something production-like (same instance size, realistic data volume, warm caches), ramp up gradually, and run long enough to see steady state.</p>
+
+  <h2>Simulator: following the bottleneck</h2>
+  <p>The service under test handles <code>GET /quote</code>: it takes a connection from a pool, runs a 40 ms query, then does 4 ms of CPU work (pricing rules, serialisation) on the event loop. The Node.js generator ran a closed workload of 1 to 128 users for 4 seconds after a 2-second warm-up, against three configurations. Inside the service, every request recorded how long it waited for a connection, how long the query took and how long the CPU work took; the generator measured CPU use of each worker process.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Where does it run out?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="pf-l">Configuration</div>
+      <div class="seg" id="pfC"><button class="active" data-v="p4w1">pool of 4, 1 worker</button><button data-v="p16w1">pool of 16, 1 worker</button><button data-v="p16w2">pool of 16, 2 workers</button></div>
+      <div class="pf-l">Concurrent users</div>
+      <div class="seg" id="pfU"><button data-v="1">1</button><button data-v="2">2</button><button data-v="4">4</button><button data-v="8">8</button><button data-v="16">16</button><button class="active" data-v="32">32</button><button data-v="64">64</button><button data-v="128">128</button></div>
+      <div class="pf-chart" id="pfChart"></div>
+      <div class="pf-break" id="pfBreak"></div>
+      <div class="stats" id="pfStats"></div>
+      <div class="pf-why" id="pfWhy"></div>
+    </div>
+    <div class="panel-foot">uvicorn with FastAPI 0.142.2 on a 16-thread Windows machine; Node.js closed-loop generator with keep-alive. The query is a 40 ms <code>time.sleep</code> on a pool thread, the CPU work a 4 ms busy loop. "Worker CPU" is process CPU time divided by wall time. Latency is measured by the client; the breakdown is measured inside the handler, and "outside the handler" is the rest: queueing for the event loop, HTTP parsing and the network.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>Pool of 4, rising users</b>: throughput stops at 89 requests a second from 8 users on, while CPU sits at about 42%. Every extra user only adds time waiting for a connection: latency doubles each time users double.</li>
+    <li><b>Pool of 16</b>: the ceiling rises to 221 a second and the CPU hits 100%. Now the query itself appears to take 58 ms instead of 41: the event loop is so busy that finished queries wait to be resumed.</li>
+    <li><b>Two workers</b>: two processes, two CPUs, 448 a second. At 8 users, two separate runs had connections stall until the client's 20-second timeout; uvicorn's multi-worker mode on Windows did not spread a few long-lived connections evenly. At 128 users, p50 (173 ms) and mean (287 ms) diverge for the same reason: one worker held more of the connections.</li>
+    <li>On every row, compare <b>λ × W</b> with the number of users: that is Little's law, and it holds to within 2% everywhere except the stalled run.</li>
+  </ul>
+
+  <h2>Percentiles and tails</h2>
+  <p>Report latency as percentiles from a histogram: p50 for the typical request, p95 and p99 for the slow ones that users remember, and the maximum to spot outliers. Averages hide structure, as Chapter 31 showed. Tails matter more than they look. A page that makes 20 backend calls sees the p99 of at least one of them on about 18% of loads (1 − 0.99<sup>20</sup>), and a heavy user making hundreds of requests a day meets the tail daily. Measure latency <b>from when the request should have been sent</b>, not from when the generator got round to sending it. A closed-loop generator stops sending while the service stalls, so it never records the requests that would have queued behind the stall; Gil Tene called this <b>coordinated omission</b> and wrote wrk2 to measure with an open model and fix it.</p>
+  <p>The open model also shows what overload really looks like. Against the pool-of-4 configuration (capacity about 89 a second), open arrivals measured:</p>
+<pre class="code"><span class="c">arrivals/s   p50      p99      median latency in each second of the test</span>
+    50       52 ms    60 ms    52  52  52  52  52
+    80       51 ms    66 ms    51  51  53  50  52
+   100      392 ms   715 ms   116 238 392 521 655    <span class="c"># 12% over capacity: the queue grows every second</span></pre>
+  <p>At 80 arrivals a second, 90% of capacity, the service was fine. At 100, only 12% over, latency climbed by about 130 ms every second and up to 64 requests were in flight at once; it would keep climbing until clients time out. A closed test cannot show this, because its users politely wait. Production traffic does not.</p>
+
+  <h2>Little's law</h2>
+  <p>For any stable system, the average number of requests inside it equals the arrival rate times the average time each spends there: <b>L = λ × W</b>. It needs no assumptions about distributions, and it turns capacity planning into arithmetic. A pool of 4 connections each held for about 45 ms can complete at most 4 / 0.045 ≈ 89 requests a second, which is exactly the measured ceiling. To serve 1,000 requests a second with 45 ms queries you need at least 1,000 × 0.045 = 45 connections busy at once, plus headroom, and the database must be able to run 45 queries concurrently. In a closed test, L is the number of users, so once throughput is fixed by the bottleneck, W must grow in proportion to the users: the doubling latency in the lab is Little's law, not bad luck.</p>
+
+  <h2>Finding the bottleneck</h2>
+  <p>Throughput is set by the scarcest resource, so the job is to find which one is <b>saturated</b>. Brendan Gregg's USE method gives a checklist: for each resource (CPU, memory, connection pool, worker threads, disk, network, the database itself, a downstream API) look at <b>U</b>tilisation, <b>S</b>aturation (work queued waiting for it) and <b>E</b>rrors. In the lab, the pool of 4 was 100% utilised with requests queueing for it, while CPU was at 42%: adding CPU would have done nothing. Enlarging the pool moved the bottleneck to the event loop's single core; adding a worker process moved it again. Each fix raises throughput only until the next resource saturates, and the database behind a bigger pool is often that next resource, so check it before and after. Find the bottleneck, fix it, measure again.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Configuration</th><th>Ceiling (req/s)</th><th>Saturated resource</th><th>Evidence</th><th>Next fix</th></tr></thead>
+      <tbody>
+        <tr><td><b>Pool of 4, 1 worker</b></td><td>89</td><td>Connection pool</td><td>Pool wait grows with users; CPU 42%</td><td>Bigger pool, if the database can take it</td></tr>
+        <tr><td><b>Pool of 16, 1 worker</b></td><td>221</td><td>One CPU (the event loop)</td><td>CPU 100%; queries appear slower</td><td>More worker processes, or less CPU per request</td></tr>
+        <tr><td><b>Pool of 16, 2 workers</b></td><td>448</td><td>Two CPUs</td><td>Both workers at 100%</td><td>More workers or instances; then the database</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Set a target</b> e.g. 300 req/s with p99 under 200 ms</li>
+      <li data-k="step"><b>Load test</b> ramp up; open model for overload behaviour</li>
+      <li data-k="step"><b>Find the saturated resource</b> utilisation, queueing, errors</li>
+      <li data-k="step"><b>Profile or reconfigure</b> fix the top item only</li>
+      <li data-k="end"><b>Measure again</b> the bottleneck has moved</li>
+    </ol>
+    <figcaption><b>The performance loop.</b> Every step is a measurement; nothing is optimised on a hunch.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🐢</div>
+    <div class="body"><div class="title">Use case: "The Tail at Scale" at Google</div><p>In 2013 Jeffrey Dean and Luiz André Barroso published "The Tail at Scale" in Communications of the ACM, explaining why Google's large services cared so much about rare slow responses. Their example: if a single server answers in 10 ms but takes a second 1% of the time, a user request that waits on 100 such servers in parallel is slower than a second 63% of the time. Fan-out turns one server's p99 into the whole service's typical case. Slowness came from mundane sources: shared machines, background jobs such as compaction and garbage collection, queueing and power management. Rather than trying to remove every source, they described techniques that tolerate it, such as hedged requests: send a request to one replica and, if it has not answered within the 95th-percentile expected latency, send it to another and use whichever replies first. In one Bigtable benchmark, hedging after 10 ms cut the 99.9th-percentile latency from 1,800 ms to 74 ms while sending only 2% more requests. The lesson for any backend is the one in this chapter: measure percentiles, not means, and remember that every extra call in a request path multiplies the tail.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Optimising without a profile,</b> or optimising the second item before the first.</li>
+      <li><b>Reporting average latency</b> instead of percentiles.</li>
+      <li><b>A load generator that is itself the bottleneck,</b> or that runs on the same busy machine.</li>
+      <li><b>Only closed-model tests,</b> which hide overload and coordinated omission.</li>
+      <li><b>Testing against an empty database</b> or cold caches unlike production.</li>
+      <li><b>Raising one limit,</b> such as pool size, without checking the resource behind it.</li>
+      <li><b>Short runs</b> that never reach steady state.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is Little's law and how would you use it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Little's law says that in a stable system the average number of items inside equals the arrival rate times the average time each spends inside: L equals lambda times W. For a backend, it links concurrency, throughput and latency. If each request holds a database connection for 45 ms and I need 1,000 requests a second, I need about 45 connections in use at once, plus headroom, and the database must handle that concurrency. Turned round, a pool of 4 connections at 45 ms each can never exceed about 89 requests a second, however many users arrive; extra users just wait, and their latency grows in proportion.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A service handles 200 requests a second today and must handle 1,000 for a launch. How do you get there?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Start with a target: 1,000 requests a second at, say, p99 under 300 ms and under 0.1% errors, on a realistic mix of endpoints. Build a load test with production-like data and a production-sized environment, using an open arrival model so overload shows up. Ramp until the target or failure, and at each step check every resource for utilisation, queueing and errors: CPU per worker, connection pool wait, database CPU and locks, downstream calls and their limits. Fix the saturated one: profile hot endpoints and remove N+1 queries or heavy serialisation, add caching, size pools by Little's law, add worker processes or instances, and offload slow work to queues. Re-run after every change, because the bottleneck moves, and usually ends at the database or a third-party limit. Finally keep headroom, add load shedding and rate limits for traffic beyond the plan, and set alerts on the same percentiles.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Profile first; fix the top item, then profile again.</li>
+      <li>Make sure the load generator is not the bottleneck, and use an open model to see overload.</li>
+      <li>Report p50, p95 and p99; tails multiply across calls.</li>
+      <li>Little's law, L = λW, sizes pools and predicts ceilings.</li>
+      <li>Throughput is set by the saturated resource; fixing it moves the bottleneck.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A profile shows 5,001 calls to <code>execute</code> taking 73% of a handler's time. What is the likely fix?</p>
+      <div class="opts">
+        <button class="opt">Switch to a faster JSON library</button>
+        <button class="opt">Add more worker processes</button>
+        <button class="opt">Replace the per-row query with one JOIN or batched query</button>
+        <button class="opt">Cache the regular expression</button>
+      </div>
+      <div class="explain">Measured: 407 ms down to 27.5 ms; the other items were each a few milliseconds.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A pool of 4 connections, each held for about 45 ms. What is the most throughput it can sustain?</p>
+      <div class="opts">
+        <button class="opt">About 89 requests a second</button>
+        <button class="opt">About 22 requests a second</button>
+        <button class="opt">It depends only on CPU</button>
+        <button class="opt">Unlimited, if users wait</button>
+      </div>
+      <div class="explain">Little's law: 4 / 0.045 ≈ 89, the measured ceiling.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why can a closed-model load test hide overload?</p>
+      <div class="opts">
+        <button class="opt">It sends requests too fast</button>
+        <button class="opt">It ignores errors</button>
+        <button class="opt">It cannot measure percentiles</button>
+        <button class="opt">Its users wait for each reply, so arrivals slow down when the service does</button>
+      </div>
+      <div class="explain">An open model at 12% over capacity showed latency climbing every second.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">After enlarging the pool, CPU is at 100% and the query appears to take 58 ms instead of 41. What is happening?</p>
+      <div class="opts">
+        <button class="opt">The database got slower</button>
+        <button class="opt">The event loop is saturated, so finished queries wait to be resumed</button>
+        <button class="opt">The pool is too big</button>
+        <button class="opt">The network is congested</button>
+      </div>
+      <div class="explain">The bottleneck moved to the CPU; a second worker process doubled throughput.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does the USE method check for each resource?</p>
+      <div class="opts">
+        <button class="opt">Uptime, speed and efficiency</button>
+        <button class="opt">Users, sessions and endpoints</button>
+        <button class="opt">Utilisation, saturation and errors</button>
+        <button class="opt">Usage, scaling and elasticity</button>
+      </div>
+      <div class="explain">Saturation, work queued for the resource, is the clearest sign of a bottleneck.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"closed":{"p16w2":[{"u":1,"rps":21.8,"mean":45.7,"p50":45.7,"p95":46.2,"p99":46.7,"max":46.7,"L":0.99,"cpu":[10,1],"err":0,"s":{"pool_wait_ms":0.01,"db_ms":40.81,"cpu_ms":4.0,"handler_ms":44.82}},{"u":2,"rps":40.0,"mean":49.6,"p50":49.6,"p95":53.8,"p99":54.2,"max":54.5,"L":1.98,"cpu":[19,0],"err":0,"s":{"pool_wait_ms":0.0,"db_ms":42.1,"cpu_ms":4.0,"handler_ms":46.11}},{"u":4,"rps":80.0,"mean":49.6,"p50":49.5,"p95":53.9,"p99":54.3,"max":54.4,"L":3.97,"cpu":[20,19],"err":0,"s":{"pool_wait_ms":0.0,"db_ms":42.81,"cpu_ms":4.0,"handler_ms":46.82}},{"u":8,"rps":79.5,"mean":62.7,"p50":62.6,"p95":75.6,"p99":79.5,"max":80.2,"L":4.99,"cpu":[9,0],"err":3,"s":{"pool_wait_ms":0.0,"db_ms":47.22,"cpu_ms":4.0,"handler_ms":51.22}},{"u":16,"rps":217.0,"mean":74.2,"p50":74.9,"p95":93.0,"p99":100.2,"max":105.8,"L":16.1,"cpu":[51,49],"err":0,"s":{"pool_wait_ms":0.0,"db_ms":55.08,"cpu_ms":4.0,"handler_ms":59.09}},{"u":32,"rps":316.8,"mean":100.8,"p50":100.2,"p95":132.4,"p99":148.5,"max":161.8,"L":31.92,"cpu":[80,62],"err":0,"s":{"pool_wait_ms":5.27,"db_ms":63.84,"cpu_ms":4.0,"handler_ms":73.11}},{"u":64,"rps":448.5,"mean":142.7,"p50":142.7,"p95":152.0,"p99":156.2,"max":163.6,"L":64.0,"cpu":[100,100],"err":0,"s":{"pool_wait_ms":40.92,"db_ms":61.04,"cpu_ms":4.0,"handler_ms":105.96}},{"u":128,"rps":446.5,"mean":286.8,"p50":173.3,"p95":438.6,"p99":451.3,"max":464.1,"L":128.05,"cpu":[97,94],"err":0,"s":{"pool_wait_ms":196.46,"db_ms":60.19,"cpu_ms":4.0,"handler_ms":260.65}}],"p4w1":[{"u":1,"rps":21.8,"mean":45.9,"p50":45.8,"p95":46.3,"p99":46.6,"max":46.6,"L":1.0,"cpu":[12],"err":0,"s":{"pool_wait_ms":0.01,"db_ms":40.89,"cpu_ms":4.0,"handler_ms":44.9}},{"u":2,"rps":40.0,"mean":50.0,"p50":50.0,"p95":54.3,"p99":54.8,"max":54.8,"L":2.0,"cpu":[20],"err":0,"s":{"pool_wait_ms":0.01,"db_ms":42.91,"cpu_ms":4.0,"handler_ms":46.92}},{"u":4,"rps":68.0,"mean":58.6,"p50":58.5,"p95":66.8,"p99":70.9,"max":71.9,"L":3.98,"cpu":[32],"err":0,"s":{"pool_wait_ms":0.0,"db_ms":47.15,"cpu_ms":4.0,"handler_ms":51.16}},{"u":8,"rps":89.0,"mean":90.1,"p50":89.9,"p95":91.0,"p99":94.1,"max":98.0,"L":8.02,"cpu":[41],"err":0,"s":{"pool_wait_ms":42.47,"db_ms":40.9,"cpu_ms":4.0,"handler_ms":87.37}},{"u":16,"rps":89.0,"mean":180.5,"p50":179.9,"p95":188.2,"p99":194.4,"max":197.5,"L":16.06,"cpu":[42],"err":0,"s":{"pool_wait_ms":131.62,"db_ms":40.87,"cpu_ms":4.0,"handler_ms":176.49}},{"u":32,"rps":88.2,"mean":362.2,"p50":361.3,"p95":372.6,"p99":373.2,"max":376.1,"L":31.97,"cpu":[42],"err":0,"s":{"pool_wait_ms":305.23,"db_ms":40.99,"cpu_ms":4.0,"handler_ms":350.22}},{"u":64,"rps":88.2,"mean":722.1,"p50":721.4,"p95":729.4,"p99":730.2,"max":730.5,"L":63.73,"cpu":[42],"err":0,"s":{"pool_wait_ms":638.03,"db_ms":40.9,"cpu_ms":4.0,"handler_ms":682.93}},{"u":128,"rps":88.5,"mean":1454.4,"p50":1448.1,"p95":1494.1,"p99":1498.9,"max":1503.4,"L":128.71,"cpu":[41],"err":0,"s":{"pool_wait_ms":1278.73,"db_ms":41.39,"cpu_ms":4.0,"handler_ms":1324.13}}],"p16w1":[{"u":1,"rps":21.8,"mean":45.9,"p50":45.7,"p95":46.3,"p99":53.0,"max":53.0,"L":1.0,"cpu":[11],"err":0,"s":{"pool_wait_ms":0.01,"db_ms":40.86,"cpu_ms":4.0,"handler_ms":44.87}},{"u":2,"rps":40.0,"mean":49.9,"p50":50.0,"p95":54.2,"p99":54.8,"max":54.9,"L":2.0,"cpu":[20],"err":0,"s":{"pool_wait_ms":0.0,"db_ms":42.88,"cpu_ms":4.0,"handler_ms":46.88}},{"u":4,"rps":68.0,"mean":58.5,"p50":58.4,"p95":67.0,"p99":71.8,"max":72.1,"L":3.98,"cpu":[30],"err":0,"s":{"pool_wait_ms":0.0,"db_ms":47.14,"cpu_ms":4.0,"handler_ms":51.14}},{"u":8,"rps":106.0,"mean":75.8,"p50":75.7,"p95":93.3,"p99":101.1,"max":102.1,"L":8.04,"cpu":[48],"err":0,"s":{"pool_wait_ms":0.0,"db_ms":55.49,"cpu_ms":4.0,"handler_ms":59.5}},{"u":16,"rps":144.5,"mean":109.4,"p50":109.8,"p95":126.5,"p99":146.3,"max":167.2,"L":15.81,"cpu":[64],"err":0,"s":{"pool_wait_ms":0.0,"db_ms":71.18,"cpu_ms":4.0,"handler_ms":75.19}},{"u":32,"rps":221.8,"mean":144.0,"p50":144.1,"p95":145.3,"p99":145.7,"max":146.1,"L":31.92,"cpu":[101],"err":0,"s":{"pool_wait_ms":46.0,"db_ms":57.68,"cpu_ms":4.0,"handler_ms":107.68}},{"u":64,"rps":221.2,"mean":288.5,"p50":288.5,"p95":290.7,"p99":291.2,"max":301.6,"L":63.83,"cpu":[99],"err":0,"s":{"pool_wait_ms":186.97,"db_ms":58.12,"cpu_ms":4.0,"handler_ms":249.09}},{"u":128,"rps":221.2,"mean":576.1,"p50":576.7,"p95":579.0,"p99":579.8,"max":580.4,"L":127.47,"cpu":[100],"err":0,"s":{"pool_wait_ms":457.56,"db_ms":57.84,"cpu_ms":4.0,"handler_ms":519.4}}]},"ceiling":3705.0};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const NAMES = { p4w1: 'pool 4 · 1 worker', p16w1: 'pool 16 · 1 worker', p16w2: 'pool 16 · 2 workers' };
+  const USERS = [1, 2, 4, 8, 16, 32, 64, 128];
+  function chart(cfg, u) {
+    const W = 640, H = 210, L = 46, R = 16, T = 12, B = 30, max = 500;
+    const x = (i) => L + (W - L - R) * i / (USERS.length - 1), y = (r) => T + (H - T - B) * (1 - r / max);
+    let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Throughput against concurrent users">`;
+    for (const g of [0, 100, 200, 300, 400, 500]) s += `<line x1="${L}" x2="${W - R}" y1="${y(g)}" y2="${y(g)}" stroke="var(--border)"/><text x="${L - 6}" y="${y(g) + 4}" text-anchor="end">${g}</text>`;
+    USERS.forEach((n, i) => { s += `<text x="${x(i)}" y="${H - 10}" text-anchor="middle">${n}</text>`; });
+    s += `<text x="${L}" y="${T - 2}" style="font-size:10px">req/s</text>`;
+    for (const k of ['p4w1', 'p16w1', 'p16w2']) {
+      const rows = D.closed[k], on = k === cfg;
+      s += `<polyline fill="none" stroke="${on ? 'var(--accent)' : 'var(--muted)'}" stroke-width="${on ? 3 : 1.5}" opacity="${on ? 1 : .45}" points="${rows.map((r, i) => x(i) + ',' + y(r.rps)).join(' ')}"/>`;
+      const last = rows[rows.length - 1];
+      s += `<text x="${x(USERS.length - 1) - 4}" y="${y(last.rps) - 6}" text-anchor="end" style="${on ? 'fill:var(--accent);font-weight:700' : ''}">${NAMES[k]}</text>`;
+    }
+    const i = USERS.indexOf(u), r = D.closed[cfg][i];
+    s += `<circle cx="${x(i)}" cy="${y(r.rps)}" r="6" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/></svg>`;
+    return s;
+  }
+  function draw() {
+    const cfg = v('#pfC'), u = Number(v('#pfU'));
+    const r0 = D.closed[cfg][USERS.indexOf(u)], r = { ...r0, cpu: r0.cpu.map(c => Math.min(100, c)) }, s = r.s;
+    $('#pfChart').innerHTML = chart(cfg, u);
+    const outside = Math.max(0, r.mean - s.handler_ms);
+    const parts = [['pool wait', s.pool_wait_ms, 'var(--amber)'], ['query', s.db_ms, 'var(--accent)'], ['CPU work', s.cpu_ms, 'var(--pink)'], ['outside the handler', outside, 'var(--muted)']];
+    const tot = parts.reduce((a, p) => a + p[1], 0) || 1;
+    $('#pfBreak').innerHTML = `mean latency ${r.mean} ms, made of:<div class="pf-bar">${parts.map(p => `<i style="width:${100 * p[1] / tot}%;background:${p[2]}" title="${p[0]} ${p[1].toFixed(1)} ms"></i>`).join('')}</div>` +
+      `<div class="pf-key">${parts.map(p => `<span><b style="background:${p[2]}"></b>${p[0]} ${p[1].toFixed(1)} ms</span>`).join('')}</div>`;
+    const cpuMax = Math.max(...r.cpu), lw = (r.rps * r.mean / 1000);
+    const bott = r.err ? 'stalled' : cpuMax >= 95 ? 'CPU' : s.pool_wait_ms > 0.3 * r.mean ? 'pool' : 'none yet';
+    $('#pfStats').innerHTML = `<div class="stat"><div class="k">Throughput</div><div class="v">${r.rps} /s</div></div>` +
+      `<div class="stat"><div class="k">p50 / p99</div><div class="v">${Math.round(r.p50)} / ${Math.round(r.p99)} ms</div></div>` +
+      `<div class="stat ${Math.abs(lw - u) / u < 0.05 ? 'good' : 'warn'}"><div class="k">Rate × latency vs users</div><div class="v">${lw.toFixed(1)} vs ${u}</div></div>` +
+      `<div class="stat ${cpuMax >= 95 ? 'warn' : 'good'}"><div class="k">Worker CPU</div><div class="v">${r.cpu.map(c => c + '%').join(' · ')}</div></div>` +
+      `<div class="stat ${bott === 'none yet' ? 'good' : 'warn'}"><div class="k">Bottleneck</div><div class="v">${bott}</div></div>`;
+    let why;
+    if (r.err) why = `<b>${r.err} connections stalled until the client's 20-second timeout.</b> With only a few long-lived keep-alive connections, uvicorn's multi-worker mode on Windows left one worker idle (CPU ${r.cpu.join('% and ')}%) and some connections unanswered. This happened at this load in both runs; from 16 users on, both workers were used and nothing stalled. Throughput here (${r.rps}/s) is not representative.`;
+    else if (bott === 'pool') why = `<b>The pool is the bottleneck.</b> Requests spend ${s.pool_wait_ms.toFixed(0)} ms waiting for one of ${cfg === 'p4w1' ? 4 : 16} connections, on top of the ${s.db_ms.toFixed(0)} ms query itself, while CPU is only at ${cpuMax}%. Throughput is pinned at ${r.rps}/s; more users only queue longer. Little's law: ${r.rps} × ${(r.mean / 1000).toFixed(3)} s ≈ ${lw.toFixed(1)} requests in the system, the ${u} users.`;
+    else if (bott === 'CPU') why = `<b>The CPU is the bottleneck.</b> ${r.cpu.length > 1 ? 'Both workers are' : 'The worker is'} at ${r.cpu.join('% and ')}% CPU. The query, 40 ms of sleep on a pool thread, now appears to take ${s.db_ms.toFixed(0)} ms because the busy event loop takes a while to resume each finished request${s.pool_wait_ms > 5 ? `, and that slowness in turn keeps connections held longer, so ${s.pool_wait_ms.toFixed(0)} ms of pool wait appears too` : ''}. ${cfg === 'p16w2' ? 'The ceiling is twice one worker’s: more processes or instances would raise it again, until the database saturates.' : 'A second worker process is the next fix.'}`;
+    else why = `<b>No resource is saturated yet.</b> Throughput is still rising with users (${r.rps}/s at ${u}), there is no pool wait, and CPU is at ${cpuMax}%. Latency (${r.mean} ms mean) is close to the 44 ms of work each request does${r.mean > 50 ? ', plus some queueing for the single event loop as requests’ CPU work collides' : ''}.`;
+    $('#pfWhy').innerHTML = why;
+    $('#pfWhy').dataset.x = JSON.stringify({ cfg, u, bott, rps: r.rps, lw: +lw.toFixed(1) });
+  }
+  $('#pfC').addEventListener('segchange', draw);
+  $('#pfU').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
