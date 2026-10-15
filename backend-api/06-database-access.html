@@ -3,37 +3,294 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Talking to a Database</title>
+<title>Talking to a Database · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 6 of Backend & API. Drivers and connections, connection pools, a session per request, parameterised queries and pool exhaustion, with SQLAlchemy's real pool measured under a burst of requests.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pl-ctl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 18px; }
+  @media (max-width:800px) { .pl-ctl { grid-template-columns:1fr; } }
+  .pl-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .pl-plot { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); }
+  .pl-plot svg { display:block; width:100%; height:auto; }
+  .pl-ax { font-family:var(--mono); font-size:10.5px; fill:var(--muted); }
+  .pl-err { margin-top:12px; border:1px solid var(--red); border-radius:12px; background:var(--red-soft); padding:8px 14px; font-family:var(--mono); font-size:12.5px; word-break:break-all; }
+  .pl-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="6">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 6</span><span class="pill">Beginner</span><span class="pill">⏱ 45 min</span></div>
     <h1>Talking to a <span class="grad">Database</span></h1>
-    <p class="lead">Connections, pools, sessions per request and parameterised queries, with what goes wrong under load.</p>
+    <p class="lead">Almost every request a backend handles reads or writes the database, so the way a service connects to it shapes how fast the service is and how it fails. Database connections are expensive to open and limited in number, so services keep a small <b>pool</b> of them and lend one to each request. Used well, a pool of five connections can serve hundreds of requests a second. Used badly, holding a connection while waiting for something else, or forgetting to give one back, a pool turns a slow dependency into an outage.</p>
+    <p class="lead">This chapter covers drivers, connections, pools and a clean session-per-request pattern in FastAPI with SQLAlchemy. The lab bursts 60 requests at a real service, with SQLAlchemy's real pool, in three styles of handler.</p>
+    <ul class="objectives">
+      <li><span>Explain what a database connection costs and why services pool them</span></li>
+      <li><span>Configure a SQLAlchemy pool: size, overflow, timeout and health checks</span></li>
+      <li><span>Give each request its own session with a FastAPI dependency</span></li>
+      <li><span>Keep connections out of slow work, and never leak one</span></li>
+      <li><span>Recognise and diagnose pool exhaustion</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>SQL and parameterised queries:</b> <a href="p5-sql-for-app-developers.html">Prerequisite 5</a>.</li>
+        <li><b>FastAPI's thread pool for <code>def</code> handlers:</b> <a href="p2-async-python.html">Prerequisite 2</a>; dependencies: <a href="03-first-fastapi-service.html">Chapter 3</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Drivers and connections</li>
-    <li>Connection pools</li>
-    <li>A session per request</li>
-    <li>Parameterised queries</li>
-    <li>Pool exhaustion</li>
-  </ol>
+  <h2>Drivers and connections</h2>
+  <p>A <b>driver</b> speaks a database's wire protocol: <code>sqlite3</code> in the standard library, psycopg or asyncpg for PostgreSQL, and others for MySQL and SQL Server. Most follow Python's DB-API (PEP 249): connect, get a cursor, execute with parameters, fetch, commit. A <b>connection</b> to a server database is a real, stateful thing at the other end: PostgreSQL starts a separate server process for each one, with its own memory, and opening one costs a TCP handshake, usually TLS, and authentication, typically a few milliseconds and more across a network. Every connection also holds its own transaction state, so two requests must never share one at the same time.</p>
+  <p>Databases cap connections: PostgreSQL's <code>max_connections</code> defaults to 100. That number has to cover every process of every service, every migration, every analyst's tool, all at once.</p>
+
+  <h2>Connection pools</h2>
+  <p>A <b>pool</b> keeps a few connections open and lends them out: a request checks one out, uses it, and returns it, and the next request reuses it without paying to connect. SQLAlchemy's engine pools by default. Its main settings:</p>
+  <ul>
+    <li><b><code>pool_size</code></b> (default 5): connections kept open.</li>
+    <li><b><code>max_overflow</code></b> (default 10): extra connections opened under load and closed when returned.</li>
+    <li><b><code>pool_timeout</code></b> (default 30 s): how long a request waits for a free connection before failing.</li>
+    <li><b><code>pool_pre_ping=True</code></b>: test a connection before lending it, so one the database or a firewall silently dropped is replaced instead of failing a request; <b><code>pool_recycle</code></b> closes connections older than a given age.</li>
+  </ul>
+  <p>The total is per process: a service with 4 workers per container and 10 containers, each with 5 + 10, can open 600 connections. Size pools from the database's limit downwards, and when there are too many processes, put a pooler such as PgBouncer between the services and PostgreSQL.</p>
+
+  <h2>A session per request</h2>
+  <p>In SQLAlchemy, a <b>Session</b> is a unit of work: it checks a connection out of the pool when it first needs one, keeps it for the duration of the transaction, and returns it on <code>commit()</code>, <code>rollback()</code> or <code>close()</code>. In FastAPI, a dependency with <code>yield</code> gives every request its own session and guarantees it is closed, even if the handler raises. This is the pattern the lab's service uses, with the switch that makes it buggy:</p>
+<pre class="code">import os
+import time
+
+from fastapi import Depends, FastAPI
+from fastapi.responses import JSONResponse
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import TimeoutError as PoolTimeout
+from sqlalchemy.orm import Session, sessionmaker
+
+PATTERN = os.environ.get("PATTERN", "release")   # hold | release | leak
+engine = create_engine("sqlite:///" + os.environ.get("DB", "pool.db"),
+                       pool_size=int(os.environ.get("POOL", 5)), max_overflow=int(os.environ.get("OVERFLOW", 0)),
+                       pool_timeout=2)          # wait at most 2 s for a free connection (default 30)
+SessionLocal = sessionmaker(engine)
+app = FastAPI()
+LEAKED = []
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        if PATTERN != "leak":
+            db.close()                           # returns the connection to the pool
+        else:
+            LEAKED.append(db)                    # the bug: a reference kept, so the connection never returns
+
+
+def call_payment_provider():
+    time.sleep(0.2)                              # a slow external HTTP call
+
+
+@app.exception_handler(PoolTimeout)
+async def pool_timeout(request, exc):
+    return JSONResponse({"code": "db_pool_timeout", "detail": str(exc).split("(")[0].strip()}, status_code=503)
+
+
+@app.post("/checkout")
+def checkout(db: Session = Depends(get_db)):
+    price = db.execute(text("SELECT 850")).scalar()  # first query: a connection is checked out here
+    if PATTERN == "release":
+        db.commit()                                   # the transaction ends, the connection goes back to the pool
+        db.close()
+    call_payment_provider()
+    return {"ok": True, "price": price}
+
+
+@app.get("/pool")
+def pool_status():
+    return {"status": engine.pool.status()}</pre>
+  <p>Queries use <code>text("... WHERE id = :id")</code> with parameters, or the ORM (<a href="07-orms-and-migrations.html">Chapter 7</a>), never string formatting (<a href="p5-sql-for-app-developers.html">Prerequisite 5</a>).</p>
+
+  <h2>Simulator: 60 checkouts, five connections</h2>
+  <p>Each checkout reads a price from the database, then calls a payment provider that takes 200 ms. Thirty clients send 60 checkouts at once. Choose how the handler treats its connection, and the pool size, and see every request: when it started, how long it took, and whether it succeeded.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">SQLAlchemy pool under a burst</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="pl-ctl">
+        <div><div class="pl-l">Handler</div><div class="seg" id="plP"><button class="active" data-v="release">commit, then call the provider</button><button data-v="hold">hold the connection during the call</button><button data-v="leak">leak the session</button></div></div>
+        <div><div class="pl-l">Pool</div><div class="seg" id="plO"><button class="active" data-v="0">pool_size=5, max_overflow=0</button><button data-v="10">pool_size=5, max_overflow=10</button></div></div>
+      </div>
+      <div class="pl-plot"><svg id="plSvg" viewBox="0 0 680 300" role="img" aria-label="Request timeline"></svg></div>
+      <div id="plErr"></div>
+      <div class="stats" id="plStats"></div>
+      <div class="pl-why" id="plWhy"></div>
+    </div>
+    <div class="panel-foot">uvicorn and FastAPI with <code>def</code> handlers (FastAPI's 40-thread pool), SQLAlchemy 2.1.4 with a <code>QueuePool</code> on a SQLite file and <code>pool_timeout=2</code> so failures show quickly (the default is 30 s). 60 requests from 30 concurrent clients, each on its own connection. Rows are requests in the order they started; bars run from start to finish.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>commit, then call the provider</b>: each request holds a connection for well under a millisecond, so five connections serve all 60 requests, and everything finishes in the time the provider calls take.</li>
+    <li><b>hold the connection during the call</b>, pool of 5: only five checkouts can be in their 200 ms provider call at once, so the rest queue for a connection. Total time quadruples. Add overflow: better, at the price of 15 connections per process.</li>
+    <li><b>leak the session</b>: the first five requests succeed and never give their connections back. Every later request waits 2 seconds and fails with SQLAlchemy's own error. Overflow only postpones it.</li>
+  </ul>
+
+  <h2>Pool exhaustion</h2>
+  <p>When every connection is checked out, new requests wait, then fail. The usual causes: holding a session open across slow work, such as calls to other services, file uploads or sleeping retries; leaked sessions, from code paths that skip <code>close()</code> or objects that keep a session alive; long transactions, including one left open by an error; slow queries; and a sudden rise in traffic with the pool sized for an average day. The symptoms are distinctive: latency rises for every endpoint that touches the database, CPU stays low, and logs fill with "QueuePool limit ... reached" or connection timeouts. Monitor checked-out connections and pool wait time, set <code>pool_timeout</code> lower than your request timeout so requests fail fast rather than pile up, and keep transactions short: read, write, commit, then do the slow work.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Setting or pattern</th><th>What it protects</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td><b>Small pool per process</b></td><td>The database's connection limit</td><td>Multiply by processes and containers</td></tr>
+        <tr><td><b>max_overflow</b></td><td>Short bursts</td><td>Postpones exhaustion; does not fix holding</td></tr>
+        <tr><td><b>Short pool_timeout</b></td><td>Fail fast with a clear error</td><td>Too short fails healthy requests during spikes</td></tr>
+        <tr><td><b>pool_pre_ping / pool_recycle</b></td><td>Dropped and stale connections</td><td>A tiny extra round trip per checkout</td></tr>
+        <tr><td><b>Session per request, closed in a finally</b></td><td>Leaks</td><td>Objects that keep sessions alive elsewhere</td></tr>
+        <tr><td><b>Commit before slow work</b></td><td>Pool capacity and lock time</td><td>The work after commit must cope with failure separately (<a href="30-outbox-events.html">Chapter 30</a>)</td></tr>
+        <tr><td><b>PgBouncer</b></td><td>The database, when there are many processes</td><td>Transaction pooling breaks session features such as some prepared statements</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Request arrives</b> dependency creates a Session</li>
+      <li data-k="step"><b>First query</b> a connection is checked out</li>
+      <li data-k="step"><b>Commit</b> transaction ends, connection returned</li>
+      <li data-k="step"><b>Slow work</b> calls other services without a connection</li>
+      <li data-k="end"><b>Response</b> the dependency's finally closes the session</li>
+    </ol>
+    <figcaption><b>A connection's short life in a well-behaved request.</b> It is checked out only between the first query and the commit.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">📸</div>
+    <div class="body"><div class="title">Use case: Instagram and PgBouncer, 2011</div><p>When Instagram's engineers described their stack in late 2011, about a year after launch and with around 14 million users, it was a Django application running on many app servers, backed by PostgreSQL. Each application process needs database connections, and the number of processes grew with traffic, while PostgreSQL, with a process per connection, does not like thousands of them. Their answer, described in the post, was PgBouncer: a lightweight pooler between the application and the database, so many application connections share a small number of real PostgreSQL connections. The same arithmetic applies to any service today: connections per process times processes must fit the database, and when it no longer does, an external pooler, or a managed equivalent such as Amazon RDS Proxy, is the standard answer, with the pool in each process kept small.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Calling other services, uploading files or sleeping while a transaction is open.</b></li>
+      <li><b>Sessions that are not closed on every path,</b> including errors.</li>
+      <li><b>A new engine, and so a new pool, per request,</b> or a new connection per query.</li>
+      <li><b>Sharing one session between concurrent requests or threads.</b></li>
+      <li><b>Pool sizes chosen per process</b> without multiplying by the number of processes.</li>
+      <li><b>A 30-second pool timeout behind a 10-second request timeout,</b> so requests pile up long after clients gave up.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is a connection pool and why do services use one?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Opening a database connection is slow, a network handshake, often TLS, authentication and, in PostgreSQL, a new server process, and the database only allows a limited number at once. A pool keeps a few connections open and lends one to each request for as long as it needs it, then takes it back for the next request. That removes the connection cost from every request and caps how many connections the service can open. The settings that matter are the pool size, how many extra connections may be opened under load, and how long a request waits for one before failing.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Latency for every endpoint jumps from 50 ms to 5 seconds, CPU is low, and the logs show "QueuePool limit of size 5 overflow 10 reached". What do you do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>That is pool exhaustion: requests are waiting for connections, not working. Short term, find what is holding them. In the database, list active sessions and their states (in PostgreSQL, <code>pg_stat_activity</code>): many "idle in transaction" sessions mean code is holding transactions open while doing something else, long-running queries mean a slow query, and connections that never go away suggest a leak. Correlate with recent deploys and with a slow downstream service, since a provider that went from 200 ms to 5 s will hold every connection if calls happen inside transactions. Mitigate by rolling back the change or failing the slow dependency fast. Raising the pool size buys time but can push the database over its limit. The lasting fixes: commit before calling other services, close sessions in a <code>finally</code>, a pool timeout shorter than the request timeout, statement timeouts in the database, and alerts on checked-out connections and pool wait time.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Database connections are expensive and limited; services pool them.</li>
+      <li>Pool size times processes must fit the database's connection limit; PgBouncer helps when it does not.</li>
+      <li>One session per request, from a <code>yield</code> dependency that always closes it.</li>
+      <li>Hold a connection only between the first query and the commit, never across slow work.</li>
+      <li>Exhaustion shows as slow everything with low CPU; fail fast and monitor pool usage.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">When does a SQLAlchemy Session give its connection back to the pool?</p>
+      <div class="opts">
+        <button class="opt">After each query</button>
+        <button class="opt">On commit, rollback or close</button>
+        <button class="opt">Only when the process exits</button>
+        <button class="opt">Never; the pool takes it back after a timeout</button>
+      </div>
+      <div class="explain">So a session that stays in a transaction keeps its connection checked out.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">In the lab, what happened when handlers held their connection through a 200 ms provider call, with a pool of 5?</p>
+      <div class="opts">
+        <button class="opt">Requests failed immediately</button>
+        <button class="opt">Nothing changed</button>
+        <button class="opt">The database crashed</button>
+        <button class="opt">Only five calls ran at once, so the burst took about four times longer</button>
+      </div>
+      <div class="explain">Measured: 2.5 s instead of 0.6 s for 60 requests.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A service runs 8 containers with 4 workers each, every worker with pool_size=5 and max_overflow=10. How many connections can it open?</p>
+      <div class="opts">
+        <button class="opt">480</button>
+        <button class="opt">15</button>
+        <button class="opt">60</button>
+        <button class="opt">160</button>
+      </div>
+      <div class="explain">32 processes × 15. Far above PostgreSQL's default limit of 100.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does <code>pool_pre_ping=True</code> protect against?</p>
+      <div class="opts">
+        <button class="opt">SQL injection</button>
+        <button class="opt">Pool exhaustion</button>
+        <button class="opt">Lending out a connection the database or network has silently dropped</button>
+        <button class="opt">Slow queries</button>
+      </div>
+      <div class="explain">It checks the connection before handing it over and replaces it if it is dead.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why should <code>pool_timeout</code> be shorter than the request timeout?</p>
+      <div class="opts">
+        <button class="opt">To save memory</button>
+        <button class="opt">So requests fail fast with a clear error instead of waiting after the client has given up</button>
+        <button class="opt">It must, or SQLAlchemy refuses to start</button>
+        <button class="opt">To make connections open faster</button>
+      </div>
+      <div class="explain">Waiting requests also hold threads, which spreads the problem.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"r":{"release|0":{"pool":5,"overflow":0,"ok":60,"failed":0,"wall_s":0.61,"p50":278.5,"max":302,"reqs":[{"i":0,"status":200,"ms":243,"start":1,"code":null},{"i":1,"status":200,"ms":266,"start":2,"code":null},{"i":2,"status":200,"ms":262,"start":3,"code":null},{"i":3,"status":200,"ms":259,"start":4,"code":null},{"i":4,"status":200,"ms":268,"start":5,"code":null},{"i":5,"status":200,"ms":264,"start":5,"code":null},{"i":6,"status":200,"ms":301,"start":6,"code":null},{"i":7,"status":200,"ms":259,"start":7,"code":null},{"i":8,"status":200,"ms":289,"start":10,"code":null},{"i":9,"status":200,"ms":292,"start":11,"code":null},{"i":10,"status":200,"ms":286,"start":12,"code":null},{"i":11,"status":200,"ms":284,"start":13,"code":null},{"i":12,"status":200,"ms":302,"start":14,"code":null},{"i":13,"status":200,"ms":288,"start":16,"code":null},{"i":14,"status":200,"ms":285,"start":17,"code":null},{"i":15,"status":200,"ms":295,"start":18,"code":null},{"i":16,"status":200,"ms":300,"start":19,"code":null},{"i":17,"status":200,"ms":281,"start":20,"code":null},{"i":18,"status":200,"ms":299,"start":21,"code":null},{"i":19,"status":200,"ms":284,"start":22,"code":null},{"i":20,"status":200,"ms":284,"start":23,"code":null},{"i":21,"status":200,"ms":295,"start":25,"code":null},{"i":22,"status":200,"ms":280,"start":27,"code":null},{"i":23,"status":200,"ms":285,"start":30,"code":null},{"i":24,"status":200,"ms":294,"start":33,"code":null},{"i":25,"status":200,"ms":290,"start":36,"code":null},{"i":26,"status":200,"ms":281,"start":50,"code":null},{"i":27,"status":200,"ms":279,"start":55,"code":null},{"i":28,"status":200,"ms":271,"start":61,"code":null},{"i":29,"status":200,"ms":273,"start":66,"code":null},{"i":30,"status":200,"ms":222,"start":245,"code":null},{"i":31,"status":200,"ms":221,"start":263,"code":null},{"i":32,"status":200,"ms":263,"start":265,"code":null},{"i":33,"status":200,"ms":250,"start":266,"code":null},{"i":34,"status":200,"ms":259,"start":268,"code":null},{"i":35,"status":200,"ms":260,"start":269,"code":null},{"i":36,"status":200,"ms":238,"start":273,"code":null},{"i":37,"status":200,"ms":241,"start":297,"code":null},{"i":38,"status":200,"ms":248,"start":298,"code":null},{"i":39,"status":200,"ms":252,"start":299,"code":null},{"i":40,"status":200,"ms":251,"start":301,"code":null},{"i":41,"status":200,"ms":281,"start":302,"code":null},{"i":42,"status":200,"ms":274,"start":303,"code":null},{"i":43,"status":200,"ms":290,"start":303,"code":null},{"i":44,"status":200,"ms":271,"start":306,"code":null},{"i":45,"status":200,"ms":278,"start":307,"code":null},{"i":46,"status":200,"ms":291,"start":307,"code":null},{"i":47,"status":200,"ms":244,"start":308,"code":null},{"i":48,"status":200,"ms":288,"start":313,"code":null},{"i":49,"status":200,"ms":290,"start":315,"code":null},{"i":50,"status":200,"ms":274,"start":316,"code":null},{"i":51,"status":200,"ms":286,"start":319,"code":null},{"i":52,"status":200,"ms":286,"start":319,"code":null},{"i":53,"status":200,"ms":280,"start":320,"code":null},{"i":54,"status":200,"ms":279,"start":326,"code":null},{"i":55,"status":200,"ms":275,"start":327,"code":null},{"i":56,"status":200,"ms":258,"start":331,"code":null},{"i":57,"status":200,"ms":272,"start":333,"code":null},{"i":58,"status":200,"ms":261,"start":334,"code":null},{"i":59,"status":200,"ms":258,"start":339,"code":null}],"pool_status":"Pool size: 5  Connections in pool: 5 Current Overflow: 0 Current Checked out connections: 0","error":null},"release|10":{"pool":5,"overflow":10,"ok":60,"failed":0,"wall_s":0.63,"p50":261.5,"max":307,"reqs":[{"i":0,"status":200,"ms":302,"start":1,"code":null},{"i":1,"status":200,"ms":292,"start":2,"code":null},{"i":2,"status":200,"ms":295,"start":3,"code":null},{"i":3,"status":200,"ms":295,"start":4,"code":null},{"i":4,"status":200,"ms":301,"start":5,"code":null},{"i":5,"status":200,"ms":289,"start":5,"code":null},{"i":6,"status":200,"ms":298,"start":6,"code":null},{"i":7,"status":200,"ms":293,"start":7,"code":null},{"i":8,"status":200,"ms":284,"start":8,"code":null},{"i":9,"status":200,"ms":287,"start":9,"code":null},{"i":10,"status":200,"ms":305,"start":10,"code":null},{"i":11,"status":200,"ms":307,"start":11,"code":null},{"i":12,"status":200,"ms":260,"start":60,"code":null},{"i":13,"status":200,"ms":263,"start":67,"code":null},{"i":14,"status":200,"ms":255,"start":68,"code":null},{"i":15,"status":200,"ms":259,"start":69,"code":null},{"i":16,"status":200,"ms":262,"start":70,"code":null},{"i":17,"status":200,"ms":261,"start":71,"code":null},{"i":18,"status":200,"ms":267,"start":72,"code":null},{"i":19,"status":200,"ms":262,"start":73,"code":null},{"i":20,"status":200,"ms":264,"start":74,"code":null},{"i":21,"status":200,"ms":298,"start":75,"code":null},{"i":22,"status":200,"ms":294,"start":76,"code":null},{"i":23,"status":200,"ms":306,"start":77,"code":null},{"i":24,"status":200,"ms":296,"start":79,"code":null},{"i":25,"status":200,"ms":293,"start":81,"code":null},{"i":26,"status":200,"ms":291,"start":85,"code":null},{"i":27,"status":200,"ms":285,"start":86,"code":null},{"i":28,"status":200,"ms":291,"start":91,"code":null},{"i":29,"status":200,"ms":279,"start":97,"code":null},{"i":30,"status":200,"ms":235,"start":292,"code":null},{"i":31,"status":200,"ms":231,"start":293,"code":null},{"i":32,"status":200,"ms":230,"start":294,"code":null},{"i":33,"status":200,"ms":244,"start":296,"code":null},{"i":34,"status":200,"ms":240,"start":298,"code":null},{"i":35,"status":200,"ms":242,"start":298,"code":null},{"i":36,"status":200,"ms":244,"start":300,"code":null},{"i":37,"status":200,"ms":255,"start":302,"code":null},{"i":38,"status":200,"ms":247,"start":304,"code":null},{"i":39,"status":200,"ms":248,"start":306,"code":null},{"i":40,"status":200,"ms":243,"start":315,"code":null},{"i":41,"status":200,"ms":238,"start":318,"code":null},{"i":42,"status":200,"ms":272,"start":320,"code":null},{"i":43,"status":200,"ms":268,"start":324,"code":null},{"i":44,"status":200,"ms":261,"start":328,"code":null},{"i":45,"status":200,"ms":264,"start":330,"code":null},{"i":46,"status":200,"ms":256,"start":332,"code":null},{"i":47,"status":200,"ms":265,"start":333,"code":null},{"i":48,"status":200,"ms":260,"start":335,"code":null},{"i":49,"status":200,"ms":258,"start":338,"code":null},{"i":50,"status":200,"ms":256,"start":339,"code":null},{"i":51,"status":200,"ms":229,"start":370,"code":null},{"i":52,"status":200,"ms":242,"start":372,"code":null},{"i":53,"status":200,"ms":252,"start":373,"code":null},{"i":54,"status":200,"ms":254,"start":374,"code":null},{"i":55,"status":200,"ms":239,"start":375,"code":null},{"i":56,"status":200,"ms":230,"start":376,"code":null},{"i":57,"status":200,"ms":252,"start":376,"code":null},{"i":58,"status":200,"ms":246,"start":382,"code":null},{"i":59,"status":200,"ms":223,"start":384,"code":null}],"pool_status":"Pool size: 5  Connections in pool: 4 Current Overflow: -1 Current Checked out connections: 0","error":null},"hold|0":{"pool":5,"overflow":0,"ok":60,"failed":0,"wall_s":2.53,"p50":1203.5,"max":1239,"reqs":[{"i":0,"status":200,"ms":286,"start":1,"code":null},{"i":1,"status":200,"ms":488,"start":2,"code":null},{"i":2,"status":200,"ms":283,"start":3,"code":null},{"i":3,"status":200,"ms":490,"start":4,"code":null},{"i":4,"status":200,"ms":285,"start":5,"code":null},{"i":5,"status":200,"ms":284,"start":5,"code":null},{"i":6,"status":200,"ms":487,"start":6,"code":null},{"i":7,"status":200,"ms":482,"start":7,"code":null},{"i":8,"status":200,"ms":283,"start":8,"code":null},{"i":9,"status":200,"ms":486,"start":9,"code":null},{"i":10,"status":200,"ms":695,"start":10,"code":null},{"i":11,"status":200,"ms":692,"start":11,"code":null},{"i":12,"status":200,"ms":649,"start":57,"code":null},{"i":13,"status":200,"ms":646,"start":61,"code":null},{"i":14,"status":200,"ms":643,"start":63,"code":null},{"i":15,"status":200,"ms":831,"start":65,"code":null},{"i":16,"status":200,"ms":829,"start":68,"code":null},{"i":17,"status":200,"ms":830,"start":70,"code":null},{"i":18,"status":200,"ms":831,"start":71,"code":null},{"i":19,"status":200,"ms":1029,"start":72,"code":null},{"i":20,"status":200,"ms":828,"start":73,"code":null},{"i":21,"status":200,"ms":1025,"start":74,"code":null},{"i":22,"status":200,"ms":1026,"start":76,"code":null},{"i":23,"status":200,"ms":1239,"start":78,"code":null},{"i":24,"status":200,"ms":1023,"start":80,"code":null},{"i":25,"status":200,"ms":1235,"start":85,"code":null},{"i":26,"status":200,"ms":1233,"start":87,"code":null},{"i":27,"status":200,"ms":1016,"start":89,"code":null},{"i":28,"status":200,"ms":1227,"start":93,"code":null},{"i":29,"status":200,"ms":1227,"start":94,"code":null},{"i":30,"status":200,"ms":1223,"start":286,"code":null},{"i":31,"status":200,"ms":1219,"start":287,"code":null},{"i":32,"status":200,"ms":1219,"start":290,"code":null},{"i":33,"status":200,"ms":1214,"start":290,"code":null},{"i":34,"status":200,"ms":1219,"start":292,"code":null},{"i":35,"status":200,"ms":1219,"start":490,"code":null},{"i":36,"status":200,"ms":1217,"start":490,"code":null},{"i":37,"status":200,"ms":1218,"start":494,"code":null},{"i":38,"status":200,"ms":1219,"start":494,"code":null},{"i":39,"status":200,"ms":1217,"start":495,"code":null},{"i":40,"status":200,"ms":1212,"start":704,"code":null},{"i":41,"status":200,"ms":1212,"start":705,"code":null},{"i":42,"status":200,"ms":1207,"start":705,"code":null},{"i":43,"status":200,"ms":1204,"start":706,"code":null},{"i":44,"status":200,"ms":1208,"start":708,"code":null},{"i":45,"status":200,"ms":1216,"start":896,"code":null},{"i":46,"status":200,"ms":1217,"start":897,"code":null},{"i":47,"status":200,"ms":1217,"start":899,"code":null},{"i":48,"status":200,"ms":1218,"start":901,"code":null},{"i":49,"status":200,"ms":1217,"start":902,"code":null},{"i":50,"status":200,"ms":1215,"start":1099,"code":null},{"i":51,"status":200,"ms":1215,"start":1101,"code":null},{"i":52,"status":200,"ms":1216,"start":1102,"code":null},{"i":53,"status":200,"ms":1216,"start":1104,"code":null},{"i":54,"status":200,"ms":1217,"start":1105,"code":null},{"i":55,"status":200,"ms":1200,"start":1318,"code":null},{"i":56,"status":200,"ms":1203,"start":1319,"code":null},{"i":57,"status":200,"ms":1200,"start":1320,"code":null},{"i":58,"status":200,"ms":1197,"start":1320,"code":null},{"i":59,"status":200,"ms":1201,"start":1321,"code":null}],"pool_status":"Pool size: 5  Connections in pool: 5 Current Overflow: 0 Current Checked out connections: 0","error":null},"hold|10":{"pool":5,"overflow":10,"ok":60,"failed":0,"wall_s":0.94,"p50":403.5,"max":438,"reqs":[{"i":0,"status":200,"ms":308,"start":1,"code":null},{"i":1,"status":200,"ms":293,"start":2,"code":null},{"i":2,"status":200,"ms":297,"start":3,"code":null},{"i":3,"status":200,"ms":295,"start":4,"code":null},{"i":4,"status":200,"ms":307,"start":5,"code":null},{"i":5,"status":200,"ms":296,"start":6,"code":null},{"i":6,"status":200,"ms":294,"start":6,"code":null},{"i":7,"status":200,"ms":300,"start":7,"code":null},{"i":8,"status":200,"ms":288,"start":8,"code":null},{"i":9,"status":200,"ms":303,"start":9,"code":null},{"i":10,"status":200,"ms":310,"start":10,"code":null},{"i":11,"status":200,"ms":311,"start":11,"code":null},{"i":12,"status":200,"ms":429,"start":69,"code":null},{"i":13,"status":200,"ms":254,"start":71,"code":null},{"i":14,"status":200,"ms":254,"start":75,"code":null},{"i":15,"status":200,"ms":252,"start":76,"code":null},{"i":16,"status":200,"ms":425,"start":77,"code":null},{"i":17,"status":200,"ms":427,"start":78,"code":null},{"i":18,"status":200,"ms":425,"start":79,"code":null},{"i":19,"status":200,"ms":420,"start":80,"code":null},{"i":20,"status":200,"ms":431,"start":81,"code":null},{"i":21,"status":200,"ms":428,"start":82,"code":null},{"i":22,"status":200,"ms":423,"start":83,"code":null},{"i":23,"status":200,"ms":431,"start":84,"code":null},{"i":24,"status":200,"ms":431,"start":86,"code":null},{"i":25,"status":200,"ms":432,"start":89,"code":null},{"i":26,"status":200,"ms":438,"start":93,"code":null},{"i":27,"status":200,"ms":429,"start":96,"code":null},{"i":28,"status":200,"ms":429,"start":98,"code":null},{"i":29,"status":200,"ms":432,"start":102,"code":null},{"i":30,"status":200,"ms":407,"start":294,"code":null},{"i":31,"status":200,"ms":410,"start":296,"code":null},{"i":32,"status":200,"ms":403,"start":299,"code":null},{"i":33,"status":200,"ms":407,"start":299,"code":null},{"i":34,"status":200,"ms":407,"start":300,"code":null},{"i":35,"status":200,"ms":403,"start":302,"code":null},{"i":36,"status":200,"ms":404,"start":307,"code":null},{"i":37,"status":200,"ms":408,"start":309,"code":null},{"i":38,"status":200,"ms":404,"start":312,"code":null},{"i":39,"status":200,"ms":400,"start":313,"code":null},{"i":40,"status":200,"ms":412,"start":321,"code":null},{"i":41,"status":200,"ms":414,"start":322,"code":null},{"i":42,"status":200,"ms":400,"start":325,"code":null},{"i":43,"status":200,"ms":401,"start":328,"code":null},{"i":44,"status":200,"ms":398,"start":329,"code":null},{"i":45,"status":200,"ms":407,"start":498,"code":null},{"i":46,"status":200,"ms":403,"start":500,"code":null},{"i":47,"status":200,"ms":406,"start":503,"code":null},{"i":48,"status":200,"ms":407,"start":503,"code":null},{"i":49,"status":200,"ms":406,"start":505,"code":null},{"i":50,"status":200,"ms":403,"start":506,"code":null},{"i":51,"status":200,"ms":402,"start":510,"code":null},{"i":52,"status":200,"ms":402,"start":512,"code":null},{"i":53,"status":200,"ms":403,"start":515,"code":null},{"i":54,"status":200,"ms":418,"start":516,"code":null},{"i":55,"status":200,"ms":397,"start":522,"code":null},{"i":56,"status":200,"ms":402,"start":525,"code":null},{"i":57,"status":200,"ms":401,"start":527,"code":null},{"i":58,"status":200,"ms":399,"start":531,"code":null},{"i":59,"status":200,"ms":404,"start":534,"code":null}],"pool_status":"Pool size: 5  Connections in pool: 5 Current Overflow: 0 Current Checked out connections: 0","error":null},"leak|0":{"pool":5,"overflow":0,"ok":5,"failed":55,"wall_s":4.23,"p50":282,"max":283,"reqs":[{"i":0,"status":200,"ms":282,"start":1,"code":null},{"i":1,"status":503,"ms":2096,"start":1,"code":"db_pool_timeout"},{"i":2,"status":503,"ms":2098,"start":2,"code":"db_pool_timeout"},{"i":3,"status":503,"ms":2092,"start":3,"code":"db_pool_timeout"},{"i":4,"status":200,"ms":283,"start":3,"code":null},{"i":5,"status":200,"ms":282,"start":4,"code":null},{"i":6,"status":200,"ms":276,"start":5,"code":null},{"i":7,"status":200,"ms":280,"start":6,"code":null},{"i":8,"status":503,"ms":2091,"start":7,"code":"db_pool_timeout"},{"i":9,"status":503,"ms":2091,"start":8,"code":"db_pool_timeout"},{"i":10,"status":503,"ms":2110,"start":9,"code":"db_pool_timeout"},{"i":11,"status":503,"ms":2108,"start":10,"code":"db_pool_timeout"},{"i":12,"status":503,"ms":2056,"start":59,"code":"db_pool_timeout"},{"i":13,"status":503,"ms":2050,"start":62,"code":"db_pool_timeout"},{"i":14,"status":503,"ms":2050,"start":65,"code":"db_pool_timeout"},{"i":15,"status":503,"ms":2048,"start":66,"code":"db_pool_timeout"},{"i":16,"status":503,"ms":2094,"start":67,"code":"db_pool_timeout"},{"i":17,"status":503,"ms":2086,"start":68,"code":"db_pool_timeout"},{"i":18,"status":503,"ms":2093,"start":69,"code":"db_pool_timeout"},{"i":19,"status":503,"ms":2089,"start":71,"code":"db_pool_timeout"},{"i":20,"status":503,"ms":2090,"start":71,"code":"db_pool_timeout"},{"i":21,"status":503,"ms":2088,"start":73,"code":"db_pool_timeout"},{"i":22,"status":503,"ms":2083,"start":74,"code":"db_pool_timeout"},{"i":23,"status":503,"ms":2086,"start":76,"code":"db_pool_timeout"},{"i":24,"status":503,"ms":2090,"start":77,"code":"db_pool_timeout"},{"i":25,"status":503,"ms":2077,"start":78,"code":"db_pool_timeout"},{"i":26,"status":503,"ms":2077,"start":79,"code":"db_pool_timeout"},{"i":27,"status":503,"ms":2075,"start":83,"code":"db_pool_timeout"},{"i":28,"status":503,"ms":2073,"start":86,"code":"db_pool_timeout"},{"i":29,"status":503,"ms":2064,"start":88,"code":"db_pool_timeout"},{"i":30,"status":503,"ms":2048,"start":281,"code":"db_pool_timeout"},{"i":31,"status":503,"ms":2046,"start":283,"code":"db_pool_timeout"},{"i":32,"status":503,"ms":2059,"start":286,"code":"db_pool_timeout"},{"i":33,"status":503,"ms":2031,"start":286,"code":"db_pool_timeout"},{"i":34,"status":503,"ms":2031,"start":287,"code":"db_pool_timeout"},{"i":35,"status":503,"ms":2052,"start":2095,"code":"db_pool_timeout"},{"i":36,"status":503,"ms":2050,"start":2097,"code":"db_pool_timeout"},{"i":37,"status":503,"ms":2048,"start":2097,"code":"db_pool_timeout"},{"i":38,"status":503,"ms":2048,"start":2099,"code":"db_pool_timeout"},{"i":39,"status":503,"ms":2048,"start":2100,"code":"db_pool_timeout"},{"i":40,"status":503,"ms":2068,"start":2112,"code":"db_pool_timeout"},{"i":41,"status":503,"ms":2065,"start":2114,"code":"db_pool_timeout"},{"i":42,"status":503,"ms":2065,"start":2115,"code":"db_pool_timeout"},{"i":43,"status":503,"ms":2064,"start":2116,"code":"db_pool_timeout"},{"i":44,"status":503,"ms":2062,"start":2118,"code":"db_pool_timeout"},{"i":45,"status":503,"ms":2061,"start":2118,"code":"db_pool_timeout"},{"i":46,"status":503,"ms":2075,"start":2153,"code":"db_pool_timeout"},{"i":47,"status":503,"ms":2076,"start":2154,"code":"db_pool_timeout"},{"i":48,"status":503,"ms":2037,"start":2155,"code":"db_pool_timeout"},{"i":49,"status":503,"ms":2035,"start":2157,"code":"db_pool_timeout"},{"i":50,"status":503,"ms":2049,"start":2157,"code":"db_pool_timeout"},{"i":51,"status":503,"ms":2034,"start":2158,"code":"db_pool_timeout"},{"i":52,"status":503,"ms":2071,"start":2159,"code":"db_pool_timeout"},{"i":53,"status":503,"ms":2069,"start":2160,"code":"db_pool_timeout"},{"i":54,"status":503,"ms":2064,"start":2161,"code":"db_pool_timeout"},{"i":55,"status":503,"ms":2068,"start":2161,"code":"db_pool_timeout"},{"i":56,"status":503,"ms":2064,"start":2162,"code":"db_pool_timeout"},{"i":57,"status":503,"ms":2068,"start":2162,"code":"db_pool_timeout"},{"i":58,"status":503,"ms":2066,"start":2163,"code":"db_pool_timeout"},{"i":59,"status":503,"ms":2064,"start":2166,"code":"db_pool_timeout"}],"pool_status":"Pool size: 5  Connections in pool: 0 Current Overflow: 0 Current Checked out connections: 5","error":{"code":"db_pool_timeout","detail":"QueuePool limit of size 5 overflow 0 reached, connection timed out, timeout 2.00"}},"leak|10":{"pool":5,"overflow":10,"ok":15,"failed":45,"wall_s":4.22,"p50":283,"max":300,"reqs":[{"i":0,"status":200,"ms":290,"start":1,"code":null},{"i":1,"status":200,"ms":293,"start":2,"code":null},{"i":2,"status":200,"ms":281,"start":3,"code":null},{"i":3,"status":200,"ms":286,"start":4,"code":null},{"i":4,"status":200,"ms":286,"start":5,"code":null},{"i":5,"status":200,"ms":283,"start":5,"code":null},{"i":6,"status":200,"ms":283,"start":6,"code":null},{"i":7,"status":200,"ms":283,"start":7,"code":null},{"i":8,"status":200,"ms":276,"start":8,"code":null},{"i":9,"status":200,"ms":287,"start":9,"code":null},{"i":10,"status":200,"ms":298,"start":10,"code":null},{"i":11,"status":200,"ms":300,"start":11,"code":null},{"i":12,"status":200,"ms":259,"start":57,"code":null},{"i":13,"status":503,"ms":2095,"start":59,"code":"db_pool_timeout"},{"i":14,"status":200,"ms":258,"start":62,"code":null},{"i":15,"status":503,"ms":2083,"start":63,"code":"db_pool_timeout"},{"i":16,"status":200,"ms":254,"start":64,"code":null},{"i":17,"status":503,"ms":2053,"start":65,"code":"db_pool_timeout"},{"i":18,"status":503,"ms":2081,"start":66,"code":"db_pool_timeout"},{"i":19,"status":503,"ms":2085,"start":67,"code":"db_pool_timeout"},{"i":20,"status":503,"ms":2080,"start":68,"code":"db_pool_timeout"},{"i":21,"status":503,"ms":2078,"start":69,"code":"db_pool_timeout"},{"i":22,"status":503,"ms":2074,"start":71,"code":"db_pool_timeout"},{"i":23,"status":503,"ms":2079,"start":74,"code":"db_pool_timeout"},{"i":24,"status":503,"ms":2069,"start":77,"code":"db_pool_timeout"},{"i":25,"status":503,"ms":2076,"start":78,"code":"db_pool_timeout"},{"i":26,"status":503,"ms":2070,"start":80,"code":"db_pool_timeout"},{"i":27,"status":503,"ms":2062,"start":89,"code":"db_pool_timeout"},{"i":28,"status":503,"ms":2061,"start":91,"code":"db_pool_timeout"},{"i":29,"status":503,"ms":2062,"start":94,"code":"db_pool_timeout"},{"i":30,"status":503,"ms":2059,"start":284,"code":"db_pool_timeout"},{"i":31,"status":503,"ms":2043,"start":284,"code":"db_pool_timeout"},{"i":32,"status":503,"ms":2039,"start":288,"code":"db_pool_timeout"},{"i":33,"status":503,"ms":2053,"start":289,"code":"db_pool_timeout"},{"i":34,"status":503,"ms":2054,"start":290,"code":"db_pool_timeout"},{"i":35,"status":503,"ms":2037,"start":290,"code":"db_pool_timeout"},{"i":36,"status":503,"ms":2037,"start":291,"code":"db_pool_timeout"},{"i":37,"status":503,"ms":2051,"start":291,"code":"db_pool_timeout"},{"i":38,"status":503,"ms":2049,"start":294,"code":"db_pool_timeout"},{"i":39,"status":503,"ms":2047,"start":296,"code":"db_pool_timeout"},{"i":40,"status":503,"ms":2050,"start":308,"code":"db_pool_timeout"},{"i":41,"status":503,"ms":2046,"start":311,"code":"db_pool_timeout"},{"i":42,"status":503,"ms":2042,"start":316,"code":"db_pool_timeout"},{"i":43,"status":503,"ms":2040,"start":318,"code":"db_pool_timeout"},{"i":44,"status":503,"ms":2037,"start":319,"code":"db_pool_timeout"},{"i":45,"status":503,"ms":2032,"start":2118,"code":"db_pool_timeout"},{"i":46,"status":503,"ms":2057,"start":2145,"code":"db_pool_timeout"},{"i":47,"status":503,"ms":2039,"start":2146,"code":"db_pool_timeout"},{"i":48,"status":503,"ms":2038,"start":2146,"code":"db_pool_timeout"},{"i":49,"status":503,"ms":2054,"start":2147,"code":"db_pool_timeout"},{"i":50,"status":503,"ms":2037,"start":2147,"code":"db_pool_timeout"},{"i":51,"status":503,"ms":2053,"start":2148,"code":"db_pool_timeout"},{"i":52,"status":503,"ms":2051,"start":2149,"code":"db_pool_timeout"},{"i":53,"status":503,"ms":2049,"start":2151,"code":"db_pool_timeout"},{"i":54,"status":503,"ms":2066,"start":2152,"code":"db_pool_timeout"},{"i":55,"status":503,"ms":2065,"start":2152,"code":"db_pool_timeout"},{"i":56,"status":503,"ms":2066,"start":2153,"code":"db_pool_timeout"},{"i":57,"status":503,"ms":2064,"start":2154,"code":"db_pool_timeout"},{"i":58,"status":503,"ms":2064,"start":2154,"code":"db_pool_timeout"},{"i":59,"status":503,"ms":2062,"start":2156,"code":"db_pool_timeout"}],"pool_status":"Pool size: 5  Connections in pool: 0 Current Overflow: 10 Current Checked out connections: 15","error":{"code":"db_pool_timeout","detail":"QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 2.00"}}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  function draw() {
+    const pt = v('#plP'), o = v('#plO'), r = D.r[`${pt}|${o}`];
+    const reqs = r.reqs.slice().sort((a, b) => a.start - b.start || a.i - b.i);
+    const tmax = Math.max(4300, ...reqs.map((x) => x.start + x.ms));
+    const W = 680, H = 300, L = 40, R = 12, T = 18, B = 26, rowH = (H - T - B) / reqs.length, sx = (t) => L + t / tmax * (W - L - R);
+    let s = `<line x1="${L}" y1="${H - B}" x2="${W - R}" y2="${H - B}" stroke="var(--border)"/>`;
+    [0, 1000, 2000, 3000, 4000].forEach((t) => { if (t <= tmax) s += `<line x1="${sx(t)}" y1="${T}" x2="${sx(t)}" y2="${H - B}" stroke="var(--border)" stroke-dasharray="2 4"/><text class="pl-ax" x="${sx(t)}" y="${H - 9}" text-anchor="middle">${t / 1000} s</text>`; });
+    reqs.forEach((x, k) => { const y = T + k * rowH; s += `<rect x="${sx(x.start).toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(1.5, sx(x.start + x.ms) - sx(x.start)).toFixed(1)}" height="${Math.max(1.5, rowH - 1).toFixed(1)}" rx="1" fill="${x.status === 200 ? 'var(--green)' : 'var(--red)'}" opacity=".85"/>`; });
+    s += `<text class="pl-ax" x="${L}" y="12">60 requests ↓ · <tspan fill="var(--green)">200 OK</tspan> · <tspan fill="var(--red)">503 pool timeout</tspan></text>`;
+    $('#plSvg').innerHTML = s;
+    $('#plErr').innerHTML = r.error ? `<div class="pl-err">503 ${esc(JSON.stringify(r.error))}</div>` : '';
+    $('#plStats').innerHTML = `<div class="stat good"><div class="k">Succeeded</div><div class="v">${r.ok} of 60</div></div><div class="stat ${r.failed ? 'warn' : ''}"><div class="k">Failed (503)</div><div class="v">${r.failed}</div></div><div class="stat"><div class="k">All done after</div><div class="v">${r.wall_s.toFixed(2)} s</div></div><div class="stat"><div class="k">Median success</div><div class="v">${r.p50 === null ? '–' : Math.round(r.p50) + ' ms'}</div></div>`;
+    let why;
+    if (pt === 'release') why = `<b>All 60 succeeded in ${r.wall_s.toFixed(2)} s.</b> Each request held a connection only for its tiny query and commit, so five connections were plenty; the time is the provider calls, running 30 at a time. After the burst the pool reported: <code>${esc(r.pool_status)}</code>.`;
+    else if (pt === 'hold') why = o === '0' ? `<b>All succeeded, but the burst took ${r.wall_s.toFixed(2)} s and the median request ${(r.p50 / 1000).toFixed(1)} s.</b> Each request kept its connection through the 200 ms provider call, so at most five calls ran at once and the rest queued for a connection. The database did no extra work; the pool was the bottleneck.` : `<b>Overflow helped: ${r.wall_s.toFixed(2)} s.</b> Up to 15 connections now, so 15 provider calls at once. It also means three times as many database connections per process, for a problem that committing first solves for free.`;
+    else why = `<b>${r.ok} succeeded, then everything failed.</b> Each of the first ${r.ok} requests kept its session alive, so its connection never returned. Every later request waited the full 2-second pool timeout and got a 503. After the burst: <code>${esc(r.pool_status)}</code>. ${o === '10' ? 'Overflow only delayed it by ten more requests.' : 'Nothing short of a restart recovers this process.'}`;
+    $('#plWhy').innerHTML = why;
+    $('#plWhy').dataset.x = JSON.stringify({ pt, o, ok: r.ok });
+  }
+  ['#plP', '#plO'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
