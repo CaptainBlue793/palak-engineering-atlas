@@ -626,20 +626,48 @@
   }
 
   /* ---------------------------------------------------------
-     The mosaic: one square per chapter of every released course.
-     Planned courses live in their tabs only, so the tracker stays
-     the height of the hero however many are on the way.
+     The mosaic: one square per chapter, one subject-area tab at a time.
+     Released courses link each square to its chapter; a course still
+     being written shows its planned size as faint outlines.
      --------------------------------------------------------- */
+  // A planned course is drawn at the standard size: 8 prerequisites + 40 chapters + 8 case studies.
+  var PLANNED = 56;
+  function trackTotal(c) { return c.soon ? (c.chapters || PLANNED) : countOf(c); }
+  function trackDone(c) { return c.soon ? 0 : doneCount(c); }
+  var COURSE_TABS = TABS.filter(function (t) { return !t.paths; });
+  var trackTab = null;
+
   function chapterAt(c, n) {
     if (!c.data) return null;
     if (!c.byN) { c.byN = {}; c.data.forEach(function (ch) { c.byN[ch.n] = ch; }); }
     return c.byN[n] || null;
   }
 
+  function mosaicTab(t) {
+    var list = inTab(t), done = 0, total = 0;
+    list.forEach(function (c) { done += trackDone(c); total += trackTotal(c); });
+    var on = t.id === trackTab;
+    return '<button type="button" class="mtab" role="tab" id="mtab-' + t.id + '" aria-controls="mpanel" ' +
+      'aria-selected="' + on + '" tabindex="' + (on ? 0 : -1) + '" data-mtab="' + t.id + '">' +
+      '<span>' + esc(t.title) + '</span><span class="mct">' + done + '/' + total + '</span></button>';
+  }
+
   function renderMosaic() {
-    // Every row gets as many columns as the longest course, so squares match across rows.
-    $('#mosaic').style.setProperty('--cols', Math.max.apply(null, LIVE.map(countOf)));
-    $('#mosaic').innerHTML = LIVE.map(function (c) {
+    if (!trackTab) {
+      // Open on the tab of the course you are furthest into, else the one you last chose, else the first.
+      var saved = LS.get('atlas-track-tab', null), going = LIVE.filter(function (c) { return doneCount(c) > 0 && doneCount(c) < countOf(c); })
+        .sort(function (a, b) { return doneCount(b) - doneCount(a); })[0];
+      trackTab = COURSE_TABS.some(function (t) { return t.id === saved; }) ? saved : going ? going.tab : COURSE_TABS[0].id;
+    }
+    var tab = COURSE_TABS.filter(function (t) { return t.id === trackTab; })[0];
+    var rows = inTab(tab).map(function (c) {
+      if (c.soon) {
+        var n = trackTotal(c);
+        return '<div class="mgroup tint soon" style="' + tintVars(c) + '">' +
+          '<div class="gh"><span class="nm">' + esc(c.title) + '</span>' +
+          '<span class="rule"></span><span class="ct">coming soon · 0/' + n + '</span></div>' +
+          '<div class="mosaic" role="img" aria-label="' + esc(c.title) + ': coming soon, ' + n + ' chapters planned">' + new Array(n + 1).join('<span></span>') + '</div></div>';
+      }
       var total = countOf(c), d = doneOf(c), next = nextChapter(c), sq = '';
       var chapters = c.data ? c.data.slice().sort(function (a, b) { return a.n - b.n; }) :
         Array.from({ length: total }, function (_, i) { return { n: i + 1 }; });
@@ -655,6 +683,15 @@
         '<span class="rule"></span><span class="ct">' + doneCount(c) + '/' + total + '</span></div>' +
         '<div class="mosaic">' + sq + '</div></div>';
     }).join('');
+    $('#mosaic').innerHTML = '<div class="mtabs" role="tablist" aria-label="Progress by subject area">' + COURSE_TABS.map(mosaicTab).join('') + '</div>' +
+      '<div id="mpanel" role="tabpanel" aria-labelledby="mtab-' + trackTab + '">' + rows + '</div>';
+  }
+
+  function selectTrackTab(id, focus) {
+    trackTab = id;
+    LS.set('atlas-track-tab', id);
+    renderMosaic();
+    if (focus) $('#mtab-' + id).focus();
   }
 
   function nextChapter(c) {
@@ -1034,6 +1071,19 @@
     selectTab(ids[(j + ids.length) % ids.length], true);
   });
   window.addEventListener('hashchange', tabFromHash);
+
+  // The tracker's own tabs: click or arrow keys switch the subject area shown.
+  $('#mosaic').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-mtab]'); if (b) selectTrackTab(b.dataset.mtab);
+  });
+  $('#mosaic').addEventListener('keydown', function (e) {
+    var b = e.target.closest('[data-mtab]'); if (!b) return;
+    var ids = COURSE_TABS.map(function (t) { return t.id; }), i = ids.indexOf(b.dataset.mtab);
+    var j = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: ids.length - 1 }[e.key];
+    if (j === undefined) return;
+    e.preventDefault();
+    selectTrackTab(ids[(j + ids.length) % ids.length], true);
+  });
 
   $('#pal').addEventListener('click', function (e) { if (e.target === $('#pal')) closePal(); });
   $('#palInput').addEventListener('input', runSearch);
