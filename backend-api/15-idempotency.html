@@ -3,37 +3,279 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Idempotency &amp; Safe Retries</title>
+<title>Idempotency &amp; Safe Retries · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 15 of Backend & API. Why retries duplicate work, idempotent methods, idempotency keys, storing and replaying responses, and concurrent duplicates, with real payments charged twice, or once, under timeouts and double clicks.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .id-ctl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 18px; }
+  @media (max-width:800px) { .id-ctl { grid-template-columns:1fr; } }
+  .id-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .id-grid { margin-top:14px; display:grid; grid-template-columns:repeat(10,minmax(0,1fr)); gap:6px; }
+  @media (max-width:600px) { .id-grid { grid-template-columns:repeat(5,minmax(0,1fr)); } }
+  .id-c { border:1px solid var(--border); border-radius:9px; background:var(--surface-2); padding:6px 4px; text-align:center; cursor:pointer; font-family:var(--mono); }
+  .id-c .n { font-size:18px; font-weight:700; }
+  .id-c .k { font-size:10px; color:var(--muted); }
+  .id-c.one .n { color:var(--green); } .id-c.dup .n { color:var(--red); } .id-c.zero .n { color:var(--amber); }
+  .id-c.sel { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-soft); }
+  .id-log { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-family:var(--mono); font-size:12.5px; line-height:1.6; }
+  .id-log .t { display:block; font-family:var(--font); font-size:10.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); margin-bottom:4px; }
+  .id-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="15">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 15</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Idempotency &amp; Safe <span class="grad">Retries</span></h1>
-    <p class="lead">Clients retry; networks duplicate. Idempotency keys make "charge the card" safe to send twice.</p>
+    <p class="lead">Networks fail in an awkward way: when a request times out, the client cannot know whether the server never got it, got it and failed, or got it, did the work, and the answer was lost on the way back. The only sensible client behaviour is to retry, and the only safe server behaviour is to make sure a retry cannot do the work twice. For reading data that is free. For "charge this card £49.99" it is the difference between a reliable payment system and one that charges customers twice.</p>
+    <p class="lead">This chapter explains why retries duplicate work and how idempotency keys prevent it, including the subtle case of two identical requests arriving at once. The lab charges real (fake) cards through a FastAPI service in three implementations and counts the charges.</p>
+    <ul class="objectives">
+      <li><span>Explain why timeouts force retries and why retries duplicate work</span></li>
+      <li><span>Know which HTTP methods are idempotent by definition</span></li>
+      <li><span>Implement idempotency keys for POST</span></li>
+      <li><span>Store and replay responses, and reject a reused key with a different body</span></li>
+      <li><span>Handle concurrent duplicates with an atomic reservation</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Safe and idempotent methods:</b> <a href="02-http-in-depth.html">Chapter 2</a>.</li>
+        <li><b>Unique constraints and transactions:</b> <a href="p5-sql-for-app-developers.html">Prerequisite 5</a> and <a href="06-database-access.html">Chapter 6</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why retries duplicate work</li>
-    <li>Idempotent methods</li>
-    <li>Idempotency keys</li>
-    <li>Storing and replaying responses</li>
-    <li>Concurrent duplicates</li>
-  </ol>
+  <h2>Why retries duplicate work</h2>
+  <p>A client sends <code>POST /payments</code>. The server charges the card, which takes a moment, and replies. If the reply is slower than the client's timeout, or the connection drops, or a load balancer gives up, the client sees a failure for a payment that actually happened. It retries, and the card is charged again. Retries come from everywhere: users pressing the button twice, apps retrying on timeouts, HTTP libraries retrying on connection errors, proxies and queues redelivering. You cannot stop them, and you should not want to, since without them every network blip would lose an order. You make them harmless instead.</p>
+
+  <h2>Idempotent methods</h2>
+  <p>HTTP already defines GET, HEAD, PUT and DELETE as idempotent (<a href="02-http-in-depth.html">Chapter 2</a>), and a server must honour that: <code>PUT /orders/42/address</code> sent twice leaves one address, and <code>DELETE /orders/42</code> sent twice leaves one deleted order. Sometimes you can design an operation to be naturally idempotent, for example by letting the client choose the ID, <code>PUT /payments/{client_generated_id}</code>, so a repeat finds the existing payment. POST, the method for "create something new" and "do this action", is not idempotent, and needs an idempotency key.</p>
+
+  <h2>Idempotency keys</h2>
+  <p>The client generates a unique key, usually a UUID, for each logical operation, sends it in a header (<code>Idempotency-Key</code>, as Stripe popularised and an IETF draft standardises), and reuses the <i>same</i> key for every retry of that operation. The server records the key with the outcome. A new key means new work; a known key means "you asked this already", and the server returns the original result instead of doing it again. Three details make it correct:</p>
+  <ul>
+    <li><b>Reserve before working.</b> Insert the key as "in progress" with a unique constraint <i>before</i> charging. Checking first and inserting afterwards leaves a window where two concurrent requests both see "new".</li>
+    <li><b>Fingerprint the request.</b> Store a hash of the body with the key; if the same key arrives with a different body, it is a client bug, answer 422, never replay a different payment's result.</li>
+    <li><b>Answer the in-progress case.</b> A duplicate that arrives while the first is still running gets <b>409 Conflict</b> with <code>Retry-After</code>; once the first finishes, duplicates get the stored response, marked as a replay.</li>
+  </ul>
+<pre class="code">@app.post("/payments", status_code=201)
+def create_payment(body: PaymentIn, idempotency_key: str | None = Header(default=None)):
+    con = db()
+    try:
+        if MODE == "none" or idempotency_key is None:
+            return charge_card(con, body)
+
+        fingerprint = hashlib.sha256(body.model_dump_json().encode()).hexdigest()
+        if MODE == "naive":
+            # check, then act: two requests can both pass the check
+            row = con.execute("SELECT response FROM idem WHERE key = ?", (idempotency_key,)).fetchone()
+            if row:
+                return JSONResponse(json.loads(row[0]), status_code=201, headers={"Idempotent-Replayed": "true"})
+            result = charge_card(con, body)
+            con.execute("INSERT OR REPLACE INTO idem (key, fingerprint, status, response) VALUES (?, ?, 'done', ?)", (idempotency_key, fingerprint, json.dumps(result)))
+            return result
+
+        # proper: reserve the key atomically first, then do the work, then store the response
+        try:
+            con.execute("INSERT INTO idem (key, fingerprint, status) VALUES (?, ?, 'in_progress')", (idempotency_key, fingerprint))
+        except sqlite3.IntegrityError:
+            fp, status, response = con.execute("SELECT fingerprint, status, response FROM idem WHERE key = ?", (idempotency_key,)).fetchone()
+            if fp != fingerprint:
+                return JSONResponse({"code": "idempotency_key_reused", "detail": "This key was used with a different request body"}, status_code=422)
+            if status == "in_progress":
+                return JSONResponse({"code": "request_in_progress", "detail": "A request with this key is still being processed"}, status_code=409, headers={"Retry-After": "1"})
+            return JSONResponse(json.loads(response), status_code=201, headers={"Idempotent-Replayed": "true"})
+        result = charge_card(con, body)
+        con.execute("UPDATE idem SET status = 'done', response = ? WHERE key = ?", (json.dumps(result), idempotency_key))
+        return result
+    finally:
+        con.close()</pre>
+
+  <h2>Simulator: twenty payments, three implementations</h2>
+  <p>A FastAPI service charges cards; the card network takes 300 ms. In <b>timeouts and retries</b>, a client with a 200 ms timeout sends each of 20 payments and retries up to three times with the same key. In <b>double clicks</b>, each payment is sent twice at the same moment with the same key. Each square is one payment; the number is how many charges the card received. Click a square for what the client saw.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">How many times was each card charged?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="id-ctl">
+        <div><div class="id-l">Server</div><div class="seg" id="idM"><button class="active" data-v="none">no idempotency</button><button data-v="naive">key, check then act</button><button data-v="proper">key, reserved atomically</button></div></div>
+        <div><div class="id-l">Client behaviour</div><div class="seg" id="idS"><button class="active" data-v="retry">timeouts and retries</button><button data-v="double">double clicks</button></div></div>
+      </div>
+      <div class="id-grid" id="idGrid"></div>
+      <div class="id-log" id="idLog"></div>
+      <div class="stats" id="idStats"></div>
+      <div class="id-why" id="idWhy"></div>
+    </div>
+    <div class="panel-foot">uvicorn and FastAPI with SQLite in WAL mode; charges are rows in a <code>charges</code> table, counted after each run. The client used httpx. "Overcharged" is the duplicate charges at £49.99 each.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>no idempotency</b>, timeouts and retries: every payment charged four times, and the client still saw only timeouts, so it reported every payment as failed. The worst of both worlds.</li>
+    <li><b>key, check then act</b>: retries are mostly fixed, because by the time the client retries, the first request has stored its result and the retry gets a replay. Now switch to <b>double clicks</b>: both requests check at the same moment, both see nothing, and both charge.</li>
+    <li><b>key, reserved atomically</b>: one charge per payment in both scenarios. The second of a concurrent pair gets 409 "in progress"; a retry after the first finished gets the stored response.</li>
+  </ul>
+
+  <h2>Storing and replaying responses</h2>
+  <p>Store the status code and body of the completed operation and return exactly that for duplicates, with a header such as <code>Idempotent-Replayed: true</code> so clients and logs can tell. Decide what to store: final outcomes, successes and business failures such as "card declined", are replayed; failures that happened <i>before</i> any work, such as validation errors, need not be stored, so the client can fix the request and retry with the same key; and if the server crashes mid-operation, an "in progress" row older than a timeout should be resolved by checking with the provider, not by blindly retrying. Scope keys to the client or account, so two customers cannot collide, and expire them after a period long enough to cover retries; Stripe, for example, keeps them for at least 24 hours. When this service calls another service, pass a key on too: idempotency must hold end to end.</p>
+  <p>Measured on the lab service: the first request with key <code>k-reuse</code> got <code>201 {&quot;id&quot;:&quot;ch_7a8969f7c7&quot;,&quot;amount_cents&quot;:4999,&quot;status&quot;:&quot;succeeded&quot;}</code>; the same key with a different amount got <code>422 {&quot;code&quot;:&quot;idempotency_key_reused&quot;,&quot;detail&quot;:&quot;This key was used with a different request body&quot;}</code>; and the original body again got the stored response, with <code>Idempotent-Replayed: true</code>.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Approach</th><th>Sequential retries</th><th>Concurrent duplicates</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><b>No protection</b></td><td>Duplicate work</td><td>Duplicate work</td><td>Only acceptable for naturally idempotent operations</td></tr>
+        <tr><td><b>Check, then act</b></td><td>Usually safe</td><td>Duplicate work</td><td>The race window is the whole duration of the work</td></tr>
+        <tr><td><b>Atomic reservation (unique key)</b></td><td>Safe, replayed</td><td>Safe, 409 then replay</td><td>Needs an "in progress" state and crash recovery</td></tr>
+        <tr><td><b>Client-chosen ID with PUT</b></td><td>Safe</td><td>Safe with a unique constraint</td><td>Clean when the resource is the operation</td></tr>
+        <tr><td><b>Natural key / unique business constraint</b></td><td>Safe</td><td>Safe</td><td>For example, one payment per order ID</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Concurrent duplicates</h2>
+  <p>The lab's double-click results are the general lesson: any "check, then act" sequence is a race unless the check and the claim are a single atomic step. The database's unique constraint is the simplest atomic step available, which is why the correct version inserts the key first and lets the database decide who wins. The same pattern appears in Chapters 16 and 17: correctness under concurrency comes from constraints, conditional updates and transactions, not from reading and then deciding in application code.</p>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Client</b> generates a key per operation, reuses it on retry</li>
+      <li data-k="step"><b>Reserve</b> INSERT key as in progress; unique constraint decides</li>
+      <li data-k="step"><b>Duplicate?</b> different body: 422; in progress: 409; done: replay</li>
+      <li data-k="step"><b>Do the work once</b> pass a key downstream too</li>
+      <li data-k="end"><b>Store the result</b> status and body, kept for 24 hours or more</li>
+    </ol>
+    <figcaption><b>An idempotent POST.</b> The key is claimed before any work happens, so only one request can ever do it.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">☁️</div>
+    <div class="body"><div class="title">Use case: client tokens in the Amazon EC2 API</div><p>Launching virtual machines has the same problem as charging cards: if a <code>RunInstances</code> call times out and the caller retries, it may launch two fleets and pay for both. The EC2 API therefore accepts a <code>ClientToken</code>, a unique string chosen by the caller for each launch request, and AWS's SDKs and tools use it so that retries return the original result instead of starting more instances. AWS's Builders' Library article "Making retries safe with idempotent APIs" describes the reasoning behind the design, and it maps directly onto this chapter: the caller supplies the unique token; the service records it atomically with the request; a repeat with the same token and the same parameters returns the response to the original request; and a repeat with the same token but different parameters is rejected as an error, rather than silently treated as the same request. Idempotency is not a payments-only concern. Any API whose operations cost money or cannot be undone needs it.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Generating a new key on every retry,</b> which makes each retry look new.</li>
+      <li><b>Check-then-insert</b> instead of an atomic reservation.</li>
+      <li><b>Replaying the stored response for a different request body.</b></li>
+      <li><b>Keys shared across customers,</b> so one customer can receive another's replay.</li>
+      <li><b>Doing the work before storing the key,</b> leaving a window for duplicates.</li>
+      <li><b>Not passing idempotency downstream</b> to the payment provider or other services.</li>
+      <li><b>Client timeouts shorter than normal server latency,</b> turning every request into several.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is an idempotency key and why do payment APIs need them?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>When a payment request times out, the client cannot tell whether the charge happened, so it has to retry, and without protection a retry charges again. An idempotency key is a unique value the client creates for one logical payment and sends with every attempt. The server records the key with the outcome the first time; later requests with the same key get the original response instead of a new charge. To be correct, the server must claim the key atomically before doing the work, using a unique constraint, so two simultaneous duplicates cannot both proceed; it should reject the same key with a different body; and while the first request is still running, duplicates get a 409 and retry later.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your service receives a payment request with an idempotency key, charges the card through a provider, and crashes before storing the result. What happens on retry, and how do you make it safe?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The key is stuck "in progress", and the service does not know whether the charge succeeded. Blindly retrying could charge twice; refusing forever loses the payment. First, pass an idempotency key to the provider too, derived from ours, so if we call the provider again with the same key, the provider returns the original charge instead of creating a new one: the end-to-end chain is idempotent. Then, when a retry finds an "in progress" record older than a reasonable timeout, a recovery step either re-issues the provider call with the same downstream key or queries the provider for the charge, records the real outcome, and replays it. A background job can sweep stale in-progress records too. Using the outbox pattern (<a href="30-outbox-events.html">Chapter 30</a>), recording the intent in our database before calling out, makes the recovery systematic.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Timeouts make retries unavoidable; idempotency makes them harmless.</li>
+      <li>GET, PUT and DELETE must be idempotent; POST needs an idempotency key.</li>
+      <li>Reserve the key atomically before working; check-then-act fails under concurrent duplicates.</li>
+      <li>Fingerprint requests, replay stored responses, answer 409 while in progress.</li>
+      <li>Scope and expire keys, and pass idempotency downstream.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A client's payment request times out. What does it know about the payment?</p>
+      <div class="opts">
+        <button class="opt">It failed</button>
+        <button class="opt">It succeeded</button>
+        <button class="opt">Nothing: it may or may not have happened</button>
+        <button class="opt">It is queued</button>
+      </div>
+      <div class="explain">In the lab, every timed-out request without a key had in fact charged the card.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why did "check, then act" still double-charge on double clicks?</p>
+      <div class="opts">
+        <button class="opt">The keys were different</button>
+        <button class="opt">Both requests checked before either stored the key, so both saw it as new</button>
+        <button class="opt">SQLite does not support unique keys</button>
+        <button class="opt">The client retried</button>
+      </div>
+      <div class="explain">Measured: 19 of 20 payments charged twice. Only an atomic claim closes the window.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">The same idempotency key arrives with a different amount. What should the server do?</p>
+      <div class="opts">
+        <button class="opt">Reject it, for example with 422, because the key was reused for a different request</button>
+        <button class="opt">Replay the original response</button>
+        <button class="opt">Process the new amount</button>
+        <button class="opt">Charge both amounts</button>
+      </div>
+      <div class="explain">Store a fingerprint of the request body with the key and compare.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A duplicate arrives while the first request with that key is still running. A good response is:</p>
+      <div class="opts">
+        <button class="opt">Process it too</button>
+        <button class="opt">200 with an empty body</button>
+        <button class="opt">500</button>
+        <button class="opt">409 Conflict with Retry-After, then a replay once the first finishes</button>
+      </div>
+      <div class="explain">The client retries shortly and receives the stored result.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How should a client choose idempotency keys?</p>
+      <div class="opts">
+        <button class="opt">A new random key for every HTTP attempt</button>
+        <button class="opt">The current timestamp</button>
+        <button class="opt">One unique key per logical operation, reused for all its retries</button>
+        <button class="opt">The customer's ID</button>
+      </div>
+      <div class="explain">A key per attempt defeats the purpose; a key per customer merges unrelated payments.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"r":{"none|retry":{"charges":80,"per_payment":[4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4],"dupes":60,"missing":0,"log":[[0,0,"timeout"],[0,1,"timeout"],[0,2,"timeout"],[0,3,"timeout"],[1,0,"timeout"],[1,1,"timeout"],[1,2,"timeout"],[1,3,"timeout"],[2,0,"timeout"],[2,1,"timeout"],[2,2,"timeout"],[2,3,"timeout"],[3,0,"timeout"],[3,1,"timeout"],[3,2,"timeout"],[3,3,"timeout"],[4,0,"timeout"],[4,1,"timeout"],[4,2,"timeout"],[4,3,"timeout"],[5,0,"timeout"],[5,1,"timeout"],[5,2,"timeout"],[5,3,"timeout"],[6,0,"timeout"],[6,1,"timeout"],[6,2,"timeout"],[6,3,"timeout"],[7,0,"timeout"],[7,1,"timeout"],[7,2,"timeout"],[7,3,"timeout"],[8,0,"timeout"],[8,1,"timeout"],[8,2,"timeout"],[8,3,"timeout"],[9,0,"timeout"],[9,1,"timeout"],[9,2,"timeout"],[9,3,"timeout"],[10,0,"timeout"],[10,1,"timeout"],[10,2,"timeout"],[10,3,"timeout"],[11,0,"timeout"],[11,1,"timeout"],[11,2,"timeout"],[11,3,"timeout"],[12,0,"timeout"],[12,1,"timeout"],[12,2,"timeout"],[12,3,"timeout"],[13,0,"timeout"],[13,1,"timeout"],[13,2,"timeout"],[13,3,"timeout"],[14,0,"timeout"],[14,1,"timeout"],[14,2,"timeout"],[14,3,"timeout"]]},"none|double":{"charges":40,"per_payment":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"dupes":20,"missing":0,"log":[[0,0,"201 + 201"],[1,0,"201 + 201"],[2,0,"201 + 201"],[3,0,"201 + 201"],[4,0,"201 + 201"],[5,0,"201 + 201"],[6,0,"201 + 201"],[7,0,"201 + 201"],[8,0,"201 + 201"],[9,0,"201 + 201"],[10,0,"201 + 201"],[11,0,"201 + 201"],[12,0,"201 + 201"],[13,0,"201 + 201"],[14,0,"201 + 201"],[15,0,"201 + 201"],[16,0,"201 + 201"],[17,0,"201 + 201"],[18,0,"201 + 201"],[19,0,"201 + 201"]]},"naive|retry":{"charges":21,"per_payment":[2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"dupes":1,"missing":0,"log":[[0,0,"timeout"],[0,1,"timeout"],[0,2,"201 replayed"],[1,0,"timeout"],[1,1,"201 replayed"],[2,0,"timeout"],[2,1,"201 replayed"],[3,0,"timeout"],[3,1,"201 replayed"],[4,0,"timeout"],[4,1,"201 replayed"],[5,0,"timeout"],[5,1,"201 replayed"],[6,0,"timeout"],[6,1,"201 replayed"],[7,0,"timeout"],[7,1,"201 replayed"],[8,0,"timeout"],[8,1,"201 replayed"],[9,0,"timeout"],[9,1,"201 replayed"],[10,0,"timeout"],[10,1,"201 replayed"],[11,0,"timeout"],[11,1,"201 replayed"],[12,0,"timeout"],[12,1,"201 replayed"],[13,0,"timeout"],[13,1,"201 replayed"],[14,0,"timeout"],[14,1,"201 replayed"],[15,0,"timeout"],[15,1,"201 replayed"],[16,0,"timeout"],[16,1,"201 replayed"],[17,0,"timeout"],[17,1,"201 replayed"],[18,0,"timeout"],[18,1,"201 replayed"],[19,0,"timeout"],[19,1,"201 replayed"]]},"naive|double":{"charges":39,"per_payment":[1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"dupes":19,"missing":0,"log":[[0,0,"500 + 201"],[1,0,"201 + 201"],[2,0,"201 + 201"],[3,0,"201 + 201"],[4,0,"201 + 201"],[5,0,"201 + 201"],[6,0,"201 + 201"],[7,0,"201 + 201"],[8,0,"201 + 201"],[9,0,"201 + 201"],[10,0,"201 + 201"],[11,0,"201 + 201"],[12,0,"201 + 201"],[13,0,"201 + 201"],[14,0,"201 + 201"],[15,0,"201 + 201"],[16,0,"201 + 201"],[17,0,"201 + 201"],[18,0,"201 + 201"],[19,0,"201 + 201"]]},"proper|retry":{"charges":20,"per_payment":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"dupes":0,"missing":0,"log":[[0,0,"timeout"],[0,1,"409 in progress"],[0,2,"201 replayed"],[1,0,"timeout"],[1,1,"201 replayed"],[2,0,"timeout"],[2,1,"201 replayed"],[3,0,"timeout"],[3,1,"201 replayed"],[4,0,"timeout"],[4,1,"201 replayed"],[5,0,"timeout"],[5,1,"201 replayed"],[6,0,"timeout"],[6,1,"201 replayed"],[7,0,"timeout"],[7,1,"201 replayed"],[8,0,"timeout"],[8,1,"201 replayed"],[9,0,"timeout"],[9,1,"201 replayed"],[10,0,"timeout"],[10,1,"201 replayed"],[11,0,"timeout"],[11,1,"201 replayed"],[12,0,"timeout"],[12,1,"201 replayed"],[13,0,"timeout"],[13,1,"201 replayed"],[14,0,"timeout"],[14,1,"201 replayed"],[15,0,"timeout"],[15,1,"201 replayed"],[16,0,"timeout"],[16,1,"201 replayed"],[17,0,"timeout"],[17,1,"201 replayed"],[18,0,"timeout"],[18,1,"201 replayed"],[19,0,"timeout"],[19,1,"201 replayed"]]},"proper|double":{"charges":20,"per_payment":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"dupes":0,"missing":0,"log":[[0,0,"409 + 201"],[1,0,"201 + 409"],[2,0,"409 + 201"],[3,0,"409 + 201"],[4,0,"201 + 409"],[5,0,"409 + 201"],[6,0,"409 + 201"],[7,0,"201 + 409"],[8,0,"201 + 409"],[9,0,"409 + 201"],[10,0,"201 + 409"],[11,0,"409 + 201"],[12,0,"409 + 201"],[13,0,"409 + 201"],[14,0,"201 + 409"],[15,0,"201 + 409"],[16,0,"201 + 409"],[17,0,"409 + 201"],[18,0,"409 + 201"],[19,0,"409 + 201"]]}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  let sel = 0;
+  function draw() {
+    const m = v('#idM'), s = v('#idS'), r = D.r[`${m}|${s}`];
+    $('#idGrid').innerHTML = r.per_payment.map((n, i) => `<div class="id-c ${n === 1 ? 'one' : n > 1 ? 'dup' : 'zero'} ${i === sel ? 'sel' : ''}" data-i="${i}"><div class="n">${n}</div><div class="k">#${i + 1}</div></div>`).join('');
+    const lg = r.log.filter((x) => x[0] === sel);
+    $('#idLog').innerHTML = `<span class="t">Payment #${sel + 1}: what the client saw</span>` + (lg.length ? lg.map((x) => s === 'retry' ? `attempt ${x[1] + 1}: ${esc(x[2])}` : `two simultaneous requests: ${esc(x[2])}`).join('<br>') : '(not recorded)');
+    const okClient = s === 'retry' ? r.per_payment.map((_, i) => r.log.filter((x) => x[0] === i).some((x) => /^201/.test(x[2]))).filter(Boolean).length : 20;
+    $('#idStats').innerHTML = `<div class="stat"><div class="k">Charges for 20 payments</div><div class="v">${r.charges}</div></div><div class="stat ${r.dupes ? 'warn' : 'good'}"><div class="k">Duplicate charges</div><div class="v">${r.dupes}</div></div><div class="stat ${r.dupes ? 'warn' : 'good'}"><div class="k">Overcharged</div><div class="v">£${(r.dupes * 49.99).toFixed(2)}</div></div><div class="stat ${okClient < 20 ? 'warn' : 'good'}"><div class="k">Client saw success</div><div class="v">${okClient} of 20</div></div>`;
+    let why;
+    if (m === 'none' && s === 'retry') why = `<b>Four charges per payment, and the client thinks all of them failed.</b> Each attempt charged the card, then the 300 ms network confirmation outlasted the 200 ms timeout, so the client retried. Without a key, the server has no way to know attempt 2 is attempt 1 again.`;
+    else if (m === 'none') why = `<b>Every double click is two charges.</b> Without a key the two requests are simply two payments.`;
+    else if (m === 'naive' && s === 'retry') why = `<b>Mostly fixed: ${r.dupes} duplicate.</b> Retries came after the first request had stored its result, so they got a replay. ${r.dupes ? 'But one retry arrived inside the window between the check and the store, and charged again.' : ''}`;
+    else if (m === 'naive') why = `<b>${r.dupes} duplicate charges out of 20.</b> Both requests ran <code>SELECT ... WHERE key = ?</code> at the same moment, both found nothing, and both charged. The check and the claim must be one atomic step.`;
+    else if (s === 'retry') why = `<b>Exactly one charge per payment.</b> The first attempt reserved the key; a retry while it was still running got 409 "in progress", and the next retry got the stored response, marked as a replay. Every client eventually saw success.`;
+    else why = `<b>Exactly one charge per payment.</b> Both requests tried to insert the key; the unique constraint let exactly one succeed. The other got 409 "in progress" and would retry to receive the replay.`;
+    $('#idWhy').innerHTML = why;
+    $('#idWhy').dataset.x = JSON.stringify({ m, s, dupes: r.dupes, okClient });
+  }
+  $('#idGrid').addEventListener('click', (e) => { const c = e.target.closest('.id-c'); if (c) { sel = +c.dataset.i; draw(); } });
+  ['#idM', '#idS'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
