@@ -3,37 +3,256 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Rate Limiting &amp; Quotas</title>
+<title>Rate Limiting &amp; Quotas · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 19 of Backend & API. Why limit, fixed and sliding windows, the token bucket, distributed counters in Redis, and 429 with Retry-After, with four real limiters run against three traffic patterns.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rl-ctl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 18px; }
+  @media (max-width:800px) { .rl-ctl { grid-template-columns:1fr; } }
+  .rl-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .rl-plot { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); }
+  .rl-plot svg { display:block; width:100%; height:auto; }
+  .rl-ax { font-family:var(--mono); font-size:10.5px; fill:var(--muted); }
+  .rl-hdr { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-family:var(--mono); font-size:12.5px; }
+  .rl-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="19">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 19</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Rate Limiting &amp; <span class="grad">Quotas</span></h1>
-    <p class="lead">Fixed windows, sliding windows and token buckets, in Redis, with 429 and Retry-After done properly.</p>
+    <p class="lead">Every API eventually meets a client that sends too much: a script in a loop, a scraper, an attacker trying stolen passwords, a partner's batch job, a mobile app with a retry bug released to a million phones. A <b>rate limit</b> caps how many requests a client may make in a period, and a <b>quota</b> caps how much it may use over a longer one. Together they keep one client from degrading the service for everyone, make costs predictable, and slow down abuse.</p>
+    <p class="lead">The interesting part is the algorithm: "10 requests per second" can mean quite different things at the edges. The lab runs four real limiters, all set to 10 per second, against three traffic patterns.</p>
+    <ul class="objectives">
+      <li><span>Decide what to limit, by which key, and why</span></li>
+      <li><span>Compare fixed windows, sliding logs and sliding window counters</span></li>
+      <li><span>Use a token bucket to allow bursts with a steady average</span></li>
+      <li><span>Share counters across instances with Redis</span></li>
+      <li><span>Respond with 429, Retry-After and rate-limit headers, and back off as a client</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Status codes, including 429 and Retry-After:</b> <a href="02-http-in-depth.html">Chapter 2</a>.</li>
+        <li><b>Redis and shared state across workers:</b> <a href="18-caching.html">Chapter 18</a>; dependencies: <a href="03-first-fastapi-service.html">Chapter 3</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why limit</li>
-    <li>Fixed and sliding windows</li>
-    <li>Token bucket</li>
-    <li>Distributed counters in Redis</li>
-    <li>429 and Retry-After</li>
-  </ol>
+  <h2>Why limit</h2>
+  <p>Limits protect four things: <b>availability</b>, so one heavy client cannot exhaust shared capacity; <b>fairness</b> between customers on the same plan; <b>cost</b>, for endpoints that call paid services or run expensive queries; and <b>security</b>, since credential stuffing, card testing and scraping all depend on volume. Choose the <b>key</b> to count by: an API key or user ID for authenticated traffic, an IP address only as a fallback (many users share one behind a NAT or mobile carrier), and sometimes a target, such as "login attempts for this email address". Different endpoints deserve different limits, generous for cheap reads and strict for logins, password resets and expensive exports, and some APIs limit by cost rather than count, so a heavy query uses more of the budget than a light one.</p>
+
+  <h2>Fixed and sliding windows</h2>
+  <ul>
+    <li><b>Fixed window:</b> count requests in each calendar second (or minute); reset at the boundary. One counter per key per window, the easiest to build, and the lab shows its flaw: a client can send a full allowance just before a boundary and another just after.</li>
+    <li><b>Sliding log:</b> keep each request's timestamp and count those in the last second. Exact, but it stores one entry per request.</li>
+    <li><b>Sliding window counter:</b> keep the counts of the current and previous fixed windows and weight the previous one by how much of it still overlaps the last second. Two counters per key, close to exact, and a common choice for Redis-based limiters.</li>
+  </ul>
+
+  <h2>Token bucket</h2>
+  <p>A <b>token bucket</b> holds up to <i>capacity</i> tokens and is refilled at a steady <i>rate</i>; each request takes a token, and a request that finds the bucket empty is refused. It allows short bursts up to the capacity while holding the long-run average to the rate, which matches how real clients behave: a page load fires a dozen requests at once, then nothing for a while. The leaky bucket is its mirror image, smoothing output to a constant rate, and is used more for shaping traffic than for API limits.</p>
+<pre class="code">class TokenBucket:
+    """Capacity 10 tokens, refilled at 10 per second: bursts up to 10, sustained 10/s."""
+    def __init__(self, capacity=LIMIT, rate=LIMIT / WINDOW):
+        self.cap, self.rate, self.state = capacity, rate, {}
+
+    def allow(self, key, now):
+        tokens, last = self.state.get(key, (self.cap, now))
+        tokens = min(self.cap, tokens + (now - last) * self.rate)
+        if tokens &gt;= 1:
+            self.state[key] = (tokens - 1, now)
+            return True, int(tokens - 1), 0.0
+        self.state[key] = (tokens, now)
+        return False, 0, (1 - tokens) / self.rate</pre>
+
+  <h2>Simulator: four limiters, 10 per second</h2>
+  <p>Each limiter was put behind a FastAPI dependency and sent three request patterns from one client: a <b>boundary</b> pattern, 10 requests just before the 1-second mark, 10 just after, and 10 more half a second later; a <b>burst</b>, 30 requests at once followed by one every 100 ms; and a <b>steady overload</b> of 15 requests a second for 3 seconds. Each request carried its timestamp in a header, read by the limiter as its clock, so the results are exact and repeatable.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Which requests got through?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="rl-ctl">
+        <div><div class="rl-l">Limiter (10 per second)</div><div class="seg" id="rlA"><button class="active" data-v="fixed">fixed window</button><button data-v="slog">sliding log</button><button data-v="scount">sliding window counter</button><button data-v="bucket">token bucket</button></div></div>
+        <div><div class="rl-l">Traffic</div><div class="seg" id="rlP"><button class="active" data-v="boundary">around a boundary</button><button data-v="burst">burst, then trickle</button><button data-v="steady">steady 15/s</button></div></div>
+      </div>
+      <div class="rl-plot"><svg id="rlSvg" viewBox="0 0 680 150" role="img" aria-label="Requests over time"></svg></div>
+      <div class="rl-hdr" id="rlHdr"></div>
+      <div class="stats" id="rlStats"></div>
+      <div class="rl-why" id="rlWhy"></div>
+    </div>
+    <div class="panel-foot">The four limiter classes and the dependency are the code below the lab and above, run through FastAPI's <code>TestClient</code>; the token bucket has capacity 10 and refills at 10 tokens per second. "Most in any 1 s" slides a one-second window over the allowed requests.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>fixed window</b>, around a boundary: 20 requests allowed within a fifth of a second, twice the limit, because 10 landed in the first second's window and 10 in the second's. Switch to <b>sliding log</b>: never more than 10 in any second.</li>
+    <li><b>sliding window counter</b>: close to the log with only two counters per client, a little generous at the boundary because the weighting assumes requests were spread evenly.</li>
+    <li><b>token bucket</b>, burst then trickle: the first 10 pass at once, then roughly one in two as tokens refill, then everything once the client slows to 10 a second. Its "most in any 1 s" is above 10: by design, it allows a burst on top of the rate.</li>
+    <li><b>steady 15/s</b>: the window limiters allow 30 of 45, the bucket 39, the extra being its initial burst capacity.</li>
+  </ul>
+
+  <h2>Distributed counters in Redis</h2>
+  <p>A limiter that keeps counts in process memory limits each worker separately: with eight workers, a client gets eight times the limit (<a href="01-what-a-backend-does.html">Chapter 1</a>). Keep counters in a shared store, almost always Redis, and update them atomically. A fixed window is <code>INCR</code> on a key such as <code>rl:{client}:{window}</code> plus <code>EXPIRE</code>; a sliding log is a sorted set of timestamps, trimmed with <code>ZREMRANGEBYSCORE</code> and counted with <code>ZCARD</code>; a token bucket keeps tokens and a timestamp and must update them in one step, so it runs as a Lua script inside Redis. Decide what happens if Redis is down: usually fail open, allowing traffic, for ordinary limits, and fail closed for security limits such as login attempts. Many teams enforce coarse limits at the API gateway or CDN (<a href="35-gateways-bff.html">Chapter 35</a>) and fine-grained ones in the service.</p>
+
+  <h2>429 and Retry-After</h2>
+  <p>Refuse with <b>429 Too Many Requests</b>, a <code>Retry-After</code> header in seconds, and a problem-details body with a code such as <code>rate_limited</code> (<a href="05-validation-and-errors.html">Chapter 5</a>). Tell well-behaved clients where they stand on every response, so they can slow down before hitting the limit: many APIs use <code>X-RateLimit-Limit</code>, <code>-Remaining</code> and <code>-Reset</code>, and an IETF draft standardises <code>RateLimit-Policy</code> and <code>RateLimit</code> headers, which the lab's service sends. Clients should honour Retry-After and back off exponentially with random jitter, so a thousand clients refused at the same moment do not all retry at the same moment.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Algorithm</th><th>State per client</th><th>Boundary bursts</th><th>Allows bursts by design</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td><b>Fixed window</b></td><td>1 counter</td><td>Up to 2× the limit</td><td>No</td><td>Simple quotas (per day, per month)</td></tr>
+        <tr><td><b>Sliding log</b></td><td>1 entry per request</td><td>None</td><td>No</td><td>Low-volume, strict limits such as logins</td></tr>
+        <tr><td><b>Sliding window counter</b></td><td>2 counters</td><td>Small</td><td>No</td><td>General API limits in Redis</td></tr>
+        <tr><td><b>Token bucket</b></td><td>Tokens + timestamp</td><td>Bounded by capacity</td><td>Yes</td><td>APIs with bursty clients; per-second limits</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Identify</b> API key, user, or IP as a fallback</li>
+      <li data-k="step"><b>Pick the budget</b> per endpoint and plan</li>
+      <li data-k="step"><b>Check atomically</b> in Redis, shared by all instances</li>
+      <li data-k="step"><b>Allowed</b> add RateLimit headers</li>
+      <li data-k="end"><b>Refused</b> 429 with Retry-After and a code</li>
+    </ol>
+    <figcaption><b>A rate-limited request.</b> The check is one atomic operation in a shared store, before any expensive work.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🐙</div>
+    <div class="body"><div class="title">Use case: GitHub's API limits</div><p>GitHub's REST API shows the layers of a mature rate-limiting design. Unauthenticated requests are limited to 60 an hour per IP address, which is enough to try the API and far too little to scrape it; authenticated requests get 5,000 an hour per user or token, with higher limits for some GitHub Apps and enterprise accounts. Every response carries <code>x-ratelimit-limit</code>, <code>x-ratelimit-remaining</code>, <code>x-ratelimit-used</code> and <code>x-ratelimit-reset</code>, so clients can pace themselves, and a dedicated endpoint reports the current status without counting against it. On top of these primary limits, GitHub applies "secondary rate limits" to patterns that are expensive or abusive even within the hourly budget: too many concurrent requests, too many content-creating requests in a short time, or heavy CPU use, answered with 403 or 429 and a Retry-After header. The GraphQL API is limited by a points system that charges each query by how much work it asks for. Count-based limits, cost-based limits and behaviour-based limits, all communicated in headers: that is the shape most large APIs converge on.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Counters in process memory</b> behind several workers or instances.</li>
+      <li><b>Limiting only by IP,</b> punishing everyone behind one NAT and missing distributed attackers.</li>
+      <li><b>One limit for every endpoint,</b> too loose for logins and too tight for cheap reads.</li>
+      <li><b>No Retry-After,</b> so clients guess and hammer.</li>
+      <li><b>Non-atomic read-then-increment in Redis,</b> letting concurrent requests slip through.</li>
+      <li><b>Clients retrying 429s immediately</b> and in lockstep, without jitter.</li>
+      <li><b>Counting before authentication,</b> so attackers can exhaust a victim's limit.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does a token bucket rate limiter work, and why use it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Each client has a bucket that holds up to a fixed number of tokens and refills at a steady rate, say 10 tokens and 10 per second. Every request takes one token; if the bucket is empty, the request is refused with 429 until tokens refill. It lets a client burst, sending up to the bucket's capacity at once, which suits real clients that fire several requests together, while the refill rate caps the long-run average. It needs only two numbers per client, the tokens and the last update time, which can be updated atomically in Redis with a small Lua script so every instance of the service shares the same bucket.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Design rate limiting for a public API with free and paid plans, plus a login endpoint under credential-stuffing attack.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>For the API, identify clients by API key and apply per-plan token buckets in Redis, for example 10 per second with bursts of 20 for free and 100 per second for paid, plus monthly quotas tracked as fixed-window counters, with RateLimit headers and 429 with Retry-After; expensive endpoints cost more than one token. Enforce a coarse IP-based limit at the edge or CDN to absorb floods before they reach the service. For login, credential stuffing comes from many IPs trying many accounts, so limit along several keys: attempts per account (sliding log, strict, for example 5 in 15 minutes, then require a CAPTCHA or delay), attempts per IP and per IP range, and a global rate of failed logins that triggers stronger defences. Do these checks before the expensive password hash, return the same error whether or not the account exists, fail closed if Redis is unavailable, and alert on spikes. Encourage two-factor authentication and breached-password checks, since rate limits slow attacks rather than stop them.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Limit by the right key, per endpoint, to protect availability, fairness, cost and security.</li>
+      <li>Fixed windows allow double bursts at boundaries; sliding windows fix it.</li>
+      <li>Token buckets allow bounded bursts with a steady average rate.</li>
+      <li>Shared, atomic counters in Redis, or the limit multiplies with every worker.</li>
+      <li>Answer 429 with Retry-After and rate-limit headers; clients back off with jitter.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">With a fixed window of 10 per second, how many requests did the lab's client get through in about 0.2 seconds around a boundary?</p>
+      <div class="opts">
+        <button class="opt">10</button>
+        <button class="opt">5</button>
+        <button class="opt">20</button>
+        <button class="opt">30</button>
+      </div>
+      <div class="explain">10 at the end of one window and 10 at the start of the next.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does a token bucket allow that a sliding log does not?</p>
+      <div class="opts">
+        <button class="opt">A burst up to the bucket's capacity on top of the steady rate</button>
+        <button class="opt">Unlimited requests</button>
+        <button class="opt">Requests without a key</button>
+        <button class="opt">Nothing; they behave identically</button>
+      </div>
+      <div class="explain">Measured: 39 of 45 allowed at 15/s, against 30 for the window limiters.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A service with 6 workers keeps rate-limit counters in a Python dict. A client's limit is 100 per minute. Roughly how many can it really make?</p>
+      <div class="opts">
+        <button class="opt">100</button>
+        <button class="opt">16</button>
+        <button class="opt">106</button>
+        <button class="opt">Up to about 600, depending on which workers answer</button>
+      </div>
+      <div class="explain">Each worker counts separately. Shared counters belong in Redis.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What should accompany a 429 response?</p>
+      <div class="opts">
+        <button class="opt">A redirect to the documentation</button>
+        <button class="opt">Retry-After, telling the client when to try again</button>
+        <button class="opt">A new API key</button>
+        <button class="opt">Nothing</button>
+      </div>
+      <div class="explain">Plus rate-limit headers on normal responses so clients can slow down early.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why should clients add random jitter to their backoff?</p>
+      <div class="opts">
+        <button class="opt">To make requests faster</button>
+        <button class="opt">Servers require it</button>
+        <button class="opt">So many clients refused together do not retry together, causing another spike</button>
+        <button class="opt">To avoid using tokens</button>
+      </div>
+      <div class="explain">Synchronised retries recreate the overload they are reacting to.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"r":{"fixed|boundary":{"res":[[0.9,200,"limit=10, remaining=9, reset=1",null],[0.91,200,"limit=10, remaining=8, reset=1",null],[0.92,200,"limit=10, remaining=7, reset=1",null],[0.93,200,"limit=10, remaining=6, reset=1",null],[0.94,200,"limit=10, remaining=5, reset=1",null],[0.95,200,"limit=10, remaining=4, reset=1",null],[0.96,200,"limit=10, remaining=3, reset=1",null],[0.97,200,"limit=10, remaining=2, reset=1",null],[0.98,200,"limit=10, remaining=1, reset=1",null],[0.99,200,"limit=10, remaining=0, reset=1",null],[1.0,200,"limit=10, remaining=9, reset=1",null],[1.01,200,"limit=10, remaining=8, reset=1",null],[1.02,200,"limit=10, remaining=7, reset=1",null],[1.03,200,"limit=10, remaining=6, reset=1",null],[1.04,200,"limit=10, remaining=5, reset=1",null],[1.05,200,"limit=10, remaining=4, reset=1",null],[1.06,200,"limit=10, remaining=3, reset=1",null],[1.07,200,"limit=10, remaining=2, reset=1",null],[1.08,200,"limit=10, remaining=1, reset=1",null],[1.09,200,"limit=10, remaining=0, reset=1",null],[1.5,429,"limit=10, remaining=0, reset=1","1"],[1.51,429,"limit=10, remaining=0, reset=1","1"],[1.52,429,"limit=10, remaining=0, reset=1","1"],[1.53,429,"limit=10, remaining=0, reset=1","1"],[1.54,429,"limit=10, remaining=0, reset=1","1"],[1.55,429,"limit=10, remaining=0, reset=1","1"],[1.56,429,"limit=10, remaining=0, reset=1","1"],[1.57,429,"limit=10, remaining=0, reset=1","1"],[1.58,429,"limit=10, remaining=0, reset=1","1"],[1.59,429,"limit=10, remaining=0, reset=1","1"]],"allowed":20,"denied":10,"max_1s":20,"max_02s":20},"fixed|burst":{"res":[[0.0,200,"limit=10, remaining=9, reset=1",null],[0.01,200,"limit=10, remaining=8, reset=1",null],[0.02,200,"limit=10, remaining=7, reset=1",null],[0.03,200,"limit=10, remaining=6, reset=1",null],[0.04,200,"limit=10, remaining=5, reset=1",null],[0.05,200,"limit=10, remaining=4, reset=1",null],[0.06,200,"limit=10, remaining=3, reset=1",null],[0.07,200,"limit=10, remaining=2, reset=1",null],[0.08,200,"limit=10, remaining=1, reset=1",null],[0.09,200,"limit=10, remaining=0, reset=1",null],[0.1,429,"limit=10, remaining=0, reset=1","1"],[0.11,429,"limit=10, remaining=0, reset=1","1"],[0.12,429,"limit=10, remaining=0, reset=1","1"],[0.13,429,"limit=10, remaining=0, reset=1","1"],[0.14,429,"limit=10, remaining=0, reset=1","1"],[0.15,429,"limit=10, remaining=0, reset=1","1"],[0.16,429,"limit=10, remaining=0, reset=1","1"],[0.17,429,"limit=10, remaining=0, reset=1","1"],[0.18,429,"limit=10, remaining=0, reset=1","1"],[0.19,429,"limit=10, remaining=0, reset=1","1"],[0.2,429,"limit=10, remaining=0, reset=1","1"],[0.21,429,"limit=10, remaining=0, reset=1","1"],[0.22,429,"limit=10, remaining=0, reset=1","1"],[0.23,429,"limit=10, remaining=0, reset=1","1"],[0.24,429,"limit=10, remaining=0, reset=1","1"],[0.25,429,"limit=10, remaining=0, reset=1","1"],[0.26,429,"limit=10, remaining=0, reset=1","1"],[0.27,429,"limit=10, remaining=0, reset=1","1"],[0.28,429,"limit=10, remaining=0, reset=1","1"],[0.29,429,"limit=10, remaining=0, reset=1","1"],[0.4,429,"limit=10, remaining=0, reset=1","1"],[0.5,429,"limit=10, remaining=0, reset=1","1"],[0.6,429,"limit=10, remaining=0, reset=1","1"],[0.7,429,"limit=10, remaining=0, reset=1","1"],[0.8,429,"limit=10, remaining=0, reset=1","1"],[0.9,429,"limit=10, remaining=0, reset=1","1"],[1.0,200,"limit=10, remaining=9, reset=1",null],[1.1,200,"limit=10, remaining=8, reset=1",null],[1.2,200,"limit=10, remaining=7, reset=1",null],[1.3,200,"limit=10, remaining=6, reset=1",null],[1.4,200,"limit=10, remaining=5, reset=1",null],[1.5,200,"limit=10, remaining=4, reset=1",null],[1.6,200,"limit=10, remaining=3, reset=1",null],[1.7,200,"limit=10, remaining=2, reset=1",null],[1.8,200,"limit=10, remaining=1, reset=1",null],[1.9,200,"limit=10, remaining=0, reset=1",null],[2.0,200,"limit=10, remaining=9, reset=1",null],[2.1,200,"limit=10, remaining=8, reset=1",null],[2.2,200,"limit=10, remaining=7, reset=1",null],[2.3,200,"limit=10, remaining=6, reset=1",null],[2.4,200,"limit=10, remaining=5, reset=1",null],[2.5,200,"limit=10, remaining=4, reset=1",null],[2.6,200,"limit=10, remaining=3, reset=1",null],[2.7,200,"limit=10, remaining=2, reset=1",null],[2.8,200,"limit=10, remaining=1, reset=1",null],[2.9,200,"limit=10, remaining=0, reset=1",null],[3.0,200,"limit=10, remaining=9, reset=1",null]],"allowed":31,"denied":26,"max_1s":10,"max_02s":10},"fixed|steady":{"res":[[0.0,200,"limit=10, remaining=9, reset=1",null],[0.067,200,"limit=10, remaining=8, reset=1",null],[0.133,200,"limit=10, remaining=7, reset=1",null],[0.2,200,"limit=10, remaining=6, reset=1",null],[0.267,200,"limit=10, remaining=5, reset=1",null],[0.333,200,"limit=10, remaining=4, reset=1",null],[0.4,200,"limit=10, remaining=3, reset=1",null],[0.467,200,"limit=10, remaining=2, reset=1",null],[0.533,200,"limit=10, remaining=1, reset=1",null],[0.6,200,"limit=10, remaining=0, reset=1",null],[0.667,429,"limit=10, remaining=0, reset=1","1"],[0.733,429,"limit=10, remaining=0, reset=1","1"],[0.8,429,"limit=10, remaining=0, reset=1","1"],[0.867,429,"limit=10, remaining=0, reset=1","1"],[0.933,429,"limit=10, remaining=0, reset=1","1"],[1.0,200,"limit=10, remaining=9, reset=1",null],[1.067,200,"limit=10, remaining=8, reset=1",null],[1.133,200,"limit=10, remaining=7, reset=1",null],[1.2,200,"limit=10, remaining=6, reset=1",null],[1.267,200,"limit=10, remaining=5, reset=1",null],[1.333,200,"limit=10, remaining=4, reset=1",null],[1.4,200,"limit=10, remaining=3, reset=1",null],[1.467,200,"limit=10, remaining=2, reset=1",null],[1.533,200,"limit=10, remaining=1, reset=1",null],[1.6,200,"limit=10, remaining=0, reset=1",null],[1.667,429,"limit=10, remaining=0, reset=1","1"],[1.733,429,"limit=10, remaining=0, reset=1","1"],[1.8,429,"limit=10, remaining=0, reset=1","1"],[1.867,429,"limit=10, remaining=0, reset=1","1"],[1.933,429,"limit=10, remaining=0, reset=1","1"],[2.0,200,"limit=10, remaining=9, reset=1",null],[2.067,200,"limit=10, remaining=8, reset=1",null],[2.133,200,"limit=10, remaining=7, reset=1",null],[2.2,200,"limit=10, remaining=6, reset=1",null],[2.267,200,"limit=10, remaining=5, reset=1",null],[2.333,200,"limit=10, remaining=4, reset=1",null],[2.4,200,"limit=10, remaining=3, reset=1",null],[2.467,200,"limit=10, remaining=2, reset=1",null],[2.533,200,"limit=10, remaining=1, reset=1",null],[2.6,200,"limit=10, remaining=0, reset=1",null],[2.667,429,"limit=10, remaining=0, reset=1","1"],[2.733,429,"limit=10, remaining=0, reset=1","1"],[2.8,429,"limit=10, remaining=0, reset=1","1"],[2.867,429,"limit=10, remaining=0, reset=1","1"],[2.933,429,"limit=10, remaining=0, reset=1","1"]],"allowed":30,"denied":15,"max_1s":10,"max_02s":4},"slog|boundary":{"res":[[0.9,200,"limit=10, remaining=9, reset=0",null],[0.91,200,"limit=10, remaining=8, reset=0",null],[0.92,200,"limit=10, remaining=7, reset=0",null],[0.93,200,"limit=10, remaining=6, reset=0",null],[0.94,200,"limit=10, remaining=5, reset=0",null],[0.95,200,"limit=10, remaining=4, reset=0",null],[0.96,200,"limit=10, remaining=3, reset=0",null],[0.97,200,"limit=10, remaining=2, reset=0",null],[0.98,200,"limit=10, remaining=1, reset=0",null],[0.99,200,"limit=10, remaining=0, reset=0",null],[1.0,429,"limit=10, remaining=0, reset=1","1"],[1.01,429,"limit=10, remaining=0, reset=1","1"],[1.02,429,"limit=10, remaining=0, reset=1","1"],[1.03,429,"limit=10, remaining=0, reset=1","1"],[1.04,429,"limit=10, remaining=0, reset=1","1"],[1.05,429,"limit=10, remaining=0, reset=1","1"],[1.06,429,"limit=10, remaining=0, reset=1","1"],[1.07,429,"limit=10, remaining=0, reset=1","1"],[1.08,429,"limit=10, remaining=0, reset=1","1"],[1.09,429,"limit=10, remaining=0, reset=1","1"],[1.5,429,"limit=10, remaining=0, reset=1","1"],[1.51,429,"limit=10, remaining=0, reset=1","1"],[1.52,429,"limit=10, remaining=0, reset=1","1"],[1.53,429,"limit=10, remaining=0, reset=1","1"],[1.54,429,"limit=10, remaining=0, reset=1","1"],[1.55,429,"limit=10, remaining=0, reset=1","1"],[1.56,429,"limit=10, remaining=0, reset=1","1"],[1.57,429,"limit=10, remaining=0, reset=1","1"],[1.58,429,"limit=10, remaining=0, reset=1","1"],[1.59,429,"limit=10, remaining=0, reset=1","1"]],"allowed":10,"denied":20,"max_1s":10,"max_02s":10},"slog|burst":{"res":[[0.0,200,"limit=10, remaining=9, reset=0",null],[0.01,200,"limit=10, remaining=8, reset=0",null],[0.02,200,"limit=10, remaining=7, reset=0",null],[0.03,200,"limit=10, remaining=6, reset=0",null],[0.04,200,"limit=10, remaining=5, reset=0",null],[0.05,200,"limit=10, remaining=4, reset=0",null],[0.06,200,"limit=10, remaining=3, reset=0",null],[0.07,200,"limit=10, remaining=2, reset=0",null],[0.08,200,"limit=10, remaining=1, reset=0",null],[0.09,200,"limit=10, remaining=0, reset=0",null],[0.1,429,"limit=10, remaining=0, reset=1","1"],[0.11,429,"limit=10, remaining=0, reset=1","1"],[0.12,429,"limit=10, remaining=0, reset=1","1"],[0.13,429,"limit=10, remaining=0, reset=1","1"],[0.14,429,"limit=10, remaining=0, reset=1","1"],[0.15,429,"limit=10, remaining=0, reset=1","1"],[0.16,429,"limit=10, remaining=0, reset=1","1"],[0.17,429,"limit=10, remaining=0, reset=1","1"],[0.18,429,"limit=10, remaining=0, reset=1","1"],[0.19,429,"limit=10, remaining=0, reset=1","1"],[0.2,429,"limit=10, remaining=0, reset=1","1"],[0.21,429,"limit=10, remaining=0, reset=1","1"],[0.22,429,"limit=10, remaining=0, reset=1","1"],[0.23,429,"limit=10, remaining=0, reset=1","1"],[0.24,429,"limit=10, remaining=0, reset=1","1"],[0.25,429,"limit=10, remaining=0, reset=1","1"],[0.26,429,"limit=10, remaining=0, reset=1","1"],[0.27,429,"limit=10, remaining=0, reset=1","1"],[0.28,429,"limit=10, remaining=0, reset=1","1"],[0.29,429,"limit=10, remaining=0, reset=1","1"],[0.4,429,"limit=10, remaining=0, reset=1","1"],[0.5,429,"limit=10, remaining=0, reset=1","1"],[0.6,429,"limit=10, remaining=0, reset=1","1"],[0.7,429,"limit=10, remaining=0, reset=1","1"],[0.8,429,"limit=10, remaining=0, reset=1","1"],[0.9,429,"limit=10, remaining=0, reset=1","1"],[1.0,200,"limit=10, remaining=0, reset=0",null],[1.1,200,"limit=10, remaining=8, reset=0",null],[1.2,200,"limit=10, remaining=7, reset=0",null],[1.3,200,"limit=10, remaining=6, reset=0",null],[1.4,200,"limit=10, remaining=5, reset=0",null],[1.5,200,"limit=10, remaining=4, reset=0",null],[1.6,200,"limit=10, remaining=3, reset=0",null],[1.7,200,"limit=10, remaining=2, reset=0",null],[1.8,200,"limit=10, remaining=1, reset=0",null],[1.9,200,"limit=10, remaining=0, reset=0",null],[2.0,200,"limit=10, remaining=0, reset=0",null],[2.1,200,"limit=10, remaining=0, reset=0",null],[2.2,200,"limit=10, remaining=0, reset=0",null],[2.3,429,"limit=10, remaining=0, reset=0","1"],[2.4,200,"limit=10, remaining=1, reset=0",null],[2.5,200,"limit=10, remaining=1, reset=0",null],[2.6,200,"limit=10, remaining=1, reset=0",null],[2.7,200,"limit=10, remaining=1, reset=0",null],[2.8,200,"limit=10, remaining=0, reset=0",null],[2.9,200,"limit=10, remaining=1, reset=0",null],[3.0,200,"limit=10, remaining=1, reset=0",null]],"allowed":30,"denied":27,"max_1s":10,"max_02s":10},"slog|steady":{"res":[[0.0,200,"limit=10, remaining=9, reset=0",null],[0.067,200,"limit=10, remaining=8, reset=0",null],[0.133,200,"limit=10, remaining=7, reset=0",null],[0.2,200,"limit=10, remaining=6, reset=0",null],[0.267,200,"limit=10, remaining=5, reset=0",null],[0.333,200,"limit=10, remaining=4, reset=0",null],[0.4,200,"limit=10, remaining=3, reset=0",null],[0.467,200,"limit=10, remaining=2, reset=0",null],[0.533,200,"limit=10, remaining=1, reset=0",null],[0.6,200,"limit=10, remaining=0, reset=0",null],[0.667,429,"limit=10, remaining=0, reset=1","1"],[0.733,429,"limit=10, remaining=0, reset=1","1"],[0.8,429,"limit=10, remaining=0, reset=1","1"],[0.867,429,"limit=10, remaining=0, reset=1","1"],[0.933,429,"limit=10, remaining=0, reset=1","1"],[1.0,200,"limit=10, remaining=0, reset=0",null],[1.067,429,"limit=10, remaining=0, reset=0","1"],[1.133,200,"limit=10, remaining=0, reset=0",null],[1.2,200,"limit=10, remaining=0, reset=0",null],[1.267,200,"limit=10, remaining=0, reset=0",null],[1.333,200,"limit=10, remaining=0, reset=0",null],[1.4,200,"limit=10, remaining=0, reset=0",null],[1.467,200,"limit=10, remaining=0, reset=0",null],[1.533,200,"limit=10, remaining=1, reset=0",null],[1.6,200,"limit=10, remaining=1, reset=0",null],[1.667,200,"limit=10, remaining=0, reset=0",null],[1.733,429,"limit=10, remaining=0, reset=1","1"],[1.8,429,"limit=10, remaining=0, reset=1","1"],[1.867,429,"limit=10, remaining=0, reset=1","1"],[1.933,429,"limit=10, remaining=0, reset=1","1"],[2.0,200,"limit=10, remaining=0, reset=0",null],[2.067,429,"limit=10, remaining=0, reset=1","1"],[2.133,200,"limit=10, remaining=0, reset=0",null],[2.2,200,"limit=10, remaining=0, reset=0",null],[2.267,200,"limit=10, remaining=0, reset=0",null],[2.333,200,"limit=10, remaining=0, reset=0",null],[2.4,200,"limit=10, remaining=0, reset=0",null],[2.467,200,"limit=10, remaining=0, reset=0",null],[2.533,200,"limit=10, remaining=0, reset=0",null],[2.6,200,"limit=10, remaining=0, reset=0",null],[2.667,200,"limit=10, remaining=0, reset=0",null],[2.733,429,"limit=10, remaining=0, reset=1","1"],[2.8,429,"limit=10, remaining=0, reset=1","1"],[2.867,429,"limit=10, remaining=0, reset=1","1"],[2.933,429,"limit=10, remaining=0, reset=1","1"]],"allowed":30,"denied":15,"max_1s":10,"max_02s":4},"scount|boundary":{"res":[[0.9,200,"limit=10, remaining=9, reset=0",null],[0.91,200,"limit=10, remaining=8, reset=0",null],[0.92,200,"limit=10, remaining=7, reset=0",null],[0.93,200,"limit=10, remaining=6, reset=0",null],[0.94,200,"limit=10, remaining=5, reset=0",null],[0.95,200,"limit=10, remaining=4, reset=0",null],[0.96,200,"limit=10, remaining=3, reset=0",null],[0.97,200,"limit=10, remaining=2, reset=0",null],[0.98,200,"limit=10, remaining=1, reset=0",null],[0.99,200,"limit=10, remaining=0, reset=0",null],[1.0,429,"limit=10, remaining=0, reset=1","1"],[1.01,200,"limit=10, remaining=0, reset=0",null],[1.02,429,"limit=10, remaining=0, reset=1","1"],[1.03,429,"limit=10, remaining=0, reset=1","1"],[1.04,429,"limit=10, remaining=0, reset=1","1"],[1.05,429,"limit=10, remaining=0, reset=1","1"],[1.06,429,"limit=10, remaining=0, reset=1","1"],[1.07,429,"limit=10, remaining=0, reset=1","1"],[1.08,429,"limit=10, remaining=0, reset=1","1"],[1.09,429,"limit=10, remaining=0, reset=1","1"],[1.5,200,"limit=10, remaining=3, reset=0",null],[1.51,200,"limit=10, remaining=2, reset=0",null],[1.52,200,"limit=10, remaining=1, reset=0",null],[1.53,200,"limit=10, remaining=0, reset=0",null],[1.54,200,"limit=10, remaining=0, reset=0",null],[1.55,429,"limit=10, remaining=0, reset=1","1"],[1.56,429,"limit=10, remaining=0, reset=1","1"],[1.57,429,"limit=10, remaining=0, reset=1","1"],[1.58,429,"limit=10, remaining=0, reset=1","1"],[1.59,429,"limit=10, remaining=0, reset=1","1"]],"allowed":16,"denied":14,"max_1s":16,"max_02s":11},"scount|burst":{"res":[[0.0,200,"limit=10, remaining=9, reset=0",null],[0.01,200,"limit=10, remaining=8, reset=0",null],[0.02,200,"limit=10, remaining=7, reset=0",null],[0.03,200,"limit=10, remaining=6, reset=0",null],[0.04,200,"limit=10, remaining=5, reset=0",null],[0.05,200,"limit=10, remaining=4, reset=0",null],[0.06,200,"limit=10, remaining=3, reset=0",null],[0.07,200,"limit=10, remaining=2, reset=0",null],[0.08,200,"limit=10, remaining=1, reset=0",null],[0.09,200,"limit=10, remaining=0, reset=0",null],[0.1,429,"limit=10, remaining=0, reset=1","1"],[0.11,429,"limit=10, remaining=0, reset=1","1"],[0.12,429,"limit=10, remaining=0, reset=1","1"],[0.13,429,"limit=10, remaining=0, reset=1","1"],[0.14,429,"limit=10, remaining=0, reset=1","1"],[0.15,429,"limit=10, remaining=0, reset=1","1"],[0.16,429,"limit=10, remaining=0, reset=1","1"],[0.17,429,"limit=10, remaining=0, reset=1","1"],[0.18,429,"limit=10, remaining=0, reset=1","1"],[0.19,429,"limit=10, remaining=0, reset=1","1"],[0.2,429,"limit=10, remaining=0, reset=1","1"],[0.21,429,"limit=10, remaining=0, reset=1","1"],[0.22,429,"limit=10, remaining=0, reset=1","1"],[0.23,429,"limit=10, remaining=0, reset=1","1"],[0.24,429,"limit=10, remaining=0, reset=1","1"],[0.25,429,"limit=10, remaining=0, reset=1","1"],[0.26,429,"limit=10, remaining=0, reset=1","1"],[0.27,429,"limit=10, remaining=0, reset=1","1"],[0.28,429,"limit=10, remaining=0, reset=1","1"],[0.29,429,"limit=10, remaining=0, reset=1","1"],[0.4,429,"limit=10, remaining=0, reset=1","1"],[0.5,429,"limit=10, remaining=0, reset=1","1"],[0.6,429,"limit=10, remaining=0, reset=1","1"],[0.7,429,"limit=10, remaining=0, reset=1","1"],[0.8,429,"limit=10, remaining=0, reset=1","1"],[0.9,429,"limit=10, remaining=0, reset=1","1"],[1.0,429,"limit=10, remaining=0, reset=1","1"],[1.1,200,"limit=10, remaining=0, reset=0",null],[1.2,200,"limit=10, remaining=0, reset=0",null],[1.3,200,"limit=10, remaining=0, reset=0",null],[1.4,200,"limit=10, remaining=0, reset=0",null],[1.5,200,"limit=10, remaining=0, reset=0",null],[1.6,200,"limit=10, remaining=0, reset=0",null],[1.7,200,"limit=10, remaining=0, reset=0",null],[1.8,200,"limit=10, remaining=0, reset=0",null],[1.9,200,"limit=10, remaining=0, reset=0",null],[2.0,200,"limit=10, remaining=0, reset=0",null],[2.1,200,"limit=10, remaining=0, reset=0",null],[2.2,200,"limit=10, remaining=0, reset=0",null],[2.3,200,"limit=10, remaining=0, reset=0",null],[2.4,200,"limit=10, remaining=0, reset=0",null],[2.5,200,"limit=10, remaining=0, reset=0",null],[2.6,200,"limit=10, remaining=0, reset=0",null],[2.7,200,"limit=10, remaining=0, reset=0",null],[2.8,200,"limit=10, remaining=0, reset=0",null],[2.9,200,"limit=10, remaining=0, reset=0",null],[3.0,429,"limit=10, remaining=0, reset=1","1"]],"allowed":29,"denied":28,"max_1s":10,"max_02s":10},"scount|steady":{"res":[[0.0,200,"limit=10, remaining=9, reset=0",null],[0.067,200,"limit=10, remaining=8, reset=0",null],[0.133,200,"limit=10, remaining=7, reset=0",null],[0.2,200,"limit=10, remaining=6, reset=0",null],[0.267,200,"limit=10, remaining=5, reset=0",null],[0.333,200,"limit=10, remaining=4, reset=0",null],[0.4,200,"limit=10, remaining=3, reset=0",null],[0.467,200,"limit=10, remaining=2, reset=0",null],[0.533,200,"limit=10, remaining=1, reset=0",null],[0.6,200,"limit=10, remaining=0, reset=0",null],[0.667,429,"limit=10, remaining=0, reset=1","1"],[0.733,429,"limit=10, remaining=0, reset=1","1"],[0.8,429,"limit=10, remaining=0, reset=1","1"],[0.867,429,"limit=10, remaining=0, reset=1","1"],[0.933,429,"limit=10, remaining=0, reset=1","1"],[1.0,429,"limit=10, remaining=0, reset=1","1"],[1.067,200,"limit=10, remaining=0, reset=0",null],[1.133,200,"limit=10, remaining=0, reset=0",null],[1.2,429,"limit=10, remaining=0, reset=1","1"],[1.267,200,"limit=10, remaining=0, reset=0",null],[1.333,200,"limit=10, remaining=0, reset=0",null],[1.4,429,"limit=10, remaining=0, reset=1","1"],[1.467,200,"limit=10, remaining=0, reset=0",null],[1.533,200,"limit=10, remaining=0, reset=0",null],[1.6,429,"limit=10, remaining=0, reset=1","1"],[1.667,200,"limit=10, remaining=0, reset=0",null],[1.733,200,"limit=10, remaining=0, reset=0",null],[1.8,429,"limit=10, remaining=0, reset=1","1"],[1.867,200,"limit=10, remaining=0, reset=0",null],[1.933,200,"limit=10, remaining=0, reset=0",null],[2.0,429,"limit=10, remaining=0, reset=1","1"],[2.067,200,"limit=10, remaining=0, reset=0",null],[2.133,200,"limit=10, remaining=0, reset=0",null],[2.2,200,"limit=10, remaining=0, reset=0",null],[2.267,429,"limit=10, remaining=0, reset=1","1"],[2.333,200,"limit=10, remaining=0, reset=0",null],[2.4,429,"limit=10, remaining=0, reset=1","1"],[2.467,200,"limit=10, remaining=0, reset=0",null],[2.533,200,"limit=10, remaining=0, reset=0",null],[2.6,429,"limit=10, remaining=0, reset=1","1"],[2.667,200,"limit=10, remaining=0, reset=0",null],[2.733,200,"limit=10, remaining=0, reset=0",null],[2.8,429,"limit=10, remaining=0, reset=1","1"],[2.867,200,"limit=10, remaining=0, reset=0",null],[2.933,200,"limit=10, remaining=0, reset=0",null]],"allowed":30,"denied":15,"max_1s":11,"max_02s":4},"bucket|boundary":{"res":[[0.9,200,"limit=10, remaining=9, reset=0",null],[0.91,200,"limit=10, remaining=8, reset=0",null],[0.92,200,"limit=10, remaining=7, reset=0",null],[0.93,200,"limit=10, remaining=6, reset=0",null],[0.94,200,"limit=10, remaining=5, reset=0",null],[0.95,200,"limit=10, remaining=4, reset=0",null],[0.96,200,"limit=10, remaining=3, reset=0",null],[0.97,200,"limit=10, remaining=2, reset=0",null],[0.98,200,"limit=10, remaining=1, reset=0",null],[0.99,200,"limit=10, remaining=0, reset=0",null],[1.0,429,"limit=10, remaining=0, reset=1","1"],[1.01,200,"limit=10, remaining=0, reset=0",null],[1.02,429,"limit=10, remaining=0, reset=1","1"],[1.03,429,"limit=10, remaining=0, reset=1","1"],[1.04,429,"limit=10, remaining=0, reset=1","1"],[1.05,429,"limit=10, remaining=0, reset=1","1"],[1.06,429,"limit=10, remaining=0, reset=1","1"],[1.07,429,"limit=10, remaining=0, reset=1","1"],[1.08,429,"limit=10, remaining=0, reset=1","1"],[1.09,429,"limit=10, remaining=0, reset=1","1"],[1.5,200,"limit=10, remaining=3, reset=0",null],[1.51,200,"limit=10, remaining=3, reset=0",null],[1.52,200,"limit=10, remaining=2, reset=0",null],[1.53,200,"limit=10, remaining=1, reset=0",null],[1.54,200,"limit=10, remaining=0, reset=0",null],[1.55,429,"limit=10, remaining=0, reset=1","1"],[1.56,429,"limit=10, remaining=0, reset=1","1"],[1.57,429,"limit=10, remaining=0, reset=1","1"],[1.58,429,"limit=10, remaining=0, reset=1","1"],[1.59,429,"limit=10, remaining=0, reset=1","1"]],"allowed":16,"denied":14,"max_1s":16,"max_02s":11},"bucket|burst":{"res":[[0.0,200,"limit=10, remaining=9, reset=0",null],[0.01,200,"limit=10, remaining=8, reset=0",null],[0.02,200,"limit=10, remaining=7, reset=0",null],[0.03,200,"limit=10, remaining=6, reset=0",null],[0.04,200,"limit=10, remaining=5, reset=0",null],[0.05,200,"limit=10, remaining=4, reset=0",null],[0.06,200,"limit=10, remaining=3, reset=0",null],[0.07,200,"limit=10, remaining=2, reset=0",null],[0.08,200,"limit=10, remaining=1, reset=0",null],[0.09,200,"limit=10, remaining=0, reset=0",null],[0.1,429,"limit=10, remaining=0, reset=1","1"],[0.11,200,"limit=10, remaining=0, reset=0",null],[0.12,429,"limit=10, remaining=0, reset=1","1"],[0.13,429,"limit=10, remaining=0, reset=1","1"],[0.14,429,"limit=10, remaining=0, reset=1","1"],[0.15,429,"limit=10, remaining=0, reset=1","1"],[0.16,429,"limit=10, remaining=0, reset=1","1"],[0.17,429,"limit=10, remaining=0, reset=1","1"],[0.18,429,"limit=10, remaining=0, reset=1","1"],[0.19,429,"limit=10, remaining=0, reset=1","1"],[0.2,429,"limit=10, remaining=0, reset=1","1"],[0.21,200,"limit=10, remaining=0, reset=0",null],[0.22,429,"limit=10, remaining=0, reset=1","1"],[0.23,429,"limit=10, remaining=0, reset=1","1"],[0.24,429,"limit=10, remaining=0, reset=1","1"],[0.25,429,"limit=10, remaining=0, reset=1","1"],[0.26,429,"limit=10, remaining=0, reset=1","1"],[0.27,429,"limit=10, remaining=0, reset=1","1"],[0.28,429,"limit=10, remaining=0, reset=1","1"],[0.29,429,"limit=10, remaining=0, reset=1","1"],[0.4,200,"limit=10, remaining=0, reset=0",null],[0.5,200,"limit=10, remaining=0, reset=0",null],[0.6,200,"limit=10, remaining=0, reset=0",null],[0.7,200,"limit=10, remaining=0, reset=0",null],[0.8,200,"limit=10, remaining=0, reset=0",null],[0.9,200,"limit=10, remaining=0, reset=0",null],[1.0,200,"limit=10, remaining=0, reset=0",null],[1.1,200,"limit=10, remaining=0, reset=0",null],[1.2,200,"limit=10, remaining=0, reset=0",null],[1.3,200,"limit=10, remaining=0, reset=0",null],[1.4,200,"limit=10, remaining=0, reset=0",null],[1.5,200,"limit=10, remaining=0, reset=0",null],[1.6,200,"limit=10, remaining=0, reset=0",null],[1.7,200,"limit=10, remaining=0, reset=0",null],[1.8,200,"limit=10, remaining=0, reset=0",null],[1.9,200,"limit=10, remaining=0, reset=0",null],[2.0,200,"limit=10, remaining=0, reset=0",null],[2.1,200,"limit=10, remaining=0, reset=0",null],[2.2,200,"limit=10, remaining=0, reset=0",null],[2.3,200,"limit=10, remaining=0, reset=0",null],[2.4,200,"limit=10, remaining=0, reset=0",null],[2.5,200,"limit=10, remaining=0, reset=0",null],[2.6,200,"limit=10, remaining=0, reset=0",null],[2.7,200,"limit=10, remaining=0, reset=0",null],[2.8,200,"limit=10, remaining=0, reset=0",null],[2.9,200,"limit=10, remaining=0, reset=0",null],[3.0,200,"limit=10, remaining=0, reset=0",null]],"allowed":39,"denied":18,"max_1s":18,"max_02s":11},"bucket|steady":{"res":[[0.0,200,"limit=10, remaining=9, reset=0",null],[0.067,200,"limit=10, remaining=8, reset=0",null],[0.133,200,"limit=10, remaining=8, reset=0",null],[0.2,200,"limit=10, remaining=8, reset=0",null],[0.267,200,"limit=10, remaining=7, reset=0",null],[0.333,200,"limit=10, remaining=7, reset=0",null],[0.4,200,"limit=10, remaining=7, reset=0",null],[0.467,200,"limit=10, remaining=6, reset=0",null],[0.533,200,"limit=10, remaining=6, reset=0",null],[0.6,200,"limit=10, remaining=6, reset=0",null],[0.667,200,"limit=10, remaining=5, reset=0",null],[0.733,200,"limit=10, remaining=5, reset=0",null],[0.8,200,"limit=10, remaining=5, reset=0",null],[0.867,200,"limit=10, remaining=4, reset=0",null],[0.933,200,"limit=10, remaining=4, reset=0",null],[1.0,200,"limit=10, remaining=4, reset=0",null],[1.067,200,"limit=10, remaining=3, reset=0",null],[1.133,200,"limit=10, remaining=3, reset=0",null],[1.2,200,"limit=10, remaining=3, reset=0",null],[1.267,200,"limit=10, remaining=2, reset=0",null],[1.333,200,"limit=10, remaining=2, reset=0",null],[1.4,200,"limit=10, remaining=1, reset=0",null],[1.467,200,"limit=10, remaining=1, reset=0",null],[1.533,200,"limit=10, remaining=1, reset=0",null],[1.6,200,"limit=10, remaining=1, reset=0",null],[1.667,200,"limit=10, remaining=0, reset=0",null],[1.733,200,"limit=10, remaining=0, reset=0",null],[1.8,200,"limit=10, remaining=0, reset=0",null],[1.867,429,"limit=10, remaining=0, reset=1","1"],[1.933,200,"limit=10, remaining=0, reset=0",null],[2.0,200,"limit=10, remaining=0, reset=0",null],[2.067,429,"limit=10, remaining=0, reset=1","1"],[2.133,200,"limit=10, remaining=0, reset=0",null],[2.2,200,"limit=10, remaining=0, reset=0",null],[2.267,429,"limit=10, remaining=0, reset=1","1"],[2.333,200,"limit=10, remaining=0, reset=0",null],[2.4,429,"limit=10, remaining=0, reset=1","1"],[2.467,200,"limit=10, remaining=0, reset=0",null],[2.533,200,"limit=10, remaining=0, reset=0",null],[2.6,200,"limit=10, remaining=0, reset=0",null],[2.667,429,"limit=10, remaining=0, reset=1","1"],[2.733,200,"limit=10, remaining=0, reset=0",null],[2.8,429,"limit=10, remaining=0, reset=1","1"],[2.867,200,"limit=10, remaining=0, reset=0",null],[2.933,200,"limit=10, remaining=0, reset=0",null]],"allowed":39,"denied":6,"max_1s":15,"max_02s":4}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const NAME = { fixed: 'fixed window', slog: 'sliding log', scount: 'sliding window counter', bucket: 'token bucket' };
+  function draw() {
+    const a = v('#rlA'), p = v('#rlP'), r = D.r[`${a}|${p}`];
+    const tmax = Math.max(3, Math.ceil(Math.max(...r.res.map((x) => x[0])) + 0.1));
+    const W = 680, H = 150, L = 20, R = 14, sx = (t) => L + t / tmax * (W - L - R);
+    let s = '';
+    for (let t = 0; t <= tmax; t++) s += `<line x1="${sx(t)}" x2="${sx(t)}" y1="18" y2="${H - 28}" stroke="var(--border)" ${t ? 'stroke-dasharray="3 4"' : ''}/><text class="rl-ax" x="${sx(t)}" y="${H - 12}" text-anchor="middle">${t} s</text>`;
+    s += `<text class="rl-ax" x="${L}" y="12"><tspan fill="var(--green)">● allowed</tspan>  <tspan fill="var(--red)">● 429</tspan>  ${a === 'fixed' ? '· dashed lines are the fixed windows\' boundaries' : ''}</text>`;
+    const counts = {};
+    r.res.forEach(([t, st]) => { const k = Math.round(t * 50); counts[k] = (counts[k] || 0) + 1; const lane = counts[k] - 1; const y = st === 200 ? 50 + (lane % 3) * 9 : 90 + (lane % 3) * 9; s += `<circle cx="${sx(t).toFixed(1)}" cy="${y}" r="3.6" fill="${st === 200 ? 'var(--green)' : 'var(--red)'}" opacity=".85"/>`; });
+    s += `<text class="rl-ax" x="${W - R}" y="47" text-anchor="end">allowed</text><text class="rl-ax" x="${W - R}" y="87" text-anchor="end">refused</text>`;
+    $('#rlSvg').innerHTML = s;
+    const firstDenied = r.res.find((x) => x[1] === 429), lastOk = r.res.filter((x) => x[1] === 200).pop();
+    $('#rlHdr').innerHTML = (lastOk ? `200 at ${lastOk[0].toFixed(2)} s · RateLimit: ${esc(lastOk[2] || '')}<br>` : '') + (firstDenied ? `429 at ${firstDenied[0].toFixed(2)} s · RateLimit: ${esc(firstDenied[2] || '')} · Retry-After: ${esc(firstDenied[3] || '')}` : 'no request was refused');
+    $('#rlStats').innerHTML = `<div class="stat"><div class="k">Allowed</div><div class="v">${r.allowed} of ${r.res.length}</div></div><div class="stat ${r.max_1s > 10 ? 'warn' : 'good'}"><div class="k">Most in any 1 s</div><div class="v">${r.max_1s}</div></div><div class="stat ${r.max_02s > 10 ? 'warn' : ''}"><div class="k">Most in any 0.2 s</div><div class="v">${r.max_02s}</div></div>`;
+    let why;
+    if (p === 'boundary') why = { fixed: `<b>20 requests allowed within 0.2 s.</b> The first 10 counted against the window ending at 1 s, the next 10 against the window starting there, so the client briefly got double the limit. The last 10, at 1.5 s, were refused: that window was already full.`, slog: `<b>Never more than 10 in any second.</b> The log remembered all 10 requests from 0.90 s, so nothing more was allowed until they aged out at 1.90 s.`, scount: `<b>16 allowed, up to 11 within 0.2 s.</b> The previous window's count is weighted by how much of it overlaps the last second, assuming its requests were spread out; they were all at the end, so the estimate is a little generous.`, bucket: `<b>A full bucket allowed the first 10, then refills allowed a few more,</b> 16 in all. The bucket's promise is about averages and bounded bursts, not "never more than 10 in a second".` }[a];
+    else if (p === 'burst') why = { fixed: `<b>${r.allowed} of ${r.res.length} allowed.</b> The burst used up the first second's 10, and the rest of that second was refused too; from the next window on, at one request every 100 ms, exactly the limit, everything got through.`, slog: `<b>${r.allowed} allowed:</b> the first 10 of the burst, then requests whenever an old one had aged out of the last second.`, scount: `<b>${r.allowed} allowed,</b> almost the same as the exact log, with two counters instead of a timestamp per request.`, bucket: `<b>${r.allowed} allowed, the most generous:</b> the burst emptied the bucket, then one request in two passed as it refilled, and once the client slowed to 10 a second every request found a token.` }[a];
+    else why = a === 'bucket' ? `<b>${r.allowed} of 45 at a steady 15/s:</b> 10 a second from refills plus the 10 tokens the bucket started with. The most in any one second, ${r.max_1s}, is the burst allowance showing.` : `<b>${r.allowed} of 45:</b> 10 in each of the three seconds, the rest refused with 429 and a Retry-After.`;
+    $('#rlWhy').innerHTML = why;
+    $('#rlWhy').dataset.x = JSON.stringify({ a, p, allowed: r.allowed });
+  }
+  ['#rlA', '#rlP'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
