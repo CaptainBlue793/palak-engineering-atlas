@@ -373,7 +373,11 @@
       c1: '#b45309', c2: '#15803d', d1: '#fbbf24', d2: '#4ade80',
       soon: true,
       store: 'rag',
+      indexVar: 'RAG_INDEX',
       dir: 'rag',
+      first: 'p1-python-for-ai-engineering.html',
+      dist: 'rag-course.html',
+      release: null,
     },
     {
       id: 'single-agent',

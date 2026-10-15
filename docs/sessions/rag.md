@@ -1,0 +1,12 @@
+# RAG — session log
+
+Branch `feature/rag-course`, clone `C:\Users\palak\atlas-courses\rag` (cut from `main` at `701d468`).
+Code: Python with sentence-transformers, faiss, hnswlib and a local model served by Ollama. Runtime namespace: `RAG`; storage prefix `rag-`.
+
+## 2026-10-15 — session 1
+- Owner: "now start working on Agents tab. As usual, keep the case studies as placeholder". Answers: small local models approved (Ollama qwen2.5:3b, bge-small-en-v1.5 embeddings, a MiniLM cross-encoder, small public datasets, faiss-cpu and hnswlib); Multi-Agent Systems to be a shorter standalone course (~30 lessons). Order: RAG, then Single Agent, then Multi-Agent Systems, one branch each.
+- Done: chapter plan in `rag/tools/chapters.cjs` (P1–P8 + 48 chapters). Case studies 41–48 stay placeholders for the later all-courses pass.
+- Decisions: scope is building retrieval that can be trusted; ML & AI Systems (model internals, its RAG survey), Databases (inverted indexes, vector databases), System Design (search at scale) and Single Agent are linked where they go deeper, not repeated. Every simulator is measured with local models.
+- Registry stub completed in `assets/atlas.js` (`indexVar: 'RAG_INDEX'`, `first`, `dist`; still `soon`) and the shell scaffolded with `tools/new-course.cjs`.
+- Course shell: home page (4 × 6 dependency map, Python retrieval code-style strip), glossary (74 terms), mock interview (22 problems, Clarify / Data / Retrieval / Generation / Evaluate / Wrap-up phases, 8-row rubric), flashcards, README.
+- Needs a shared change at release: add `rag-` (and later `agent-`, `mas-`) to the account-sync allow-lists in `assets/account.js` and `api/src/index.js`, then a Worker redeploy.
