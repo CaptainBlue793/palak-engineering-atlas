@@ -3,37 +3,251 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Concurrency Control: ETags &amp; Optimistic Locking</title>
+<title>Concurrency Control: ETags &amp; Optimistic Locking · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 16 of Backend & API. The lost update, version columns, ETag and If-Match, 412 Precondition Failed and pessimistic locks, measured with twenty real clients editing the same list at once.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .lu-ctl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 18px; }
+  @media (max-width:800px) { .lu-ctl { grid-template-columns:1fr; } }
+  .lu-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .lu-items { margin-top:14px; display:flex; flex-wrap:wrap; gap:6px; }
+  .lu-it { font-family:var(--mono); font-size:12px; padding:4px 8px; border-radius:8px; border:1px solid var(--border); }
+  .lu-it.in { background:var(--green-soft); color:var(--green); border-color:transparent; }
+  .lu-it.lost { color:var(--faint); text-decoration:line-through; background:var(--surface-2); }
+  .lu-cap { font-size:12.5px; color:var(--muted); margin-top:6px; }
+  .lu-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="16">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 16</span><span class="pill">Intermediate</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Concurrency Control: <span class="grad">ETags &amp; Optimistic Locking</span></h1>
-    <p class="lead">Two clients edit the same record: lost updates, version columns, ETags and If-Match.</p>
+    <h1>Concurrency Control: ETags &amp; Optimistic <span class="grad">Locking</span></h1>
+    <p class="lead">Two people open the same shared shopping list, each adds an item, each saves. Both saves succeed, and one item is gone: the second save wrote back the list as its author had read it, without the first person's change. This is the <b>lost update</b>, and it happens whenever a client reads a resource, changes its copy and writes the whole thing back, which is exactly what a REST client doing <code>GET</code> then <code>PUT</code> does.</p>
+    <p class="lead">This chapter covers the standard defences: version numbers, HTTP's ETag and If-Match, 412 Precondition Failed, locks, and avoiding the read-modify-write altogether. In the lab, twenty real clients add an item each to the same list at the same moment, against four server designs.</p>
+    <ul class="objectives">
+      <li><span>Recognise the lost update in read-modify-write code</span></li>
+      <li><span>Add a version column and use conditional updates</span></li>
+      <li><span>Expose versions as ETags and require If-Match on writes</span></li>
+      <li><span>Answer conflicts with 412, and know how clients should react</span></li>
+      <li><span>Choose between optimistic, pessimistic and atomic approaches</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>ETags and conditional requests:</b> <a href="02-http-in-depth.html">Chapter 2</a>.</li>
+        <li><b>Check-then-act races and atomic claims:</b> <a href="15-idempotency.html">Chapter 15</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>The lost update</li>
-    <li>Version columns</li>
-    <li>ETag and If-Match</li>
-    <li>412 Precondition Failed</li>
-    <li>Pessimistic locks, briefly</li>
-  </ol>
+  <h2>The lost update</h2>
+  <p>The pattern is: read the current state, compute a new state in the application, write it back. Between the read and the write, someone else may have written, and the write overwrites their change with a stale copy. It does not matter whether the gap is a person editing a form for five minutes or a handler that takes fifty milliseconds; under concurrency, some writes are lost, silently, with every request returning success. The lab's first design shows how bad it gets when many writers collide.</p>
+
+  <h2>Version columns</h2>
+  <p>Give each row a <code>version</code> integer, incremented on every update. A writer remembers the version it read and makes the update conditional on it still being current:</p>
+<pre class="code">cur = con.<span class="f">execute</span>(
+    <span class="s">"UPDATE lists SET items = ?, version = version + 1 WHERE id = 1 AND version = ?"</span>,
+    (json.<span class="f">dumps</span>(new_items), version_i_read))
+<span class="k">if</span> cur.rowcount == <span class="m">0</span>:
+    ...   <span class="c"># someone else updated it first: do not overwrite</span></pre>
+  <p>The condition and the write are one atomic statement, so the database guarantees only one writer per version succeeds. This is <b>optimistic</b> concurrency control: no locks are held while the client works, and conflicts are detected at write time. SQLAlchemy can do it for you with a <code>version_id_col</code> on the mapper, raising <code>StaleDataError</code> when the conditional update matches no row.</p>
+
+  <h2>ETag and If-Match</h2>
+  <p>HTTP carries the same idea. The server sends the version as an <b>ETag</b> on <code>GET</code> (<code>ETag: "v7"</code>); the client sends it back on the write as <code>If-Match: "v7"</code>; the server applies the write only if the resource still has that ETag, and otherwise answers <b>412 Precondition Failed</b>. A server can insist on it, answering <b>428 Precondition Required</b> to writes without If-Match, so no client can blindly overwrite. On a 412, the client fetches the resource again and either reapplies its change automatically, if it is a simple addition like the lab's, or shows the user both versions and lets them decide.</p>
+<pre class="code">@app.put("/lists/1")
+def put_list(body: ListIn, if_match: str | None = Header(default=None)):
+    con = db()
+    try:
+        if if_match is None:                       # blind write: last writer wins
+            con.execute("UPDATE lists SET items = ?, version = version + 1 WHERE id = 1", (json.dumps(body.items),))
+            return {"ok": True}
+        expected = int(if_match.strip('"').lstrip("v"))
+        cur = con.execute("UPDATE lists SET items = ?, version = version + 1 WHERE id = 1 AND version = ?", (json.dumps(body.items), expected))
+        if cur.rowcount == 0:                      # someone else changed it since this client read it
+            return JSONResponse({"code": "precondition_failed", "detail": "The list changed; fetch it again"}, status_code=412)
+        return {"ok": True}
+    finally:
+        con.close()</pre>
+
+  <h2>Simulator: twenty writers, one list</h2>
+  <p>Twenty clients start at the same moment. Each reads the list, spends 50 ms on it, and adds its own item: <code>item-01</code> to <code>item-20</code>. In the first two designs that is a <code>GET</code> then a <code>PUT</code> of the whole list; with ETags, a client that gets 412 starts again. The third design locks before reading; the fourth asks the server to append, so nothing is read in the client at all. Each design ran three times.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Which items survived?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="lu-ctl">
+        <div><div class="lu-l">Server design</div><div class="seg" id="luM"><button class="active" data-v="blind">blind PUT</button><button data-v="etag">ETag + If-Match</button><button data-v="locked">pessimistic lock</button><button data-v="atomic">atomic append</button></div></div>
+        <div><div class="lu-l">Run</div><div class="seg" id="luR"><button class="active" data-v="0">1</button><button data-v="1">2</button><button data-v="2">3</button></div></div>
+      </div>
+      <div class="lu-items" id="luItems"></div>
+      <div class="lu-cap" id="luCap"></div>
+      <div class="stats" id="luStats"></div>
+      <div class="lu-why" id="luWhy"></div>
+    </div>
+    <div class="panel-foot">uvicorn and FastAPI over SQLite in WAL mode; 20 httpx clients in parallel threads. The pessimistic design uses SQLite's <code>BEGIN IMMEDIATE</code> write lock, standing in for PostgreSQL's <code>SELECT ... FOR UPDATE</code>; the atomic design uses SQLite's <code>json_insert</code> in a single <code>UPDATE</code>. Times are from the first request to the last response.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>blind PUT</b>: every request returned 200, and one item survived. Nineteen users were told their change was saved.</li>
+    <li><b>ETag + If-Match</b>: all twenty survive, but look at the 412 count. With twenty writers fighting over one resource, most attempts lose and retry; the unluckiest client needed close to twenty tries. Optimistic concurrency is excellent when conflicts are rare and expensive when they are constant.</li>
+    <li><b>pessimistic lock</b>: all twenty, no retries, but the writers queue: twenty times the 50 ms of work, one after another.</li>
+    <li><b>atomic append</b>: all twenty in a fraction of the time. When the change can be expressed as an operation ("add this item"), let the database apply it, and there is nothing to race.</li>
+  </ul>
+
+  <h2>412 Precondition Failed, and what clients do</h2>
+  <p>A 412 is not an error in the usual sense; it is the system working. Clients should treat it as "your copy is stale": fetch again, then reapply or merge. Automatic reapplying is fine for commutative changes, such as adding an item; for edits where both sides changed the same field, show the conflict to a person. Keep the retry loop bounded and add a small random delay, or, as the lab shows, heavy contention turns into many wasted round trips. Return the current ETag with the 412, or include the current resource, to save the client a request.</p>
+
+  <h2>Pessimistic locks, briefly</h2>
+  <p>A <b>pessimistic</b> lock blocks other writers while you work: <code>SELECT ... FOR UPDATE</code> in PostgreSQL and MySQL locks the selected rows until the transaction ends. It avoids retries and suits short, high-contention critical sections inside one request, such as allocating the last seat. It is a poor fit across HTTP requests: a lock held while a user edits a form ties up a connection (<a href="06-database-access.html">Chapter 6</a>) and blocks everyone else until a timeout. Keep locks short, lock rows in a consistent order to avoid deadlocks, and set lock timeouts.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Approach</th><th>How</th><th>Best when</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><b>Blind write</b></td><td>PUT the whole resource</td><td>Never for shared data</td><td>Lost updates, silently</td></tr>
+        <tr><td><b>Optimistic (version / ETag)</b></td><td>Conditional update; 412 on conflict</td><td>Conflicts are rare; edits span requests</td><td>Retries or merges when conflicts happen</td></tr>
+        <tr><td><b>Pessimistic (row lock)</b></td><td><code>SELECT ... FOR UPDATE</code> in a short transaction</td><td>High contention inside one request</td><td>Waiting, deadlock risk, held connections</td></tr>
+        <tr><td><b>Atomic operation</b></td><td><code>UPDATE ... SET n = n - 1 WHERE n &gt; 0</code>, appends, upserts</td><td>The change can be expressed as an operation</td><td>Needs an operation-shaped API</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>GET</b> resource with ETag "v7"</li>
+      <li data-k="step"><b>Edit locally</b> no locks held</li>
+      <li data-k="step"><b>PUT with If-Match: "v7"</b> conditional update</li>
+      <li data-k="step"><b>Version still 7?</b> yes: write, ETag becomes "v8"</li>
+      <li data-k="end"><b>No: 412</b> re-fetch, reapply or show the conflict</li>
+    </ol>
+    <figcaption><b>Optimistic concurrency over HTTP.</b> The database's conditional update decides; the client handles the rare loser.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">📝</div>
+    <div class="body"><div class="title">Use case: Wikipedia's edit conflicts</div><p>Wikipedia has always faced the shopping-list problem at enormous scale: thousands of people editing the same pages, each spending minutes in an edit box. Locking a page while someone edits would let one idle editor block everyone, so MediaWiki, the software behind it, uses optimistic concurrency. When you open the editor, the form records which revision of the page you started from. When you save, MediaWiki checks whether anyone else has saved a newer revision in the meantime. If not, your edit is saved. If they have, it tries to merge the two changes automatically, which works when you edited different parts of the page; if the edits overlap, it shows an "edit conflict" screen with the current text, your version and the differences, and asks you to combine them. It is the ETag pattern with a human merge on 412, and it is why concurrent editing on Wikipedia loses almost nothing despite its scale.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>GET then PUT of whole resources</b> with no version check.</li>
+      <li><b>Checking the version in Python and then writing</b> instead of one conditional UPDATE.</li>
+      <li><b>Unbounded retry loops on 412</b> under heavy contention.</li>
+      <li><b>Pessimistic locks held across HTTP requests</b> or user think time.</li>
+      <li><b>Read-modify-write for counters and lists</b> that one atomic statement could change.</li>
+      <li><b>Weak ETags (<code>W/"..."</code>) used for If-Match,</b> which requires strong comparison.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is a lost update and how do ETags prevent it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A lost update happens when two clients read the same resource, each changes its copy, and each writes it back: the second write overwrites the first, so one change disappears even though both requests succeeded. With ETags, the server sends a version identifier when the client reads, and the client sends it back in an If-Match header when it writes. The server only applies the write if the resource still has that version, using a conditional update in the database; otherwise it returns 412 Precondition Failed, and the client re-reads and reapplies or merges. Conflicts are detected instead of silently lost.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A ticketing system sells the last seats to a popular concert and sees many 412s and slow checkouts. What do you change?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Optimistic concurrency is the wrong tool for a hot spot: when everyone is writing the same row, most attempts conflict and retry, wasting round trips, as an experiment with twenty writers on one list shows. I would avoid read-modify-write on the shared counter entirely: reserve a seat with a single atomic statement, such as <code>UPDATE seats SET held_by = :me, held_until = now() + interval '10 minutes' WHERE id = (SELECT id FROM seats WHERE event = :e AND held_by IS NULL LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id</code> in PostgreSQL, so each buyer grabs a different free seat without waiting on others, or decrement an inventory count with <code>WHERE remaining &gt; 0</code>. Holds expire if payment does not complete. For extreme demand, put a queue in front so requests are admitted at a rate the system can serve. Optimistic locking stays for things like editing an order's address, where conflicts are rare.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Read-modify-write without a check loses updates silently.</li>
+      <li>A version column plus a conditional UPDATE detects conflicts atomically.</li>
+      <li>Over HTTP: ETag on read, If-Match on write, 412 on conflict, optionally 428 without If-Match.</li>
+      <li>Optimistic suits rare conflicts; pessimistic locks suit short, hot sections inside one request.</li>
+      <li>Best of all, express changes as atomic operations so there is nothing to race.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Twenty clients GET a list and PUT it back with one item added, with no version check. What happened in the lab?</p>
+      <div class="opts">
+        <button class="opt">All 20 items were kept</button>
+        <button class="opt">Every request succeeded, and only one item survived</button>
+        <button class="opt">Most requests failed with 412</button>
+        <button class="opt">The server deadlocked</button>
+      </div>
+      <div class="explain">Each write replaced the list with its author's stale copy plus one item.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What status should a server return when If-Match does not match the current ETag?</p>
+      <div class="opts">
+        <button class="opt">409 Conflict</button>
+        <button class="opt">304 Not Modified</button>
+        <button class="opt">428 Precondition Required</button>
+        <button class="opt">412 Precondition Failed</button>
+      </div>
+      <div class="explain">428 is for a missing If-Match when the server requires one.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why must the version check be part of the UPDATE statement, not a separate SELECT?</p>
+      <div class="opts">
+        <button class="opt">A separate check-then-write leaves a window where another writer can slip in</button>
+        <button class="opt">SELECT statements cannot read versions</button>
+        <button class="opt">It is faster</button>
+        <button class="opt">ETags require it</button>
+      </div>
+      <div class="explain">The same check-then-act race as in Chapter 15.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">When is optimistic concurrency a poor choice?</p>
+      <div class="opts">
+        <button class="opt">When edits span several minutes</button>
+        <button class="opt">When conflicts are rare</button>
+        <button class="opt">When many writers constantly update the same row</button>
+        <button class="opt">For REST APIs</button>
+      </div>
+      <div class="explain">Measured: about 175 failed attempts for 20 successful writes on one hot list.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What avoids the race entirely for "add one item" or "decrement stock"?</p>
+      <div class="opts">
+        <button class="opt">A longer timeout</button>
+        <button class="opt">A single atomic statement in the database, such as UPDATE ... SET n = n - 1 WHERE n &gt; 0</button>
+        <button class="opt">Reading twice before writing</button>
+        <button class="opt">Caching the resource</button>
+      </div>
+      <div class="explain">No read in the application means no stale copy to write back.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"r":{"blind":[{"kept":1,"items":["item-09"],"version":21,"wall_ms":404,"s412":0,"max_tries":1,"p50_ms":143.0,"max_ms":392},{"kept":1,"items":["item-03"],"version":21,"wall_ms":220,"s412":0,"max_tries":1,"p50_ms":127.5,"max_ms":215},{"kept":1,"items":["item-08"],"version":21,"wall_ms":268,"s412":0,"max_tries":1,"p50_ms":144.0,"max_ms":258}],"etag":[{"kept":20,"items":["item-02","item-05","item-01","item-08","item-13","item-15","item-12","item-03","item-09","item-16","item-17","item-20","item-18","item-04","item-11","item-19","item-14","item-06","item-10","item-07"],"version":21,"wall_ms":1549,"s412":175,"max_tries":20,"p50_ms":763.5,"max_ms":1540},{"kept":20,"items":["item-03","item-08","item-06","item-12","item-11","item-14","item-04","item-20","item-09","item-05","item-18","item-13","item-16","item-17","item-19","item-07","item-10","item-02","item-15","item-01"],"version":21,"wall_ms":1552,"s412":171,"max_tries":18,"p50_ms":810.0,"max_ms":1549},{"kept":20,"items":["item-01","item-04","item-08","item-07","item-06","item-15","item-19","item-02","item-20","item-10","item-13","item-03","item-12","item-16","item-17","item-09","item-05","item-11","item-14","item-18"],"version":21,"wall_ms":1532,"s412":177,"max_tries":19,"p50_ms":791.0,"max_ms":1506}],"locked":[{"kept":20,"items":["item-05","item-13","item-04","item-01","item-03","item-08","item-02","item-09","item-10","item-06","item-07","item-12","item-17","item-11","item-18","item-20","item-14","item-19","item-16","item-15"],"version":21,"wall_ms":1887,"s412":0,"max_tries":1,"p50_ms":850.5,"max_ms":1867},{"kept":20,"items":["item-03","item-18","item-12","item-11","item-10","item-13","item-06","item-01","item-09","item-04","item-08","item-02","item-05","item-07","item-14","item-20","item-19","item-15","item-17","item-16"],"version":21,"wall_ms":1877,"s412":0,"max_tries":1,"p50_ms":855.5,"max_ms":1822},{"kept":20,"items":["item-06","item-12","item-08","item-04","item-09","item-03","item-10","item-02","item-07","item-01","item-05","item-15","item-18","item-17","item-16","item-11","item-13","item-19","item-14","item-20"],"version":21,"wall_ms":1905,"s412":0,"max_tries":1,"p50_ms":866.5,"max_ms":1843}],"atomic":[{"kept":20,"items":["item-05","item-09","item-06","item-07","item-10","item-02","item-13","item-12","item-16","item-17","item-15","item-19","item-20","item-18","item-11","item-14","item-08","item-03","item-04","item-01"],"version":21,"wall_ms":209,"s412":0,"max_tries":1,"p50_ms":67.5,"max_ms":206},{"kept":20,"items":["item-04","item-09","item-06","item-11","item-07","item-12","item-14","item-15","item-16","item-17","item-19","item-13","item-05","item-20","item-03","item-10","item-18","item-01","item-08","item-02"],"version":21,"wall_ms":232,"s412":0,"max_tries":1,"p50_ms":67.0,"max_ms":229},{"kept":20,"items":["item-01","item-05","item-02","item-09","item-08","item-10","item-03","item-14","item-13","item-17","item-20","item-12","item-19","item-18","item-06","item-16","item-11","item-15","item-04","item-07"],"version":21,"wall_ms":207,"s412":0,"max_tries":1,"p50_ms":66.5,"max_ms":198}]}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  function draw() {
+    const m = v('#luM'), k = +v('#luR'), r = D.r[m][k], have = new Set(r.items);
+    const all = Array.from({ length: 20 }, (_, i) => 'item-' + String(i + 1).padStart(2, '0'));
+    $('#luItems').innerHTML = all.map((x) => `<span class="lu-it ${have.has(x) ? 'in' : 'lost'}">${x}</span>`).join('');
+    $('#luCap').textContent = `Final list after all 20 clients finished: ${r.kept} item${r.kept === 1 ? '' : 's'}, version ${r.version}.`;
+    $('#luStats').innerHTML = `<div class="stat ${r.kept === 20 ? 'good' : 'warn'}"><div class="k">Items kept</div><div class="v">${r.kept} of 20</div></div><div class="stat ${r.kept < 20 ? 'warn' : ''}"><div class="k">Lost updates</div><div class="v">${20 - r.kept}</div></div><div class="stat ${r.s412 ? 'warn' : ''}"><div class="k">412 responses</div><div class="v">${r.s412}</div></div><div class="stat"><div class="k">All done after</div><div class="v">${(r.wall_ms / 1000).toFixed(2)} s</div></div>`;
+    const W = {
+      blind: `<b>${20 - r.kept} of 20 updates lost, and every client was told it succeeded.</b> All twenty read the empty list, added one item, and wrote back a one-item list; each write replaced the last. Only ${r.items.join(', ')} survived.`,
+      etag: `<b>No updates lost, at a price: ${r.s412} 412 responses.</b> Every round, one writer's conditional update matched the version and the rest got 412, re-read and tried again; the unluckiest client needed ${r.max_tries} attempts. Correct, but optimistic locking thrashes on a hot resource.`,
+      locked: `<b>No updates lost, no retries, ${(r.wall_ms / 1000).toFixed(1)} seconds.</b> Each request took the write lock before reading, so the twenty 50 ms critical sections ran one after another. Fine for short sections; ruinous if the lock were held during user think time.`,
+      atomic: `<b>No updates lost, no retries, ${(r.wall_ms / 1000).toFixed(2)} seconds.</b> The client says what to do, append this item, and one UPDATE statement does it inside the database. Nothing is read in the application, so nothing can be stale.`,
+    };
+    $('#luWhy').innerHTML = W[m];
+    $('#luWhy').dataset.x = JSON.stringify({ m, k, kept: r.kept });
+  }
+  ['#luM', '#luR'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
