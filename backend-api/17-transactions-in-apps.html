@@ -3,37 +3,241 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Transactions in Application Code</title>
+<title>Transactions in Application Code · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 17 of Backend & API. The unit of work, isolation from the application's side, read-modify-write races, external calls inside transactions and retrying serialisation failures, measured with 400 real transfers between bank accounts.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .tx-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .tx-plot { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); }
+  .tx-plot svg { display:block; width:100%; height:auto; }
+  .tx-ax { font-family:var(--mono); font-size:10.5px; fill:var(--muted); }
+  .tx-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="17">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 17</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Transactions in Application <span class="grad">Code</span></h1>
-    <p class="lead">Transaction boundaries in a request, isolation surprises seen from the app, and calling other services mid-transaction.</p>
+    <p class="lead">Moving money between two accounts is two writes: take it from one, add it to the other. If the service crashes between them, money vanishes. If two transfers from the same account run at once, each may check the balance, see enough, and together overdraw it. Databases have solved both problems for decades with <b>transactions</b>, but only for code that uses them properly: the right boundaries, the right statements inside them, nothing slow inside them, and a plan for when the database says "try again".</p>
+    <p class="lead">This chapter is about transactions from the application's side. The lab runs 400 real transfers between ten accounts on eight threads, crashes ten per cent of them half-way, and checks whether the bank still holds the £100,000 it started with.</p>
+    <ul class="objectives">
+      <li><span>Draw transaction boundaries around a whole unit of work</span></li>
+      <li><span>Know what isolation levels do and do not protect against</span></li>
+      <li><span>Fix read-modify-write races with atomic statements or locks</span></li>
+      <li><span>Keep external calls out of transactions</span></li>
+      <li><span>Retry serialisation failures and deadlocks correctly</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Sessions, commits and connection pools:</b> <a href="06-database-access.html">Chapter 6</a>.</li>
+        <li><b>Conditional updates and lost updates:</b> <a href="16-optimistic-concurrency.html">Chapter 16</a>. For how databases implement transactions, see the Databases course.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Unit of work</li>
-    <li>Isolation from the app's side</li>
-    <li>Read-modify-write races</li>
-    <li>External calls inside transactions</li>
-    <li>Retrying serialisation failures</li>
-  </ol>
+  <h2>Unit of work</h2>
+  <p>A transaction makes a group of statements <b>atomic</b>: all of them take effect, or none do. Its boundaries should match one business operation, "transfer £50", "place an order", not one SQL statement and not one whole HTTP session. In SQLAlchemy, <code>with session.begin():</code> commits at the end of the block and rolls back if anything inside raises; in a FastAPI service, a request usually performs one unit of work, opened and committed by the dependency or service function that owns it. Code that runs each statement in its own implicit transaction, called autocommit, gives up atomicity, and the lab shows what that costs.</p>
+<pre class="code"><span class="k">def</span> <span class="f">transfer</span>(session, src: <span class="t">int</span>, dst: <span class="t">int</span>, amount: <span class="t">int</span>) -&gt; <span class="t">bool</span>:
+    <span class="k">with</span> session.<span class="f">begin</span>():                                     <span class="c"># one unit of work</span>
+        debited = session.<span class="f">execute</span>(
+            text(<span class="s">"UPDATE accounts SET balance = balance - :a WHERE id = :s AND balance &gt;= :a"</span>),
+            {<span class="s">"a"</span>: amount, <span class="s">"s"</span>: src}).rowcount
+        <span class="k">if not</span> debited:
+            <span class="k">return False</span>                                         <span class="c"># insufficient funds; nothing changed</span>
+        session.<span class="f">execute</span>(text(<span class="s">"UPDATE accounts SET balance = balance + :a WHERE id = :d"</span>), {<span class="s">"a"</span>: amount, <span class="s">"d"</span>: dst})
+        session.<span class="f">add</span>(LedgerEntry(src=src, dst=dst, amount=amount))   <span class="c"># the record of it, in the same transaction</span>
+    <span class="k">return True</span>                                              <span class="c"># committed; now notify, email, call others</span></pre>
+
+  <h2>Isolation from the application's side</h2>
+  <p>Atomicity covers crashes; <b>isolation</b> covers concurrency: what one transaction can see of others running at the same time. SQL defines levels, and the defaults are weaker than many developers assume. PostgreSQL defaults to <b>READ COMMITTED</b>: each statement sees data committed before it began, so two transactions can both read a balance of £1,000 and both subtract £800 from their own copies, and neither gets an error. <b>REPEATABLE READ</b> gives each transaction a consistent snapshot and, in PostgreSQL, aborts a transaction that tries to update a row someone else changed. <b>SERIALIZABLE</b> guarantees the outcome of some serial order, aborting transactions that would break it. MySQL's InnoDB defaults to REPEATABLE READ with its own semantics. SQLite, used in the lab, allows one writer at a time and refuses to let a transaction write if another committed a write after it started reading. Whatever the database, know which level you run at, and know that stronger levels turn races into errors you must retry.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Level</th><th>Prevents</th><th>Still allows</th><th>Application must</th></tr></thead>
+      <tbody>
+        <tr><td><b>READ COMMITTED</b> (PostgreSQL default)</td><td>Dirty reads</td><td>Lost updates in read-modify-write, write skew</td><td>Use atomic updates or <code>SELECT ... FOR UPDATE</code></td></tr>
+        <tr><td><b>REPEATABLE READ</b></td><td>Non-repeatable reads; in PostgreSQL, concurrent updates of the same row</td><td>Write skew across different rows</td><td>Retry on serialisation failure</td></tr>
+        <tr><td><b>SERIALIZABLE</b></td><td>All anomalies: result equals some serial order</td><td>Nothing, at the cost of more aborts</td><td>Retry every transaction on failure</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Simulator: a bank under load</h2>
+  <p>Ten accounts start with £10,000 each. Eight threads perform 400 random transfers of £100 to £3,000, refusing any that would overdraw the source. One transfer in ten crashes between its debit and its credit, as a bug or a killed process would. Pick a design; every number is from a real run against SQLite.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">400 transfers, 8 threads, 10% crash mid-way</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="tx-l">Design</div>
+      <div class="seg" id="txM"><button class="active" data-v="autocommit">no transaction</button><button data-v="rmw">transaction, read then write</button><button data-v="rmw_retry">… with retries</button><button data-v="atomic">transaction, atomic update</button><button data-v="call_inside">… with a 20 ms call inside</button><button data-v="call_after">… call after commit</button></div>
+      <div class="tx-plot"><svg id="txSvg" viewBox="0 0 680 230" role="img" aria-label="Final balances"></svg></div>
+      <div class="stats" id="txStats"></div>
+      <div class="tx-why" id="txWhy"></div>
+    </div>
+    <div class="panel-foot">Python's sqlite3 with one connection per thread, WAL mode and a 10-second busy timeout. "Conflicts" counts SQLite's "database is locked" errors, raised when a transaction that has read tries to write after another transaction committed; with retries, the whole transfer is attempted again, up to 20 times. The same 400 transfers, in the same order, were used for every design.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>no transaction</b>: the bank lost tens of thousands of pounds, one debit at a time, in the transfers that crashed after taking the money. And an account went negative: two transfers checked its balance at the same moment.</li>
+    <li><b>transaction, read then write</b>: the money is all there, but most transfers failed. SQLite refused to let a transaction that had read a balance write after someone else changed the database. Add <b>retries</b> and they succeed, after hundreds of conflicts.</li>
+    <li><b>atomic update</b>: <code>balance = balance - :a WHERE balance &gt;= :a</code> checks and debits in one statement. No conflicts, no overdrafts, the highest throughput.</li>
+    <li><b>a 20 ms call inside</b> the transaction: same correctness, a fraction of the throughput, because each transaction holds the write lock while it waits. Move the call <b>after commit</b> and the throughput comes back.</li>
+  </ul>
+
+  <h2>Read-modify-write races</h2>
+  <p>"Read the balance, check it in Python, write the new value" is the same race as Chapter 16's lost update, inside a transaction. At READ COMMITTED it silently loses money or overdraws; at stronger levels, or in SQLite, it fails with conflicts that must be retried. Three fixes, in order of preference: express the change as an <b>atomic conditional statement</b> (<code>UPDATE ... SET balance = balance - :a WHERE id = :s AND balance &gt;= :a</code>) and check the row count; <b>lock the rows</b> you are about to change with <code>SELECT ... FOR UPDATE</code>, in a consistent order such as ascending ID to avoid deadlocks; or run at <b>SERIALIZABLE</b> and retry. Let constraints help too: <code>CHECK (balance &gt;= 0)</code> turns any bug that would overdraw into an error instead of bad data.</p>
+
+  <h2>External calls inside transactions</h2>
+  <p>Do not call other services, send email or upload files inside a transaction. While the transaction is open it holds locks, other writers wait, and the connection is out of the pool (<a href="06-database-access.html">Chapter 6</a>); measured here, a 20 ms call inside each transfer cut throughput by a factor of seven. Worse, the outside world does not roll back: if the email is sent and then the commit fails, the customer is told about a transfer that never happened. Commit first, then do the external work, and if that work must be guaranteed, record the intent in the same transaction and deliver it afterwards with the outbox pattern (<a href="30-outbox-events.html">Chapter 30</a>).</p>
+
+  <h2>Retrying serialisation failures</h2>
+  <p>Under stronger isolation, or with optimistic schemes, the database will sometimes abort a transaction: PostgreSQL reports serialisation failures as SQLSTATE <code>40001</code> and deadlocks as <code>40P01</code>; SQLite reports "database is locked". These are not bugs to log and give up on; they are the database asking you to try again. Retry the <b>whole transaction</b>, from its first read, not just the failed statement; use a few attempts with jittered backoff; and make sure everything inside it is safe to repeat, which is one more reason to keep external calls out.</p>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Begin</b> one business operation</li>
+      <li data-k="step"><b>Atomic statements</b> conditional updates, constraints, locks if needed</li>
+      <li data-k="step"><b>Record intent</b> ledger rows, outbox rows, same transaction</li>
+      <li data-k="step"><b>Commit</b> or roll back everything</li>
+      <li data-k="end"><b>Then act outside</b> emails, calls; retry the whole unit on 40001</li>
+    </ol>
+    <figcaption><b>A well-behaved unit of work.</b> Short, self-contained, safe to retry, with all side effects after the commit.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🪙</div>
+    <div class="body"><div class="title">Use case: Flexcoin, 2014</div><p>Flexcoin was a small Bitcoin bank. On 2 March 2014 it announced that its hot wallet had been emptied of 896 bitcoins and that it was closing. The attacker had used Flexcoin's feature for transferring coins between its own users. By sending many transfer requests at the same moment, they had several transfers check the same balance before any of them updated it, so each saw enough funds, and together they moved far more than the account held, repeatedly, into accounts the attacker then withdrew from. Reports at the time described it as a race condition in the balance update, the read-modify-write race of this chapter, and a similar flaw was reported at the exchange Poloniex days later. A single conditional statement, debiting only where the balance was still sufficient, or a row lock around the check and the debit, would have made every concurrent transfer after the first fail cleanly.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Several related writes outside one transaction.</b></li>
+      <li><b>Checking a balance in Python and writing a computed value</b> at READ COMMITTED.</li>
+      <li><b>HTTP calls, emails or uploads inside a transaction.</b></li>
+      <li><b>Retrying only the failed statement</b> instead of the whole transaction.</li>
+      <li><b>Swallowing serialisation failures and deadlocks</b> as generic 500s.</li>
+      <li><b>Locking rows in inconsistent orders,</b> producing deadlocks under load.</li>
+      <li><b>Assuming the default isolation level</b> without checking it.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How would you implement a money transfer between two accounts safely?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>In one database transaction: debit the source with a conditional statement, <code>UPDATE accounts SET balance = balance - :amount WHERE id = :src AND balance &gt;= :amount</code>, and check that one row changed, so the balance check and the debit are a single atomic step that concurrent transfers cannot both pass; credit the destination; insert a ledger entry; commit. If anything fails, the whole thing rolls back. A <code>CHECK (balance &gt;= 0)</code> constraint backs it up. The request carries an idempotency key so a retried transfer does not run twice. Notifications happen after the commit, ideally through an outbox. If the database aborts the transaction because of a conflict or deadlock, I retry the whole transaction a few times with backoff.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your service uses PostgreSQL at READ COMMITTED. An on-call rule says "at least one doctor must be on call". Two doctors go off call at the same time and both succeed, leaving nobody. Why, and how do you fix it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is write skew. Each transaction counts the doctors on call, sees two, and updates its own doctor's row to off call. They update different rows, so neither blocks the other and READ COMMITTED, or even REPEATABLE READ in PostgreSQL, allows both commits, breaking the rule that depended on rows neither of them wrote. Fixes: run this transaction at SERIALIZABLE and retry on serialisation failure, which PostgreSQL detects for exactly this pattern; or lock the rows the decision depends on with <code>SELECT ... FROM shifts WHERE on_call FOR UPDATE</code> before counting, so the second transaction waits and then sees one doctor; or materialise the constraint, for example a row per shift that both transactions must update, turning the conflict into a write-write conflict on one row. I would pick SERIALIZABLE with retries for clarity if the transaction is short.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>One business operation, one transaction: all its writes commit or none do.</li>
+      <li>Default isolation is usually READ COMMITTED, which allows read-modify-write races.</li>
+      <li>Prefer atomic conditional statements; otherwise lock rows or use SERIALIZABLE with retries.</li>
+      <li>Keep external calls out of transactions; commit first, or use an outbox.</li>
+      <li>Retry whole transactions on serialisation failures and deadlocks.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A transfer debits one account, then crashes before crediting the other, with no transaction. What happens to the money?</p>
+      <div class="opts">
+        <button class="opt">The database restores it automatically</button>
+        <button class="opt">It is credited on restart</button>
+        <button class="opt">It is gone: the debit was committed on its own</button>
+        <button class="opt">Both accounts keep their balances</button>
+      </div>
+      <div class="explain">Measured: about £46,700 of £100,000 lost over 30 crashed transfers.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Which statement checks and debits a balance atomically?</p>
+      <div class="opts">
+        <button class="opt"><code>UPDATE accounts SET balance = balance - :a WHERE id = :s AND balance &gt;= :a</code>, then check the row count</button>
+        <button class="opt"><code>SELECT balance</code>, compare in Python, then <code>UPDATE ... SET balance = :new</code></button>
+        <button class="opt"><code>SELECT COUNT(*)</code> then <code>DELETE</code></button>
+        <button class="opt">Two UPDATE statements in a row</button>
+      </div>
+      <div class="explain">The condition and the change happen in one statement the database applies atomically.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What is PostgreSQL's default isolation level?</p>
+      <div class="opts">
+        <button class="opt">SERIALIZABLE</button>
+        <button class="opt">REPEATABLE READ</button>
+        <button class="opt">READ UNCOMMITTED</button>
+        <button class="opt">READ COMMITTED</button>
+      </div>
+      <div class="explain">It allows read-modify-write races unless you use atomic statements or locks.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why keep a 20 ms call to another service out of the transaction?</p>
+      <div class="opts">
+        <button class="opt">Calls cannot be made from inside transactions</button>
+        <button class="opt">The transaction holds locks and a connection while waiting, and the call cannot be rolled back</button>
+        <button class="opt">It makes the call slower</button>
+        <button class="opt">It is required by HTTP</button>
+      </div>
+      <div class="explain">Measured: 42 transfers per second with the call inside, 292 with it after commit.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">PostgreSQL aborts a transaction with SQLSTATE 40001. What should the application do?</p>
+      <div class="opts">
+        <button class="opt">Return 500 and log the error</button>
+        <button class="opt">Retry only the last statement</button>
+        <button class="opt">Retry the whole transaction, a few times with backoff</button>
+        <button class="opt">Lower the isolation level permanently</button>
+      </div>
+      <div class="explain">Serialisation failures are an expected outcome at stronger isolation levels.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"r":{"autocommit":{"ok":311,"insufficient":59,"crashed":30,"busy_errors":0,"gave_up":0,"total":53306,"expected":100000,"min_balance":-2090,"secs":1.36,"per_s":229.5,"balances":[10492,11628,6989,-133,4306,5418,8963,3278,4455,-2090]},"rmw":{"ok":52,"insufficient":0,"crashed":6,"busy_errors":342,"gave_up":342,"total":100000,"expected":100000,"min_balance":3951,"secs":0.22,"per_s":234.8,"balances":[8110,12245,9833,12475,5223,3951,17991,14011,6672,9489]},"rmw_retry":{"ok":323,"insufficient":28,"crashed":31,"busy_errors":789,"gave_up":18,"total":100000,"expected":100000,"min_balance":1824,"secs":1.26,"per_s":257.0,"balances":[20936,9189,13521,1824,7444,5202,27979,4908,6696,2301]},"atomic":{"ok":334,"insufficient":32,"crashed":34,"busy_errors":0,"gave_up":0,"total":100000,"expected":100000,"min_balance":1283,"secs":0.91,"per_s":365.9,"balances":[20302,11529,11603,1506,7644,4401,25175,3309,13248,1283]},"call_inside":{"ok":332,"insufficient":34,"crashed":34,"busy_errors":0,"gave_up":0,"total":100000,"expected":100000,"min_balance":1746,"secs":7.86,"per_s":42.2,"balances":[22302,11712,12452,3176,9640,4577,20876,1746,11516,2003]},"call_after":{"ok":332,"insufficient":34,"crashed":34,"busy_errors":0,"gave_up":0,"total":100000,"expected":100000,"min_balance":313,"secs":1.14,"per_s":291.7,"balances":[23525,9118,13190,588,7644,313,27586,3724,11524,2788]}}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const gbp = (n) => (n < 0 ? '−£' : '£') + Math.abs(n).toLocaleString('en-GB');
+  function draw() {
+    const m = v('#txM'), r = D.r[m];
+    const W = 680, H = 230, L = 52, R = 12, T = 16, B = 30, max = 24000, min = -4000, sy = (x) => T + (max - x) / (max - min) * (H - T - B), bw = (W - L - R) / 10;
+    let s = '';
+    [-4000, 0, 10000, 20000].forEach((g) => { s += `<line x1="${L}" x2="${W - R}" y1="${sy(g)}" y2="${sy(g)}" stroke="var(--border)" ${g ? 'stroke-dasharray="2 4"' : ''}/><text class="tx-ax" x="${L - 6}" y="${sy(g) + 4}" text-anchor="end">${g / 1000}k</text>`; });
+    s += `<line x1="${L}" x2="${W - R}" y1="${sy(10000)}" y2="${sy(10000)}" stroke="var(--accent-2)" stroke-dasharray="5 4" opacity=".6"/><text class="tx-ax" x="${W - R}" y="${sy(10000) - 5}" text-anchor="end" fill="var(--accent-2)">starting balance</text>`;
+    r.balances.forEach((b, i) => { const x = L + i * bw + bw * 0.18, y0 = sy(0), y1 = sy(b); s += `<rect x="${x.toFixed(1)}" y="${Math.min(y0, y1).toFixed(1)}" width="${(bw * 0.64).toFixed(1)}" height="${Math.max(1, Math.abs(y1 - y0)).toFixed(1)}" rx="3" fill="${b < 0 ? 'var(--red)' : 'var(--green)'}" opacity=".85"/><text class="tx-ax" x="${(x + bw * 0.32).toFixed(1)}" y="${H - 12}" text-anchor="middle">A${i + 1}</text>`; });
+    $('#txSvg').innerHTML = s;
+    const lost = r.expected - r.total;
+    $('#txStats').innerHTML = `<div class="stat ${lost ? 'warn' : 'good'}"><div class="k">Money in the bank</div><div class="v">${gbp(r.total)}</div></div><div class="stat ${r.min_balance < 0 ? 'warn' : 'good'}"><div class="k">Lowest balance</div><div class="v">${gbp(r.min_balance)}</div></div><div class="stat"><div class="k">Transfers committed</div><div class="v">${r.ok} of 400</div></div><div class="stat ${r.busy_errors ? 'warn' : ''}"><div class="k">Conflicts / gave up</div><div class="v">${r.busy_errors} / ${r.gave_up}</div></div><div class="stat"><div class="k">Throughput</div><div class="v">${Math.round(r.per_s)}/s</div></div>`;
+    const Wh = {
+      autocommit: `<b>${gbp(lost)} vanished, and an account reached ${gbp(r.min_balance)}.</b> Each statement committed on its own, so the ${r.crashed} crashes after a debit kept the debit and lost the credit. Separately, two transfers read the same balance before either debited it, and both went ahead.`,
+      rmw: `<b>Not a penny lost, but ${r.gave_up} of 400 transfers failed.</b> Each transaction read a balance, then tried to write; when another transaction had committed in between, SQLite refused the write rather than let it act on stale data. PostgreSQL at SERIALIZABLE behaves similarly; at its default, READ COMMITTED, the same code would instead have silently overdrawn accounts.`,
+      rmw_retry: `<b>Correct, with ${r.busy_errors} conflicts along the way.</b> Retrying the whole transfer after a conflict let ${r.ok} succeed; ${r.gave_up} still gave up after 20 attempts. Correct but wasteful: the design invites the conflicts it then has to retry.`,
+      atomic: `<b>Correct, with no conflicts at all, at ${Math.round(r.per_s)} transfers a second.</b> The debit is a single conditional UPDATE, so there is no read to go stale, and the ${r.crashed} crashes rolled back cleanly.`,
+      call_inside: `<b>Correct, but only ${Math.round(r.per_s)} transfers a second.</b> Each transaction held SQLite's write lock for the whole 20 ms call, so the eight threads queued behind one another, ${r.secs.toFixed(1)} s in total.`,
+      call_after: `<b>The same work in ${r.secs.toFixed(1)} s, ${Math.round(r.per_s)} a second.</b> The call happens after the commit, while other transactions get on with their writes. And if it fails, the transfer is already safely recorded.`,
+    };
+    $('#txWhy').innerHTML = Wh[m];
+    $('#txWhy').dataset.x = JSON.stringify({ m, total: r.total, min: r.min_balance });
+  }
+  $('#txM').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
