@@ -3,37 +3,250 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Reranking with Cross-Encoders</title>
+<title>Reranking with Cross-Encoders · RAG by Palak Deb Patra</title>
+<meta name="description" content="Chapter 13 of RAG. Bi-encoders versus cross-encoders, retrieving wide and reranking narrow, latency budgets, LLM rerankers and measuring the lift, with a MiniLM cross-encoder over three first stages on SciFact and the Atlas set.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('rag-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rr-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .rr-chart { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:8px 10px; }
+  .rr-chart svg { width:100%; height:auto; display:block; }
+  .rr-chart text { font-family:var(--mono); font-size:11px; fill:var(--muted); }
+  .rr-key { display:flex; flex-wrap:wrap; gap:6px 14px; font-size:12px; color:var(--muted); margin:6px 2px 0; }
+  .rr-key i { display:inline-block; width:14px; height:3px; border-radius:2px; vertical-align:middle; margin-right:5px; }
+  .rr-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="13">
-<!-- rag:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 13</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Reranking with <span class="grad">Cross-Encoders</span></h1>
-    <p class="lead">Bi-encoders retrieve, cross-encoders judge: the second stage that fixes the order, and what it costs.</p>
+    <p class="lead">Retrieval has to be fast over millions of chunks, so it compares precomputed vectors. A <b>reranker</b> gets more time per candidate. It reads the query and each of the top few dozen chunks together and scores how well they match, then reorders them. Reranking is one of the most recommended upgrades in RAG, and it often helps. Whether it helps <i>you</i> depends on one comparison: is the reranker better than your first stage, on your data?</p>
+    <p class="lead">This chapter puts a popular small cross-encoder behind three first stages (BM25, dense and the hybrid from Chapter 12) on two datasets. It lifted the weak first stages and pulled the strongest one down. It also compares a 3B language model as reranker and measures what each costs in latency.</p>
+    <ul class="objectives">
+      <li><span>Explain the difference between a bi-encoder and a cross-encoder</span></li>
+      <li><span>Design a retrieve-wide, rerank-narrow pipeline</span></li>
+      <li><span>Budget reranking latency by depth and hardware</span></li>
+      <li><span>Use a language model as a reranker, and weigh its cost</span></li>
+      <li><span>Measure the lift on your own data before shipping a reranker</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The three first stages:</b> <a href="11-bm25.html">Chapter 11</a> (BM25), <a href="05-embedding-models.html">Chapter 5</a> (dense) and <a href="12-hybrid-search.html">Chapter 12</a> (hybrid).</li>
+        <li><b>nDCG and recall@k:</b> <a href="p8-ranking-metrics.html">Prerequisite 8</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Bi- vs cross-encoders</li>
-    <li>Retrieve wide, rerank narrow</li>
-    <li>Latency budgets</li>
-    <li>LLM rerankers</li>
-    <li>Measuring the lift</li>
-  </ol>
+  <h2>Bi- vs cross-encoders</h2>
+  <p>An embedding model is a <b>bi-encoder</b>. It encodes the query and each document separately into vectors, so documents can be encoded once, indexed, and compared with any query by a dot product. That speed has a price: the document's vector is fixed before the model ever sees the question. A <b>cross-encoder</b> feeds the query and one document into the transformer together, so every word of the question can attend to every word of the passage, and it outputs one relevance score. It is more accurate per pair, but nothing can be precomputed. Every query–document pair is a full forward pass, so it is used only on a shortlist.</p>
+<pre class="code"><span class="k">from</span> sentence_transformers <span class="k">import</span> CrossEncoder
+reranker = CrossEncoder(<span class="s">"cross-encoder/ms-marco-MiniLM-L-6-v2"</span>, max_length=<span class="m">512</span>)
+candidates = first_stage(query, k=<span class="m">50</span>)                                   <span class="c"># retrieve wide</span>
+scores = reranker.<span class="f">predict</span>([(query, doc.text) <span class="k">for</span> doc <span class="k">in</span> candidates])
+top = [d <span class="k">for</span> _, d <span class="k">in</span> <span class="f">sorted</span>(<span class="f">zip</span>(scores, candidates), key=<span class="k">lambda</span> p: -p[<span class="m">0</span>])][:<span class="m">5</span>]  <span class="c"># rerank narrow</span></pre>
+
+  <h2>Retrieve wide, rerank narrow</h2>
+  <p>The usual pipeline retrieves the top 20 to 100 cheaply, reranks them, and passes the best 3 to 10 to the model. The first stage's job changes. It no longer needs the right chunk at rank 1, only somewhere in the shortlist, which is recall@N (Chapter 19). In the lab, 86% of the relevant SciFact abstracts sat in the hybrid's top 10 and 96% in its top 100. That is the most any reranker could recover. Deeper shortlists raise that ceiling, but they cost more latency and give the reranker more chances to promote a wrong chunk.</p>
+
+  <h2>Latency budgets</h2>
+  <p>Reranking cost grows linearly with depth, because each candidate is a separate forward pass of up to 512 tokens. On the lab's 4 GB laptop GPU the MiniLM cross-encoder took about 45 ms for 20 candidates in half precision and 177 ms for 100. Full precision took about 2.5 times as long. On the CPU, 20 candidates took 1,563 ms and 100 took 7.0 seconds, too slow for interactive use at that depth. Truncating passages, using a smaller model, batching and half precision all help. The budget decides the depth.</p>
+
+  <h2>LLM rerankers</h2>
+  <p>A general language model can rerank too. Ask it whether each passage answers the query, and read off the probability of "Yes" rather than the generated word, so the scores can be sorted. LLM rerankers can follow domain instructions and handle unusual queries, but they cost far more per pair. In the lab, qwen2.5:3b took about 3.3 seconds per query to judge 20 passages, against tens of milliseconds for the cross-encoder. Larger hosted models are better rankers and slower still. Listwise prompts, which ask the model to order all candidates at once, reduce calls but are harder to parse and limited by context length.</p>
+
+  <h2>Simulator: one reranker, three first stages</h2>
+  <p>The cross-encoder is ms-marco-MiniLM-L-6-v2: six layers, trained on Bing search queries from MS MARCO. It reranked the top N of each first stage for all 300 SciFact claims (nDCG@10) and for 500 Atlas glossary terms (recall@5 of the defining chapter). Documents below the top N keep their first-stage order.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Does the reranker beat the first stage?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="rr-l">Dataset</div>
+      <div class="seg" id="rrD"><button class="active" data-v="SciFact">SciFact (nDCG@10)</button><button data-v="Atlas glossary">Atlas glossary (recall@5)</button></div>
+      <div class="rr-l">First stage</div>
+      <div class="seg" id="rrS"><button data-v="BM25">BM25</button><button data-v="Dense">Dense (bge-small)</button><button class="active" data-v="Hybrid (RRF)">Hybrid (RRF)</button></div>
+      <div class="rr-l">Rerank the top</div>
+      <div class="seg" id="rrN"><button data-v="10">10</button><button class="active" data-v="20">20</button><button data-v="50">50</button><button data-v="100">100</button></div>
+      <div class="rr-l">Hardware (latency)</div>
+      <div class="seg" id="rrH"><button class="active" data-v="GPU fp16">GPU, half precision</button><button data-v="GPU fp32">GPU, full precision</button><button data-v="CPU">CPU, 8 threads</button></div>
+      <div class="stats" id="rrStats"></div>
+      <div class="rr-chart" id="rrChart"></div>
+      <div class="rr-key"><span><i style="background:var(--amber)"></i>BM25</span><span><i style="background:var(--pink)"></i>Dense</span><span><i style="background:var(--accent-2)"></i>Hybrid</span><span>none = first stage alone</span></div>
+      <div class="rr-why" id="rrWhy"></div>
+    </div>
+    <div class="panel-foot">sentence-transformers CrossEncoder, max 512 tokens, on an RTX 3050 Ti laptop GPU (4 GB) and 8 CPU threads; latency is the mean over 20 queries, reranking only. Half and full precision gave identical rankings. The Atlas set is a fixed random sample of 500 of the 1,922 terms.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>Atlas, Dense, depth 0 → 100</b>: recall@5 rises from 0.764 to 0.838. The reranker fixes much of what the embedding model got wrong on short terms.</li>
+    <li><b>SciFact, BM25</b>: a small lift, from 0.663 to 0.683 at the top 20.</li>
+    <li><b>SciFact, Hybrid</b>: reranking <i>lowers</i> nDCG, from 0.722 to 0.686 at the top 100. Every first stage ends up near the same place, because after reranking the order is the reranker's own.</li>
+    <li><b>Depth 20 → 100 on SciFact</b>: deeper is worse here. More candidates give a mediocre reranker more wrong documents to promote.</li>
+    <li><b>Hardware</b>: the same top 100 takes 177 ms on the GPU in half precision and 7.0 s on the CPU.</li>
+  </ul>
+
+  <h2>Measuring the lift</h2>
+  <p>The lab's lesson is that a reranker replaces your first stage's ordering with its own. It helps when its judgement on your data is better than the first stage's, and hurts when it is worse. This model was trained on web search questions. On scientific claims it scored about 0.68 whatever it reranked, close to the 0.688 that the BEIR benchmark reports for the same kind of model over BM25 on SciFact. Measure before and after on your own labelled queries (Chapter 19), count per-query wins and losses, and try the reranker over each first stage you might ship. Rephrasing the Atlas terms as questions ("What is …?") made no useful difference. Stronger or domain-tuned rerankers (Chapter 33) are the next lever.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Reranker (top 20, 60 queries)</th><th>SciFact nDCG@10</th><th>Atlas recall@5</th><th>Time per query</th></tr></thead>
+      <tbody><tr><td><b>Hybrid first stage alone</b></td><td>0.663</td><td>0.883</td><td>—</td></tr><tr><td><b>MiniLM cross-encoder</b></td><td>0.646</td><td>0.900</td><td>~45 ms (GPU, fp16)</td></tr><tr><td><b>qwen2.5:3b, P(Yes)</b></td><td>0.661</td><td>0.900</td><td>~3.3 s</td></tr></tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Retrieve</b> 20–100 candidates cheaply</li>
+      <li data-k="step"><b>Check</b> the ceiling: is the answer in there?</li>
+      <li data-k="step"><b>Rerank</b> within the latency budget</li>
+      <li data-k="step"><b>Keep</b> the best few for the prompt</li>
+      <li data-k="end"><b>Compare</b> with and without, on your data</li>
+    </ol>
+    <figcaption><b>A two-stage retrieval pipeline.</b> The reranker only reorders; it cannot find what the first stage missed.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🥇</div>
+    <div class="body"><div class="title">Use case: BERT reranking on MS MARCO, and BEIR's warning</div><p>In January 2019 Rodrigo Nogueira and Kyunghyun Cho posted "Passage Re-ranking with BERT". They fine-tuned BERT as a cross-encoder on Microsoft's MS MARCO passage dataset, real Bing queries with human-marked answers, and used it to rerank BM25's top 1,000. It took first place on the leaderboard by a wide margin, nearly doubling BM25's MRR@10. Reranking a cheap first stage with a cross-encoder became the standard recipe, and small distilled versions such as the MiniLM model in this chapter made it affordable. In 2021 the BEIR benchmark (Nandan Thakur and colleagues) tested retrievers and rerankers zero-shot on 18 different datasets. On average, BM25 plus a cross-encoder generalised better than dense retrievers trained on MS MARCO. But the gains varied widely by dataset, and on some the reranker barely moved or lowered the score. The lab reproduces both halves: big lifts over weak first stages, no lift or a loss over a strong one.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Adding a reranker without measuring it</b> on your own data.</li>
+      <li><b>Reranking too few candidates.</b></li>
+      <li><b>Reranking too many</b> on a CPU.</li>
+      <li><b>Using a reranker trained on one kind of query</b> for another.</li>
+      <li><b>Comparing only averages.</b></li>
+      <li><b>Generating "yes"/"no" with an LLM</b> instead of reading its probability.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is a cross-encoder reranker and why use one?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Retrieval uses a bi-encoder: query and documents are embedded separately, so documents can be indexed in advance and searched fast, but the model never sees them together. A cross-encoder reads the query and one document side by side and outputs a relevance score, which is more accurate because the words can attend to each other, but nothing can be precomputed. So you retrieve a shortlist of 20 to 100 cheaply, rerank that with the cross-encoder, and send the best few to the model. It costs latency proportional to the shortlist, and it only helps if the reranker is better than the first stage on your data.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You added a well-known cross-encoder and offline nDCG went down. What happened, and what do you do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Reranking replaces the first stage's order with the reranker's. If your first stage is already strong, for example a tuned hybrid, and the reranker was trained on a different kind of query, such as web questions when your users type product codes or scientific claims, its judgement can be worse than what it replaces. Check per-query wins and losses, try it over each first stage, and try other depths, since deeper can be worse. Then try a stronger or domain-specific reranker, fine-tune one on your own labelled pairs (Chapter 33), or keep the first stage and spend the latency elsewhere. Ship only what wins on your labelled set and in an online test.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Cross-encoders read query and passage together: more accurate, but only affordable on a shortlist.</li>
+      <li>A reranker can only reorder; recall@N of the first stage is its ceiling.</li>
+      <li>It lifted weak first stages and lowered the strongest one: measure on your data.</li>
+      <li>Latency grows with depth; half precision on a GPU cut it by about 2.5 times.</li>
+      <li>LLM rerankers can match a cross-encoder but cost seconds per query.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why can't a cross-encoder be used to search a whole corpus directly?</p>
+      <div class="opts">
+        <button class="opt">It cannot read long documents</button>
+        <button class="opt">It scores each query–document pair with a full forward pass, so nothing can be precomputed</button>
+        <button class="opt">It produces vectors that are too large</button>
+        <button class="opt">It only works with BM25</button>
+      </div>
+      <div class="explain">Hence retrieve wide with a bi-encoder, then rerank narrow.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What limits how much a reranker can improve retrieval?</p>
+      <div class="opts">
+        <button class="opt">The size of the index</button>
+        <button class="opt">The embedding dimension</button>
+        <button class="opt">The number of tokens in the query</button>
+        <button class="opt">Whether the relevant documents are in the shortlist at all</button>
+      </div>
+      <div class="explain">It can only reorder what the first stage returned.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">On SciFact the reranker lowered the hybrid's nDCG but raised BM25's. Why?</p>
+      <div class="opts">
+        <button class="opt">Its own judgement sat between the two: better than BM25, worse than the hybrid</button>
+        <button class="opt">It was given fewer candidates from the hybrid</button>
+        <button class="opt">BM25 documents are shorter</button>
+        <button class="opt">The hybrid had a bug</button>
+      </div>
+      <div class="explain">After reranking, the order is the reranker's own.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How should an LLM be used as a pointwise reranker?</p>
+      <div class="opts">
+        <button class="opt">Ask it to rewrite each passage</button>
+        <button class="opt">Generate the word Yes or No and sort by it</button>
+        <button class="opt">Ask whether the passage answers the query and sort by the probability of "Yes"</button>
+        <button class="opt">Embed its answer</button>
+      </div>
+      <div class="explain">Probabilities give a sortable score; words give ties.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Reranking the top 100 on a CPU took several seconds per query. What is the first fix?</p>
+      <div class="opts">
+        <button class="opt">Use a larger reranker</button>
+        <button class="opt">Rerank fewer candidates, or move it to a GPU in half precision</button>
+        <button class="opt">Remove the first stage</button>
+        <button class="opt">Increase max_length</button>
+      </div>
+      <div class="explain">Cost grows linearly with depth.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = RAG;
+  const D = {"sets":{"SciFact":{"metric":"nDCG@10","queries":300,"stages":{"BM25":{"first stage":0.6635,"top 10":0.6709,"top 20":0.6833,"top 50":0.6809,"top 100":0.6754},"Dense":{"first stage":0.7084,"top 10":0.7076,"top 20":0.7022,"top 50":0.6926,"top 100":0.6907},"Hybrid (RRF)":{"first stage":0.7218,"top 10":0.7113,"top 20":0.7,"top 50":0.69,"top 100":0.6861}},"ceiling":{"10":0.8622,"20":0.9029,"50":0.9477,"100":0.965},"latency_ms":{"GPU fp16|10":24.1,"GPU fp16|20":44.9,"GPU fp16|50":106.3,"GPU fp16|100":176.9,"GPU fp32|10":55.3,"GPU fp32|20":111.5,"GPU fp32|50":279.3,"GPU fp32|100":494.5,"CPU|10":738.3,"CPU|20":1563.4,"CPU|50":3935.6,"CPU|100":7014.0}},"Atlas glossary":{"metric":"recall@5","queries":500,"stages":{"BM25":{"first stage":0.866,"top 10":0.86,"top 20":0.888,"top 50":0.884,"top 100":0.884},"Dense":{"first stage":0.764,"top 10":0.788,"top 20":0.808,"top 50":0.824,"top 100":0.838},"Hybrid (RRF)":{"first stage":0.884,"top 10":0.886,"top 20":0.878,"top 50":0.884,"top 100":0.878}},"ceiling":{"10":0.928,"20":0.96,"50":0.978,"100":0.986},"latency_ms":{"GPU fp16|10":25.6,"GPU fp16|20":46.0,"GPU fp16|50":107.0,"GPU fp16|100":180.1,"GPU fp32|10":59.4,"GPU fp32|20":113.4,"GPU fp32|50":277.0,"GPU fp32|100":487.7,"CPU|10":763.2,"CPU|20":1526.6,"CPU|50":3834.5,"CPU|100":6745.3}}}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const COL = { 'BM25': 'var(--amber)', 'Dense': 'var(--pink)', 'Hybrid (RRF)': 'var(--accent-2)' };
+  const DEP = ['0', '10', '20', '50', '100'];
+  const val = (S, d) => d === '0' ? S['first stage'] : S['top ' + d];
+  function chart(ds, st, n) {
+    const X = D.sets[ds].stages, W = 640, H = 240, L = 50, R = 32, T = 12, B = 30;
+    const all = Object.values(X).flatMap(S => DEP.map(d => val(S, d)));
+    const lo = Math.floor((Math.min(...all) - 0.005) * 50) / 50, hi = Math.ceil((Math.max(...all) + 0.005) * 50) / 50;
+    const x = (i) => L + (W - L - R) * i / (DEP.length - 1), y = (s) => T + (H - T - B) * (1 - (s - lo) / (hi - lo));
+    let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Score against rerank depth">`;
+    for (let g = lo; g <= hi + 1e-9; g += 0.02) s += `<line x1="${L}" x2="${W - R}" y1="${y(g)}" y2="${y(g)}" stroke="var(--border)"/><text x="${L - 6}" y="${y(g) + 4}" text-anchor="end">${g.toFixed(2)}</text>`;
+    DEP.forEach((d, i) => { s += `<text x="${x(i)}" y="${H - 8}" text-anchor="middle">${d === '0' ? 'none' : 'top ' + d}</text>`; });
+    for (const k of Object.keys(COL)) s += `<polyline fill="none" stroke="${COL[k]}" stroke-width="${k === st ? 3 : 1.5}" points="${DEP.map((d, i) => x(i) + ',' + y(val(X[k], d))).join(' ')}"/>`;
+    const i = DEP.indexOf(n);
+    s += `<circle cx="${x(0)}" cy="${y(val(X[st], '0'))}" r="5" fill="${COL[st]}" opacity=".6"/><circle cx="${x(i)}" cy="${y(val(X[st], n))}" r="7" fill="${COL[st]}" stroke="var(--surface)" stroke-width="2"/>`;
+    return s + '</svg>';
+  }
+  function draw() {
+    const ds = v('#rrD'), st = v('#rrS'), n = v('#rrN'), hw = v('#rrH'), X = D.sets[ds], S = X.stages[st];
+    const before = S['first stage'], after = S['top ' + n], d = after - before, ms = X.latency_ms[hw + '|' + n];
+    $('#rrStats').innerHTML = `<div class="stat"><div class="k">${X.metric}, first stage</div><div class="v">${before.toFixed(3)}</div></div>` +
+      `<div class="stat ${d > 0.002 ? 'good' : 'warn'}"><div class="k">After reranking top ${n}</div><div class="v">${after.toFixed(3)} (${d >= 0 ? '+' : '−'}${Math.abs(d).toFixed(3)})</div></div>` +
+      `<div class="stat ${ms < 200 ? 'good' : 'warn'}"><div class="k">Rerank time, ${hw === 'CPU' ? 'CPU' : 'GPU ' + (hw.endsWith('16') ? 'fp16' : 'fp32')}</div><div class="v">${ms >= 1000 ? (ms / 1000).toFixed(1) + ' s' : Math.round(ms) + ' ms'}</div></div>` +
+      (st === 'Hybrid (RRF)' ? `<div class="stat"><div class="k">${ds === 'SciFact' ? 'Relevant abstracts in top ' + n : 'Right chapter in top ' + n}</div><div class="v">${(100 * X.ceiling[n]).toFixed(0)}%</div></div>` : `<div class="stat"><div class="k">Queries</div><div class="v">${X.queries}</div></div>`);
+    $('#rrChart').innerHTML = chart(ds, st, n);
+    let why = `<b>${st === 'Hybrid (RRF)' ? 'Hybrid' : st} then the cross-encoder over its top ${n}: ${X.metric} ${before.toFixed(3)} → ${after.toFixed(3)}.</b> `;
+    why += d > 0.01 ? 'The reranker judges these candidates better than the first stage ordered them, so it lifts the score.' :
+      d < -0.01 ? 'The first stage was already better than the reranker on this data, so replacing its order with the reranker\'s lowers the score.' :
+      'The reranker and the first stage are about equally good here, so reranking changes the order but not the score — and costs latency.';
+    $('#rrWhy').innerHTML = why;
+    $('#rrWhy').dataset.x = JSON.stringify({ ds, st, n, before, after, ms });
+  }
+  for (const id of ['#rrD', '#rrS', '#rrN', '#rrH']) $(id).addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
