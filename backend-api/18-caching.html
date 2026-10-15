@@ -3,37 +3,258 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Caching: HTTP Caches &amp; Redis</title>
+<title>Caching: HTTP Caches &amp; Redis · Backend &amp; API by Palak Deb Patra</title>
+<meta name="description" content="Chapter 18 of Backend & API. Cache-Control and max-age, conditional requests, cache-aside with Redis, TTLs and invalidation, and stampedes, with four caching strategies measured in front of an expensive query.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('api-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ca-ctl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 18px; }
+  @media (max-width:800px) { .ca-ctl { grid-template-columns:1fr; } }
+  .ca-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .ca-bars { margin-top:14px; display:grid; gap:6px; }
+  .ca-bar { display:grid; grid-template-columns:190px minmax(0,1fr) 110px; gap:10px; align-items:center; font-size:13px; }
+  @media (max-width:700px) { .ca-bar { grid-template-columns:110px minmax(0,1fr) 84px; font-size:12px; } }
+  .ca-bar .trk { height:14px; border-radius:7px; background:var(--surface-3); overflow:hidden; }
+  .ca-bar .fill { display:block; height:100%; border-radius:7px; }
+  .ca-bar .val { font-family:var(--mono); text-align:right; }
+  .ca-bar.sel .lab { color:var(--accent); font-weight:700; }
+  .ca-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="18">
-<!-- api:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 18</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Caching: <span class="grad">HTTP Caches &amp; Redis</span></h1>
-    <p class="lead">Cache-Control and conditional requests for clients and CDNs, cache-aside with Redis for the service, and invalidation.</p>
+    <h1>Caching: HTTP Caches &amp; <span class="grad">Redis</span></h1>
+    <p class="lead">The fastest request is the one your service never computes. A cache keeps the result of expensive work and hands it out again: in the client, in a CDN, in a shared store such as Redis in front of your database. Done well, it turns a 150 ms aggregation into a 15 ms lookup and lets a small database serve a large audience. Done carelessly, it serves yesterday's prices, or, at the worst moment, sends every request to the database at once.</p>
+    <p class="lead">This chapter covers HTTP caching, which the rest of the internet does for you when you set the right headers, and application caching with Redis: the cache-aside pattern, expiry and invalidation, and the stampede. The lab puts four strategies in front of a deliberately expensive query and measures how often the database is hit.</p>
+    <ul class="objectives">
+      <li><span>Set Cache-Control so browsers and CDNs cache correctly</span></li>
+      <li><span>Use ETags and conditional requests to revalidate cheaply</span></li>
+      <li><span>Implement cache-aside with Redis</span></li>
+      <li><span>Choose TTLs and invalidate on writes</span></li>
+      <li><span>Prevent stampedes with single-flight and stale-while-revalidate</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + FastAPI listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>ETags, Vary and conditional GET:</b> <a href="02-http-in-depth.html">Chapter 2</a>.</li>
+        <li><b>Why process memory is not shared between workers:</b> <a href="01-what-a-backend-does.html">Chapter 1</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Cache-Control and max-age</li>
-    <li>Conditional requests</li>
-    <li>Cache-aside with Redis</li>
-    <li>TTLs and invalidation</li>
-    <li>Stampedes</li>
-  </ol>
+  <h2>Cache-Control and max-age</h2>
+  <p>HTTP caches, in browsers, in CDNs and in reverse proxies, follow the <code>Cache-Control</code> response header (RFC 9111). The directives that matter for APIs:</p>
+  <ul>
+    <li><b><code>max-age=60</code></b>: the response may be reused for 60 seconds without asking. <code>s-maxage</code> sets a different lifetime for shared caches such as CDNs.</li>
+    <li><b><code>public</code> / <code>private</code></b>: whether shared caches may store it. Anything that depends on who is asking, a user's orders, a personalised price, is <code>private</code>.</li>
+    <li><b><code>no-cache</code></b>: store it, but revalidate before every reuse. <b><code>no-store</code></b>: never store it, for sensitive data.</li>
+    <li><b><code>stale-while-revalidate=30</code></b>: after expiry, serve the stale copy for up to 30 seconds while fetching a fresh one in the background (RFC 5861).</li>
+    <li><b><code>Vary</code></b>: the request headers the response depends on, so caches keep separate copies (<code>Vary: Accept-Encoding</code>).</li>
+  </ul>
+  <p>A public product catalogue might send <code>Cache-Control: public, max-age=60, stale-while-revalidate=300</code> and let a CDN absorb most of its traffic. A user's account page sends <code>private, no-cache</code>. Responses with an <code>Authorization</code> header are not stored by shared caches unless you explicitly allow it.</p>
+
+  <h2>Conditional requests</h2>
+  <p>When a cached copy expires, the cache does not have to download it again: it sends <code>If-None-Match</code> with the ETag it holds, and the server answers <b>304 Not Modified</b> with no body if nothing changed (<a href="02-http-in-depth.html">Chapter 2</a>). That saves bandwidth and serialisation, though the server still has to work out whether the resource changed, which is cheap if the ETag comes from a version column or an <code>updated_at</code>, and expensive if it is a hash of a response you must first build.</p>
+
+  <h2>Cache-aside with Redis</h2>
+  <p>Inside the service, the common pattern is <b>cache-aside</b>: on a read, look in the cache; on a miss, compute from the database, store the result with a time-to-live, and return it. Redis is the usual store because it is shared by every worker and every instance, which an in-process dictionary is not (<a href="01-what-a-backend-does.html">Chapter 1</a>), and it expires keys itself:</p>
+<pre class="code"><span class="k">import</span> json, redis
+
+r = redis.Redis(host=<span class="s">"cache"</span>, port=<span class="m">6379</span>, decode_responses=<span class="k">True</span>)
+
+<span class="k">def</span> <span class="f">product_summary</span>(pid: <span class="t">int</span>) -&gt; <span class="t">dict</span>:
+    key = <span class="s">f"summary:v3:{pid}"</span>                       <span class="c"># a version in the key lets you change the format safely</span>
+    <span class="k">if</span> (hit := r.<span class="f">get</span>(key)) <span class="k">is not None</span>:
+        <span class="k">return</span> json.<span class="f">loads</span>(hit)
+    <span class="k">if</span> r.<span class="f">set</span>(<span class="s">f"lock:{key}"</span>, <span class="s">"1"</span>, nx=<span class="k">True</span>, ex=<span class="m">5</span>):       <span class="c"># single-flight: only one request recomputes</span>
+        <span class="k">try</span>:
+            value = <span class="f">compute_summary</span>(pid)              <span class="c"># the expensive query</span>
+            r.<span class="f">set</span>(key, json.<span class="f">dumps</span>(value), ex=<span class="m">60</span> + random.<span class="f">randint</span>(<span class="m">0</span>, <span class="m">10</span>))   <span class="c"># TTL with jitter</span>
+            <span class="k">return</span> value
+        <span class="k">finally</span>:
+            r.<span class="f">delete</span>(<span class="s">f"lock:{key}"</span>)
+    <span class="k">return</span> <span class="f">wait_for</span>(key) <span class="k">or</span> <span class="f">compute_summary</span>(pid)    <span class="c"># others poll briefly for the result</span></pre>
+  <p>No Redis server ran for this page, so the lab uses an in-process cache with the same three operations, <code>GET</code>, <code>SET ... EX</code> and <code>SET ... NX EX</code>, in a single uvicorn worker, where it behaves like a Redis that every request shares.</p>
+
+  <h2>Simulator: four strategies, one expensive query</h2>
+  <p>The summary for a product scans its reviews, 600,000 rows in all, taking about 150 ms. The service caches it for 2 seconds. Three experiments: <b>steady traffic</b>, 300 requests spread over products 1 to 5 with product 1 the most popular; a <b>stampede</b>, 50 requests at the same moment for product 1 just after its entry expired; and an <b>update</b>, product 1's price changes and a client reads it every 100 ms.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">How often did the database work?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ca-ctl">
+        <div><div class="ca-l">Strategy</div><div class="seg" id="caM"><button data-v="none">no cache</button><button class="active" data-v="aside">cache-aside</button><button data-v="singleflight">+ single-flight</button><button data-v="swr">+ stale-while-revalidate</button></div></div>
+        <div><div class="ca-l">Experiment</div><div class="seg" id="caS"><button data-v="steady">steady traffic</button><button class="active" data-v="stampede">stampede</button><button data-v="stale_inv0">update, TTL only</button><button data-v="stale_inv1">update, delete on write</button></div></div>
+      </div>
+      <div class="ca-bars" id="caBars"></div>
+      <div class="stats" id="caStats"></div>
+      <div class="ca-why" id="caWhy"></div>
+    </div>
+    <div class="panel-foot">uvicorn and FastAPI, one worker, SQLite with no index on <code>reviews.product_id</code>, so each summary is a real scan. The cache is an in-process TTL store with Redis's semantics. Latencies are from httpx clients; the update experiment reads every 100 ms for 3 seconds.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>steady traffic</b>: caching cuts database work by about two-thirds and the median latency from about 150 ms to under 20 ms. The p99 barely moves: someone still pays for every miss.</li>
+    <li><b>stampede</b> with plain <b>cache-aside</b>: the hot entry expires and almost every one of the 50 simultaneous requests recomputes it, so the database does dozens of identical scans at once, and every request is slow. <b>single-flight</b>: one scan, the rest wait for it. <b>stale-while-revalidate</b>: one scan, in the background, while everyone gets the slightly old value immediately.</li>
+    <li><b>update, TTL only</b>: after the price change, readers see the old price until the entry expires, about one and a half seconds here and up to the full TTL in general. <b>delete on write</b>: the next read is fresh.</li>
+  </ul>
+
+  <h2>TTLs and invalidation</h2>
+  <p>A TTL is a promise about staleness: "readers may see data up to 60 seconds old". Choose it per kind of data, from what users and the business can accept: product descriptions for hours, stock levels for seconds, balances not at all. To be fresher than the TTL, <b>invalidate on write</b>: after committing a change, delete the affected keys, and the next read recomputes. Delete rather than overwrite, and do it after the commit, or a concurrent reader may cache the old value again; for extra safety, keep the TTL anyway, so any missed invalidation heals itself. Changing a value's format? Put a version in the key (<code>summary:v3:42</code>) so old entries are simply never read. And remember the hardest part is knowing which keys a write affects: keep cached items close to single resources, and be wary of caching aggregates that many writes touch.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Layer</th><th>Shared by</th><th>Controlled with</th><th>Best for</th></tr></thead>
+      <tbody>
+        <tr><td><b>Browser / app cache</b></td><td>One user</td><td>Cache-Control, ETag</td><td>Anything the user re-reads</td></tr>
+        <tr><td><b>CDN / reverse proxy</b></td><td>Everyone, near them</td><td>Cache-Control (public, s-maxage), purges</td><td>Public, identical-for-all responses</td></tr>
+        <tr><td><b>Redis (cache-aside)</b></td><td>All instances of the service</td><td>Your code: TTLs, deletes, locks</td><td>Expensive results, per-user data, sessions</td></tr>
+        <tr><td><b>In-process memory</b></td><td>One worker</td><td>Your code</td><td>Tiny, rarely changing data such as configuration</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Stampedes</h2>
+  <p>A <b>cache stampede</b>, or thundering herd, happens when a popular entry expires and every request that misses recomputes it at once: the database gets N copies of its most expensive query exactly when traffic is highest. The defences, all visible in the lab: <b>single-flight</b> (one request takes a short lock with <code>SET key NX EX</code> and recomputes; the others wait or get stale data); <b>stale-while-revalidate</b> (keep serving the old value while one background refresh runs); <b>jittered TTLs</b> (random extra seconds so many keys do not expire together); and <b>early refresh</b> (recompute hot keys shortly before they expire). Also plan for the cache itself failing: if Redis restarts empty, every key misses at once, so ramp traffic back, or protect the database with limits (<a href="29-resilience.html">Chapter 29</a>).</p>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Read</b> GET key from the cache</li>
+      <li data-k="step"><b>Hit</b> return it; stale? serve and refresh in the background</li>
+      <li data-k="step"><b>Miss</b> SET lock NX EX; winner computes, others wait</li>
+      <li data-k="step"><b>Store</b> SET key EX ttl + jitter</li>
+      <li data-k="end"><b>On write</b> commit, then DELETE the affected keys</li>
+    </ol>
+    <figcaption><b>Cache-aside, done carefully.</b> Single-flight and stale-while-revalidate stop the herd; delete-on-write keeps data fresh.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🔁</div>
+    <div class="body"><div class="title">Use case: Facebook's outage of 23 September 2010</div><p>For about two and a half hours, Facebook was down or unusable for many users. In the post-mortem, engineering director Robert Johnson explained that a system meant to protect the site made it worse. Facebook ran an automated check that looked for invalid configuration values in its caches; when it found one, it deleted the cached value and fetched a fresh one from the database. That day, someone changed a configuration value in the database itself, to a value the check considered invalid. Every client saw the invalid value, deleted the cache entry and queried the database, which was immediately flooded with hundreds of thousands of queries a second; when queries failed, clients treated that as another invalid value, deleted the key again and queried again, a feedback loop. The only way out was to stop all traffic to the database cluster, which meant taking the site down, and let it recover. It is a stampede with no single-flight, no backoff and no fallback to stale data, and each of this chapter's defences would have damped it.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Personalised responses marked <code>public</code>,</b> so a CDN serves one user's data to another.</li>
+      <li><b>In-process caches in multi-worker services,</b> each with different contents.</li>
+      <li><b>No single-flight on hot, expensive keys,</b> inviting stampedes.</li>
+      <li><b>Updating the cache before the database commit,</b> or overwriting instead of deleting.</li>
+      <li><b>Caching without TTLs,</b> so a missed invalidation lasts forever.</li>
+      <li><b>All keys sharing one TTL,</b> expiring together.</li>
+      <li><b>Treating the cache as the source of truth</b> for data that must not be lost.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does cache-aside work, and what can go wrong?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>On a read, the service checks the cache; on a hit it returns the cached value, and on a miss it reads from the database, stores the result in the cache with an expiry time, and returns it. Writes go to the database and then delete the cached entry so the next read is fresh. Things that go wrong: stale data, bounded by the TTL unless you invalidate on write; invalidation races, if you write the cache before the database commit; stampedes, when a hot key expires and many requests recompute it at once, which needs a single-flight lock or stale-while-revalidate; and the cache going down, when every request falls through to the database, so the database needs protection too.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A product page API is slow under a flash sale. Walk through how you would use caching to fix it safely.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Split the page into what is the same for everyone and what is personal. The shared part, description, images, price, is served with <code>Cache-Control: public, s-maxage=30, stale-while-revalidate=120</code> so a CDN absorbs most requests, with a purge when the product is edited. Behind it, the service caches the expensive product summary in Redis with cache-aside, a short TTL with jitter, single-flight on misses and stale-while-revalidate for the hottest keys, and deletes the key when the product changes. Stock is the exception: it changes every second, so I would not cache it beyond a second or two, and the actual purchase always checks stock in the database atomically (<a href="17-transactions-in-apps.html">Chapter 17</a>). Per-user data, basket and recommendations, is fetched separately and marked private. Finally, I would warm the cache before the sale starts, monitor hit rates and database load, and have a fallback if Redis fails, such as serving stale data or shedding load, rather than letting every miss hit the database.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Cache-Control tells browsers and CDNs what to keep: max-age, public or private, no-store, stale-while-revalidate.</li>
+      <li>ETags and 304s make revalidation cheap.</li>
+      <li>Cache-aside in a shared store like Redis: read through on miss, TTL on every key.</li>
+      <li>Invalidate by deleting after the commit; version keys when formats change.</li>
+      <li>Stop stampedes with single-flight locks, stale-while-revalidate and jittered TTLs.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Which Cache-Control fits a user's own order history?</p>
+      <div class="opts">
+        <button class="opt">public, max-age=3600</button>
+        <button class="opt">s-maxage=60</button>
+        <button class="opt">immutable</button>
+        <button class="opt">private, no-cache</button>
+      </div>
+      <div class="explain">It depends on who asks, so no shared cache may store it; no-cache makes clients revalidate.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A hot cache entry expires and 50 requests arrive at once. With plain cache-aside, what happened in the lab?</p>
+      <div class="opts">
+        <button class="opt">One database query</button>
+        <button class="opt">About 40 identical expensive queries at once</button>
+        <button class="opt">All requests failed</button>
+        <button class="opt">Requests were served stale</button>
+      </div>
+      <div class="explain">Single-flight and stale-while-revalidate both brought it down to one.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">After updating a product in the database, what should the service do with its cache entry?</p>
+      <div class="opts">
+        <button class="opt">Delete it after the commit, so the next read recomputes</button>
+        <button class="opt">Write the new value before committing</button>
+        <button class="opt">Nothing; the TTL will handle it</button>
+        <button class="opt">Flush the whole cache</button>
+      </div>
+      <div class="explain">TTL-only left the old price visible for about 1.7 seconds here; delete-on-write fixed it at once.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does stale-while-revalidate do?</p>
+      <div class="opts">
+        <button class="opt">Deletes stale entries immediately</button>
+        <button class="opt">Blocks requests until fresh data is ready</button>
+        <button class="opt">Serves the expired value while one background refresh fetches a new one</button>
+        <button class="opt">Doubles the TTL</button>
+      </div>
+      <div class="explain">Measured: median latency of 30 ms during the stampede, against 170 ms with single-flight.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why add random jitter to TTLs?</p>
+      <div class="opts">
+        <button class="opt">To make caching more secure</button>
+        <button class="opt">So many keys set at the same time do not all expire together</button>
+        <button class="opt">Redis requires it</button>
+        <button class="opt">To make values fresher</button>
+      </div>
+      <div class="explain">Synchronised expiry turns into synchronised load on the database.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = API;
+  const D = {"r":{"none":{"steady":{"db":300,"p50":156.4,"p99":223.9,"secs":97.7,"n":300},"stampede":{"db":50,"p50":684.9,"p99":800.2,"n":50},"stale_inv0":{"stale":0,"reads":13,"fresh_after_ms":135},"stale_inv1":{"stale":0,"reads":13,"fresh_after_ms":142}},"aside":{"steady":{"db":109,"p50":19.2,"p99":235.2,"secs":94.1,"n":300},"stampede":{"db":40,"p50":584.3,"p99":706.4,"n":50},"stale_inv0":{"stale":14,"reads":27,"fresh_after_ms":1669},"stale_inv1":{"stale":0,"reads":27,"fresh_after_ms":138}},"singleflight":{"steady":{"db":109,"p50":19.1,"p99":204.7,"secs":95.5,"n":300},"stampede":{"db":1,"p50":170.0,"p99":249.6,"n":50},"stale_inv0":{"stale":14,"reads":28,"fresh_after_ms":1608},"stale_inv1":{"stale":0,"reads":27,"fresh_after_ms":138}},"swr":{"steady":{"db":113,"p50":15.3,"p99":156.8,"secs":93.5,"n":300},"stampede":{"db":1,"p50":30.3,"p99":74.0,"n":50},"stale_inv0":{"stale":17,"reads":29,"fresh_after_ms":1765},"stale_inv1":{"stale":0,"reads":28,"fresh_after_ms":144}}}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const NAMES = { none: 'no cache', aside: 'cache-aside', singleflight: '+ single-flight', swr: '+ stale-while-revalidate' };
+  function draw() {
+    const m = v('#caM'), s = v('#caS'), r = D.r[m][s], isStale = s.startsWith('stale');
+    const metric = (x) => isStale ? (x.fresh_after_ms || 0) : x.db, label = (x) => isStale ? (x.fresh_after_ms === null ? '–' : x.fresh_after_ms.toLocaleString('en-GB') + ' ms') : x.db + ' queries';
+    const max = Math.max(...Object.keys(NAMES).map((k) => metric(D.r[k][s])), 1);
+    $('#caBars').innerHTML = Object.keys(NAMES).map((k) => { const x = D.r[k][s]; return `<div class="ca-bar ${k === m ? 'sel' : ''}"><span class="lab">${NAMES[k]}</span><span class="trk"><span class="fill" style="width:${(metric(x) / max * 100).toFixed(1)}%;background:${k === m ? 'var(--accent)' : 'var(--muted)'}"></span></span><span class="val">${label(x)}</span></div>`; }).join('') + `<div class="small" style="color:var(--muted)">${isStale ? 'Time until a reader first saw the new price.' : 'Expensive database queries run during the experiment.'}</div>`;
+    if (isStale) $('#caStats').innerHTML = `<div class="stat ${r.stale ? 'warn' : 'good'}"><div class="k">Stale reads</div><div class="v">${r.stale} of ${r.reads}</div></div><div class="stat"><div class="k">Fresh after</div><div class="v">${r.fresh_after_ms === null ? '–' : r.fresh_after_ms + ' ms'}</div></div>`;
+    else $('#caStats').innerHTML = `<div class="stat ${r.db > r.n / 2 ? 'warn' : 'good'}"><div class="k">Database queries</div><div class="v">${r.db} for ${r.n} requests</div></div><div class="stat"><div class="k">Median latency</div><div class="v">${Math.round(r.p50)} ms</div></div><div class="stat"><div class="k">p99 latency</div><div class="v">${Math.round(r.p99)} ms</div></div>`;
+    let why;
+    if (s === 'steady') why = m === 'none' ? `<b>Every one of the 300 requests ran the scan.</b> Median ${Math.round(r.p50)} ms: the cost of the query itself.` : `<b>${r.db} scans for 300 requests, median ${Math.round(r.p50)} ms.</b> Most requests hit the cache; each product is recomputed roughly once per 2-second TTL, by whichever request misses. The p99, ${Math.round(r.p99)} ms, is the misses.`;
+    else if (s === 'stampede') why = { none: `<b>50 requests, 50 scans, all at once.</b> Without a cache, a burst is a burst of queries: median ${Math.round(r.p50)} ms as they compete.`, aside: `<b>${r.db} identical scans at the same moment.</b> Every request that found the entry expired recomputed it before any of them had stored the result, so the burst went straight to the database.`, singleflight: `<b>One scan.</b> The first request took the lock and recomputed; the other 49 waited a little and read its result. Median ${Math.round(r.p50)} ms: everyone waited for one query instead of fifty.`, swr: `<b>One scan, in the background, and a median of ${Math.round(r.p50)} ms.</b> Requests were answered from the expired entry while a single refresh ran. Users saw data up to a few hundred milliseconds old instead of waiting.` }[m];
+    else if (s === 'stale_inv0') why = m === 'none' ? `<b>No cache, no staleness:</b> every read is computed fresh, at full cost.` : `<b>${r.stale} of ${r.reads} reads showed the old price, for ${r.fresh_after_ms} ms.</b> With TTL-only caching, a change becomes visible when the cached entry expires, here within the 2-second TTL, in production up to whatever TTL you chose.`;
+    else why = m === 'none' ? `<b>No cache, no staleness.</b>` : `<b>No stale reads.</b> The write deleted the key after committing, so the next read missed and recomputed. The TTL stays as a safety net for any invalidation that is missed.`;
+    $('#caWhy').innerHTML = why;
+    $('#caWhy').dataset.x = JSON.stringify({ m, s });
+  }
+  ['#caM', '#caS'].forEach((id) => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
