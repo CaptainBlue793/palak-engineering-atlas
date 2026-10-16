@@ -3,37 +3,267 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Observability &amp; Feedback Loops</title>
+<title>Observability &amp; Feedback Loops · RAG by Palak Deb Patra</title>
+<meta name="description" content="Chapter 36 of RAG. Tracing a request, what to log, user feedback, online metrics and closing the loop, measured by tracing 400 requests through a small pipeline under normal and drifted traffic.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('rag-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ob-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ob-head { display:grid; grid-template-columns:minmax(0,14rem) minmax(0,1fr) minmax(0,1fr); gap:10px; padding:0 10px; margin-top:14px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .ob-rows { margin-top:6px; display:grid; gap:6px; }
+  .ob-row { display:grid; grid-template-columns:minmax(0,14rem) minmax(0,1fr) minmax(0,1fr); gap:10px; align-items:center; padding:6px 10px; border-radius:10px; border:1px solid var(--border); background:var(--surface-2); font-size:13px; }
+  .ob-row.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .ob-row .nm { font-weight:600; }
+  .ob-row .sh { font-family:var(--mono); font-size:12px; }
+  .ob-bar { position:relative; height:18px; border-radius:6px; background:var(--surface); overflow:hidden; }
+  .ob-bar i { position:absolute; inset:0 auto 0 0; border-radius:6px; background:var(--accent-2); opacity:.8; }
+  .ob-bar b { position:absolute; top:0; bottom:0; left:0; width:0; border-left:2px dashed var(--muted); }
+  .ob-bar span { position:relative; padding-left:6px; font-family:var(--mono); font-size:11px; line-height:18px; color:var(--text); }
+  .ob-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .ob-row, .ob-head { grid-template-columns:minmax(0,1fr) minmax(0,1fr); } .ob-row .nm, .ob-head .nm { grid-column:1 / -1; } }
+</style>
 </head>
 <body data-chapter="36">
-<!-- rag:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 36</span><span class="pill">Expert</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Observability &amp; Feedback <span class="grad">Loops</span></h1>
-    <p class="lead">Tracing each answer to its retrieval, collecting feedback, and turning failures into evaluation cases.</p>
+    <h1>Observability &amp; <span class="grad">Feedback Loops</span></h1>
+    <p class="lead">Offline evaluation tells you how the system did on questions you wrote last month. Production tells you how it is doing now, on questions you never imagined, against an index that keeps changing. You cannot read every answer, so you need two things. The first is traces that let you reconstruct any single answer. The second is cheap online signals that move when quality drops, so a regression shows on a dashboard before it shows in complaints.</p>
+    <p class="lead">The lab traces 400 requests through a small pipeline. Half are normal traffic. The other half are drifted: for every second drifted question, the chapter that answers it has been removed from the index, as happens when content goes stale or a sync job silently fails. Every trace records six signals available at answer time. It then measures which signals moved, and which could tell good answers from bad.</p>
+    <ul class="objectives">
+      <li><span>Trace a request from question to cited answer</span></li>
+      <li><span>Decide what to log, and what not to</span></li>
+      <li><span>Collect user feedback and know its biases</span></li>
+      <li><span>Choose online metrics that actually track quality</span></li>
+      <li><span>Close the loop: turn failures into evaluation cases and fixes</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Offline evaluation sets:</b> <a href="21-building-an-eval-set.html">Chapter 21</a>.</li>
+        <li><b>Confidence signals and abstention:</b> <a href="32-hallucination-and-abstention.html">Chapter 32</a>.</li>
+        <li><b>The pipeline being observed:</b> <a href="35-production-architecture.html">Chapter 35</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Tracing a request</li>
-    <li>What to log</li>
-    <li>User feedback</li>
-    <li>Online metrics</li>
-    <li>Closing the loop</li>
-  </ol>
+  <h2>Tracing a request</h2>
+  <p>A <b>trace</b> follows one request through every stage and records what each stage saw and produced. Each stage is a <b>span</b>: rewriting, retrieval, reranking, context assembly, generation and post-processing. A good RAG trace answers, months later, the question "why did it say that?" It records:</p>
+  <ul>
+    <li>the question as received and as rewritten;</li>
+    <li>the IDs, versions and scores of the chunks retrieved, and which made it into the prompt;</li>
+    <li>the prompt template version and model version;</li>
+    <li>the answer, its citations and any post-processing decisions;</li>
+    <li>the time taken and tokens used by each stage.</li>
+  </ul>
+  <p>Store chunk IDs and versions rather than full text, so the trace stays small and still points at the exact evidence. Chapter 37 uses traces like these to debug a bad answer stage by stage.</p>
+<pre class="code">trace = {<span class="s">"id"</span>: req_id, <span class="s">"prompt_v"</span>: <span class="s">"answer-v12"</span>, <span class="s">"model"</span>: <span class="s">"qwen2.5:3b"</span>, <span class="s">"index_v"</span>: <span class="s">"2026-10-15"</span>,
+         <span class="s">"question"</span>: q, <span class="s">"rewritten"</span>: q2,
+         <span class="s">"retrieved"</span>: [(c.id, c.version, round(c.score, 3)) <span class="k">for</span> c <span class="k">in</span> hits],     <span class="c"># IDs and scores, not text</span>
+         <span class="s">"in_prompt"</span>: [c.id <span class="k">for</span> c <span class="k">in</span> context], <span class="s">"cited"</span>: cited_ids, <span class="s">"abstained"</span>: abstained,
+         <span class="s">"signals"</span>: {<span class="s">"top_sim"</span>: hits[<span class="n">0</span>].score, <span class="s">"gap"</span>: hits[<span class="n">0</span>].score - hits[<span class="n">1</span>].score, <span class="s">"p_yes"</span>: p_yes},
+         <span class="s">"ms"</span>: {<span class="s">"retrieve"</span>: t1, <span class="s">"generate"</span>: t2}, <span class="s">"tokens"</span>: {<span class="s">"in"</span>: n_in, <span class="s">"out"</span>: n_out}}</pre>
+
+  <h2>What to log</h2>
+  <p>Log enough to reconstruct and aggregate, and no more:</p>
+  <ul>
+    <li><b>Always:</b> versions of everything (prompt, model, index, embedding model), chunk IDs and scores, citations, abstentions, timings, tokens and errors.</li>
+    <li><b>Carefully:</b> question and answer text. These are the most useful for debugging and the most sensitive. Keep them access-controlled, redact personal data where you can, and give them a retention period. Chapter 39 covers deletion, which must reach traces too.</li>
+    <li><b>Never:</b> secrets, full documents the user could not see, or anything you would not want in a breach report.</li>
+  </ul>
+  <p>Sample text logging if volume is high, but keep the cheap numeric signals for every request. Dashboards need the full population.</p>
+
+  <h2>User feedback</h2>
+  <p>Thumbs up and down, "copy answer", follow-up questions, clicks on citations and escalations to a human all carry signal. All of it is biased:</p>
+  <ul>
+    <li>Most users give no explicit feedback.</li>
+    <li>Those who do skew towards strong reactions.</li>
+    <li>A thumbs-up often means "fast and confident", not "correct".</li>
+  </ul>
+  <p>Implicit signals are more plentiful but ambiguous. A rephrased follow-up may mean the answer failed, or that the user wants more. Use feedback to find candidates for review, not as a quality metric on its own. Never optimise directly against thumbs: a system tuned to please can drift towards confident flattery.</p>
+
+  <h2>Simulator: which signals notice when quality drops?</h2>
+  <p>For each request the pipeline retrieves the top 5 chunks with bge-small and answers with qwen2.5:3b, citing sources. A separate one-token call asks the model whether the sources contain the answer, giving P(yes) as in Chapter 32. The offline label, which production never sees directly, is whether the answer cited the defining chapter. The share of bad answers rose from 50% on normal traffic to 72% on drifted traffic.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Which online signals move with quality?</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ob-l">Signal</div>
+      <div class="seg" id="obS"><button data-v="cited">Answer cites a source</button><button data-v="p_yes">Model&#x27;s P(sources contain the answer)</button><button data-v="abstained">Answer abstains</button><button data-v="length">Answer length</button><button class="active" data-v="top_sim">Top retrieval similarity</button><button data-v="gap">Gap between first and second score</button></div>
+      <div class="stats" id="obStats"></div>
+      <div class="ob-head"><span class="nm">Signal</span><span>Normal → drifted (mean)</span><span>Separates good from bad answers (AUC)</span></div>
+      <div class="ob-rows" id="obRows"></div>
+      <div class="ob-why" id="obWhy"></div>
+    </div>
+    <div class="panel-foot">400 requests: half normal, half drifted (in half of the drifted requests the defining chapter is removed from the index). bge-small over the Atlas chunks, top 5; qwen2.5:3b, temperature 0. AUC 0.5 is chance (dashed line); 1.0 separates good and bad answers perfectly. Good = the answer cited a chunk from the defining chapter.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>Top retrieval similarity</b>: 0.703 → 0.693 on average, almost unchanged, while bad answers rose from 50% to 72%. With the defining chapter gone, neighbouring chunks still scored nearly as well, so a dashboard of retrieval scores alone would have missed this drift.</li>
+    <li><b>Answer abstains</b>: 15% → 28%, the clearest shift, with citations falling 78% → 66%. When content goes missing, the answer-side signals are the ones that move.</li>
+    <li><b>P(yes) against top similarity</b>: AUC 0.73 against 0.62 for flagging individual bad answers, the same ordering as Chapter 32. Citation presence also scores 0.73, but partly because an answer with no citation can never count as good here.</li>
+  </ul>
+
+  <h2>Online metrics</h2>
+  <p>No online signal is the truth. Track several, compare each against its own history, and alert on shifts rather than absolute values. A useful dashboard shows, per day and per segment (tenant, topic, client version):</p>
+  <ul>
+    <li><b>Retrieval:</b> mean top similarity and the share of low-similarity requests.</li>
+    <li><b>Grounding:</b> abstention rate, citation rate and a sufficiency score such as P(yes).</li>
+    <li><b>Users:</b> feedback rate and negative share, rephrase rate and escalation rate.</li>
+    <li><b>Operations:</b> latency percentiles, tokens and errors (Chapter 28).</li>
+  </ul>
+  <p>Mark every deploy on the dashboard, because most sudden shifts are self-inflicted: a new prompt, a re-embedded index, a changed chunker. In the lab the answer-side signals moved most under drift: abstention went 15% → 28% and citation 78% → 66%, while mean top similarity moved only 0.703 → 0.693.</p>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Signal</th><th>Cost to collect</th><th>Normal → drifted</th><th>Flags bad answers (AUC)</th></tr></thead>
+      <tbody><tr><td><b>Answer cites a source</b></td><td>Free</td><td>78% → 66%</td><td>0.73</td></tr><tr><td><b>Model&#x27;s P(sources contain the answer)</b></td><td>One extra token call</td><td>0.521 → 0.431</td><td>0.73</td></tr><tr><td><b>Answer abstains</b></td><td>Free</td><td>15% → 28%</td><td>0.67</td></tr><tr><td><b>Answer length</b></td><td>Free</td><td>47 words → 44 words</td><td>0.64</td></tr><tr><td><b>Top retrieval similarity</b></td><td>Free</td><td>0.703 → 0.693</td><td>0.62</td></tr><tr><td><b>Gap between first and second score</b></td><td>Free</td><td>0.025 → 0.022</td><td>0.61</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>Closing the loop</h2>
+  <p>Observability pays off only if failures flow back into the system:</p>
+  <ul>
+    <li>Sample traces for review: low-signal requests, negative feedback, escalations and a random slice, since the random slice catches failures no signal flagged.</li>
+    <li>Label each with a failure stage (Chapter 37).</li>
+    <li>Fix the cause, whether content, retrieval, prompt or model.</li>
+    <li>Add the case to the evaluation set (Chapter 21), so the fix is tested forever and the offline set keeps tracking what users actually ask.</li>
+  </ul>
+  <p>Review the loop's own health too: how many cases were added this month, how long reports sit unreviewed, and whether the same failure keeps returning.</p>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Trace</b> every request: versions, chunk IDs, scores, citations</li>
+      <li data-k="step"><b>Watch</b> cheap signals by segment against their own history</li>
+      <li data-k="step"><b>Sample</b> flagged, negative and random traces for review</li>
+      <li data-k="step"><b>Label</b> the failure stage and fix the cause</li>
+      <li data-k="end"><b>Add</b> the case to the evaluation set; mark the deploy</li>
+    </ol>
+    <figcaption><b>The feedback loop.</b> Signals find candidates; people judge them; the evaluation set remembers.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">📡</div>
+    <div class="body"><div class="title">Use case: the 2025 GPT-4o sycophancy rollback</div><p>In April 2025 OpenAI rolled back an update to GPT-4o in ChatGPT a few days after release, because the model had become noticeably sycophantic: it flattered users and validated doubtful decisions. In its published review, OpenAI said the update had added a reward signal based on users' thumbs-up and thumbs-down feedback. That signal, combined with other changes, weakened the checks that had held sycophancy back. Offline evaluations and A/B tests had looked positive, and some expert testers had said the model "felt off". The lesson carries straight to RAG: user feedback is a biased signal to investigate, not a target to optimise. Releases need checks for the specific failure you fear, and qualitative review deserves a vote alongside the numbers.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Logging answers without versions or chunk IDs.</b></li>
+      <li><b>Treating thumbs-up rate as accuracy.</b></li>
+      <li><b>One global average with no segments.</b></li>
+      <li><b>Alerting on absolute values instead of shifts.</b></li>
+      <li><b>Reviewing only flagged traces.</b></li>
+      <li><b>Fixing failures without adding them to the evaluation set.</b></li>
+      <li><b>Keeping raw question text forever.</b></li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How would you monitor the quality of a RAG system in production?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Trace every request: the question, retrieved chunk IDs and scores, what went into the prompt, versions of the prompt, model and index, the answer, its citations and timings. Then watch cheap signals that track quality, segmented and compared with their own history: top retrieval similarity, abstention and citation rates, a sufficiency score from the model, and user feedback. None is ground truth, so I'd also sample flagged, negative and random traces for human review, label the failure stage, fix it and add the case to the evaluation set. Every deploy gets marked so shifts can be traced to changes.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Product wants to use thumbs-up rate as the quality KPI. What do you say?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It's useful but biased. Few users click, the ones who do skew to strong reactions, and a thumbs-up often rewards confidence and speed over correctness. Optimising against it can push the system towards confident, pleasing answers, which is what happened with the 2025 GPT-4o sycophancy rollback. I'd report it alongside grounding signals such as abstention, citation and sufficiency rates, and regular human-labelled samples, and use negative feedback mainly to find cases to review and add to the evaluation set.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Trace every request with versions, chunk IDs and scores, so any answer can be explained later.</li>
+      <li>Log text carefully: access control, redaction, retention, deletion.</li>
+      <li>Feedback finds cases to review; it is not an accuracy metric.</li>
+      <li>Watch answer-side signals (abstention, citation, sufficiency) as well as retrieval scores: here top similarity barely moved while bad answers rose from 50% to 72%.</li>
+      <li>Close the loop: review, label, fix, and add the case to the evaluation set.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why store chunk IDs and versions in a trace rather than only the answer?</p>
+      <div class="opts">
+        <button class="opt">IDs are required by vector databases</button>
+        <button class="opt">It makes answers faster</button>
+        <button class="opt">They let you reconstruct exactly what evidence the model saw, even after the index changes</button>
+        <button class="opt">Answers cannot be logged</button>
+      </div>
+      <div class="explain">"Why did it say that?" needs the evidence and versions.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why is thumbs-up rate a poor quality metric on its own?</p>
+      <div class="opts">
+        <button class="opt">Few users click, the clicks are skewed, and they often reward confidence over correctness</button>
+        <button class="opt">It is too expensive to collect</button>
+        <button class="opt">It is always 50%</button>
+        <button class="opt">It cannot be segmented</button>
+      </div>
+      <div class="explain">Use it to find cases, not to score the system.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why alert on shifts against a signal's own history?</p>
+      <div class="opts">
+        <button class="opt">Absolute values are secret</button>
+        <button class="opt">History is cheaper to store</button>
+        <button class="opt">Shifts are always bad</button>
+        <button class="opt">Each signal's normal level depends on the corpus and traffic; a change is what reveals a problem</button>
+      </div>
+      <div class="explain">Compare like with like, by segment and over time.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why include a random sample in trace review, not only flagged traces?</p>
+      <div class="opts">
+        <button class="opt">Random samples are easier to read</button>
+        <button class="opt">It catches failures that no signal flagged</button>
+        <button class="opt">Flagged traces are always correct</button>
+        <button class="opt">It is required by law</button>
+      </div>
+      <div class="explain">Signals miss things; random review measures what they miss.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What should happen to a reviewed failure after it is fixed?</p>
+      <div class="opts">
+        <button class="opt">Delete its trace</button>
+        <button class="opt">Nothing more</button>
+        <button class="opt">Add it to the evaluation set so the fix stays tested</button>
+        <button class="opt">Retrain the embedding model</button>
+      </div>
+      <div class="explain">The evaluation set is the loop's memory.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = RAG;
+  const D = {"shift":{"top_sim":{"normal":0.7032,"drifted":0.6931},"gap":{"normal":0.0247,"drifted":0.022},"cited":{"normal":0.78,"drifted":0.655},"abstained":{"normal":0.15,"drifted":0.275},"length":{"normal":47.29,"drifted":43.605},"p_yes":{"normal":0.5213,"drifted":0.4308},"good":{"normal":0.5,"drifted":0.285}},"flag_auc":{"top_sim":0.6208,"top_sim_direction":"higher is better","gap":0.6092,"gap_direction":"higher is better","cited":0.7325,"cited_direction":"higher is better","abstained":0.6749,"abstained_direction":"lower is better","length":0.6362,"length_direction":"higher is better","p_yes":0.7253,"p_yes_direction":"higher is better"},"meta":{"top_sim":{"name":"Top retrieval similarity","kind":"num","cost":"Free","note":"Retrieval's own confidence. It drops when nothing close is found, but a neighbouring chapter that covers related ground can still score almost as well as the right one."},"gap":{"name":"Gap between first and second score","kind":"num","cost":"Free","note":"A clear winner suggests one passage owns the answer; a flat top suggests several partial matches. Weak on its own."},"cited":{"name":"Answer cites a source","kind":"rate","cost":"Free","note":"A missing citation is a strong warning. It is partly built into this lab's label, though: an answer with no citation can never count as good."},"abstained":{"name":"Answer abstains","kind":"rate","cost":"Free","note":"When content goes missing, abstaining is the right behaviour, so a rising abstention rate is an alarm about the index, not the model."},"length":{"name":"Answer length","kind":"words","cost":"Free","note":"Short answers are often abstentions or refusals, so length tracks them loosely. Cheap, noisy and easy to over-read."},"p_yes":{"name":"Model's P(sources contain the answer)","kind":"num","cost":"One extra token call","note":"A one-token sufficiency check (Chapter 32). It reads the actual sources and question, so it sees problems retrieval scores cannot."}},"order":["cited","p_yes","abstained","length","top_sim","gap"]};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const fmt = (s, x) => D.meta[s].kind === 'rate' ? (100 * x).toFixed(0) + '%' : D.meta[s].kind === 'words' ? x.toFixed(0) + ' words' : x.toFixed(3);
+  function draw() {
+    const s = v('#obS'), m = D.meta[s], sh = D.shift[s], auc = D.flag_auc[s];
+    $('#obStats').innerHTML = `<div class="stat"><div class="k">Normal traffic</div><div class="v">${fmt(s, sh.normal)}</div></div>` +
+      `<div class="stat ${Math.abs(sh.drifted - sh.normal) / (Math.abs(sh.normal) || 1) > 0.1 ? 'warn' : ''}"><div class="k">Drifted traffic</div><div class="v">${fmt(s, sh.drifted)}</div></div>` +
+      `<div class="stat ${auc >= 0.7 ? 'good' : auc < 0.6 ? 'warn' : ''}"><div class="k">AUC, good vs bad</div><div class="v">${auc.toFixed(2)}</div></div>` +
+      `<div class="stat"><div class="k">Cost</div><div class="v">${m.cost}</div></div>`;
+    $('#obRows').innerHTML = D.order.map(k => { const a = D.flag_auc[k], z = D.shift[k];
+      return `<div class="ob-row${k === s ? ' sel' : ''}"><span class="nm">${D.meta[k].name}</span><span class="sh">${fmt(k, z.normal)} → ${fmt(k, z.drifted)}</span>` +
+        `<div class="ob-bar"><i style="width:${(100 * a).toFixed(1)}%"></i><b style="left:50%"></b><span>${a.toFixed(2)}</span></div></div>`; }).join('');
+    $('#obWhy').innerHTML = `<b>${m.name}: AUC ${auc.toFixed(2)} (${D.flag_auc[s + '_direction']}).</b> ${m.note}`;
+    $('#obWhy').dataset.x = JSON.stringify({ s, auc });
+  }
+  $('#obS').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
