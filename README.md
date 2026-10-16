@@ -2,7 +2,7 @@
 
 **[captainblue793.github.io/palak-engineering-atlas](https://captainblue793.github.io/palak-engineering-atlas/)**
 
-Every interactive engineering course I've written, in one place — **620 chapters (532 main chapters plus an 88-chapter Prerequisites level), ~447 hours,
+Every interactive engineering course I've written, in one place — **676 chapters (580 main chapters plus a 96-chapter Prerequisites level), ~486 hours,
 zero dependencies**. No walls of text: every chapter has animated diagrams, simulators you can
 break, an interview drill and a quiz. It all runs in your browser, offline, with no account and
 no build step.
@@ -20,6 +20,7 @@ no build step.
 | **[Cloud & DevOps](cloud-devops/)** | 8 prerequisites + 48 | Docker, Kubernetes, CI/CD, Terraform and observability, then SLOs, disaster recovery, cost and incident response in Bash, YAML and Terraform — plus 8 case studies |
 | **[ML Fundamentals](ml-fundamentals/)** | 8 prerequisites + 48 | Regression, classification, trees and ensembles, clustering, dimensionality reduction, forecasting, calibration, interpretability, leakage and honest evaluation in Python and scikit-learn — 8 case studies on the way |
 | **[ML & AI Systems](ml-ai-systems/)** | 8 prerequisites + 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
+| **[RAG](rag/)** | 8 prerequisites + 48 | Chunking, embedding models, exact, HNSW and IVF vector search, BM25 and hybrid search, reranking, query rewriting, citations and grounding, evaluation, permissions, GraphRAG, prompt injection and running it in production, measured on small local models in Python — 8 case studies on the way |
 
 The Atlas home page suggests an order through the courses for each kind of role.
 
@@ -82,7 +83,8 @@ palak-engineering-atlas/
 ├── distributed-systems/
 ├── cloud-devops/
 ├── ml-fundamentals/
-└── ml-ai-systems/
+├── ml-ai-systems/
+└── rag/
 ```
 
 ## What the Atlas adds
@@ -93,9 +95,10 @@ entry point:
 
 - **Combined progress** — reads each course's own `localStorage` key (`dsa-done`, `os-done`,
   `net-done` and so on), so ticking a chapter off inside a course shows up on the hub, and vice versa.
-  The chapter mosaic on the home page is one square per chapter, all 620 of them.
+  The chapter tracker on the home page has a tab per subject area: one square per chapter, 676 of them
+  in released courses, and outlines for the courses still to come.
 - **Resume** — deep-links to the next unread chapter of whichever course you're furthest into.
-- **Cross-course search** — `Ctrl+K` (or `/`) searches ~9,300 chapter, section and demo entries
+- **Cross-course search** — `Ctrl+K` (or `/`) searches ~12,500 chapter, section and demo entries
   across every released course at once, filterable by course, deep-linking to the exact anchor.
   The indexes load lazily after first paint, so the page opens instantly.
 - **Shared theme** — the toggle writes every course's theme key, so it carries across.

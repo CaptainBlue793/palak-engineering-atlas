@@ -18,7 +18,7 @@
 const COURSE = {
   dsa: 'dsa', os: 'os', net: 'networks', db: 'databases', lld: 'lld',
   sd: 'system-design', dist: 'distributed-systems', ops: 'cloud-devops', ml: 'ml-ai-systems', mlf: 'ml-fundamentals',
-  api: 'backend-api',
+  api: 'backend-api', rag: 'rag',
 };
 
 const TOPICS = [
@@ -38,7 +38,7 @@ const TOPICS = [
   ['JSON, YAML and other data formats', ['db/p5', 'sd/p5', 'dist/p3', 'ops/p4', 'api/p4']],
   ['Time and clocks in code', ['db/p4', 'lld/28', 'dist/p5']],
   ['Probability and expectation', ['dsa/46', 'ml/p5', 'mlf/p6']],
-  ['Python basics, and Python in use', ['net/p5', 'db/p6', 'ml/p1', 'mlf/p1', 'api/p1']],
+  ['Python basics, and Python in use', ['net/p5', 'db/p6', 'ml/p1', 'mlf/p1', 'api/p1', 'rag/p1']],
   ['State machines', ['os/04', 'net/08', 'lld/18', 'sd/35']],
   ['Turning requirements into a design', ['lld/02', 'sd/01', 'ml/01']],
 
@@ -65,7 +65,7 @@ const TOPICS = [
   ['The page cache and the database buffer pool', ['os/31', 'os/43', 'db/p3', 'db/12']],
   ['Eviction: LRU, Clock and friends', ['dsa/51', 'os/15', 'db/12', 'lld/31', 'sd/06']],
   ['CPU scheduling and job scheduling', ['dsa/15', 'os/07', 'os/08', 'lld/35', 'sd/38']],
-  ['Percentiles and tail latency', ['os/38', 'net/33', 'net/38', 'sd/p8', 'sd/04', 'ops/24', 'api/32']],
+  ['Percentiles and tail latency', ['os/38', 'net/33', 'net/38', 'sd/p8', 'sd/04', 'ops/24', 'api/32', 'rag/28']],
   ['Queues, overload and backpressure', ['os/27', 'net/12', 'lld/23', 'lld/34', 'sd/p2', 'sd/04', 'dist/04', 'ops/39', 'api/28']],
 
   /* ---------- networking ---------- */
@@ -111,13 +111,13 @@ const TOPICS = [
   ['Consistent hashing', ['sd/08', 'sd/39', 'dist/p6', 'dist/19']],
   ['Generating unique IDs', ['db/p1', 'db/46', 'sd/17', 'sd/26']],
   ['NoSQL and choosing a database', ['db/30', 'sd/07', 'dist/26', 'dist/45']],
-  ['Caching and invalidation', ['net/15', 'db/33', 'lld/31', 'sd/06', 'api/18']],
-  ['Full-text search and inverted indexes', ['db/31', 'sd/10', 'sd/31', 'ml/42']],
-  ['Vector search and embeddings', ['db/32', 'sd/10', 'ml/p3', 'ml/15', 'ml/20', 'ml/21', 'ml/46']],
+  ['Caching and invalidation', ['net/15', 'db/33', 'lld/31', 'sd/06', 'api/18', 'rag/28']],
+  ['Full-text search and inverted indexes', ['db/31', 'sd/10', 'sd/31', 'ml/42', 'rag/p7', 'rag/11']],
+  ['Vector search and embeddings', ['db/32', 'sd/10', 'ml/p3', 'ml/15', 'ml/20', 'ml/21', 'ml/46', 'rag/p4', 'rag/05', 'rag/07', 'rag/09']],
   ['Sorting and merging at scale', ['dsa/08', 'db/18', 'dist/47']],
   ['Time-series data and metrics storage', ['db/29', 'sd/10', 'sd/41', 'ops/21']],
   ['Geospatial indexes', ['db/15', 'sd/10', 'sd/35']],
-  ['Graphs: algorithms and graph data', ['dsa/25', 'db/30', 'sd/12']],
+  ['Graphs: algorithms and graph data', ['dsa/25', 'db/30', 'sd/12', 'rag/26']],
   ['Column stores, warehouses and batch processing', ['db/28', 'db/48', 'sd/18', 'dist/47', 'ml/28']],
   ['Stream processing: event time, windows and late data', ['sd/18', 'dist/30', 'ml/28']],
   ['Schema changes and migrations without downtime', ['db/34', 'sd/08', 'ops/42', 'api/37']],
@@ -163,13 +163,13 @@ const TOPICS = [
   ['Serverless', ['sd/21', 'sd/24', 'ops/26']],
   ['Scaling out and autoscaling', ['sd/04', 'sd/21', 'ops/03', 'ops/25']],
   ['Capacity planning', ['sd/04', 'sd/24', 'ops/39', 'ml/26', 'ml/38', 'api/32']],
-  ['Cost engineering', ['db/48', 'sd/24', 'ops/31', 'ops/46', 'ml/27', 'ml/38']],
-  ['Metrics, logs and traces', ['os/37', 'lld/33', 'sd/16', 'sd/41', 'dist/36', 'ops/21', 'ops/22', 'ops/23', 'ml/34', 'api/31']],
+  ['Cost engineering', ['db/48', 'sd/24', 'ops/31', 'ops/46', 'ml/27', 'ml/38', 'rag/29']],
+  ['Metrics, logs and traces', ['os/37', 'lld/33', 'sd/16', 'sd/41', 'dist/36', 'ops/21', 'ops/22', 'ops/23', 'ml/34', 'api/31', 'rag/36']],
   ['SLOs, alerting and incident response', ['sd/16', 'sd/41', 'ops/01', 'ops/24', 'ops/37', 'ops/38', 'api/39']],
   ['Real outages, taken apart', ['os/48', 'net/44', 'net/45', 'db/44', 'dist/48', 'ops/43', 'ops/44', 'ops/45']],
   ['Authentication, authorisation and least privilege', ['os/36', 'sd/11', 'ops/06', 'ops/36', 'ops/p7', 'api/09', 'api/10', 'api/11', 'api/12']],
   ['Configuration and secrets', ['lld/24', 'sd/11', 'ops/13', 'ops/28', 'api/p6']],
-  ['Attacks and their defences', ['os/36', 'os/47', 'net/03', 'net/36', 'db/p6', 'sd/11', 'ops/29', 'ml/36', 'api/33']],
+  ['Attacks and their defences', ['os/36', 'os/47', 'net/03', 'net/36', 'db/p6', 'sd/11', 'ops/29', 'ml/36', 'api/33', 'rag/31']],
 
   /* ---------- machine learning ---------- */
   ['ML platforms: leakage, skew, evaluation and drift', ['sd/23', 'ml/01', 'ml/03', 'ml/07', 'ml/29', 'ml/32', 'ml/34', 'mlf/37', 'mlf/39']],
@@ -178,7 +178,15 @@ const TOPICS = [
   ['Evaluating and comparing models', ['mlf/08', 'mlf/13', 'mlf/36', 'ml/07']],
   ['Features and data quality', ['mlf/14', 'mlf/15', 'mlf/16', 'ml/03', 'ml/04']],
   ['Linear algebra for machine learning', ['mlf/p4', 'ml/02']],
-  ['Serving LLMs', ['sd/42', 'ml/14', 'ml/26', 'ml/39', 'ml/45']],
+  ['Tokens and context windows', ['ml/15', 'rag/p3']],
+  ['Prompting a model with context', ['ml/19', 'rag/10', 'rag/16']],
+  ['Retrieval-augmented generation', ['ml/21', 'ml/46', 'rag/01', 'rag/02']],
+  ['Search ranking and ranking metrics', ['ml/42', 'rag/p8', 'rag/13']],
+  ['Fine-tuning models', ['ml/17', 'rag/33']],
+  ['Evaluating LLM systems', ['ml/35', 'rag/20', 'rag/21']],
+  ['Agents and tool use', ['ml/22', 'rag/34']],
+  ['Privacy, retention and deletion of personal data', ['ml/37', 'rag/39']],
+  ['Serving LLMs', ['sd/42', 'ml/14', 'ml/26', 'ml/39', 'ml/45', 'rag/35']],
   ['Feeds, ranking and recommendations', ['sd/27', 'ml/30', 'ml/41', 'mlf/31']],
   ['Ads: counting clicks and predicting them', ['sd/40', 'ml/43']],
   ['Payments and fraud', ['sd/37', 'ml/44']],
@@ -193,7 +201,7 @@ const TOPICS = [
   ['Video streaming', ['net/43', 'sd/32']],
 
   /* ---------- interviews ---------- */
-  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40', 'mlf/40', 'api/40']],
+  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40', 'mlf/40', 'api/40', 'rag/40']],
 ];
 
 module.exports = { COURSE, TOPICS };

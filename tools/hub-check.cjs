@@ -76,6 +76,7 @@ window.addEventListener('load', function () { whenIndexed(function () {
     featured: q('#pathFeatured .pchip').map(chip),
     paths: q('#pathGrid .path').map(function (p) { return { id: p.dataset.path, chips: q('.pchip', p).map(chip), prog: ((p.querySelector('.pprog') || {}).textContent || '').trim() }; }),
     progTxt: document.getElementById('progTxt').textContent,
+    trackTab: (document.querySelector('#mosaic .mtab[aria-selected="true"]') || { dataset: {} }).dataset.mtab || '',
     mosaic: q('#mosaic .mgroup').map(function (g) { var nm = g.querySelector('.nm'), ct = g.querySelector('.ct');
       return { name: nm ? nm.textContent : '', soon: g.classList.contains('soon'), links: q('a[href]', g).length,
         squares: q('.mosaic > *', g).length, done: q('.mosaic .done', g).length, ct: ct ? ct.textContent : '',
@@ -177,16 +178,17 @@ function checks(s) {
   check('coming-soon cards have no links', s.cards.filter((c) => c.soon).every((c) => c.links === 0), s.cards);
   check('released cards keep their links', s.cards.filter((c) => !c.soon).every((c) => c.links >= 3), s.cards);
   check('combined progress counts released courses only', s.progTxt === (3 + COMPLETE_ALL.length) + ' of ' + TOTAL + ' chapters read', s.progTxt);
-  // Planned courses appear only as cards in their tab, so stale progress saved for one has nowhere to show.
-  check('tracker lists released courses only, in order', eq(s.mosaic.map((g) => g.name), LIVE.map((c) => c.title)), s.mosaic.map((g) => g.name));
-  check('released rows link every square', s.mosaic.every((g) => g.links === g.squares + 1), s.mosaic);
-  // Laptop and wider: one line of squares per course, all rows the same square size, big enough to click.
-  // Phones wrap (64 squares on one 390 px line would be ~4 px each).
-  if (WIDTH >= 1280) {
-    check('each tracker row is one line of squares', s.mosaic.every((g) => g.lines === 1), s.mosaic.map((g) => [g.name, g.lines]));
-    const sizes = [...new Set(s.mosaic.map((g) => g.size))];
-    check('every row uses the same square size, at least 7 px', sizes.length === 1 && sizes[0] >= 7, sizes);
-  }
+  // The tracker shows one subject-area tab at a time: its released courses with linked squares, and its planned
+  // courses as outlined, unlinked squares (56 each unless the registry says otherwise).
+  check('tracker opens on a course tab', COURSE_TABS.some((t) => t.id === s.trackTab), s.trackTab);
+  const inTrack = REG.COURSES.filter((c) => c.tab === s.trackTab);
+  check('tracker lists the open tab\'s courses, in order', eq(s.mosaic.map((g) => g.name), inTrack.map((c) => c.title)), s.mosaic.map((g) => g.name));
+  check('planned rows are marked and unlinked', eq(s.mosaic.filter((g) => g.soon).map((g) => g.name), inTrack.filter((c) => c.soon).map((c) => c.title)) &&
+    s.mosaic.filter((g) => g.soon).every((g) => g.links === 0), s.mosaic.filter((g) => g.soon));
+  check('released rows link every square', s.mosaic.filter((g) => !g.soon).every((g) => g.links === g.squares + 1), s.mosaic);
+  // Squares keep one size and wrap onto more lines rather than shrinking: 15 px on laptops, 14 px on phones.
+  const sizes = [...new Set(s.mosaic.map((g) => g.size))];
+  check('every row uses the same square size, at least 12 px', sizes.length === 1 && sizes[0] >= 12, sizes);
   check('search filters list released courses only', eq(s.filters, ['all'].concat(LIVE.map((c) => c.id))), s.filters);
   check('study data requested for released courses only',
     s.studyScripts.length === LIVE.length && s.studyScripts.every((x) => !SOON.some((c) => x.startsWith(c.dir + '/'))), s.studyScripts);
