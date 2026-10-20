@@ -3,37 +3,260 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Parallel Fan-Out &amp; Aggregation</title>
+<title>Parallel Fan-Out &amp; Aggregation · Multi-Agent Systems by Palak Deb Patra</title>
+<meta name="description" content="Chapter 8 of Multi-Agent Systems. Splitting a batch across parallel agents and merging the results, measured with qwen3:14b on 60 and 240 feedback items: label accuracy, re-posts that cross chunk boundaries, merging and deduplicating, and what fan-out costs on one GPU.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('mas-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .fo-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .fo-grid { display:grid; grid-template-columns:repeat(15, 1fr); gap:3px; margin-top:10px; max-width:480px; }
+  .fo-grid i { aspect-ratio:1; border-radius:3px; background:var(--green); cursor:pointer; position:relative; }
+  .fo-grid i.bad { background:var(--red); }
+  .fo-grid i.dup { outline:2px solid var(--amber, #d97706); outline-offset:-2px; }
+  .fo-grid i.cut { margin-left:6px; }
+  .fo-item { margin-top:8px; font-size:13px; min-height:2.6em; }
+  .fo-pairs { margin-top:10px; display:grid; gap:5px; font-size:12.5px; }
+  .fo-pairs div { border:1px solid var(--border); border-radius:8px; padding:6px 10px; background:var(--surface-2); }
+  .fo-pairs div.ok { border-left:3px solid var(--green); }
+  .fo-pairs div.miss { border-left:3px solid var(--red); }
+  .fo-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="8">
-<!-- mas:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 8</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
     <h1>Parallel Fan-Out &amp; <span class="grad">Aggregation</span></h1>
-    <p class="lead">Running many agents at once on independent pieces, then merging, deduplicating and resolving conflicts.</p>
+    <p class="lead">Fan-out is the most natural way to use several agents. Split a batch into pieces, give each piece to its own agent, run them at the same time and merge what comes back. It promises speed, a small context per agent, and no agent ever facing a long list. It costs something too. Every worker re-reads the instructions, the merge is a new step that can go wrong, and anything that connects two pieces is invisible to the agents holding them.</p>
+    <p class="lead">The batch is <b>60 pieces of customer feedback</b>. Each must be labelled with a category (bug, billing, feature request, praise, performance) and a product area. Eight of the 60 are re-posts: the same customer's issue, reworded, which should be counted once. There were five set-ups. One agent labelled all 60 in one call. Fan-outs of 4 agents × 15 items and 12 agents × 5 were merged by code. Two repairs followed the 12 × 5 run, deduplication in code and a model that looks for re-posts. A second run used <b>240 items</b> to see whether one agent breaks down on a long list. Everything ran on qwen3:14b on one GPU.</p>
+    <ul class="objectives">
+      <li><span>Check that subtasks really are independent before splitting</span></li>
+      <li><span>Know what running in parallel speeds up on one model server</span></li>
+      <li><span>Merge results in code, checking coverage</span></li>
+      <li><span>Find duplicates and conflicts that cross chunk boundaries</span></li>
+      <li><span>Weigh the speed-up against the cost</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>gather, limits and partial failure:</b> <a href="p2-asyncio.html">Primer 2</a> and <a href="p4-failure-in-distributed-work.html">Primer 4</a>.</li>
+        <li><b>When one agent cuts corners on long work:</b> <a href="01-why-multiple-agents.html">Chapter 1</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Independent subtasks</li>
-    <li>Running in parallel</li>
-    <li>Merging results</li>
-    <li>Conflicts and duplicates</li>
-    <li>Speed-up vs cost</li>
-  </ol>
+  <h2>Independent subtasks</h2>
+  <p>Labelling one item does not depend on another, so labelling splits cleanly. Spotting re-posts does not split, because it is a relation <em>between</em> items. Put the two copies in different chunks and neither worker can see the pair. With 60 items in one call, one agent found <b>7 of the 8</b> re-posts. Split into 4 chunks of 15, the workers found 1, the only pair that happened to share a chunk. Split into 12 chunks of 5, they found <b>0</b>. Before fanning out, ask what in the task connects pieces to each other: duplicates, totals, rankings, order. Each of those needs a step after the merge that sees everything.</p>
+<pre class="code">chunks = [items[k:k + <span class="m">5</span>] <span class="k">for</span> k <span class="k">in</span> <span class="f">range</span>(<span class="m">0</span>, <span class="f">len</span>(items), <span class="m">5</span>)]
+parts  = <span class="k">await</span> asyncio.<span class="f">gather</span>(*(<span class="f">label</span>(c) <span class="k">for</span> c <span class="k">in</span> chunks))      <span class="c"># each worker sees only its 5 items</span>
+rows   = [r <span class="k">for</span> part <span class="k">in</span> parts <span class="k">for</span> r <span class="k">in</span> part]
+<span class="k">assert</span> <span class="f">sorted</span>(r[<span class="s">"id"</span>] <span class="k">for</span> r <span class="k">in</span> rows) == <span class="f">sorted</span>(it[<span class="s">"id"</span>] <span class="k">for</span> it <span class="k">in</span> items)   <span class="c"># coverage: none lost, none twice</span></pre>
+
+  <h2>Running in parallel</h2>
+  <p>Fan-out did not make this job faster. On 60 items one agent took 26.6 s and 12 workers 27.7 s. A GPU that serves one request at a time queues the workers' calls one after another (<a href="p2-asyncio.html">Primer 2</a>), and there were no tool waits to overlap. On 240 items the workers took 110 s against one agent's 131 s. That was not parallelism: shorter prompts are cheaper per token to read, and 20 calls over 12 rows each read less in total than one call over 240. Real speed-ups need either several model servers, an API that serves requests concurrently, or work that waits on tools and people (<a href="01-why-multiple-agents.html">Chapter 1</a>).</p>
+
+  <h2>Merging results</h2>
+  <p>With typed rows keyed by item id, merging is concatenation plus a check. In every set-up, every item came back exactly once: no item was dropped, repeated or invented, at 60 or at 240. That check is cheap and it is the first thing to write. Label accuracy barely moved with the split. Both labels were right for <b>54 of 60</b> items with one agent and with 12 × 5, and for 51 with 4 × 15. At 240 items one agent got 224 right against 217 and 216 for the fan-outs. Most errors in every set-up were the same ambiguity: a broken invoice page labelled <i>bug</i> rather than <i>billing</i>. Splitting does not fix a labelling scheme that is unclear.</p>
+
+  <h2>Conflicts and duplicates</h2>
+  <p>The question "how many distinct issues did customers raise?" has the answer 52. One agent counted 53. The 12 × 5 fan-out counted <b>60</b>, every re-post counted again. Two repairs ran after the merge. A code step paired items with the same labels and enough words in common, and found <b>5 of 8</b> with no false pairs, at no token cost. A model given all 60 labelled items and asked to find re-posts found <b>4 of 8</b>, with no false pairs, for 1,400 more tokens. Neither matched the single agent that saw everything at once. The same problem appears as conflicts: two workers labelling the same customer's issue differently, or reporting different values for the same thing. Merging needs a rule for which wins, and the rule belongs in code.</p>
+<pre class="code"><span class="k">def</span> <span class="f">likely_reposts</span>(labels: <span class="t">dict</span>, texts: <span class="t">dict</span>, threshold: <span class="t">float</span> = <span class="m">0.25</span>) -&gt; <span class="t">dict</span>[<span class="t">int</span>, <span class="t">int</span>]:
+    <span class="s">"""Same labels and enough shared words: a candidate re-post (5 of 8 found, 0 false here)."""</span>
+    words = {i: <span class="t">set</span>(re.<span class="f">findall</span>(<span class="s">r"[a-z0-9£]+"</span>, texts[i].<span class="f">lower</span>())) - STOP <span class="k">for</span> i <span class="k">in</span> labels}
+    found = {}
+    <span class="k">for</span> b <span class="k">in</span> <span class="f">sorted</span>(labels):
+        <span class="k">for</span> a <span class="k">in</span> <span class="f">sorted</span>(labels):
+            <span class="k">if</span> a &gt;= b: <span class="k">break</span>
+            <span class="k">if</span> labels[a] == labels[b] <span class="k">and</span> <span class="f">len</span>(words[a] &amp; words[b]) / <span class="f">len</span>(words[a] | words[b]) &gt;= threshold:
+                found[b] = a; <span class="k">break</span>
+    <span class="k">return</span> found</pre>
+
+  <h2>Speed-up vs cost</h2>
+  <p>Every worker reads the instructions and the output schema again, so more workers cost more tokens for the same items. On 60 items: one agent <b>3,050</b> tokens, 4 workers 3,360, 12 workers 4,190 (+37%), and 5,620 with the model looking for re-posts. On 240 items: 14,600 for one agent against 15,500 and 16,700. Here the extra cost bought nothing: no speed-up on one GPU, no better labels, and lost re-posts. Fan-out earns its cost when one agent's context would be too long or too distracting, when each piece needs its own tool calls (<a href="01-why-multiple-agents.html">Chapter 1</a>'s 40 services), or when the pieces wait on the outside world. A batch of short, structured judgements is often better as one call, or a few large chunks.</p>
+
+  <h2>Simulator: sixty items, five ways</h2>
+  <p>Each square is one feedback item in id order, green if both labels are right, red if not. Outlined squares are re-posts. Each row of 15 is one chunk of the 4 × 15 split; the 12 × 5 split cuts each row into three. Click a square to read the item.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Split, label, merge</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="fo-l">Set-up</div>
+      <div class="seg" id="foA"><button data-v="0">one agent</button><button data-v="1">4 × 15</button><button class="active" data-v="2">12 × 5</button><button data-v="3">12 × 5 + code dedupe</button><button data-v="4">12 × 5 + model dedupe</button></div>
+      <div class="stats" id="foStats"></div>
+      <div class="fo-grid" id="foGrid"></div>
+      <div class="fo-item" id="foItem">Click a square.</div>
+      <div class="fo-l">The 8 re-posts</div>
+      <div class="fo-pairs" id="foPairs"></div>
+      <div class="fo-why" id="foWhy"></div>
+    </div>
+    <div class="panel-foot">qwen3:14b, temperature 0, one GPU serving one request at a time. Items were shuffled with a fixed seed before chunking.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>one agent</b>, then <b>12 × 5</b>: the re-post list goes from 7 found to none.</li>
+    <li><b>12 × 5 + code dedupe</b>: which re-posts plain word overlap can and cannot see.</li>
+    <li>Any red square: the same billing-or-bug ambiguity in every set-up.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Set-up</th><th>Both labels right (of 60)</th><th>Re-posts found (of 8)</th><th>Distinct issues counted (truth 52)</th><th>Model calls</th><th>Tokens</th><th>Time</th></tr></thead>
+      <tbody id="foTable"></tbody>
+    </table>
+  </div>
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>240 items</th><th>Labelled once each</th><th>Both labels right</th><th>Model calls</th><th>Tokens</th><th>Time</th></tr></thead>
+      <tbody id="foScale"></tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Find the links</b> duplicates, totals, rankings</li>
+      <li data-k="step"><b>Split</b> into chunks with ids</li>
+      <li data-k="step"><b>Fan out</b> typed rows back</li>
+      <li data-k="step"><b>Merge in code</b> check every id once</li>
+      <li data-k="end"><b>Cross-chunk pass</b> dedupe, resolve, total</li>
+    </ol>
+    <figcaption><b>Fan-out with the links kept.</b> What connects pieces must be handled after the merge, by something that sees all of them.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🌿</div>
+    <div class="body"><div class="title">Use case: map-reduce over documents</div><p>Summarising or classifying large document sets with "map" calls over chunks and a "reduce" call over the results is a standard pattern. LangChain has long shipped map-reduce summarisation, and batch inference APIs from model providers exist for exactly this kind of job. The well-known failure modes match this chapter. Facts that span chunks are lost, duplicates are counted twice, and the reduce step either sees too little or re-reads everything. Production pipelines usually add stable ids for every item, a coverage check after the map, and a cross-chunk step, often in code, for deduplication and totals.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Splitting a task with links between items:</b> re-posts found fell from 7 to 0.</li>
+      <li><b>Expecting a speed-up on one model server:</b> 26.6 s against 27.7 s.</li>
+      <li><b>No coverage check after the merge,</b> so dropped or doubled items go unnoticed.</li>
+      <li><b>Totals from a fan-out without deduplication:</b> 60 distinct issues counted instead of 52.</li>
+      <li><b>A model for a merge code can do,</b> or for deduplication that word overlap does as well.</li>
+      <li><b>Blaming the split for label errors</b> that come from an unclear labelling scheme.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> When does fanning out a batch to parallel agents help?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>When pieces are independent and either the whole would be too long for one agent, each piece needs its own tool calls, or the work waits on I/O that can overlap. In a test labelling 60 and 240 feedback items, one agent did as well as fan-outs of 4, 12 and 24 workers, at lower token cost, and one GPU gave no real speed-up. Fan-out also lost every re-post that crossed a chunk boundary.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your fan-out's totals are too high. Why, and how do you fix it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Duplicates across chunks: no worker sees both copies. In a test, splitting 60 items into chunks of 5 counted 60 distinct issues instead of 52. Fix it after the merge with a pass that sees everything: word-overlap matching on items with the same labels found 5 of 8 re-posts with no false pairs and no tokens, and a model pass found 4. Also check coverage, every id exactly once, before computing totals.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Split only what is independent: re-posts found fell from 7 of 8 (one agent) to 0 (12 × 5).</li>
+      <li>On one GPU fan-out gave no real speed-up; extra workers cost up to 37% more tokens.</li>
+      <li>Merge by id in code and check coverage: every item came back exactly once.</li>
+      <li>Repair cross-chunk links after the merge: code found 5 of 8 re-posts, a model 4.</li>
+      <li>At 240 items one agent labelled as well as the fan-outs (224 against 217 and 216).</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why did the 12 × 5 fan-out find no re-posts?</p>
+      <div class="opts">
+        <button class="opt">The workers were told not to look</button>
+        <button class="opt">Five items is too few to label</button>
+        <button class="opt">Every re-post's original was in a different chunk, so no worker saw both</button>
+        <button class="opt">The merge deleted them</button>
+      </div>
+      <div class="explain">Relations between items do not survive a split. Handle them after the merge.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why was fan-out not faster here?</p>
+      <div class="opts">
+        <button class="opt">One GPU serves one request at a time, and there were no tool waits to overlap</button>
+        <button class="opt">asyncio was used wrongly</button>
+        <button class="opt">The workers had too many items</button>
+        <button class="opt">The merge was slow</button>
+      </div>
+      <div class="explain">26.6 s for one agent, 27.7 s for 12 workers on 60 items.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What should you check first after merging a fan-out?</p>
+      <div class="opts">
+        <button class="opt">The tone of the outputs</button>
+        <button class="opt">The token count</button>
+        <button class="opt">The workers' reasoning</button>
+        <button class="opt">Coverage: every item id back exactly once, none invented</button>
+      </div>
+      <div class="explain">Cheap, exact and the base for any totals.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How many distinct issues did the 12 × 5 fan-out count, against a truth of 52?</p>
+      <div class="opts">
+        <button class="opt">52</button>
+        <button class="opt">60: every re-post counted again</button>
+        <button class="opt">44</button>
+        <button class="opt">53</button>
+      </div>
+      <div class="explain">Totals from a fan-out need deduplication across chunks.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">When does fan-out earn its extra cost?</p>
+      <div class="opts">
+        <button class="opt">Always, for any batch</button>
+        <button class="opt">When items are short structured judgements</button>
+        <button class="opt">When one context would be too long or distracting, each piece needs tool calls, or work waits on I/O</button>
+        <button class="opt">When the labelling scheme is unclear</button>
+      </div>
+      <div class="explain">Here, one agent matched the fan-outs at 60 and 240 items.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = MAS;
+  const D = {"items":[{"id":1,"text":"Your API docs are the clearest I've used.","category":"praise","area":"API","duplicate_of":null},{"id":2,"text":"CSV exports from reports come out empty since Tuesday.","category":"bug","area":"reports","duplicate_of":null},{"id":3,"text":"Setting up the Google Drive integration took two minutes. Excellent.","category":"praise","area":"integrations","duplicate_of":null},{"id":4,"text":"Please add an offline mode to the mobile app.","category":"feature request","area":"mobile app","duplicate_of":null},{"id":5,"text":"Our Jira sync stopped creating tickets after the update.","category":"bug","area":"integrations","duplicate_of":null},{"id":6,"text":"The mobile app crashes as soon as I open the camera upload.","category":"bug","area":"mobile app","duplicate_of":null},{"id":7,"text":"The API returns 500 errors when I send a date without a time zone.","category":"bug","area":"API","duplicate_of":null},{"id":8,"text":"The Salesforce sync takes hours to finish each night.","category":"performance","area":"integrations","duplicate_of":null},{"id":9,"text":"I'd love keyboard shortcuts in the web editor.","category":"feature request","area":"web app","duplicate_of":null},{"id":10,"text":"The Salesforce connector is billed even though we disabled it.","category":"billing","area":"integrations","duplicate_of":null},{"id":11,"text":"Year-to-date reports take minutes to generate.","category":"performance","area":"reports","duplicate_of":null},{"id":12,"text":"Scheduled reports are counted as extra seats on our invoice.","category":"billing","area":"reports","duplicate_of":null},{"id":13,"text":"The new mobile app design is lovely and much faster to navigate.","category":"praise","area":"mobile app","duplicate_of":null},{"id":14,"text":"Slack notifications from the integration arrive 15 minutes late.","category":"performance","area":"integrations","duplicate_of":null},{"id":15,"text":"The in-app purchase on iPhone didn't unlock the Pro plan.","category":"billing","area":"mobile app","duplicate_of":null},{"id":16,"text":"The monthly report shows last month's totals twice.","category":"bug","area":"reports","duplicate_of":null},{"id":17,"text":"I was charged twice for the mobile subscription in the App Store.","category":"billing","area":"mobile app","duplicate_of":null},{"id":18,"text":"Loving the drag-and-drop board in the browser version.","category":"praise","area":"web app","duplicate_of":null},{"id":19,"text":"Can reports be scheduled to send as PDF every Monday?","category":"feature request","area":"reports","duplicate_of":null},{"id":20,"text":"Reports finally load the charts we need. Great job.","category":"praise","area":"reports","duplicate_of":null},{"id":21,"text":"We paid for the HubSpot integration but it isn't on our plan.","category":"billing","area":"integrations","duplicate_of":null},{"id":22,"text":"The web dashboard takes over 10 seconds to load our projects.","category":"performance","area":"web app","duplicate_of":null},{"id":23,"text":"Each alert shows up three times in our Slack channel through your integration.","category":"bug","area":"integrations","duplicate_of":57},{"id":24,"text":"The new API rate-limit headers made our client so much simpler.","category":"praise","area":"API","duplicate_of":null},{"id":25,"text":"We were charged for 12 seats but only have 9 users.","category":"billing","area":"web app","duplicate_of":null},{"id":26,"text":"Could the mobile app support Face ID login?","category":"feature request","area":"mobile app","duplicate_of":null},{"id":27,"text":"Clicking Save on the settings page in the browser does nothing.","category":"bug","area":"web app","duplicate_of":null},{"id":28,"text":"Loading our projects on the web dashboard takes more than ten seconds.","category":"performance","area":"web app","duplicate_of":22},{"id":29,"text":"The GitHub integration just works. Thank you.","category":"praise","area":"integrations","duplicate_of":null},{"id":30,"text":"Please build a Microsoft Teams integration.","category":"feature request","area":"integrations","duplicate_of":null},{"id":31,"text":"The app crashes every time I rotate my phone in the editor.","category":"bug","area":"mobile app","duplicate_of":null},{"id":32,"text":"We need reports grouped by region, not just by team.","category":"feature request","area":"reports","duplicate_of":null},{"id":33,"text":"Why does the reporting add-on cost more for annual plans?","category":"billing","area":"reports","duplicate_of":null},{"id":34,"text":"No change in our traffic, yet the API bill went from £40 to £400 this month.","category":"billing","area":"API","duplicate_of":60},{"id":35,"text":"The VAT number on the web billing page is wrong.","category":"billing","area":"web app","duplicate_of":56},{"id":36,"text":"The mobile app takes 20 seconds to open on older phones.","category":"performance","area":"mobile app","duplicate_of":null},{"id":37,"text":"Since Tuesday, every CSV I export from the reports section is blank.","category":"bug","area":"reports","duplicate_of":2},{"id":38,"text":"Opening a report with 50 charts freezes the tab.","category":"performance","area":"reports","duplicate_of":null},{"id":39,"text":"Opening the camera upload in the phone app makes it crash straight away.","category":"bug","area":"mobile app","duplicate_of":6},{"id":40,"text":"The new report builder saved our finance team hours.","category":"praise","area":"reports","duplicate_of":null},{"id":41,"text":"Typing in the browser editor lags with long documents.","category":"performance","area":"web app","duplicate_of":null},{"id":42,"text":"Any chance of webhooks in the API when a status changes?","category":"feature request","area":"API","duplicate_of":58},{"id":43,"text":"API response times have doubled since last week.","category":"performance","area":"API","duplicate_of":null},{"id":44,"text":"Big thanks for the dark mode on the phone app!","category":"praise","area":"mobile app","duplicate_of":null},{"id":45,"text":"Could the Zapier integration trigger on comment events?","category":"feature request","area":"integrations","duplicate_of":null},{"id":46,"text":"On Android the app logs me out every time I switch apps.","category":"bug","area":"mobile app","duplicate_of":null},{"id":47,"text":"Scrolling the feed in the app stutters badly on Android.","category":"performance","area":"mobile app","duplicate_of":null},{"id":48,"text":"Please add pagination cursors to the list endpoints of the API.","category":"feature request","area":"API","duplicate_of":null},{"id":49,"text":"I can't download invoices from the account page in the browser.","category":"billing","area":"web app","duplicate_of":null},{"id":50,"text":"The web app's new search is brilliant.","category":"praise","area":"web app","duplicate_of":null},{"id":51,"text":"We were billed for API calls that returned errors.","category":"billing","area":"API","duplicate_of":null},{"id":52,"text":"Since last week your API has been twice as slow to respond.","category":"performance","area":"API","duplicate_of":43},{"id":53,"text":"POST /v2/orders accepts the request but never creates the order.","category":"bug","area":"API","duplicate_of":null},{"id":54,"text":"The web dashboard shows a blank page after I log in on Firefox.","category":"bug","area":"web app","duplicate_of":null},{"id":55,"text":"The /search endpoint of the API times out on large accounts.","category":"performance","area":"API","duplicate_of":null},{"id":56,"text":"The billing page in the web app shows the wrong VAT number.","category":"billing","area":"web app","duplicate_of":null},{"id":57,"text":"The Slack integration posts every alert three times.","category":"bug","area":"integrations","duplicate_of":null},{"id":58,"text":"Can the API support webhooks for status changes?","category":"feature request","area":"API","duplicate_of":null},{"id":59,"text":"Please let us pin projects to the top of the web dashboard.","category":"feature request","area":"web app","duplicate_of":null},{"id":60,"text":"Our API usage bill jumped from £40 to £400 with no change in traffic.","category":"billing","area":"API","duplicate_of":null}],"runs":[{"arm":"one agent","labels":{"1":["praise","API",null],"2":["bug","reports",null],"3":["praise","integrations",null],"4":["feature request","mobile app",null],"5":["bug","integrations",null],"6":["bug","mobile app",null],"7":["bug","API",null],"8":["performance","integrations",null],"9":["feature request","web app",null],"10":["billing","integrations",null],"11":["performance","reports",null],"12":["billing","reports",null],"13":["praise","mobile app",null],"14":["bug","integrations",null],"15":["bug","mobile app",null],"16":["bug","reports",null],"17":["billing","mobile app",null],"18":["praise","web app",null],"19":["feature request","reports",null],"20":["praise","reports",null],"21":["billing","integrations",null],"22":["performance","web app",null],"23":["bug","integrations",null],"24":["praise","API",null],"25":["billing","web app",null],"26":["feature request","mobile app",null],"27":["bug","web app",null],"28":["performance","web app",null],"29":["praise","integrations",null],"30":["feature request","integrations",null],"31":["bug","mobile app",null],"32":["feature request","reports",null],"33":["billing","reports",null],"34":["billing","API",null],"35":["bug","web app",null],"36":["performance","mobile app",null],"37":["bug","reports",2],"38":["bug","reports",null],"39":["bug","mobile app",6],"40":["praise","reports",null],"41":["performance","web app",null],"42":["feature request","API",null],"43":["performance","API",null],"44":["praise","mobile app",null],"45":["feature request","integrations",null],"46":["bug","mobile app",null],"47":["performance","mobile app",null],"48":["feature request","API",null],"49":["bug","web app",null],"50":["praise","web app",null],"51":["billing","API",null],"52":["performance","API",43],"53":["bug","API",null],"54":["bug","web app",null],"55":["performance","API",null],"56":["bug","web app",35],"57":["bug","integrations",23],"58":["feature request","API",42],"59":["feature request","web app",null],"60":["billing","API",34]},"pairs":[[37,2],[39,6],[52,43],[56,35],[57,23],[58,42],[60,34]],"found":7,"false":0,"both":54,"distinct":53,"counts":{"bug":16,"billing":8,"feature request":10,"praise":10,"performance":9},"truth_counts":{"bug":11,"billing":11,"feature request":10,"praise":10,"performance":10},"calls":1,"tok":3048,"s":26.6},{"arm":"fan-out 4 x 15","labels":{"1":["praise","API",null],"2":["bug","reports",null],"3":["praise","integrations",null],"4":["feature request","mobile app",null],"5":["bug","integrations",null],"6":["bug","mobile app",null],"7":["bug","API",null],"8":["performance","integrations",null],"9":["feature request","web app",null],"10":["billing","integrations",null],"11":["performance","reports",null],"12":["billing","reports",null],"13":["praise","mobile app",null],"14":["bug","integrations",null],"15":["bug","mobile app",null],"16":["bug","reports",null],"17":["billing","mobile app",null],"18":["praise","web app",null],"19":["feature request","reports",null],"20":["praise","reports",null],"21":["bug","integrations",null],"22":["performance","web app",null],"23":["bug","integrations",null],"24":["praise","API",null],"25":["billing","web app",null],"26":["feature request","mobile app",null],"27":["bug","web app",null],"28":["performance","web app",22],"29":["praise","integrations",null],"30":["feature request","integrations",null],"31":["bug","mobile app",null],"32":["feature request","reports",null],"33":["billing","web app",null],"34":["bug","API",null],"35":["bug","web app",null],"36":["performance","mobile app",null],"37":["bug","reports",null],"38":["bug","web app",null],"39":["bug","mobile app",null],"40":["praise","reports",null],"41":["performance","web app",null],"42":["feature request","API",null],"43":["performance","API",null],"44":["praise","mobile app",null],"45":["feature request","integrations",null],"46":["bug","mobile app",null],"47":["performance","mobile app",null],"48":["feature request","API",null],"49":["bug","web app",null],"50":["praise","web app",null],"51":["billing","API",null],"52":["performance","API",null],"53":["bug","API",null],"54":["bug","web app",null],"55":["performance","API",null],"56":["bug","web app",null],"57":["bug","integrations",null],"58":["feature request","API",null],"59":["feature request","web app",null],"60":["billing","API",null]},"pairs":[[28,22]],"found":1,"false":0,"both":51,"distinct":59,"counts":{"bug":22,"billing":7,"feature request":11,"praise":10,"performance":9},"truth_counts":{"bug":11,"billing":11,"feature request":10,"praise":10,"performance":10},"calls":4,"tok":3355,"s":26.4},{"arm":"fan-out 12 x 5","labels":{"1":["praise","API",null],"2":["bug","reports",null],"3":["praise","integrations",null],"4":["feature request","mobile app",null],"5":["bug","integrations",null],"6":["bug","mobile app",null],"7":["bug","API",null],"8":["performance","integrations",null],"9":["feature request","web app",null],"10":["billing","integrations",null],"11":["performance","reports",null],"12":["billing","reports",null],"13":["praise","mobile app",null],"14":["bug","integrations",null],"15":["bug","mobile app",null],"16":["bug","reports",null],"17":["billing","mobile app",null],"18":["praise","web app",null],"19":["feature request","reports",null],"20":["praise","reports",null],"21":["billing","integrations",null],"22":["performance","web app",null],"23":["bug","integrations",null],"24":["praise","API",null],"25":["billing","integrations",null],"26":["feature request","mobile app",null],"27":["bug","web app",null],"28":["performance","web app",null],"29":["praise","integrations",null],"30":["feature request","integrations",null],"31":["bug","mobile app",null],"32":["feature request","reports",null],"33":["billing","web app",null],"34":["billing","API",null],"35":["bug","web app",null],"36":["performance","mobile app",null],"37":["bug","reports",null],"38":["performance","reports",null],"39":["bug","mobile app",null],"40":["praise","reports",null],"41":["performance","web app",null],"42":["feature request","API",null],"43":["performance","API",null],"44":["praise","mobile app",null],"45":["feature request","integrations",null],"46":["bug","mobile app",null],"47":["performance","mobile app",null],"48":["feature request","API",null],"49":["bug","web app",null],"50":["praise","web app",null],"51":["billing","API",null],"52":["performance","API",null],"53":["bug","API",null],"54":["bug","web app",null],"55":["performance","API",null],"56":["billing","web app",null],"57":["bug","integrations",null],"58":["feature request","API",null],"59":["feature request","web app",null],"60":["billing","API",null]},"pairs":[],"found":0,"false":0,"both":54,"distinct":60,"counts":{"bug":18,"billing":10,"feature request":11,"praise":10,"performance":11},"truth_counts":{"bug":11,"billing":11,"feature request":10,"praise":10,"performance":10},"calls":12,"tok":4192,"s":27.7},{"arm":"fan-out 12 x 5 + word-overlap dedupe","labels":{"1":["praise","API",null],"2":["bug","reports",null],"3":["praise","integrations",null],"4":["feature request","mobile app",null],"5":["bug","integrations",null],"6":["bug","mobile app",null],"7":["bug","API",null],"8":["performance","integrations",null],"9":["feature request","web app",null],"10":["billing","integrations",null],"11":["performance","reports",null],"12":["billing","reports",null],"13":["praise","mobile app",null],"14":["bug","integrations",null],"15":["bug","mobile app",null],"16":["bug","reports",null],"17":["billing","mobile app",null],"18":["praise","web app",null],"19":["feature request","reports",null],"20":["praise","reports",null],"21":["billing","integrations",null],"22":["performance","web app",null],"23":["bug","integrations",null],"24":["praise","API",null],"25":["billing","integrations",null],"26":["feature request","mobile app",null],"27":["bug","web app",null],"28":["performance","web app",null],"29":["praise","integrations",null],"30":["feature request","integrations",null],"31":["bug","mobile app",null],"32":["feature request","reports",null],"33":["billing","web app",null],"34":["billing","API",null],"35":["bug","web app",null],"36":["performance","mobile app",null],"37":["bug","reports",null],"38":["performance","reports",null],"39":["bug","mobile app",null],"40":["praise","reports",null],"41":["performance","web app",null],"42":["feature request","API",null],"43":["performance","API",null],"44":["praise","mobile app",null],"45":["feature request","integrations",null],"46":["bug","mobile app",null],"47":["performance","mobile app",null],"48":["feature request","API",null],"49":["bug","web app",null],"50":["praise","web app",null],"51":["billing","API",null],"52":["performance","API",null],"53":["bug","API",null],"54":["bug","web app",null],"55":["performance","API",null],"56":["billing","web app",null],"57":["bug","integrations",null],"58":["feature request","API",null],"59":["feature request","web app",null],"60":["billing","API",null]},"pairs":[[28,22],[37,2],[57,23],[58,42],[60,34]],"found":5,"false":0,"both":54,"distinct":55,"counts":{"bug":16,"billing":9,"feature request":10,"praise":10,"performance":10},"truth_counts":{"bug":11,"billing":11,"feature request":10,"praise":10,"performance":10},"calls":12,"tok":4192,"s":27.5},{"arm":"fan-out 12 x 5 + model finds re-posts","labels":{"1":["praise","API",null],"2":["bug","reports",null],"3":["praise","integrations",null],"4":["feature request","mobile app",null],"5":["bug","integrations",null],"6":["bug","mobile app",null],"7":["bug","API",null],"8":["performance","integrations",null],"9":["feature request","web app",null],"10":["billing","integrations",null],"11":["performance","reports",null],"12":["billing","reports",null],"13":["praise","mobile app",null],"14":["bug","integrations",null],"15":["bug","mobile app",null],"16":["bug","reports",null],"17":["billing","mobile app",null],"18":["praise","web app",null],"19":["feature request","reports",null],"20":["praise","reports",null],"21":["billing","integrations",null],"22":["performance","web app",null],"23":["bug","integrations",null],"24":["praise","API",null],"25":["billing","integrations",null],"26":["feature request","mobile app",null],"27":["bug","web app",null],"28":["performance","web app",null],"29":["praise","integrations",null],"30":["feature request","integrations",null],"31":["bug","mobile app",null],"32":["feature request","reports",null],"33":["billing","web app",null],"34":["billing","API",null],"35":["bug","web app",null],"36":["performance","mobile app",null],"37":["bug","reports",null],"38":["performance","reports",null],"39":["bug","mobile app",null],"40":["praise","reports",null],"41":["performance","web app",null],"42":["feature request","API",null],"43":["performance","API",null],"44":["praise","mobile app",null],"45":["feature request","integrations",null],"46":["bug","mobile app",null],"47":["performance","mobile app",null],"48":["feature request","API",null],"49":["bug","web app",null],"50":["praise","web app",null],"51":["billing","API",null],"52":["performance","API",null],"53":["bug","API",null],"54":["bug","web app",null],"55":["performance","API",null],"56":["billing","web app",null],"57":["bug","integrations",null],"58":["feature request","API",null],"59":["feature request","web app",null],"60":["billing","API",null]},"pairs":[[37,2],[57,23],[58,42],[60,34]],"found":4,"false":0,"both":54,"distinct":56,"counts":{"bug":16,"billing":9,"feature request":10,"praise":10,"performance":11},"truth_counts":{"bug":11,"billing":11,"feature request":10,"praise":10,"performance":10},"calls":13,"tok":5621,"s":29.1}],"scale":[{"arm":"one agent","chunk":240,"labelled":240,"rows_returned":240,"both_ok":224,"calls":1,"tokens":14616,"capped":0,"seconds":131.3},{"arm":"fan-out 12 x 20","chunk":20,"labelled":240,"rows_returned":240,"both_ok":217,"calls":12,"tokens":15515,"capped":0,"seconds":111.3},{"arm":"fan-out 24 x 10","chunk":10,"labelled":240,"rows_returned":240,"both_ok":216,"calls":24,"tokens":16721,"capped":0,"seconds":109.9}]};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const items = [...D.items].sort((a, b) => a.id - b.id), BY = Object.fromEntries(items.map(it => [it.id, it]));
+  const fmt = (n) => Math.round(n).toLocaleString('en-GB');
+  $('#foTable').innerHTML = D.runs.map(r => `<tr><td><b>${esc(r.arm)}</b></td><td>${r.both}</td><td>${r.found}</td><td>${r.distinct}</td><td>${r.calls}</td><td>${fmt(r.tok)}</td><td>${r.s} s</td></tr>`).join('');
+  $('#foScale').innerHTML = D.scale.map(r => `<tr><td><b>${esc(r.arm)}</b></td><td>${r.labelled} of 240</td><td>${r.both_ok}</td><td>${r.calls}</td><td>${fmt(r.tokens)}</td><td>${r.seconds} s</td></tr>`).join('');
+  const grid = $('#foGrid');
+  grid.addEventListener('click', (e) => {
+    const sq = e.target.closest('i'); if (!sq) return;
+    const it = BY[+sq.dataset.id], r = D.runs[+v('#foA')], l = r.labels[it.id] || [];
+    $('#foItem').innerHTML = `<b>#${it.id}</b> ${esc(it.text)}<br>truth: ${it.category}, ${it.area}${it.duplicate_of ? ` · re-post of #${it.duplicate_of}` : ''} · labelled: <b>${esc(l[0] || '–')}, ${esc(l[1] || '–')}</b>`;
+  });
+  function draw() {
+    const r = D.runs[+v('#foA')];
+    grid.innerHTML = items.map(it => { const l = r.labels[it.id] || []; const ok = l[0] === it.category && l[1] === it.area; return `<i class="${ok ? '' : 'bad'} ${it.duplicate_of ? 'dup' : ''}" data-id="${it.id}" title="#${it.id}"></i>`; }).join('');
+    const found = new Set(r.pairs.map(p => p.join('-')));
+    const pairs = items.filter(it => it.duplicate_of).map(it => ({ a: it.id, b: it.duplicate_of, hit: found.has(`${Math.max(it.id, it.duplicate_of)}-${Math.min(it.id, it.duplicate_of)}`) }));
+    $('#foPairs').innerHTML = pairs.map(p => `<div class="${p.hit ? 'ok' : 'miss'}">${p.hit ? '✓' : '✗'} #${p.b} "${esc(BY[p.b].text)}" · #${p.a} "${esc(BY[p.a].text)}"</div>`).join('');
+    $('#foStats').innerHTML = `<div class="stat"><div class="k">Both labels right</div><div class="v">${r.both} of 60</div></div><div class="stat ${r.found >= 7 ? 'good' : 'warn'}"><div class="k">Re-posts found</div><div class="v">${r.found} of 8</div></div><div class="stat ${r.distinct === 52 ? 'good' : 'warn'}"><div class="k">Distinct issues</div><div class="v">${r.distinct} (truth 52)</div></div><div class="stat"><div class="k">Calls · tokens · time</div><div class="v">${r.calls} · ${fmt(r.tok)} · ${r.s} s</div></div>`;
+    const why = {
+      'one agent': 'One call saw all 60 items, so it could notice re-posts anywhere in the list.',
+      'fan-out 4 x 15': 'Only one re-post shared a chunk with its original, and that is the only one found.',
+      'fan-out 12 x 5': 'No re-post shared a chunk with its original. Every one was counted as a new issue.',
+      'fan-out 12 x 5 + word-overlap dedupe': 'After the merge, code paired items with the same labels and enough shared words: no tokens, no false pairs.',
+      'fan-out 12 x 5 + model finds re-posts': 'After the merge, one model call read all 60 labelled items and listed re-posts.' };
+    $('#foWhy').innerHTML = why[r.arm];
+    $('#foItem').textContent = 'Click a square.';
+  }
+  $('#foA').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
