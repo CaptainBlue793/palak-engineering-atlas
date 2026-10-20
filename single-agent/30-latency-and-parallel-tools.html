@@ -3,37 +3,241 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Latency &amp; Parallel Tool Calls</title>
+<title>Latency &amp; Parallel Tool Calls · Single Agent by Palak Deb Patra</title>
+<meta name="description" content="Chapter 30 of Single Agent. Where an agent's time goes, measured with qwen3:14b on three fan-out tasks with tools that take half a second: prompt processing, generation and tools per step, parallel tool calls, prompt caching, and fewer, bigger steps.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('agent-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .lt-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .lt-row { display:grid; grid-template-columns:70px 1fr 70px; gap:8px; align-items:center; font-size:12px; margin:4px 0; }
+  .lt-bar { display:flex; height:16px; border-radius:4px; overflow:hidden; background:var(--surface); border:1px solid var(--border); }
+  .lt-bar span { display:block; height:100%; }
+  .lt-pre { background:var(--accent); } .lt-gen { background:var(--amber, #d97706); } .lt-tool { background:var(--green); }
+  .lt-key { display:flex; gap:14px; font-size:11.5px; color:var(--muted); margin-top:6px; }
+  .lt-key i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:-1px; }
+  .lt-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-size:13px; }
+  .lt-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="30">
-<!-- agent:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 30</span><span class="pill">Advanced</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Latency &amp; Parallel Tool <span class="grad">Calls</span></h1>
-    <p class="lead">Where an agent run spends its time, parallel tool calls, streaming and smaller models for small steps.</p>
+    <h1>Latency &amp; Parallel <span class="grad">Tool Calls</span></h1>
+    <p class="lead">An agent's response time is the sum of its steps, and each step has three parts. The model processes the prompt, the model generates its reply, and the tools run. Which part dominates decides what to optimise. Guess wrong and you speed up the part that did not matter.</p>
+    <p class="lead">This chapter measures the three parts with qwen3:14b on three fan-out tasks: the metrics of all ten services, the errors of every service checkout calls, and the deploys of four named services. Every tool took half a second, like a slow internal API. Each task ran with tool calls executed one after another and concurrently, with and without a hint asking for parallel calls, and once more with the prompt cache deliberately defeated.</p>
+    <ul class="objectives">
+      <li><span>Break an agent run into a latency budget</span></li>
+      <li><span>Use parallel tool calls and execute them concurrently</span></li>
+      <li><span>Know when streaming helps and when it does not</span></li>
+      <li><span>Keep the prompt cache working</span></li>
+      <li><span>Prefer fewer, bigger steps</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Tokens, prefill and generation:</b> <a href="p4-tokens-and-cost.html">Primer 4</a>.</li>
+        <li><b>The agent loop:</b> <a href="02-first-agent-loop.html">Chapter 2</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>A latency budget</li>
-    <li>Parallel tool calls</li>
-    <li>Streaming</li>
-    <li>Prompt caching</li>
-    <li>Fewer, bigger steps</li>
-  </ol>
+  <h2>A latency budget</h2>
+  <p>On the all-services task with concurrent tools, the run took 6.7 seconds in three model steps. Processing prompts took <b>0.17 s</b> in total, because the server reused the cached prefix of each prompt. Generating replies took <b>5.5 s</b>. Tools took <b>1.0 s</b>. Generation was over 80% of the run, at about 12 ms per output token on this GPU. The model wrote 201 tokens in the step that requested ten tool calls and 227 in the final answer. So the first thing to cut is output tokens: compact tool arguments, a final answer of the length the user needs, and no thinking unless it pays (<a href="22-choosing-a-model.html">Chapter 22</a>). With long prompts and a cold cache the balance shifts. In <a href="p4-tokens-and-cost.html">Primer 4</a> a 4,829-token prompt took 1.6 seconds to process the first time.</p>
+
+  <h2>Parallel tool calls</h2>
+  <p>qwen3:14b put independent calls in one reply without being asked. All ten <code>get_metrics</code> calls came in a single step, the three dependency checks in one, the four deploy lists in one. The hint "request them all at once" changed nothing, because there was nothing left to change. What mattered was what the loop did with them. Executed one after another, ten half-second calls took 5.5 s and the run 11.6 s. Executed concurrently they took 1.0 s, and the run <b>6.7 s</b>, a 42% cut from one change in the harness. The four-deploys task went from 4.9 to 3.3 s, and the dependencies task from 3.7 to 2.7 s.</p>
+<pre class="code"><span class="k">from</span> concurrent.futures <span class="k">import</span> ThreadPoolExecutor
+
+<span class="k">def</span> <span class="f">run_calls</span>(calls, tools):
+    <span class="s">"""Independent calls from one model reply run at the same time; results keep the reply's order."""</span>
+    <span class="k">with</span> <span class="f">ThreadPoolExecutor</span>(max_workers=<span class="m">16</span>) <span class="k">as</span> pool:
+        <span class="k">return</span> <span class="t">list</span>(pool.<span class="f">map</span>(<span class="k">lambda</span> c: tools[c.name](**c.arguments), calls))</pre>
+  <p>Run calls concurrently only when they are independent and safe to overlap: reads, generally yes; writes to the same resource, no. Keep the results in the order the model asked for them, and cap concurrency so a reply asking for fifty calls does not overload the service behind the tools (<a href="p5-http-apis-and-errors.html">Primer 5</a>).</p>
+
+  <h2>Streaming</h2>
+  <p>Streaming sends the reply token by token as it is generated. It does not make the run finish sooner, but it changes what the user waits for. The final answer here took 2.9 s to generate; streamed, its first words would appear after about a tenth of a second. For agents, stream the final answer and show progress during tool steps ("checking 10 services…"). Streaming the tool-call steps themselves helps nobody, since a half-written tool call cannot be run.</p>
+
+  <h2>Prompt caching</h2>
+  <p>Each step re-sends the whole conversation, and a server that caches the processed prefix only has to process what is new. One version of the all-services run put the current time on the first line of the system prompt, a common pattern, so the prefix changed at every step. Prompt processing went from 22, 27 and 120 ms per step to <b>101, 118 and 234 ms</b>, from 0.17 s to 0.45 s in total, with the same prompts otherwise. On prompts of a few hundred tokens that is a small cost. On long prompts with many tools or documents it is the difference between milliseconds and seconds per step, and on hosted APIs it also changes the bill (<a href="31-cost-and-budgets.html">Chapter 31</a>). Put stable content first (system prompt, tool schemas) and anything that changes, such as the time, the user or the retrieved documents, at the end.</p>
+
+  <h2>Fewer, bigger steps</h2>
+  <p>Every model step pays for prompt processing and generation, so the number of steps is a direct latency multiplier. The all-services task took 3 model steps because the calls were batched. Called one at a time it would have needed 11, with eleven rounds of generation. Encourage batching with tools that accept several items (<code>get_metrics(services=[...])</code>), make tools return everything the next decision needs so the model does not have to come back, and merge small steps into one where the order does not matter. The opposite move, splitting work into more agents or more rounds, multiplies latency and is worth it only when it buys accuracy (<a href="13-task-decomposition.html">Chapter 13</a>).</p>
+
+  <h2>Simulator: where the seconds go</h2>
+  <p>qwen3:14b in Ollama 0.40.6, temperature 0, thinking off; every tool sleeps 0.5 s before answering; nothing else ran on the GPU. Pick a task and an execution mode to see each step's time split into prompt processing, generation and tools.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A run's latency, step by step</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="lt-l">Task</div>
+      <div class="seg" id="ltT"><button class="active" data-v="all metrics">metrics of all 10 services</button><button data-v="dependencies' errors">errors of checkout's dependencies</button><button data-v="four deploy lists">four deploy lists</button></div>
+      <div class="lt-l">Tool execution</div>
+      <div class="seg" id="ltP"><button data-v="seq">one after another</button><button class="active" data-v="par">concurrent</button><button data-v="cache">concurrent, prompt cache defeated</button></div>
+      <div id="ltBars"></div>
+      <div class="lt-key"><span><i class="lt-pre"></i>prompt processing</span><span><i class="lt-gen"></i>generation</span><span><i class="lt-tool"></i>tools</span></div>
+      <div class="lt-box" id="ltOut"></div>
+      <div class="stats" id="ltStats"></div>
+      <div class="lt-why" id="ltWhy"></div>
+    </div>
+    <div class="panel-foot">Runs with and without the parallel-calls hint were identical in steps and calls; the hint-free runs are shown. The cache-defeated run exists for the first task only.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>metrics of all 10</b>: switch between one after another and concurrent, and watch the green bar.</li>
+    <li>Any task: compare the amber bars with everything else.</li>
+    <li><b>prompt cache defeated</b>: the blue bars, small here, grow with prompt length.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Task</th><th>Model steps</th><th>Calls in one step</th><th>Wall time, sequential tools</th><th>Wall time, concurrent tools</th><th>Generation share (concurrent)</th></tr></thead>
+      <tbody>
+        <tr><td><b>Metrics of all 10 services</b></td><td>3</td><td>10</td><td>11.6 s</td><td>6.7 s</td><td>82%</td></tr>
+        <tr><td><b>Errors of checkout's dependencies</b></td><td>3</td><td>3</td><td>3.7 s</td><td>2.7 s</td><td>59%</td></tr>
+        <tr><td><b>Four deploy lists</b></td><td>2</td><td>4</td><td>4.9 s</td><td>3.3 s</td><td>82%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Measure</b> prompt processing, generation, tools per step</li>
+      <li data-k="step"><b>Cut output</b> compact calls, right-sized answers</li>
+      <li data-k="step"><b>Run calls concurrently</b> when independent</li>
+      <li data-k="step"><b>Keep the prefix stable</b> for the cache</li>
+      <li data-k="end"><b>Stream</b> the final answer; fewer, bigger steps</li>
+    </ol>
+    <figcaption><b>Speeding up an agent.</b> Optimise the part that dominates, which here was generation.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">⚡</div>
+    <div class="body"><div class="title">Use case: parallel function calling in model APIs</div><p>Model APIs added parallel tool calls in 2023 and 2024: a single reply can request several functions at once, each with its own call id. OpenAI introduced parallel function calling in late 2023, and Anthropic's and Google's APIs support several tool calls in one reply. The API only returns the requests. Running them concurrently is the application's job, and many early agent loops executed them one by one and lost the benefit, as the sequential runs here did. Agent frameworks now run independent tool calls concurrently by default. Providers also document latency guidance that matches this chapter: reduce output tokens, stream, cache stable prefixes, and use fewer round trips.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Executing a batch of independent calls one by one:</b> 11.6 s instead of 6.7 s here.</li>
+      <li><b>Optimising tools or prompts</b> when generation is 80% of the time.</li>
+      <li><b>A timestamp or user name at the top of the prompt,</b> defeating the cache.</li>
+      <li><b>Overlapping writes</b> to the same resource because "they were in one reply".</li>
+      <li><b>Not streaming the final answer.</b></li>
+      <li><b>Many small steps</b> where one batched step would do.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Your agent is slow. Where do you start?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Measure each step's prompt processing, generation and tool time before changing anything. In a measured run of 6.7 seconds, generation was 5.5, tools 1.0 and prompt processing 0.17 thanks to caching, so the first cuts are output tokens and thinking. Then make sure independent tool calls in one reply run concurrently: that alone took a run from 11.6 to 6.7 seconds. Keep stable content at the start of the prompt for caching, stream the final answer, and reduce the number of steps with tools that take several items.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> The model already requests parallel calls. Why might the agent still be slow?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because the loop may execute them one by one. The API returns several call requests; running them concurrently is the application's job. Measured, the model batched ten calls in one reply whether or not it was asked to, and the sequential loop still spent 5.5 seconds on them against 1.0 concurrently. I would run independent reads in a bounded thread pool, keep result order, never overlap writes to the same resource, and check that the prompt prefix is stable so each step does not reprocess it.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Generation was over 80% of run time; prompt processing was 0.17 s thanks to caching.</li>
+      <li>The model batched independent calls unprompted; the loop decided whether they ran concurrently.</li>
+      <li>Concurrent execution cut the ten-service task from 11.6 to 6.7 seconds.</li>
+      <li>A changing first line made prompt processing 2.6 times slower.</li>
+      <li>Stream the final answer and prefer fewer, bigger steps.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In the measured ten-service run, which part of the time dominated?</p>
+      <div class="opts">
+        <button class="opt">Prompt processing</button>
+        <button class="opt">Tools</button>
+        <button class="opt">Generating replies: 5.5 of 6.7 seconds</button>
+        <button class="opt">Network</button>
+      </div>
+      <div class="explain">About 12 ms per output token; cut output before anything else.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What did the "request calls at once" hint change?</p>
+      <div class="opts">
+        <button class="opt">Nothing: the model already batched independent calls</button>
+        <button class="opt">It halved the steps</button>
+        <button class="opt">It made calls concurrent</button>
+        <button class="opt">It broke the agent</button>
+      </div>
+      <div class="explain">Concurrency is decided by the loop, not the model.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does streaming improve?</p>
+      <div class="opts">
+        <button class="opt">Total run time</button>
+        <button class="opt">Tool latency</button>
+        <button class="opt">Accuracy</button>
+        <button class="opt">The time until the user sees the first words of the answer</button>
+      </div>
+      <div class="explain">A 2.9-second answer starts appearing after about a tenth of a second.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why should a timestamp not go on the first line of the system prompt?</p>
+      <div class="opts">
+        <button class="opt">Models cannot read times</button>
+        <button class="opt">It changes the prefix every step, so the cached prompt cannot be reused</button>
+        <button class="opt">It adds many tokens</button>
+        <button class="opt">It is a security risk</button>
+      </div>
+      <div class="explain">Prompt processing rose from 0.17 to 0.45 s here, and far more on long prompts.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">When must tool calls from one reply NOT run concurrently?</p>
+      <div class="opts">
+        <button class="opt">When they are reads</button>
+        <button class="opt">When there are more than two</button>
+        <button class="opt">When they write to the same resource or one depends on another</button>
+        <button class="opt">Never</button>
+      </div>
+      <div class="explain">Overlap only independent, safe calls, with a cap on concurrency.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = AGENT;
+  const D = {"runs":[{"task":"all metrics","hint":false,"par":false,"wall":11.64,"steps":[{"pre":319,"gen":191,"out":16,"pt":351,"tool":500,"calls":1},{"pre":26,"gen":2485,"out":201,"pt":402,"tool":5002,"calls":10},{"pre":137,"gen":2870,"out":227,"pt":822,"tool":0,"calls":0}],"answer":"ain**: Error rate 0.3%, p99 152 ms\n- **cache**: Error rate 0.0%, p99 77 ms\n- **email**: Error rate 0.0%, p99 136 ms\n- **gateway**: Error rate 0.2%, p99 101 ms\n\nLet me know if you need further details!"},{"task":"all metrics","hint":false,"par":true,"wall":6.73,"steps":[{"pre":18,"gen":187,"out":16,"pt":351,"tool":501,"calls":1},{"pre":27,"gen":2475,"out":201,"pt":402,"tool":502,"calls":10},{"pre":121,"gen":2854,"out":227,"pt":822,"tool":0,"calls":0}],"answer":"ain**: Error rate 0.3%, p99 152 ms\n- **cache**: Error rate 0.0%, p99 77 ms\n- **email**: Error rate 0.0%, p99 136 ms\n- **gateway**: Error rate 0.2%, p99 101 ms\n\nLet me know if you need further details!"},{"task":"all metrics","hint":true,"par":false,"wall":11.31,"steps":[{"pre":101,"gen":189,"out":16,"pt":372,"tool":500,"calls":1},{"pre":26,"gen":2479,"out":201,"pt":423,"tool":5003,"calls":10},{"pre":137,"gen":2849,"out":227,"pt":843,"tool":0,"calls":0}],"answer":"ain**: Error rate 0.3%, p99 152 ms\n- **cache**: Error rate 0.0%, p99 77 ms\n- **email**: Error rate 0.0%, p99 136 ms\n- **gateway**: Error rate 0.2%, p99 101 ms\n\nLet me know if you need further details!"},{"task":"all metrics","hint":true,"par":true,"wall":6.65,"steps":[{"pre":17,"gen":186,"out":16,"pt":372,"tool":501,"calls":1},{"pre":27,"gen":2455,"out":201,"pt":423,"tool":501,"calls":10},{"pre":120,"gen":2797,"out":227,"pt":843,"tool":0,"calls":0}],"answer":"ain**: Error rate 0.3%, p99 152 ms\n- **cache**: Error rate 0.0%, p99 77 ms\n- **email**: Error rate 0.0%, p99 136 ms\n- **gateway**: Error rate 0.2%, p99 101 ms\n\nLet me know if you need further details!"},{"task":"dependencies' errors","hint":false,"par":false,"wall":3.72,"steps":[{"pre":22,"gen":235,"out":20,"pt":353,"tool":500,"calls":1},{"pre":24,"gen":686,"out":57,"pt":393,"tool":1501,"calls":3},{"pre":40,"gen":681,"out":56,"pt":512,"tool":0,"calls":0}],"answer":"ls directly in the last hour:\n\n- **Payments**: 6 occurrences of \"client closed request\"\n- **Inventory**: 5 occurrences of \"client closed request\"\n- **Orders**: 4 occurrences of \"client closed request\""},{"task":"dependencies' errors","hint":false,"par":true,"wall":2.7,"steps":[{"pre":17,"gen":235,"out":20,"pt":353,"tool":500,"calls":1},{"pre":24,"gen":687,"out":57,"pt":393,"tool":501,"calls":3},{"pre":40,"gen":679,"out":56,"pt":512,"tool":0,"calls":0}],"answer":"ls directly in the last hour:\n\n- **Payments**: 6 occurrences of \"client closed request\"\n- **Inventory**: 5 occurrences of \"client closed request\"\n- **Orders**: 4 occurrences of \"client closed request\""},{"task":"dependencies' errors","hint":true,"par":false,"wall":3.74,"steps":[{"pre":22,"gen":234,"out":20,"pt":374,"tool":500,"calls":1},{"pre":24,"gen":687,"out":57,"pt":414,"tool":1501,"calls":3},{"pre":40,"gen":681,"out":56,"pt":533,"tool":0,"calls":0}],"answer":"ls directly in the last hour:\n\n- **Payments**: 6 occurrences of \"client closed request\"\n- **Inventory**: 5 occurrences of \"client closed request\"\n- **Orders**: 4 occurrences of \"client closed request\""},{"task":"dependencies' errors","hint":true,"par":true,"wall":2.7,"steps":[{"pre":17,"gen":236,"out":20,"pt":374,"tool":500,"calls":1},{"pre":25,"gen":686,"out":57,"pt":414,"tool":501,"calls":3},{"pre":40,"gen":677,"out":56,"pt":533,"tool":0,"calls":0}],"answer":"ls directly in the last hour:\n\n- **Payments**: 6 occurrences of \"client closed request\"\n- **Inventory**: 5 occurrences of \"client closed request\"\n- **Orders**: 4 occurrences of \"client closed request\""},{"task":"four deploy lists","hint":false,"par":false,"wall":4.87,"steps":[{"pre":22,"gen":1015,"out":84,"pt":350,"tool":2001,"calls":4},{"pre":70,"gen":1722,"out":139,"pt":587,"tool":0,"calls":0}],"answer":" schema migration\n\n**Inventory:**\n- 08:06 v2.28.5: new feature flag\n\n**Orders:**\n- 07:46 v6.22.1: enabled request logging\n- 10:14 v4.25.2: schema migration\n\n**Auth:**\n- 08:27 v6.19.3: schema migration"},{"task":"four deploy lists","hint":false,"par":true,"wall":3.33,"steps":[{"pre":17,"gen":1018,"out":84,"pt":350,"tool":501,"calls":4},{"pre":69,"gen":1700,"out":139,"pt":587,"tool":0,"calls":0}],"answer":" schema migration\n\n**Inventory:**\n- 08:06 v2.28.5: new feature flag\n\n**Orders:**\n- 07:46 v6.22.1: enabled request logging\n- 10:14 v4.25.2: schema migration\n\n**Auth:**\n- 08:27 v6.19.3: schema migration"},{"task":"four deploy lists","hint":true,"par":false,"wall":4.83,"steps":[{"pre":22,"gen":1016,"out":84,"pt":371,"tool":2002,"calls":4},{"pre":70,"gen":1701,"out":139,"pt":608,"tool":0,"calls":0}],"answer":" schema migration\n\n**Inventory:**\n- 08:06 v2.28.5: new feature flag\n\n**Orders:**\n- 07:46 v6.22.1: enabled request logging\n- 10:14 v4.25.2: schema migration\n\n**Auth:**\n- 08:27 v6.19.3: schema migration"},{"task":"four deploy lists","hint":true,"par":true,"wall":3.33,"steps":[{"pre":17,"gen":1015,"out":84,"pt":371,"tool":501,"calls":4},{"pre":70,"gen":1697,"out":139,"pt":608,"tool":0,"calls":0}],"answer":" schema migration\n\n**Inventory:**\n- 08:06 v2.28.5: new feature flag\n\n**Orders:**\n- 07:46 v6.22.1: enabled request logging\n- 10:14 v4.25.2: schema migration\n\n**Auth:**\n- 08:27 v6.19.3: schema migration"}],"cache":[{"setting":"stable system prompt","pre":[22,27,120],"pt":[372,423,843]},{"setting":"timestamp first, changes every step","pre":[101,118,234],"pt":[385,436,856]}]};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  function draw() {
+    const t = v('#ltT'), p = v('#ltP');
+    let steps, wall, note = '';
+    if (p === 'cache') {
+      if (t !== 'all metrics') { $('#ltBars').innerHTML = ''; $('#ltOut').innerHTML = 'The cache-defeated run was measured on the ten-service task only; pick that task.'; $('#ltStats').innerHTML = ''; $('#ltWhy').innerHTML = ''; return; }
+      const base = D.runs.find(r => r.task === t && r.par && !r.hint), c = D.cache[1], c0 = D.cache[0];
+      steps = base.steps.map((s, i) => ({ ...s, pre: c.pre[i] ?? s.pre })); wall = null;
+      note = `Prompt processing per step: ${c0.pre.join(', ')} ms with a stable prompt; ${c.pre.join(', ')} ms with the time on the first line.`;
+    } else {
+      const r = D.runs.find(x => x.task === t && x.par === (p === 'par') && !x.hint); steps = r.steps; wall = r.wall;
+    }
+    const tot = (s) => s.pre + s.gen + s.tool, max = Math.max(...D.runs.flatMap(r => r.steps.map(tot)));
+    $('#ltBars').innerHTML = steps.map((s, i) => `<div class="lt-row"><span>step ${i + 1}</span><div class="lt-bar" style="width:${(100 * tot(s) / max).toFixed(1)}%"><span class="lt-pre" style="width:${(100 * s.pre / tot(s)).toFixed(1)}%"></span><span class="lt-gen" style="width:${(100 * s.gen / tot(s)).toFixed(1)}%"></span><span class="lt-tool" style="width:${(100 * s.tool / tot(s)).toFixed(1)}%"></span></div><span>${(tot(s) / 1000).toFixed(2)} s</span></div>`).join('');
+    $('#ltOut').innerHTML = steps.map((s, i) => `<div class="small">Step ${i + 1}: ${s.pt} prompt tokens, ${s.out} output tokens, ${s.calls} tool call${s.calls === 1 ? '' : 's'} · ${s.pre} ms processing, ${s.gen} ms generating, ${s.tool} ms tools</div>`).join('') + (note ? `<div class="small" style="margin-top:6px">${esc(note)}</div>` : '');
+    const sum = (k) => steps.reduce((a, s) => a + s[k], 0);
+    $('#ltStats').innerHTML = `<div class="stat"><div class="k">Prompt processing</div><div class="v">${(sum('pre') / 1000).toFixed(2)} s</div></div><div class="stat warn"><div class="k">Generation</div><div class="v">${(sum('gen') / 1000).toFixed(2)} s</div></div><div class="stat"><div class="k">Tools${wall ? ' · whole run' : ''}</div><div class="v">${(sum('tool') / 1000).toFixed(2)} s${wall ? ' · ' + wall.toFixed(1) + ' s' : ''}</div></div>`;
+    $('#ltWhy').innerHTML = p === 'seq' ? 'Calls from one reply run one after another: tool time is the sum of every call.' : p === 'par' ? 'Calls from one reply run at the same time: tool time is the slowest call in each step.' : 'The same run with the current time on the first line of the system prompt, so the cached prefix could not be reused.';
+  }
+  for (const id of ['#ltT', '#ltP']) $(id).addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
