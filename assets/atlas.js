@@ -393,7 +393,10 @@
       c1: '#be123c', c2: '#7c3aed', d1: '#fb7185', d2: '#a78bfa',
       soon: true,
       store: 'agent',
+      indexVar: 'AGENT_INDEX',
       dir: 'single-agent',
+      first: 'p1-python-for-agents.html',
+      dist: 'single-agent-course.html',
     },
     {
       id: 'multi-agent',

@@ -6,8 +6,7 @@
    for every chapter that doesn't exist yet. Once a chapter is
    written, assets/app.js is the source of truth for its
    title/blurb; `cover` is only the planned outline.
-   DRAFT (2026-10-20): waiting for the owner's approval; changes
-   welcome before chapters are written.
+   APPROVED by the owner (2026-10-20); measured with qwen3:14b.
    Scope: building one agent that works: a model in a loop with
    tools, its prompt and context, planning, memory, sandboxing
    and permissions, and evaluating an agent that acts on its own.
