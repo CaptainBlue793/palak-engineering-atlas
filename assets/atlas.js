@@ -410,7 +410,10 @@
       c1: '#1d4ed8', c2: '#9333ea', d1: '#60a5fa', d2: '#c084fc',
       soon: true,
       store: 'mas',
+      indexVar: 'MAS_INDEX',
       dir: 'multi-agent',
+      first: 'p1-one-agent-recap.html',
+      dist: 'multi-agent-course.html',
     },
   ];
 

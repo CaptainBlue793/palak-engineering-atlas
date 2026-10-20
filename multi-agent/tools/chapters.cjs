@@ -6,9 +6,9 @@
    for every chapter that doesn't exist yet. Once a chapter is
    written, assets/app.js is the source of truth for its
    title/blurb; `cover` is only the planned outline.
-   DRAFT (2026-10-20): waiting for the owner's approval; changes
-   welcome before chapters are written. A shorter course by the
-   owner's choice (~30 lessons): P1–P4 + 26 chapters.
+   APPROVED by the owner (2026-10-20). A shorter course by the
+   owner's choice (~30 lessons): P1–P4 + 26 chapters; measured
+   with qwen3:14b.
    Scope: several agents working together: when that beats one
    agent, orchestration patterns, hand-offs, shared state, agent
    protocols, coordination failures, cost and evaluation.
