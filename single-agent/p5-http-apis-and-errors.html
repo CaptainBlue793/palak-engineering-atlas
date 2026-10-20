@@ -3,37 +3,292 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Calling APIs: Timeouts, Retries &amp; Rate Limits</title>
+<title>Calling APIs: Timeouts, Retries &amp; Rate Limits · Single Agent by Palak Deb Patra</title>
+<meta name="description" content="P5 of Single Agent. Requests and status codes, timeouts, retries with backoff and jitter, rate limits and idempotency keys for the APIs an agent's tools call, measured against a deliberately flaky local API.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('agent-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ap-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ap-v { display:none; } .ap-v.on { display:block; }
+  .ap-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-size:13px; }
+  .ap-row { display:grid; grid-template-columns:210px 1fr 90px; gap:8px; align-items:center; padding:4px 0; font-size:12.5px; }
+  @media (max-width:640px) { .ap-row { grid-template-columns:1fr 70px; } .ap-row .ap-track { grid-column:1 / -1; } }
+  .ap-row.on b { color:var(--accent); }
+  .ap-track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; display:flex; }
+  .ap-track i { display:block; height:100%; }
+  .ap-dots { display:flex; flex-wrap:wrap; gap:3px; margin-top:8px; }
+  .ap-dots i { width:10px; height:10px; border-radius:2px; background:var(--green); }
+  .ap-dots i.d2 { background:var(--amber); } .ap-dots i.d3 { background:var(--red); }
+  .ap-key { font-size:11.5px; color:var(--muted); margin-top:6px; }
+  .ap-key i { display:inline-block; width:10px; height:10px; border-radius:2px; vertical-align:-1px; margin:0 4px 0 10px; }
+  .ap-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="0.5">
-<!-- agent:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 5</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Calling APIs: <span class="grad">Timeouts, Retries &amp; Rate Limits</span></h1>
-    <p class="lead">HTTP calls that fail the way real tools fail, and the timeouts, retries and backoff that keep a loop alive.</p>
+    <h1>Calling APIs: Timeouts, Retries &amp; <span class="grad">Rate Limits</span></h1>
+    <p class="lead">Most agent tools are thin wrappers around someone else's API: a ticketing system, a payments provider, a search service, a cloud console. Those APIs are slow sometimes, fail sometimes and refuse to serve you when you call too often. An agent loop calls them more often and more erratically than any person would, so the plumbing around each call (timeouts, retries, rate limits and idempotency) decides whether a run finishes, how long it takes and whether it does something twice.</p>
+    <p class="lead">This chapter builds that plumbing in Python and measures it against a local API written to misbehave in the ways real ones do: one request in five fails, a few take seconds, a rate limit allows five calls a second, and a refund endpoint sometimes commits the refund and then answers too late.</p>
+    <ul class="objectives">
+      <li><span>Read status codes as "retry", "fix the request" or "stop"</span></li>
+      <li><span>Set timeouts that bound the slowest calls</span></li>
+      <li><span>Retry with exponential backoff and jitter, a limited number of times</span></li>
+      <li><span>Stay under a rate limit instead of fighting it</span></li>
+      <li><span>Make retried writes safe with idempotency keys</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>httpx and asyncio:</b> <a href="p1-python-for-agents.html">P1</a>.</li>
+        <li><b>The same ideas from the server's side:</b> Backend &amp; API <a href="../backend-api/15-idempotency.html">Chapter 15</a> (idempotency) and <a href="../backend-api/19-rate-limiting.html">Chapter 19</a> (rate limiting); Distributed Systems <a href="../distributed-systems/04-retries-idempotency.html">Chapter 4</a> (retries) (all optional).</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Requests and status codes</li>
-    <li>Timeouts</li>
-    <li>Retries and backoff</li>
-    <li>Rate limits</li>
-    <li>Idempotency</li>
-  </ol>
+  <h2>Requests and status codes</h2>
+  <p>A status code tells the tool what to do next, and it is worth deciding once, in code, rather than leaving it to the model each time. Codes in the <b>2xx</b> range mean success. <b>4xx</b> means the request itself was wrong: retrying the same request will fail the same way, so the error goes back to the model to fix the arguments (400, 404, 422), or to a person (401, 403). Two 4xx codes are exceptions: <b>408</b> (request timeout) and <b>429</b> (too many requests) are worth retrying later. <b>5xx</b> means the server failed; 502, 503 and 504 are usually temporary, while a 500 may not be.</p>
+<pre class="code">RETRY = {<span class="m">408</span>, <span class="m">429</span>, <span class="m">500</span>, <span class="m">502</span>, <span class="m">503</span>, <span class="m">504</span>}
+
+<span class="k">def</span> <span class="f">classify</span>(status: <span class="t">int</span>) -&gt; <span class="t">str</span>:
+    <span class="k">if</span> status &lt; <span class="m">300</span>:     <span class="k">return</span> <span class="s">"ok"</span>
+    <span class="k">if</span> status <span class="k">in</span> RETRY: <span class="k">return</span> <span class="s">"retry"</span>          <span class="c"># the tool retries, the model never sees it</span>
+    <span class="k">if</span> status <span class="k">in</span> (<span class="m">401</span>, <span class="m">403</span>): <span class="k">return</span> <span class="s">"stop"</span>    <span class="c"># credentials: a person must act</span>
+    <span class="k">return</span> <span class="s">"fix"</span>                                <span class="c"># 400, 404, 409, 422: tell the model what was wrong</span></pre>
+
+  <h2>Timeouts</h2>
+  <p>Without a timeout, one stuck call holds up the whole agent. With one, you choose how long the slowest call may take. Latency in real services has a long tail: in the test API, the median call took 76 ms, but one in a hundred took over 1.7 s and the slowest 4.3 s. A 1-second timeout followed by a retry cut the 99th percentile of the whole operation from 3.4 s to 1.3 s, because a fresh attempt is usually fast. httpx's default timeout is 5 seconds; set one per tool that matches what the tool should take, and remember the whole agent step waits for the slowest tool.</p>
+
+  <h2>Retries and backoff</h2>
+  <p>Retrying a temporary failure turns most of them into successes. Against an API that failed 20% of calls at random, one attempt succeeded 235 times in 300; up to four attempts succeeded 299 and 300 times. Two rules keep retries from making things worse. Cap them: three retries, then report the failure. And wait between them, longer each time, with randomness: <b>exponential backoff with full jitter</b> waits a random time between zero and a limit that doubles with each attempt. Against random failures, waiting made little difference. Against a server that is overloaded or rate-limiting you, it is the difference between recovering and keeping it overloaded, as the next section measures.</p>
+<pre class="code"><span class="k">import</span> random, time, httpx
+
+<span class="k">def</span> <span class="f">get_with_retries</span>(client: httpx.<span class="t">Client</span>, url: <span class="t">str</span>, tries: <span class="t">int</span> = <span class="m">4</span>, timeout: <span class="t">float</span> = <span class="m">1.0</span>) -&gt; httpx.<span class="t">Response</span>:
+    <span class="k">for</span> attempt <span class="k">in</span> <span class="f">range</span>(tries):
+        <span class="k">try</span>:
+            r = client.<span class="f">get</span>(url, timeout=timeout)
+            <span class="k">if</span> <span class="f">classify</span>(r.status_code) != <span class="s">"retry"</span>:
+                <span class="k">return</span> r
+            wait = <span class="f">float</span>(r.headers.<span class="f">get</span>(<span class="s">"Retry-After"</span>, <span class="m">0</span>))
+        <span class="k">except</span> httpx.<span class="t">TimeoutException</span>:
+            wait = <span class="m">0</span>
+        <span class="k">if</span> attempt &lt; tries - <span class="m">1</span>:
+            time.<span class="f">sleep</span>(<span class="f">max</span>(wait, random.<span class="f">uniform</span>(<span class="m">0</span>, <span class="m">0.1</span> * <span class="m">2</span> ** attempt)))   <span class="c"># full jitter: 0-0.1, 0-0.2, 0-0.4 s</span>
+    <span class="k">raise</span> <span class="t">RuntimeError</span>(<span class="s">f"{url}: still failing after {tries} attempts"</span>)</pre>
+
+  <h2>Rate limits</h2>
+  <p>APIs limit how often you may call them and answer <b>429 Too Many Requests</b> when you go over, often with a <code>Retry-After</code> header saying how many seconds to wait. An agent that fans out tool calls hits these limits easily. Measured with 40 concurrent calls against a limit of 5 a second: retrying a 429 straight away produced a storm of 860 requests, 842 of them refused, and only 18 calls finished within 30 attempts each. Honouring <code>Retry-After</code> finished 38 calls but still sent 587 requests, because 40 clients that all wait the advised time come back together. A <b>client-side token bucket</b> that releases 4.5 requests a second, just under the limit, finished all 40 with exactly 40 requests and no 429s, in 8.7 s. If you know the limit, keep under it; treat 429s as the exception.</p>
+<pre class="code"><span class="k">class</span> <span class="t">Bucket</span>:
+    <span class="s">"""Release at most `rate` requests per second across all callers."""</span>
+    <span class="k">def</span> <span class="f">__init__</span>(self, rate: <span class="t">float</span>):
+        self.rate, self.next = rate, time.<span class="f">monotonic</span>()
+    <span class="k">async def</span> <span class="f">take</span>(self):
+        now = time.<span class="f">monotonic</span>()
+        wait = <span class="f">max</span>(<span class="m">0.0</span>, self.next - now)
+        self.next = <span class="f">max</span>(now, self.next) + <span class="m">1</span> / self.rate
+        <span class="k">if</span> wait: <span class="k">await</span> asyncio.<span class="f">sleep</span>(wait)</pre>
+
+  <h2>Idempotency</h2>
+  <p>A timeout does not mean the request failed. It means you stopped waiting. If the server had already done the work, a retry does it again. Measured with a refund endpoint that saved the refund and then, three times in ten, answered after the client's one-second timeout: 200 refunds retried without protection produced <b>268 refunds; 55 orders were refunded two or three times</b>. Sending an <b>Idempotency-Key</b> header, the same key on every attempt for the same refund, let the server recognise the repeats and return the first result: exactly 200 refunds. Reads (GET) are safe to retry; writes are safe to retry only with a key or an operation that is naturally idempotent, such as "set status to closed".</p>
+<pre class="code"><span class="k">def</span> <span class="f">refund</span>(client: httpx.<span class="t">Client</span>, order_id: <span class="t">str</span>, amount: <span class="t">int</span>) -&gt; <span class="t">dict</span>:
+    key = <span class="s">f"refund-{order_id}-{amount}"</span>               <span class="c"># same key on every attempt for this refund</span>
+    <span class="k">for</span> attempt <span class="k">in</span> <span class="f">range</span>(<span class="m">3</span>):
+        <span class="k">try</span>:
+            r = client.<span class="f">post</span>(<span class="s">"/refunds"</span>, json={<span class="s">"order"</span>: order_id, <span class="s">"amount"</span>: amount},
+                            headers={<span class="s">"Idempotency-Key"</span>: key}, timeout=<span class="m">1.0</span>)
+            <span class="k">return</span> r.<span class="f">json</span>()
+        <span class="k">except</span> httpx.<span class="t">TimeoutException</span>:
+            <span class="k">continue</span>                                     <span class="c"># safe: the server returns the first result</span>
+    <span class="k">return</span> {<span class="s">"error"</span>: <span class="s">"refund status unknown after 3 attempts; check before retrying"</span>}</pre>
+  <p>In an agent there is a second source of repeats: the model itself. A model that sees an error or a timeout often calls the same tool again, a step later, with the same arguments. Key the operation on what it does (this refund for this order), not on the attempt, and the server catches both kinds of repeat.</p>
+
+  <h2>Simulator: a flaky API, measured</h2>
+  <p>A local HTTP server on the same machine played the API. <code>/flaky</code> failed 20% of requests with 503 and took a random time with a long tail (median 76 ms). <code>/limited</code> allowed 5 requests a second with a burst of 5 and returned 429 with <code>Retry-After</code>. <code>/refund</code> committed each refund, then 30% of the time replied after 1.5 s. The client was httpx 0.28.1; each strategy made 300 calls (retries), 40 concurrent calls (rate limit) or 200 refunds (idempotency).</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Plumbing for an unreliable API</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ap-l">Experiment</div>
+      <div class="seg" id="apE"><button class="active" data-v="retry">retries &amp; timeouts</button><button data-v="rate">rate limit</button><button data-v="idem">retrying a write</button></div>
+      <div class="ap-v on" id="apVr"><div class="ap-l">Strategy</div><div class="seg" id="apR"><button class="active" data-v="no retry">no retry</button><button data-v="retry 3x at once">retry 3× at once</button><button data-v="backoff + jitter">backoff + jitter</button><button data-v="backoff + jitter + 1 s timeout">… + 1 s timeout</button></div></div>
+      <div class="ap-v" id="apVl"><div class="ap-l">On a 429</div><div class="seg" id="apL"><button class="active" data-v="retry immediately">retry immediately</button><button data-v="honour Retry-After">honour Retry-After</button><button data-v="client token bucket, 4.5/s">client token bucket</button></div></div>
+      <div class="ap-v" id="apVi"><div class="ap-l">Retry</div><div class="seg" id="apI"><button class="active" data-v="retry, no key">without a key</button><button data-v="retry with Idempotency-Key">with Idempotency-Key</button></div></div>
+      <div class="ap-box" id="apOut"></div>
+      <div class="stats" id="apStats"></div>
+      <div class="ap-why" id="apWhy"></div>
+    </div>
+    <div class="panel-foot">Server: Python ThreadingHTTPServer on localhost with seeded randomness. Latency percentiles are for the whole operation including retries and waits. The rate-limit strategies allowed each of 40 callers up to 30 attempts.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>retries &amp; timeouts</b>: compare "backoff + jitter" with "… + 1 s timeout". Same success, but the slowest calls are cut off and retried instead of waited for.</li>
+    <li><b>rate limit</b>: look at requests sent, not just calls finished. The storm sent 48 requests for every one that got through.</li>
+    <li><b>retrying a write</b>: each red square is an order refunded three times. Nothing in the client's view looked wrong: every call eventually returned success.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Problem</th><th>Symptom in an agent</th><th>Fix in the tool</th><th>Measured here</th></tr></thead>
+      <tbody>
+        <tr><td><b>Temporary 5xx</b></td><td>Random tool errors, wasted steps</td><td>Retry 3×, backoff with jitter</td><td>235 → 300 of 300 succeeded</td></tr>
+        <tr><td><b>Slow tail</b></td><td>Steps that hang for seconds</td><td>Per-call timeout, then retry</td><td>p99 3.4 s → 1.3 s</td></tr>
+        <tr><td><b>Rate limit</b></td><td>Bursts of 429s on fan-out</td><td>Client-side limiter under the limit</td><td>860 requests for 18 calls → 40 for 40</td></tr>
+        <tr><td><b>Retried write</b></td><td>Duplicate refunds, tickets, emails</td><td>Idempotency key per operation</td><td>268 refunds for 200 orders → 200</td></tr>
+        <tr><td><b>Bad request (4xx)</b></td><td>The same failing call, repeated</td><td>No retry: return the error to the model</td><td>See Chapter 8</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="seq" data-actors="Agent|refund tool|Payments API">
+    <ol>
+      <li data-m="0>1">refund order 1042, £25</li>
+      <li data-m="1>2">POST /refunds, Idempotency-Key: refund-1042-25</li>
+      <li data-m="2>2">refund saved</li>
+      <li data-m="1>1" data-k="bad">no reply after 1 s: timeout</li>
+      <li data-m="1>2">POST /refunds, same key</li>
+      <li data-m="2>1" data-k="reply">key seen before: return the first result</li>
+      <li data-m="1>0" data-k="reply">refund 7731 created<small>one refund, not two</small></li>
+    </ol>
+    <figcaption><b>A retried write with an idempotency key.</b> The timeout hid a success; the key lets the server answer the repeat without doing the work again.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">💳</div>
+    <div class="body"><div class="title">Use case: Stripe's idempotency keys</div><p>Stripe's API lets a client send an <code>Idempotency-Key</code> header with any POST request. The first request with a given key is processed and its result, whether success or error, is stored; repeats with the same key within 24 hours get that stored result back instead of creating a second charge or refund, and a repeat with the same key but different parameters is rejected. Stripe's own client libraries generate a key automatically and reuse it when they retry a request after a network failure. The design exists for the case measured in this chapter, a timeout that hides a successful write, and an agent with a refund tool is a client that will hit it: from the network, and from a model that decides to try again. Backend &amp; API <a href="../backend-api/41-case-stripe-idempotency.html">Chapter 41</a> looks at it from the server's side.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>No timeout,</b> so one stuck API call hangs the agent.</li>
+      <li><b>Retrying 4xx errors</b> that will fail the same way every time.</li>
+      <li><b>Retrying forever, or immediately,</b> so an overloaded service stays overloaded.</li>
+      <li><b>Answering 429s with more requests</b> instead of slowing down before the limit.</li>
+      <li><b>Retrying writes without an idempotency key,</b> so a timeout turns into a duplicate refund.</li>
+      <li><b>Letting the model handle transient errors</b> that the tool could have retried in a few milliseconds.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Your agent's tool calls a ticketing API that sometimes returns 503. Should the tool retry, or should it return the error to the model?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The tool should retry. A 503 is temporary and says nothing about the request, so the model cannot do anything useful with it except try again, and each round trip through the model costs a full step of tokens and seconds. In the tool I would retry up to three times with exponential backoff and jitter, honour Retry-After if the API sends one, and use a timeout per attempt. Only if it still fails would I return a clear error to the model, saying the service is unavailable, so it can tell the user or move on. Errors that mean the request was wrong, like 400 or 422, go straight back to the model with the details, because retrying them is pointless.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Finance reports that a few customers got two refunds after your agent processed refund requests. How could that happen, and how do you prevent it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Most likely a refund request timed out after the payments API had already processed it, and something retried: the tool's retry logic, or the model calling the refund tool again after seeing an error. Without an idempotency key the API treated each attempt as a new refund; measured, retried refunds with a 30% slow-reply rate created 268 refunds for 200 orders. The fix is an idempotency key derived from the operation, such as the order and amount, sent on every attempt, so repeats return the original result; plus a check in the tool for an existing refund before creating one, a reconciliation report, and treating "status unknown" as its own result the model must not retry blindly.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Decide per status code: retry (408, 429, 5xx), fix the request (other 4xx) or stop (401, 403).</li>
+      <li>Every call gets a timeout; a 1 s timeout plus retry cut p99 from 3.4 s to 1.3 s.</li>
+      <li>Retry a few times with exponential backoff and jitter, inside the tool, not through the model.</li>
+      <li>Stay under rate limits with a client-side limiter: 40 calls in 40 requests instead of 860.</li>
+      <li>A timeout can hide a success; retried writes need idempotency keys (268 refunds became 200).</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which response should a tool retry automatically?</p>
+      <div class="opts">
+        <button class="opt">400 Bad Request</button>
+        <button class="opt">403 Forbidden</button>
+        <button class="opt">503 Service Unavailable</button>
+        <button class="opt">422 Unprocessable Entity</button>
+      </div>
+      <div class="explain">503 is temporary. The 4xx errors here will fail the same way on every retry.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Retrying refunds after timeouts created 268 refunds for 200 orders. Why?</p>
+      <div class="opts">
+        <button class="opt">The server had saved the refund before the client gave up, and each retry was treated as a new refund</button>
+        <button class="opt">The server was overloaded</button>
+        <button class="opt">The rate limit was exceeded</button>
+        <button class="opt">The client sent duplicate order IDs</button>
+      </div>
+      <div class="explain">A timeout means you stopped waiting, not that nothing happened. An idempotency key brought it to exactly 200.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Forty callers hit a 5-per-second limit. Which approach finished all 40 with the fewest requests?</p>
+      <div class="opts">
+        <button class="opt">Retrying each 429 immediately</button>
+        <button class="opt">Honouring Retry-After</button>
+        <button class="opt">More concurrent connections</button>
+        <button class="opt">A client-side token bucket set just under the limit</button>
+      </div>
+      <div class="explain">40 requests and no 429s, against 587 for Retry-After and 860 for immediate retries.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why add random jitter to backoff waits?</p>
+      <div class="opts">
+        <button class="opt">To make retries faster on average</button>
+        <button class="opt">So that many clients that failed together do not all retry at the same moment</button>
+        <button class="opt">Because servers require it</button>
+        <button class="opt">To avoid timeouts</button>
+      </div>
+      <div class="explain">Synchronised retries recreate the overload they are recovering from.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What did a 1-second timeout plus retry change against the slow-tailed API?</p>
+      <div class="opts">
+        <button class="opt">It lowered the success rate</button>
+        <button class="opt">Nothing</button>
+        <button class="opt">It cut the 99th-percentile time from 3.4 s to 1.3 s with the same success rate</button>
+        <button class="opt">It doubled the median time</button>
+      </div>
+      <div class="explain">A fresh attempt is usually fast, so cutting off the slowest and retrying shortens the tail.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = AGENT;
+  const D = {"retry":{"no retry":{"success":235,"n":300,"attempts":300,"p50_ms":76,"p95_ms":572,"p99_ms":1729,"max_ms":4342},"retry 3x at once":{"success":299,"n":300,"attempts":373,"p50_ms":99,"p95_ms":834,"p99_ms":1397,"max_ms":2669},"backoff + jitter":{"success":300,"n":300,"attempts":371,"p50_ms":109,"p95_ms":825,"p99_ms":3371,"max_ms":5812},"backoff + jitter + 1 s timeout":{"success":300,"n":300,"attempts":359,"p50_ms":89,"p95_ms":664,"p99_ms":1323,"max_ms":3022}},"rate":{"retry immediately":{"done":18,"requests_sent":860,"got_429":842,"seconds":2.71},"honour Retry-After":{"done":38,"requests_sent":587,"got_429":549,"seconds":6.89},"client token bucket, 4.5/s":{"done":40,"requests_sent":40,"got_429":0,"seconds":8.69}},"idem":{"retry, no key":{"orders":200,"refund_rows":268,"orders_refunded_twice_or_more":55,"max_per_order":3},"retry with Idempotency-Key":{"orders":200,"refund_rows":200,"orders_refunded_twice_or_more":0,"max_per_order":1}},"idemCounts":{"retry, no key":[1,1,1,1,1,1,2,1,1,1,2,2,1,3,1,1,2,2,3,3,1,2,1,1,2,1,1,1,2,3,1,1,2,1,1,1,1,1,1,1,2,2,1,2,1,1,3,1,2,1,1,1,1,1,1,2,1,1,2,2,1,1,1,1,1,1,1,3,1,1,3,1,1,2,1,1,1,2,2,1,2,1,1,1,2,2,2,1,1,1,1,1,1,1,2,2,1,1,1,1,1,3,1,1,1,1,1,1,1,1,1,2,1,1,2,1,1,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,1,1,2,1,1,1,1,1,1,1,3,1,2,1,2,3,1,3,1,1,1,1,2,2,2,2,1,2,2,1,1,1,1,1,1,1,1,2,1,1,1,1,1,1,3,1,2,1,1,1,3,1,1,1,1,2,1,1,1,1,1],"retry with Idempotency-Key":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const n0 = (x) => Math.round(x).toLocaleString('en-GB');
+  function draw() {
+    const e = v('#apE');
+    $('#apVr').classList.toggle('on', e === 'retry'); $('#apVl').classList.toggle('on', e === 'rate'); $('#apVi').classList.toggle('on', e === 'idem');
+    let out = '', stats = '', why = '';
+    if (e === 'retry') {
+      const k = v('#apR'), all = D.retry, maxp = Math.max(...Object.values(all).map(r => r.p99_ms));
+      out = Object.entries(all).map(([name, r]) => `<div class="ap-row${name === k ? ' on' : ''}"><b>${name}</b><span class="ap-track" title="p50 / p95 / p99"><i style="width:${100 * r.p50_ms / maxp}%;background:var(--green)"></i><i style="width:${100 * (r.p95_ms - r.p50_ms) / maxp}%;background:var(--amber)"></i><i style="width:${100 * (r.p99_ms - r.p95_ms) / maxp}%;background:var(--red)"></i></span><span>${r.success}/${r.n} ok</span></div>`).join('') +
+        `<div class="ap-key"><i style="background:var(--green)"></i>median <i style="background:var(--amber)"></i>to p95 <i style="background:var(--red)"></i>to p99 (time for the whole operation)</div>`;
+      const r = all[k];
+      stats = `<div class="stat ${r.success === r.n ? 'good' : 'warn'}"><div class="k">Succeeded</div><div class="v">${r.success} of ${r.n}</div></div><div class="stat"><div class="k">Requests sent</div><div class="v">${r.attempts}</div></div><div class="stat"><div class="k">Median</div><div class="v">${r.p50_ms} ms</div></div><div class="stat"><div class="k">p99</div><div class="v">${n0(r.p99_ms)} ms</div></div><div class="stat"><div class="k">Slowest</div><div class="v">${n0(r.max_ms)} ms</div></div>`;
+      why = { 'no retry': '<b>One in five calls fails, and the agent sees every failure.</b> 235 of 300 succeeded; each of the other 65 would cost the agent a step to notice and try again.', 'retry 3x at once': '<b>Retries fix random failures.</b> 299 of 300 succeeded for 24% more requests. Retrying at once works here because the failures are random, not caused by load.', 'backoff + jitter': '<b>All 300 succeeded.</b> The waits add a little to the median. Against random failures they buy little; against an overloaded or rate-limiting server they are what stops a retry storm.', 'backoff + jitter + 1 s timeout': '<b>Same success, shorter tail.</b> Calls that would have taken several seconds were abandoned at 1 s and retried, usually quickly: p99 fell from 3.4 s to 1.3 s.' }[k];
+    } else if (e === 'rate') {
+      const k = v('#apL'), all = D.rate, maxs = Math.max(...Object.values(all).map(r => r.requests_sent));
+      out = Object.entries(all).map(([name, r]) => `<div class="ap-row${name === k ? ' on' : ''}"><b>${name}</b><span class="ap-track"><i style="width:${100 * (r.requests_sent - r.got_429) / maxs}%;background:var(--green)"></i><i style="width:${100 * r.got_429 / maxs}%;background:var(--red)"></i></span><span>${n0(r.requests_sent)} sent</span></div>`).join('') +
+        `<div class="ap-key"><i style="background:var(--green)"></i>accepted <i style="background:var(--red)"></i>refused with 429</div>`;
+      const r = all[k];
+      stats = `<div class="stat ${r.done === 40 ? 'good' : 'warn'}"><div class="k">Calls finished</div><div class="v">${r.done} of 40</div></div><div class="stat"><div class="k">Requests sent</div><div class="v">${n0(r.requests_sent)}</div></div><div class="stat ${r.got_429 ? 'warn' : 'good'}"><div class="k">429s</div><div class="v">${n0(r.got_429)}</div></div><div class="stat"><div class="k">Time</div><div class="v">${r.seconds} s</div></div>`;
+      why = { 'retry immediately': '<b>A retry storm.</b> 40 callers retrying at once sent 860 requests in under 3 s; 842 were refused, and 22 callers gave up after 30 attempts. To the API this looks like an attack.', 'honour Retry-After': '<b>Better, still noisy.</b> 38 of 40 finished, but 549 requests were refused: callers that wait the same advised time come back together and collide again.', 'client token bucket, 4.5/s': '<b>No 429s at all.</b> The client released requests just under the limit, so every request was accepted: 40 requests for 40 calls in 8.7 s, close to the 7 s the limit allows.' }[k];
+    } else {
+      const k = v('#apI'), r = D.idem[k];
+      const counts = D.idemCounts[k];
+      out = `<div class="small muted">One square per order (200), coloured by how many refunds it received.</div><div class="ap-dots">${counts.map(c => `<i class="d${Math.min(c, 3)}" title="${c} refund(s)"></i>`).join('')}</div><div class="ap-key"><i style="background:var(--green)"></i>1 refund <i style="background:var(--amber)"></i>2 <i style="background:var(--red)"></i>3</div>`;
+      stats = `<div class="stat"><div class="k">Orders</div><div class="v">200</div></div><div class="stat ${r.refund_rows > 200 ? 'warn' : 'good'}"><div class="k">Refunds created</div><div class="v">${r.refund_rows}</div></div><div class="stat ${r.orders_refunded_twice_or_more ? 'warn' : 'good'}"><div class="k">Refunded more than once</div><div class="v">${r.orders_refunded_twice_or_more}</div></div>`;
+      why = k === 'retry, no key' ? `<b>${r.refund_rows - 200} extra refunds, and every call "succeeded".</b> Each timeout hid a refund the server had already saved; the retry saved another. The client never saw an error it could have noticed.` : '<b>Exactly 200.</b> The retry carried the same key, so the server returned the stored result instead of refunding again. The timeouts still happened; they just stopped mattering.';
+    }
+    $('#apOut').innerHTML = out; $('#apStats').innerHTML = stats; $('#apWhy').innerHTML = why;
+  }
+  for (const id of ['#apE', '#apR', '#apL', '#apI']) $(id).addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
