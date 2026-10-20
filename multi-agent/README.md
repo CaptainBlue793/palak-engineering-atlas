@@ -1,35 +1,40 @@
 # Multi-Agent Systems — Interactive Course
 
-Object-oriented design for the MAS interview round, in Java: from "what is a class, really" to a
-thread-safe movie-booking system. **46 chapters across four levels, plus an 8-chapter
-Prerequisites level** (P1–P8: classes and references, encapsulation, inheritance and dispatch,
-interfaces and generics, composition, value objects and immutability, exceptions, reading UML).
+Several agents working on one job: when that beats one agent and when it does not, orchestrators
+and workers, roles, hand-offs, messages and shared state, pipelines and routing, parallel fan-out,
+critique, debate and voting, blackboards, agent protocols (MCP and A2A), frameworks, coordination
+failures, lost context, cost and latency, trust between agents, evaluation against a single-agent
+baseline, people in the loop, simulations, production architecture and debugging. **23 chapters
+across four levels plus 3 case studies, and a 4-chapter Prerequisites level** (P1–P4: one agent in
+one page, concurrency with asyncio, messages and queues, and failure in distributed work).
 
 Static site, **zero dependencies**, no build step required to read it. Open `index.html` in a
 browser; progress, quiz scores and flashcard state are saved in `localStorage` under `mas-*` keys.
 
-> **Status: complete.** All 54 pages are written. Each chapter has at least one interactive panel,
-> Java listings in the house style, a comparison table, a real-world use case, a common-mistakes box,
-> an interview drill and a five-question quiz. `grep -l mas:placeholder *.html` should print nothing.
+> **Status: in progress.** Chapters are written in order, one commit each. Pages still marked with
+> `<!-- mas:placeholder -->` are unwritten; `grep -l mas:placeholder *.html` lists them.
 
 ## The levels
 
 | Level | Chapters | What it covers |
 |---|---|---|
-| **Prerequisites** | P1–P8 | The Java object model, encapsulation, inheritance and dynamic dispatch, interfaces and generics, composition, value objects, exceptions, UML |
-| **Principles** | 1–8 | The MAS round, requirements to classes, SOLID, coupling and cohesion, relationships, class contracts, dependency injection |
-| **Design Patterns** | 9–21 | Singleton, factories, builder, adapter/facade/bridge, decorator/proxy, composite/flyweight, strategy, observer/mediator, command/memento, state, chain/template, iterator/visitor, combining patterns |
-| **Advanced MAS** | 22–30 | Thread-safe classes, producer-consumer and pools, extensibility, resilience, persistence, domain modeling, testing, refactoring, the interview playbook |
-| **Case Studies** | 31–46 | LRU cache, rate limiter, logger, pub-sub, task scheduler, file system, KV store with transactions, text editor, connection pool, parking lot, elevator, ticket booking, Splitwise, chess, vending machine/ATM, ride-hailing |
+| **Prerequisites** | P1–P4 | One agent in one page, concurrency with asyncio, messages, queues and events, failure in distributed work |
+| **Beginner** | 1–6 | Why more than one agent (and when not), a first two-agent system, roles, orchestrator and workers, hand-offs, messages vs shared state |
+| **Intermediate** | 7–13 | Pipelines and routing, parallel fan-out, critique and debate, voting and ensembles, shared memory and blackboards, agent protocols, frameworks compared |
+| **Advanced** | 14–20 | Coordination failures, context isolation, cost and latency, trust and security, evaluating multi-agent systems, humans in the team, simulations |
+| **Expert** | 21–23 | Production architecture, debugging a multi-agent run, the interview playbook |
+| **Case Studies** | 24–26 | A multi-agent research system, agents as a software company, generative agents in a simulated town |
 
-Case studies that also appear in the System Design course link to the high-level version:
-same problem, different zoom.
+Where this course meets the others, each keeps its own angle and links across: Single Agent covers
+the loop, tools, memory, sandboxing and evaluating one agent; Distributed Systems covers consensus,
+failure and queues in depth; RAG covers retrieval. This course is about deciding when several agents
+are worth it, and building them so they actually beat one.
 
 ## Study tools
 
-- **`glossary.html`**: MAS terms, each linked to the chapter that introduces it
-- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes (270 cards)
-- **`mock-interview.html`**: timed room with 18 MAS problems, a phase timer, an 8-point rubric and notes saved locally
+- **`glossary.html`**: 62 multi-agent terms, each linked to the chapter that introduces it
+- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes
+- **`mock-interview.html`**: timed room with 18 concept and design problems, a phase timer, an 8-point rubric and notes saved locally
 
 ## Tools
 
@@ -46,6 +51,8 @@ chapters start being edited by hand.
 
 ## House style
 
-Every listing is Java written the same way: interface first, constructor injection into `final`
-fields, validation at the boundary, small classes, and each design naming its pattern and the
-extension it survives.
+Listings are Python with asyncio and a local model (qwen3:14b) served by Ollama, following the same
+five rules: compare every multi-agent design with one agent on the same tasks; give every worker a
+brief with the goal, inputs, method and expected output; pass typed, schema-checked messages between
+agents; bound steps, time, tokens and concurrency per agent and per run; and give each agent only its
+own privileges, treating text from other agents as data. Every simulator is driven by real measurements.
