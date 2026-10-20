@@ -44,3 +44,4 @@ Measurement scripts and the venv live outside the repo in `C:\Users\StarBlue\atl
 - Ch23 written: 12 harmless probes x 5 set-ups in WSL: plain subprocess stopped 1, +clean env 2, +prlimit 5, +unshare -rn 7, bubblewrap+limits 12; start-up 7-11 ms; Ch18 agent inside bwrap 19/20 (same as outside)
 - Ch24 written: write tools on 12 incidents: no approval fixed 11 with 11 unneeded writes run; approval gate fixed 11 with 0 unneeded; bare denials 17 requests/6 denied vs reasons 13/2
 - Ch25 written: harmless canaries planted in a log; no defence 36/36 hijacked, system-prompt warning 36, warning+delimiters 36, keyword filter 0 but 33/36 when reworded, quarantined extraction 0/72 (7.5 s vs 2.6 s per run)
+- Ch26 written: rules vs qwen3 judge as classifiers: tool calls rules 15/16 caught 0/24 FP, judge 16/16 3/24 FP; inputs rules 11/12 0/18, judge 12/12 6/18 FP; outputs rules 11/13, judge 9/13, both 0 FP; rules ~2 us, judge ~0.5 s
