@@ -13,7 +13,7 @@ No build step, no dependencies, no server, no account. Progress is saved in your
 
 ### Option 1 — one file, offline (recommended)
 
-**[⬇ Download `ml-ai-systems-course.html`](https://github.com/CaptainBlue793/palak_ML_AI_system_playlist/releases/latest/download/ml-ai-systems-course.html)** (~2 MB)
+**[⬇ Download `ml-ai-systems-course.html`](https://github.com/CaptainBlue793/palak-engineering-atlas/raw/main/ml-ai-systems/dist/ml-ai-systems-course.html)** (~3 MB)
 
 Double-click it. The whole course opens in your browser and runs completely offline — every
 chapter, simulator, quiz and study tool is inside that single file. Nothing is installed,
@@ -23,13 +23,13 @@ Keep it on a USB stick, email it to a friend, read it on a plane.
 
 ### Option 2 — read it online
 
-**<https://captainblue793.github.io/palak_ML_AI_system_playlist/>**
+**<https://captainblue793.github.io/palak-engineering-atlas/ml-ai-systems/>**
 
 ### Option 3 — run from source
 
 ```bash
-git clone https://github.com/CaptainBlue793/palak_ML_AI_system_playlist.git
-cd palak_ML_AI_system_playlist
+git clone https://github.com/CaptainBlue793/palak-engineering-atlas.git
+cd palak-engineering-atlas/ml-ai-systems
 ```
 
 Open `index.html` in any browser. That's the whole setup.

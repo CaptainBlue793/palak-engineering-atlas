@@ -12,7 +12,7 @@ No build step, no dependencies, no server, no account. Progress is saved in your
 
 ### Option 1 — one file, offline (recommended)
 
-**[⬇ Download `system-design-course.html`](https://github.com/CaptainBlue793/palak-system-design-playlist/releases/latest/download/system-design-course.html)** (~2 MB)
+**[⬇ Download `system-design-course.html`](https://github.com/CaptainBlue793/palak-engineering-atlas/raw/main/system-design/dist/system-design-course.html)** (~3 MB)
 
 Double-click it. The whole course opens in your browser and runs completely offline — every
 chapter, simulator, quiz and study tool is inside that single file. Nothing is installed,
@@ -22,13 +22,13 @@ Keep it on a USB stick, email it to a friend, read it on a plane.
 
 ### Option 2 — read it online
 
-**<https://captainblue793.github.io/palak-system-design-playlist/>**
+**<https://captainblue793.github.io/palak-engineering-atlas/system-design/>**
 
 ### Option 3 — run from source
 
 ```bash
-git clone https://github.com/CaptainBlue793/palak-system-design-playlist.git
-cd palak-system-design-playlist
+git clone https://github.com/CaptainBlue793/palak-engineering-atlas.git
+cd palak-engineering-atlas/system-design
 ```
 
 Open `index.html` in any browser. That's the whole setup.
