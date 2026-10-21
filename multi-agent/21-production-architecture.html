@@ -3,37 +3,244 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Production Multi-Agent Architecture</title>
+<title>Production Multi-Agent Architecture · Multi-Agent Systems by Palak Deb Patra</title>
+<meta name="description" content="Chapter 21 of Multi-Agent Systems. Durable orchestration, queues and workers, state, retries and idempotency for teams of agents, measured with qwen3:14b: a release check crashed halfway at the worst moment, recovered by restarting, by resuming from checkpoints, and by checkpoints with idempotency keys.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('mas-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pa-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .pa-tl { margin-top:12px; display:flex; flex-wrap:wrap; gap:4px; }
+  .pa-tl span { font:11.5px var(--mono); padding:4px 7px; border-radius:6px; border:1px solid var(--border); background:var(--surface-2); }
+  .pa-tl span.run { border-color:var(--accent); }
+  .pa-tl span.rerun { border-color:var(--amber, #d97706); color:var(--amber, #d97706); }
+  .pa-tl span.dup { border-color:var(--red); color:var(--red); font-weight:700; }
+  .pa-tl span.crash { background:var(--red); color:#fff; border-color:var(--red); font-weight:700; }
+  .pa-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="21">
-<!-- mas:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 21</span><span class="pill">Expert</span><span class="pill">⏱ 45 min</span></div>
     <h1>Production Multi-Agent <span class="grad">Architecture</span></h1>
-    <p class="lead">Durable orchestration, queues, state stores and observability for teams of agents users depend on.</p>
+    <p class="lead">A team of agents in production runs for minutes, calls many tools, and has side effects in other systems: tickets filed, messages sent, money moved. Processes crash, machines restart and deploys happen mid-run. If the orchestration lives only in memory, a crash throws away every finished agent's work and, worse, repeats side effects when the run starts again. Production multi-agent systems are durable workflows first and agent systems second.</p>
+    <p class="lead">This chapter measures that on <a href="04-orchestrator-worker.html">Chapter 4</a>'s code-planned release check. Each worker agent checks one service and then <b>posts its finding to an external ticket system</b>, a side effect. The process crashes halfway through each of 8 releases, at the worst moment: just after a worker posted its finding and before that finding was saved. There were three ways to recover: restart from scratch; resume from a checkpoint store in SQLite holding each finished worker's finding; and the same with an idempotency key on every post. Workers ran one at a time on qwen3:14b, so the crash point is exact.</p>
+    <ul class="objectives">
+      <li><span>Make an orchestration durable, so a crash resumes</span></li>
+      <li><span>Run agents as workers behind a queue</span></li>
+      <li><span>Decide what state to store, and where</span></li>
+      <li><span>Use idempotency keys on every side effect</span></li>
+      <li><span>Name the failure modes of a production agent team</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Queues, delivery guarantees, retries and idempotency:</b> <a href="p3-messages-and-queues.html">Primer 3</a> and <a href="p4-failure-in-distributed-work.html">Primer 4</a>.</li>
+        <li><b>Checkpoints and resumption for one agent:</b> the Single Agent course, Chapter 32 (recommended).</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Durable orchestration</li>
-    <li>Queues and workers</li>
-    <li>State</li>
-    <li>Retries and idempotency</li>
-    <li>Failure modes</li>
-  </ol>
+  <h2>Durable orchestration</h2>
+  <p>A durable orchestration records each step's result before moving on, so a restart can continue rather than redo. With no checkpoints, every crash meant running every worker again. Across the 8 releases, <b>62 worker runs</b> were needed for 42 services, about 190,000 tokens. With a checkpoint store, a restart read the saved findings and ran only the workers still missing: <b>50 runs</b> and 153,000 tokens, a fifth less. Only the one worker caught mid-save had to run again. The final verdicts were identical in every design, 6 of 8 exact, because recovery should change the cost of a crash, not the answer. Workflow engines such as Temporal make this the default. Each activity's result is recorded, and a replay skips what already happened.</p>
+<pre class="code">done = store.<span class="f">done</span>(run_id)                                     <span class="c"># findings saved by an earlier attempt</span>
+<span class="k">for</span> service <span class="k">in</span> services:
+    <span class="k">if</span> service <span class="k">in</span> done: <span class="k">continue</span>                              <span class="c"># resume, do not redo</span>
+    finding = <span class="k">await</span> <span class="f">check</span>(service)                             <span class="c"># the worker agent</span>
+    tickets.<span class="f">post</span>(service, finding, key=<span class="s">f"</span>{run_id}<span class="s">:</span>{service}<span class="s">"</span>)      <span class="c"># side effect, with an idempotency key</span>
+    store.<span class="f">save</span>(run_id, service, finding)                       <span class="c"># checkpoint after the side effect</span></pre>
+
+  <h2>Queues and workers</h2>
+  <p>At scale, the orchestrator does not run workers itself. It puts tasks on a queue, and a pool of worker processes takes them, each running one agent for one task. The queue makes failure visible and recoverable. A worker that dies before acknowledging its task leaves the task to be redelivered, which is at-least-once delivery. <a href="p3-messages-and-queues.html">Primer 3</a> measured that turning 200 messages into 226 deliveries, and 26 duplicate effects for a consumer that was not idempotent. The pool size is a concurrency limit. On one GPU, <a href="16-cost-and-latency.html">Chapter 16</a> found nothing gained past about four concurrent workers. A queue also gives you a place to see the backlog, retry with backoff, and park tasks that keep failing.</p>
+
+  <h2>State</h2>
+  <p>Three kinds of state need a home outside the process. <b>Workflow state</b> is which steps are done and what they returned: the checkpoint store here, keyed by run and service. <b>Shared agent state</b> is findings, decisions and requirements, in a store with per-key writes, not a whole document that agents rewrite (<a href="11-shared-memory.html">Chapter 11</a> kept 11 of 48 findings that way). <b>Conversation state</b> is each agent's messages, kept only as long as the agent runs, and summarised or dropped after. Keep each in a store built for it, and make every write keyed so that a repeat is harmless.</p>
+
+  <h2>Retries and idempotency</h2>
+  <p>Checkpoints stop wasted work. They do not stop duplicate side effects. Restarting from scratch posted <b>20 duplicate tickets</b> across the 8 releases: every finding posted before the crash was posted again. Resuming from checkpoints cut that to <b>8</b>, exactly one per release, from the worker that had posted and then crashed before its finding was saved. No ordering of "post, then save" or "save, then post" closes that gap; one of them always leaves a window. The idempotency key closes it. The ticket system recorded each key, <code>run_id:service</code>, and treated a repeat as already done: <b>0 duplicates</b>. Every side effect an agent can cause should carry a key derived from the workflow step, never from the model's output, which may differ on a retry (<a href="p4-failure-in-distributed-work.html">Primer 4</a>).</p>
+
+  <h2>Failure modes</h2>
+  <p>The production failure modes of agent teams are those of distributed systems, plus a few of their own:</p>
+  <ul>
+    <li><b>Crashes:</b> lost work and repeated side effects, solved by checkpoints and keys.</li>
+    <li><b>Hung calls:</b> a model or tool that never answers, solved by timeouts at every level.</li>
+    <li><b>Retry storms</b> against a rate-limited model API, solved by backoff with jitter.</li>
+    <li><b>Poison tasks</b> that fail every time, solved by a retry limit and a dead-letter queue.</li>
+    <li><b>Version drift:</b> a run that started on one prompt or model version and resumed on another, solved by pinning versions per run.</li>
+    <li><b>Agent-specific failures:</b> a run that is technically healthy but wrong, such as a misread brief or a lossy hand-off. These need the evaluation and tracing of Chapters 18 and 22, not just infrastructure.</li>
+  </ul>
+
+  <h2>Simulator: crash and recovery</h2>
+  <p>Each release's workers in order: blue for the first attempt, the red block for the crash, amber for workers run again after the restart, and red names for duplicate posts in the ticket system.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">A crash halfway through</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="pa-l">Recovery</div>
+      <div class="seg" id="paD"><button class="active" data-v="restart from scratch">restart from scratch</button><button data-v="resume from checkpoints">resume from checkpoints</button><button data-v="checkpoints + idempotency keys">checkpoints + idempotency keys</button></div>
+      <div class="pa-l">Release</div>
+      <div class="seg" id="paE"></div>
+      <div class="stats" id="paStats"></div>
+      <div class="pa-tl" id="paTl"></div>
+      <div class="pa-why" id="paWhy"></div>
+    </div>
+    <div class="panel-foot">qwen3:14b, temperature 0; workers one at a time; the crash is placed just after the middle worker's post and before its finding is saved. Totals in the table are over all 8 releases.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>Restart from scratch</b> on catalog (8 services): four duplicate tickets.</li>
+    <li><b>Resume from checkpoints</b>: the single amber worker, and its one duplicate.</li>
+    <li><b>Checkpoints + idempotency keys</b>: the same rerun, no duplicate.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Recovery</th><th>Worker runs (for 42 services)</th><th>Duplicate tickets</th><th>Tokens</th><th>Time</th><th>Exact verdicts</th></tr></thead>
+      <tbody id="paTable"></tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Queue the task</b> with a run id</li>
+      <li data-k="step"><b>Worker runs one agent</b> with a timeout and a step cap</li>
+      <li data-k="step"><b>Side effect with a key</b> run id + step</li>
+      <li data-k="step"><b>Checkpoint the result</b> then acknowledge</li>
+      <li data-k="end"><b>On restart</b> skip what is saved, retry the rest</li>
+    </ol>
+    <figcaption><b>A durable step.</b> Every step is safe to run twice: the key makes the effect once-only, and the checkpoint makes the work once-only.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🏛️</div>
+    <div class="body"><div class="title">Use case: durable agents in production</div><p>Teams running long agent workflows increasingly put them on durable execution engines. Temporal, AWS Step Functions and similar systems record each step and resume after failures, and agent frameworks add their own persistence, as with LangGraph's checkpointers. Payment and ticketing APIs accept idempotency keys for exactly the retried-call case measured here. The architecture is familiar from any distributed system: a queue, a worker pool sized to the model backend's real capacity, stores for workflow and shared state, and keys on every external call. What is new is the agent itself, which is slow, costly and non-deterministic. That makes redoing work expensive and makes "just run it again" give a different answer.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Orchestration only in memory:</b> a crash cost 62 worker runs where 50 were needed.</li>
+      <li><b>Side effects without keys:</b> 20 duplicate tickets on restart, 8 even with checkpoints.</li>
+      <li><b>Keys from the model's output</b> instead of the workflow step.</li>
+      <li><b>One shared document as the state store</b> for many agents.</li>
+      <li><b>Unbounded retries</b> with no dead-letter queue.</li>
+      <li><b>Resuming on a different prompt or model version</b> than the run started with.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What makes a multi-agent workflow production-ready?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>That a crash costs a little, not everything, and never repeats an effect. Concretely: tasks on a queue, workers that run one agent each with timeouts, a checkpoint store so a restart skips finished steps, and an idempotency key on every side effect. In a test where the process crashed halfway through, restarting from scratch needed 62 worker runs and filed 20 duplicate tickets; resuming from checkpoints with keys needed 50 runs and filed none.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why are checkpoints not enough to prevent duplicate side effects?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because there is always a gap between the side effect and the checkpoint. If the process dies after posting and before saving, the restart sees the step as unfinished and posts again; in the test that left exactly one duplicate per release. Reversing the order just moves the gap, so you can lose a post instead. The receiving system has to make the second call harmless, by recording an idempotency key derived from the run and step.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Production agent teams are durable workflows first: record each step before moving on.</li>
+      <li>Checkpoints cut a crash's cost: 50 worker runs instead of 62, a fifth fewer tokens.</li>
+      <li>Checkpoints alone still left one duplicate side effect per crash; keys made it zero.</li>
+      <li>Derive keys from the workflow step, never from model output.</li>
+      <li>Infrastructure catches crashes; misread briefs and lossy hand-offs need evaluation and tracing.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What did restarting from scratch cost across the 8 crashed releases?</p>
+      <div class="opts">
+        <button class="opt">Nothing extra</button>
+        <button class="opt">62 worker runs for 42 services, and 20 duplicate tickets</button>
+        <button class="opt">A wrong verdict on every release</button>
+        <button class="opt">One duplicate ticket</button>
+      </div>
+      <div class="explain">Every finished worker ran again, and every post before the crash was repeated.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why did resuming from checkpoints still leave one duplicate per release?</p>
+      <div class="opts">
+        <button class="opt">The checkpoint store lost data</button>
+        <button class="opt">The model changed its answer</button>
+        <button class="opt">The ticket system was down</button>
+        <button class="opt">The crash came after one worker's post and before its finding was saved, so it ran and posted again</button>
+      </div>
+      <div class="explain">There is always a gap between an effect and its checkpoint.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What should an idempotency key be derived from?</p>
+      <div class="opts">
+        <button class="opt">The workflow run and step, such as run_id:service</button>
+        <button class="opt">The model's output</button>
+        <button class="opt">The current time</button>
+        <button class="opt">A random number per attempt</button>
+      </div>
+      <div class="explain">Every attempt at the same step must carry the same key.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Did the recovery design change the verdicts?</p>
+      <div class="opts">
+        <button class="opt">Yes, restarting improved them</button>
+        <button class="opt">Yes, checkpoints made them worse</button>
+        <button class="opt">No: 6 of 8 exact in every design; recovery changes cost, not the answer</button>
+        <button class="opt">Only with keys</button>
+      </div>
+      <div class="explain">Durability is about what a crash costs and repeats.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which failure does infrastructure not catch?</p>
+      <div class="opts">
+        <button class="opt">A crash</button>
+        <button class="opt">A run that is healthy but wrong, such as a misread brief or a lossy hand-off</button>
+        <button class="opt">A hung tool call</button>
+        <button class="opt">A retry storm</button>
+      </div>
+      <div class="explain">Those need the evaluation and tracing of Chapters 18 and 22.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = MAS;
+  const D = [{"design":"restart from scratch","estate":0,"target":"search","services":4,"crashed":true,"worker_runs":6,"tokens":13930,"calls":31,"posts":6,"duplicate_posts":2,"exact":true,"seconds":29.2},{"design":"restart from scratch","estate":1,"target":"pricing","services":4,"crashed":true,"worker_runs":6,"tokens":17660,"calls":36,"posts":6,"duplicate_posts":2,"exact":true,"seconds":33.3},{"design":"restart from scratch","estate":2,"target":"catalog","services":8,"crashed":true,"worker_runs":12,"tokens":39627,"calls":78,"posts":12,"duplicate_posts":4,"exact":false,"seconds":70.5},{"design":"restart from scratch","estate":3,"target":"payments","services":4,"crashed":true,"worker_runs":6,"tokens":19045,"calls":39,"posts":6,"duplicate_posts":2,"exact":true,"seconds":35.5},{"design":"restart from scratch","estate":4,"target":"checkout","services":7,"crashed":true,"worker_runs":10,"tokens":30606,"calls":62,"posts":10,"duplicate_posts":3,"exact":true,"seconds":53.6},{"design":"restart from scratch","estate":5,"target":"cache","services":4,"crashed":true,"worker_runs":6,"tokens":18907,"calls":39,"posts":6,"duplicate_posts":2,"exact":true,"seconds":34.3},{"design":"restart from scratch","estate":6,"target":"checkout","services":4,"crashed":true,"worker_runs":6,"tokens":19138,"calls":40,"posts":6,"duplicate_posts":2,"exact":true,"seconds":35.1},{"design":"restart from scratch","estate":7,"target":"media","services":7,"crashed":true,"worker_runs":10,"tokens":31443,"calls":64,"posts":10,"duplicate_posts":3,"exact":false,"seconds":54.4},{"design":"resume from checkpoints","estate":0,"target":"search","services":4,"crashed":true,"worker_runs":5,"tokens":10596,"calls":24,"posts":5,"duplicate_posts":1,"exact":true,"seconds":22.8},{"design":"resume from checkpoints","estate":1,"target":"pricing","services":4,"crashed":true,"worker_runs":5,"tokens":15860,"calls":32,"posts":5,"duplicate_posts":1,"exact":true,"seconds":28.7},{"design":"resume from checkpoints","estate":2,"target":"catalog","services":8,"crashed":true,"worker_runs":9,"tokens":28643,"calls":57,"posts":9,"duplicate_posts":1,"exact":false,"seconds":52.2},{"design":"resume from checkpoints","estate":3,"target":"payments","services":4,"crashed":true,"worker_runs":5,"tokens":15486,"calls":32,"posts":5,"duplicate_posts":1,"exact":true,"seconds":29.4},{"design":"resume from checkpoints","estate":4,"target":"checkout","services":7,"crashed":true,"worker_runs":8,"tokens":25393,"calls":51,"posts":8,"duplicate_posts":1,"exact":true,"seconds":44.4},{"design":"resume from checkpoints","estate":5,"target":"cache","services":4,"crashed":true,"worker_runs":5,"tokens":15353,"calls":32,"posts":5,"duplicate_posts":1,"exact":true,"seconds":28.5},{"design":"resume from checkpoints","estate":6,"target":"checkout","services":4,"crashed":true,"worker_runs":5,"tokens":15787,"calls":33,"posts":5,"duplicate_posts":1,"exact":true,"seconds":29.1},{"design":"resume from checkpoints","estate":7,"target":"media","services":7,"crashed":true,"worker_runs":8,"tokens":26203,"calls":53,"posts":8,"duplicate_posts":1,"exact":false,"seconds":45.6},{"design":"checkpoints + idempotency keys","estate":0,"target":"search","services":4,"crashed":true,"worker_runs":5,"tokens":10596,"calls":24,"posts":4,"duplicate_posts":0,"exact":true,"seconds":22.8},{"design":"checkpoints + idempotency keys","estate":1,"target":"pricing","services":4,"crashed":true,"worker_runs":5,"tokens":15860,"calls":32,"posts":4,"duplicate_posts":0,"exact":true,"seconds":28.7},{"design":"checkpoints + idempotency keys","estate":2,"target":"catalog","services":8,"crashed":true,"worker_runs":9,"tokens":28643,"calls":57,"posts":8,"duplicate_posts":0,"exact":false,"seconds":52.3},{"design":"checkpoints + idempotency keys","estate":3,"target":"payments","services":4,"crashed":true,"worker_runs":5,"tokens":15486,"calls":32,"posts":4,"duplicate_posts":0,"exact":true,"seconds":29.4},{"design":"checkpoints + idempotency keys","estate":4,"target":"checkout","services":7,"crashed":true,"worker_runs":8,"tokens":25393,"calls":51,"posts":7,"duplicate_posts":0,"exact":true,"seconds":44.6},{"design":"checkpoints + idempotency keys","estate":5,"target":"cache","services":4,"crashed":true,"worker_runs":5,"tokens":15353,"calls":32,"posts":4,"duplicate_posts":0,"exact":true,"seconds":28.5},{"design":"checkpoints + idempotency keys","estate":6,"target":"checkout","services":4,"crashed":true,"worker_runs":5,"tokens":15787,"calls":33,"posts":4,"duplicate_posts":0,"exact":true,"seconds":29.3},{"design":"checkpoints + idempotency keys","estate":7,"target":"media","services":7,"crashed":true,"worker_runs":8,"tokens":26203,"calls":53,"posts":7,"duplicate_posts":0,"exact":false,"seconds":45.7}];
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const DES = ['restart from scratch', 'resume from checkpoints', 'checkpoints + idempotency keys'];
+  const sum = (d, k) => D.filter(r => r.design === d).reduce((a, r) => a + (typeof r[k] === 'boolean' ? (r[k] ? 1 : 0) : r[k]), 0);
+  $('#paTable').innerHTML = DES.map(d => `<tr><td><b>${esc(d)}</b></td><td>${sum(d, 'worker_runs')}</td><td>${sum(d, 'duplicate_posts')}</td><td>${sum(d, 'tokens').toLocaleString('en-GB')}</td><td>${Math.round(sum(d, 'seconds'))} s</td><td>${sum(d, 'exact')} of 8</td></tr>`).join('');
+  const est = D.filter(r => r.design === DES[0]);
+  const segE = $('#paE');
+  segE.innerHTML = est.map((r, i) => `<button class="${i === 2 ? 'active' : ''}" data-v="${i}">${esc(r.target)} (${r.services})</button>`).join('');
+  segE.addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; segE.querySelectorAll('button').forEach(x => x.classList.toggle('active', x === b)); draw(); });
+  function draw() {
+    const d = v('#paD'), i = +segE.querySelector('.active').dataset.v, r = D.find(x => x.design === d && x.estate === i);
+    const n = r.services, crashAt = Math.max(1, Math.floor(n / 2)), keys = d.endsWith('keys');
+    let html = '';
+    for (let k = 1; k <= crashAt; k++) html += `<span class="run">worker ${k}</span>`;
+    html += '<span class="crash">crash</span>';
+    const rerunFrom = d === 'restart from scratch' ? 1 : crashAt;
+    for (let k = rerunFrom; k <= n; k++) { const again = k <= crashAt; html += `<span class="${again ? (keys ? 'rerun' : 'dup') : 'run'}">worker ${k}${again ? (keys ? ' (key seen)' : ' (posted twice)') : ''}</span>`; }
+    $('#paTl').innerHTML = html;
+    $('#paStats').innerHTML = `<div class="stat"><div class="k">Worker runs</div><div class="v">${r.worker_runs} for ${n} services</div></div><div class="stat ${r.duplicate_posts ? 'warn' : 'good'}"><div class="k">Duplicate tickets</div><div class="v">${r.duplicate_posts}</div></div><div class="stat"><div class="k">Tokens · time</div><div class="v">${r.tokens.toLocaleString('en-GB')} · ${r.seconds} s</div></div><div class="stat"><div class="k">Verdict exact</div><div class="v">${r.exact ? 'yes' : 'no'}</div></div>`;
+    $('#paWhy').innerHTML = { 'restart from scratch': 'Nothing was saved, so every worker ran again after the crash and every earlier post was repeated.',
+      'resume from checkpoints': 'Saved findings were skipped. Only the worker caught between its post and its save ran again, and its post was repeated.',
+      'checkpoints + idempotency keys': 'The same single rerun, but the ticket system had seen its key and did not post again.' }[d];
+  }
+  $('#paD').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
