@@ -19,7 +19,7 @@
    ========================================================= */
 import { apiBase, localApiBase, defaultCountryCode } from './account-config.js';
 
-const TRACK = (k) => /^(sd|ml|mlf|api|rag|agent|dsa|lld|os|net|db|dist|ops|atlas)-/.test(k);
+const TRACK = (k) => /^(sd|ml|mlf|api|rag|agent|mas|dsa|lld|os|net|db|dist|ops|atlas)-/.test(k);
 const META = '__acct-meta';    // { key: last-modified ms } for this browser
 const LAST = '__acct-uid';     // account this browser last synced with (email|phone)
 const TOKEN = '__acct-token';  // session token from the API

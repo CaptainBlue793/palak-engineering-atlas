@@ -2,7 +2,7 @@
 
 **[captainblue793.github.io/palak-engineering-atlas](https://captainblue793.github.io/palak-engineering-atlas/)**
 
-Every interactive engineering course I've written, in one place — **732 chapters (628 main chapters plus a 104-chapter Prerequisites level), ~524 hours,
+Every interactive engineering course I've written, in one place — **762 chapters (654 main chapters plus a 108-chapter Prerequisites level), ~544 hours,
 zero dependencies**. No walls of text: every chapter has animated diagrams, simulators you can
 break, an interview drill and a quiz. It all runs in your browser, offline, with no account and
 no build step.
@@ -22,6 +22,7 @@ no build step.
 | **[ML & AI Systems](ml-ai-systems/)** | 8 prerequisites + 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
 | **[RAG](rag/)** | 8 prerequisites + 48 | Chunking, embedding models, exact, HNSW and IVF vector search, BM25 and hybrid search, reranking, query rewriting, citations and grounding, evaluation, permissions, GraphRAG, prompt injection and running it in production, measured on small local models in Python — 8 case studies on the way |
 | **[Single Agent](single-agent/)** | 8 prerequisites + 48 | The agent loop, tool calling and tool errors, structured output, context engineering, planning and decomposition, memory, sandboxed code execution, MCP, prompt injection and permissions, reliability and evaluation, cost and latency, observability and debugging, coding and browser agents, measured on a local model in Python — 8 case studies on the way |
+| **[Multi-Agent Systems](multi-agent/)** | 4 prerequisites + 26 | Orchestrator and workers, hand-offs, pipelines and routing, parallel fan-out, critique, debate and voting, shared memory, A2A, frameworks compared, coordination failures, context isolation, cost, trust, evaluation, humans in the loop, simulations, production and debugging, each measured against one agent on a local model in Python — 3 case studies on the way |
 
 The Atlas home page suggests an order through the courses for each kind of role.
 
@@ -86,7 +87,8 @@ palak-engineering-atlas/
 ├── ml-fundamentals/
 ├── ml-ai-systems/
 ├── rag/
-└── single-agent/
+├── single-agent/
+└── multi-agent/
 ```
 
 ## What the Atlas adds
@@ -97,10 +99,10 @@ entry point:
 
 - **Combined progress** — reads each course's own `localStorage` key (`dsa-done`, `os-done`,
   `net-done` and so on), so ticking a chapter off inside a course shows up on the hub, and vice versa.
-  The chapter tracker on the home page has a tab per subject area: one square per chapter, 732 of them
+  The chapter tracker on the home page has a tab per subject area: one square per chapter, 762 of them
   in released courses, and outlines for the courses still to come.
 - **Resume** — deep-links to the next unread chapter of whichever course you're furthest into.
-- **Cross-course search** — `Ctrl+K` (or `/`) searches ~12,600 chapter, section and demo entries
+- **Cross-course search** — `Ctrl+K` (or `/`) searches ~13,800 chapter, section and demo entries
   across every released course at once, filterable by course, deep-linking to the exact anchor.
   The indexes load lazily after first paint, so the page opens instantly.
 - **Shared theme** — the toggle writes every course's theme key, so it carries across.

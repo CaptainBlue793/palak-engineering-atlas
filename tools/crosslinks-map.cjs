@@ -18,7 +18,7 @@
 const COURSE = {
   dsa: 'dsa', os: 'os', net: 'networks', db: 'databases', lld: 'lld',
   sd: 'system-design', dist: 'distributed-systems', ops: 'cloud-devops', ml: 'ml-ai-systems', mlf: 'ml-fundamentals',
-  api: 'backend-api', rag: 'rag', agent: 'single-agent',
+  api: 'backend-api', rag: 'rag', agent: 'single-agent', mas: 'multi-agent',
 };
 
 const TOPICS = [
@@ -52,7 +52,7 @@ const TOPICS = [
   ['Thread pools and how to size them', ['os/27', 'db/27', 'lld/23', 'lld/39']],
   ['Deadlock', ['dsa/27', 'os/22', 'db/24', 'lld/22']],
   ['Semaphores', ['os/20', 'lld/39']],
-  ['Many connections on few threads: event loops', ['os/28', 'os/29', 'os/42', 'os/44', 'net/21', 'sd/p2', 'dist/p1', 'api/p2', 'api/28']],
+  ['Many connections on few threads: event loops', ['os/28', 'os/29', 'os/42', 'os/44', 'net/21', 'sd/p2', 'dist/p1', 'api/p2', 'api/28', 'mas/p2']],
   ['Lightweight threads: goroutines and virtual threads', ['os/45', 'lld/23']],
   ['Sockets and file descriptors', ['os/09', 'os/10', 'net/p3', 'net/p5']],
   ['From the network card to the socket', ['os/06', 'os/35', 'os/42', 'net/34']],
@@ -141,10 +141,10 @@ const TOPICS = [
   ['The outbox, change data capture and dual writes', ['sd/17', 'dist/22', 'dist/28', 'ops/42', 'api/30']],
   ['Event sourcing, CQRS and logs as the source of truth', ['db/33', 'lld/27', 'sd/17', 'dist/15']],
   ['Delivery guarantees and exactly-once', ['sd/14', 'sd/18', 'sd/37', 'sd/40', 'dist/28', 'ml/28']],
-  ['Retries, backoff and idempotency', ['net/46', 'lld/25', 'sd/03', 'sd/16', 'dist/04', 'ops/p8', 'api/15', 'api/29', 'agent/p5']],
-  ['Timeouts, circuit breakers and bulkheads', ['net/32', 'lld/25', 'sd/16', 'dist/p2', 'api/29']],
+  ['Retries, backoff and idempotency', ['net/46', 'lld/25', 'sd/03', 'sd/16', 'dist/04', 'ops/p8', 'api/15', 'api/29', 'agent/p5', 'mas/p4', 'mas/21']],
+  ['Timeouts, circuit breakers and bulkheads', ['net/32', 'lld/25', 'sd/16', 'dist/p2', 'api/29', 'mas/p4']],
   ['Message queues and Kafka', ['lld/34', 'sd/14', 'sd/29', 'dist/29', 'dist/43', 'api/20']],
-  ['Publish–subscribe and the Observer pattern', ['lld/16', 'lld/34', 'sd/14', 'dist/31']],
+  ['Publish–subscribe and the Observer pattern', ['lld/16', 'lld/34', 'sd/14', 'dist/31', 'mas/p3']],
   ['Microservices and breaking up a monolith', ['lld/12', 'sd/15', 'dist/01', 'ops/47']],
   ['Testing concurrent and distributed code', ['lld/28', 'sd/19', 'dist/37', 'dist/38']],
   ['Chaos engineering and fault injection', ['sd/19', 'sd/22', 'dist/37', 'ops/34']],
@@ -163,13 +163,13 @@ const TOPICS = [
   ['Serverless', ['sd/21', 'sd/24', 'ops/26']],
   ['Scaling out and autoscaling', ['sd/04', 'sd/21', 'ops/03', 'ops/25']],
   ['Capacity planning', ['sd/04', 'sd/24', 'ops/39', 'ml/26', 'ml/38', 'api/32']],
-  ['Cost engineering', ['db/48', 'sd/24', 'ops/31', 'ops/46', 'ml/27', 'ml/38', 'rag/29', 'agent/31']],
-  ['Metrics, logs and traces', ['os/37', 'lld/33', 'sd/16', 'sd/41', 'dist/36', 'ops/21', 'ops/22', 'ops/23', 'ml/34', 'api/31', 'rag/36', 'agent/36']],
+  ['Cost engineering', ['db/48', 'sd/24', 'ops/31', 'ops/46', 'ml/27', 'ml/38', 'rag/29', 'agent/31', 'mas/16']],
+  ['Metrics, logs and traces', ['os/37', 'lld/33', 'sd/16', 'sd/41', 'dist/36', 'ops/21', 'ops/22', 'ops/23', 'ml/34', 'api/31', 'rag/36', 'agent/36', 'mas/22']],
   ['SLOs, alerting and incident response', ['sd/16', 'sd/41', 'ops/01', 'ops/24', 'ops/37', 'ops/38', 'api/39']],
   ['Real outages, taken apart', ['os/48', 'net/44', 'net/45', 'db/44', 'dist/48', 'ops/43', 'ops/44', 'ops/45']],
-  ['Authentication, authorisation and least privilege', ['os/36', 'sd/11', 'ops/06', 'ops/36', 'ops/p7', 'api/09', 'api/10', 'api/11', 'api/12', 'agent/24']],
+  ['Authentication, authorisation and least privilege', ['os/36', 'sd/11', 'ops/06', 'ops/36', 'ops/p7', 'api/09', 'api/10', 'api/11', 'api/12', 'agent/24', 'mas/17']],
   ['Configuration and secrets', ['lld/24', 'sd/11', 'ops/13', 'ops/28', 'api/p6']],
-  ['Attacks and their defences', ['os/36', 'os/47', 'net/03', 'net/36', 'db/p6', 'sd/11', 'ops/29', 'ml/36', 'api/33', 'rag/31', 'agent/25']],
+  ['Attacks and their defences', ['os/36', 'os/47', 'net/03', 'net/36', 'db/p6', 'sd/11', 'ops/29', 'ml/36', 'api/33', 'rag/31', 'agent/25', 'mas/17']],
 
   /* ---------- machine learning ---------- */
   ['ML platforms: leakage, skew, evaluation and drift', ['sd/23', 'ml/01', 'ml/03', 'ml/07', 'ml/29', 'ml/32', 'ml/34', 'mlf/37', 'mlf/39']],
@@ -183,8 +183,19 @@ const TOPICS = [
   ['Retrieval-augmented generation', ['ml/21', 'ml/46', 'rag/01', 'rag/02', 'agent/17']],
   ['Search ranking and ranking metrics', ['ml/42', 'rag/p8', 'rag/13']],
   ['Fine-tuning models', ['ml/17', 'rag/33', 'agent/38']],
-  ['Evaluating LLM systems', ['ml/35', 'rag/20', 'rag/21', 'agent/27']],
-  ['Agents and tool use', ['ml/22', 'rag/34', 'agent/01', 'agent/03']],
+  ['Evaluating LLM systems', ['ml/35', 'rag/20', 'rag/21', 'agent/27', 'mas/18']],
+  ['Agents and tool use', ['ml/22', 'rag/34', 'agent/01', 'agent/03', 'mas/01']],
+  ['Planning and splitting up work', ['agent/12', 'agent/13', 'mas/04']],
+  ['Critique, reflection and self-correction', ['agent/14', 'mas/09']],
+  ['Agent memory and shared state', ['agent/16', 'mas/11']],
+  ['Agent protocols: MCP and A2A', ['agent/20', 'mas/12']],
+  ['Agent frameworks', ['agent/21', 'mas/13']],
+  ['What each agent sees: context engineering and isolation', ['agent/11', 'mas/15']],
+  ['Running model calls in parallel', ['agent/30', 'mas/p2', 'mas/08']],
+  ['Humans approving agent actions', ['agent/24', 'mas/19']],
+  ['Repeat runs: pass@k and pass^k', ['agent/p8', 'agent/29', 'mas/18']],
+  ['Agents in production: crashes, checkpoints and resuming', ['agent/32', 'agent/35', 'mas/21']],
+  ['Debugging an agent run', ['agent/37', 'mas/22']],
   ['Privacy, retention and deletion of personal data', ['ml/37', 'rag/39']],
   ['Serving LLMs', ['sd/42', 'ml/14', 'ml/26', 'ml/39', 'ml/45', 'rag/35']],
   ['Feeds, ranking and recommendations', ['sd/27', 'ml/30', 'ml/41', 'mlf/31']],
@@ -201,7 +212,7 @@ const TOPICS = [
   ['Video streaming', ['net/43', 'sd/32']],
 
   /* ---------- interviews ---------- */
-  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40', 'mlf/40', 'api/40', 'rag/40', 'agent/40']],
+  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40', 'mlf/40', 'api/40', 'rag/40', 'agent/40', 'mas/23']],
 ];
 
 module.exports = { COURSE, TOPICS };
