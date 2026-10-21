@@ -3,37 +3,312 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Autograd &amp; the Training Loop</title>
+<title>Autograd &amp; the Training Loop · LLMs by Palak Deb Patra</title>
+<meta name="description" content="P2 of LLMs. Computation graphs and backward(), gradient descent and its learning-rate limit, nn.Module, the five-line training loop, overfitting one batch and what autograd costs, measured in PyTorch.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .gd-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .gd-v { display:none; } .gd-v.on { display:block; }
+  .gd-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 12px; }
+  .gd-plot { width:100%; height:auto; display:block; }
+  .gd-plot .ax { stroke:var(--border-2); stroke-width:1; }
+  .gd-plot .grid { stroke:var(--border); stroke-width:1; stroke-dasharray:2 4; }
+  .gd-plot text { fill:var(--muted); font-size:11px; font-family:var(--mono); }
+  .gd-plot .c0 { fill:none; stroke:var(--accent); stroke-width:2.5; }
+  .gd-plot .c1 { fill:none; stroke:var(--amber); stroke-width:2.5; stroke-dasharray:6 4; }
+  .gd-plot .ref { stroke:var(--green); stroke-width:1.5; stroke-dasharray:3 3; }
+  .gd-plot .boom { fill:var(--red); font-weight:700; font-size:12px; }
+  .gd-key { display:flex; flex-wrap:wrap; gap:14px; font-size:12.5px; margin-top:6px; color:var(--text-2); }
+  .gd-key i { display:inline-block; width:18px; height:3px; vertical-align:middle; margin-right:6px; background:var(--accent); }
+  .gd-key i.b { background:var(--amber); } .gd-key i.g { background:var(--green); }
+  .gd-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="0.2">
-<!-- llm:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 2</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Autograd &amp; the Training <span class="grad">Loop</span></h1>
-    <p class="lead">Gradients computed for you, an optimiser step, and the five lines every training loop repeats.</p>
+    <h1>Autograd &amp; the <span class="grad">Training Loop</span></h1>
+    <p class="lead">Training a language model with billions of parameters uses the same loop as fitting a straight line: compute a loss, ask how the loss changes with each parameter, nudge every parameter a little in the direction that lowers it, and repeat. PyTorch's <b>autograd</b> computes the "how the loss changes" part for you, for any code you write, which is the only reason models with billions of parameters are trainable at all.</p>
+    <p class="lead">This chapter builds that loop on a problem small enough to see whole, predicting a request's latency from its payload size, then measures where it breaks: a learning rate 20% too large that sends the loss to infinity, a forgotten line that leaves the loss almost where it started, and a one-character shape bug that a five-second check catches.</p>
+    <ul class="objectives">
+      <li><span>Explain what <code>backward()</code> computes and check a gradient three ways</span></li>
+      <li><span>Write gradient descent by hand, and predict which learning rates diverge</span></li>
+      <li><span>Use <code>nn.Module</code>, parameters and an optimiser</span></li>
+      <li><span>Write the five-line training loop, and say what each line is for</span></li>
+      <li><span>Use "overfit one batch" to catch bugs before a long run</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Tensors:</b> <a href="p1-pytorch-tensors.html">P1: PyTorch Tensors on a GPU</a>, especially shapes and broadcasting.</li>
+        <li><b>Derivatives:</b> what a derivative means and the chain rule; ML Fundamentals <a href="../ml-fundamentals/p5-calculus.html">P5: Derivatives &amp; Gradients</a> covers them.</li>
+        <li><b>Gradient descent as an idea:</b> ML Fundamentals <a href="../ml-fundamentals/05-gradient-descent.html">Chapter 5</a> (optional; this chapter is about the PyTorch machinery).</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Computation graphs and backward()</li>
-    <li>Gradient descent by hand</li>
-    <li>nn.Module and parameters</li>
-    <li>The training loop</li>
-    <li>Overfitting one batch on purpose</li>
-  </ol>
+  <h2>Computation graphs and backward()</h2>
+  <p>The problem: 256 requests, each with a payload size and a measured latency. The latency is roughly 12 ms plus 0.35 ms per kilobyte, plus noise, and we want the model <code>latency = w · payload + b</code> to find <code>w</code> and <code>b</code>. Payload is in units of 100 KB, so the true slope is 35 ms per unit. The loss is the <b>mean squared error</b> (MSE) between prediction and measurement.</p>
+<pre class="code">x = torch.<span class="f">rand</span>(<span class="m">256</span>, device=<span class="s">"cuda"</span>) * <span class="m">5</span>                       <span class="c"># (N,) payload, 0–500 KB in units of 100 KB</span>
+y = <span class="m">12</span> + <span class="m">35</span> * x + torch.<span class="f">randn</span>(<span class="m">256</span>, device=<span class="s">"cuda"</span>) * <span class="m">8</span>       <span class="c"># (N,) latency in ms, noisy</span>
+
+w = torch.<span class="f">tensor</span>(<span class="m">1.0</span>, device=<span class="s">"cuda"</span>, requires_grad=<span class="k">True</span>)   <span class="c"># () parameters we want gradients for</span>
+b = torch.<span class="f">tensor</span>(<span class="m">0.0</span>, device=<span class="s">"cuda"</span>, requires_grad=<span class="k">True</span>)
+loss = ((w * x + b - y) ** <span class="m">2</span>).<span class="f">mean</span>()                      <span class="c"># () a single number: 12,939.6</span>
+loss.<span class="f">backward</span>()                                          <span class="c"># fills w.grad and b.grad</span>
+<span class="f">print</span>(w.grad, b.grad)                                     <span class="c"># -682.5569  -204.3348</span></pre>
+  <p>Because <code>w</code> and <code>b</code> were created with <code>requires_grad=True</code>, every operation on them was recorded in a <b>computation graph</b>. Each result keeps a <code>grad_fn</code> pointing at the operation that made it; for this loss the chain is <code>MeanBackward0 → PowBackward0 → SubBackward0 → AddBackward0 → MulBackward0</code>. <code>backward()</code> walks that chain from the loss back to the parameters, applying the chain rule at each step, and stores ∂loss/∂w in <code>w.grad</code> and ∂loss/∂b in <code>b.grad</code>.</p>
+  <p>A gradient is just a number you can check. Differentiating MSE by hand gives ∂loss/∂w = mean(2 · (prediction − y) · x), and that formula gave exactly −682.5569 and −204.3348, the same as autograd. A finite difference, nudging <code>w</code> by ±0.001 and measuring how the loss moves, gave −682.62 and −204.35: the same to four significant figures. The negative sign says increasing <code>w</code> lowers the loss, which is right, since the prediction (slope 1) is far below the data (slope 35).</p>
+  <table class="t cmp">
+    <thead><tr><th>Method</th><th>How</th><th>Cost for N parameters</th><th>Here</th><th>Used for</th></tr></thead>
+    <tbody>
+      <tr><td><b>By hand</b></td><td>Derive the formula, write it in code</td><td>Your time, for every model</td><td>−682.5569</td><td>Small models, exam questions, checking autograd</td></tr>
+      <tr><td><b>Finite differences</b></td><td>Nudge one parameter, rerun the forward pass</td><td>2N forward passes</td><td>−682.62 (rounding error)</td><td>Testing a gradient you wrote (<code>torch.autograd.gradcheck</code>)</td></tr>
+      <tr><td><b>Autograd</b> (reverse mode)</td><td>Record the graph, walk it backwards</td><td>About 2× one forward pass, for all N at once</td><td>−682.5569</td><td>Every model in this course</td></tr>
+    </tbody>
+  </table>
+  <p>The cost column is the important one. A finite difference needs two forward passes per parameter, so for a model with 124 million parameters it would need 248 million forward passes per step. Reverse-mode autograd gets every gradient from one backward pass, which costs roughly two forward passes no matter how many parameters there are.</p>
+
+  <h2>Gradient descent by hand</h2>
+  <p>Gradient descent moves each parameter a small step against its gradient: <code>w ← w − lr · w.grad</code>, where <code>lr</code>, the <b>learning rate</b>, sets the step size. The update itself must not be recorded in the graph, so it runs under <code>torch.no_grad()</code>:</p>
+<pre class="code"><span class="k">for</span> step <span class="k">in</span> <span class="f">range</span>(<span class="m">200</span>):
+    loss = ((w * x + b - y) ** <span class="m">2</span>).<span class="f">mean</span>()   <span class="c"># forward</span>
+    loss.<span class="f">backward</span>()                       <span class="c"># gradients</span>
+    <span class="k">with</span> torch.<span class="f">no_grad</span>():                  <span class="c"># the update is not part of the model</span>
+        w -= lr * w.grad
+        b -= lr * b.grad
+    w.grad = <span class="k">None</span>; b.grad = <span class="k">None</span>            <span class="c"># clear, or the next backward() adds to them</span></pre>
+  <p>Too small a learning rate wastes steps; too large a one diverges. For a squared-error loss there is an exact limit: plain gradient descent is stable only if the learning rate is below 2 divided by the largest curvature of the loss (the largest eigenvalue of its second-derivative matrix, the Hessian). For this data that curvature is 19.71, so the limit is <b>0.1015</b>. Measured over 200 steps from <code>w = b = 0</code>:</p>
+  <ul>
+    <li><b>lr 0.001:</b> loss 65.1 after 200 steps; slow, and <code>b</code> was still 10.6 instead of 12.9.</li>
+    <li><b>lr 0.05:</b> loss 59.07, the least-squares optimum, by step 199 (and 59.9 by step 10).</li>
+    <li><b>lr 0.1:</b> just under the limit; the loss swung around (7,561 at step 10) but settled at 59.17.</li>
+    <li><b>lr 0.12:</b> 18% over the limit; 6.8 million at step 10, then infinity. <code>w</code> ended at −3.8 × 10²⁸.</li>
+  </ul>
+  <p>Real models have no closed-form limit, but they have the same behaviour: a learning rate that works, one slightly above it that blows up, and a loss spike or <code>NaN</code> as the symptom. Chapter 14 covers warm-up, schedules and clipping, the tools that keep large models on the stable side.</p>
+
+  <h2>nn.Module and parameters</h2>
+  <p>Writing <code>w</code> and <code>b</code> by hand does not scale to a transformer. PyTorch's <code>nn.Module</code> holds parameters for you, <code>nn.Linear(16, 64)</code> creates a 64 × 16 weight matrix and a bias with <code>requires_grad=True</code>, and an <b>optimiser</b> applies the update rule to every parameter the module lists:</p>
+<pre class="code"><span class="k">import</span> torch.nn <span class="k">as</span> nn
+
+net = nn.<span class="f">Sequential</span>(nn.<span class="f">Linear</span>(<span class="m">16</span>, <span class="m">64</span>), nn.<span class="f">GELU</span>(), nn.<span class="f">Linear</span>(<span class="m">64</span>, <span class="m">1</span>)).<span class="f">to</span>(<span class="s">"cuda"</span>)   <span class="c"># 1,153 parameters</span>
+opt = torch.optim.<span class="f">Adam</span>(net.<span class="f">parameters</span>(), lr=<span class="m">1e-2</span>)          <span class="c"># holds the update rule and its state</span>
+<span class="f">print</span>(<span class="f">sum</span>(p.<span class="f">numel</span>() <span class="k">for</span> p <span class="k">in</span> net.<span class="f">parameters</span>()))                  <span class="c"># 16·64 + 64 + 64·1 + 1 = 1,153</span></pre>
+  <p><code>torch.optim.SGD</code> is exactly the update you just wrote. <code>Adam</code>, and its variant <code>AdamW</code> used for every transformer in this course, keep two running averages per parameter and scale each step individually, which makes them far less sensitive to the learning rate (Chapter 14). Those running averages are also why training needs much more memory than inference (P7).</p>
+
+  <h2>The training loop</h2>
+  <p>Every training run in this course, from this one to a fine-tune of a billion-parameter model, is the same five lines repeated:</p>
+<pre class="code"><span class="k">for</span> xb, yb <span class="k">in</span> batches:
+    opt.<span class="f">zero_grad</span>()                      <span class="c"># 1. clear the gradients from the last step</span>
+    pred = <span class="f">net</span>(xb).<span class="f">squeeze</span>(<span class="m">1</span>)               <span class="c"># 2. forward: (B, 1) → (B,)</span>
+    loss = ((pred - yb) ** <span class="m">2</span>).<span class="f">mean</span>()      <span class="c"># 3. loss: one number</span>
+    loss.<span class="f">backward</span>()                      <span class="c"># 4. backward: a gradient for every parameter</span>
+    opt.<span class="f">step</span>()                           <span class="c"># 5. update every parameter</span></pre>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>zero_grad</b> forget last step's gradients</li>
+      <li data-k="step"><b>forward</b> batch through the model</li>
+      <li data-k="step"><b>loss</b> one number to minimise</li>
+      <li data-k="step"><b>backward</b> ∂loss/∂every parameter</li>
+      <li data-k="end"><b>step</b> move each parameter downhill</li>
+    </ol>
+    <figcaption><b>One training step.</b> Repeat it over many batches; everything else in training (schedules, mixed precision, accumulation, checkpoints) is a change to one of these five boxes.</figcaption>
+  </figure>
+  <p>Line 1 is the one people forget. <code>backward()</code> <i>adds</i> to <code>.grad</code> rather than replacing it, so that gradients from several small batches can be summed on purpose (gradient accumulation, Chapter 13). Leave out <code>zero_grad()</code> and every step uses the sum of all gradients so far, which behaves like an ever-growing step. On the latency problem, at a learning rate that worked well with it (0.01, final loss 59.3), the loop without it ended at <b>748</b>; at 0.001 it ended at <b>13,551</b>, barely below the 13,631 it started from, where the correct loop had reached 65.</p>
+
+  <h2>Overfitting one batch on purpose</h2>
+  <p>Before any long run, train on a single small batch until the loss reaches nearly zero. A model with enough parameters can memorise 32 examples, so if it cannot, something in the data, the loss or the loop is wrong, and you have found it in seconds instead of after a day of training.</p>
+  <p>The test here is the small network above on one batch of 32 random inputs and targets, with Adam. Correctly written, the loss was below 0.001 at step <b>47</b> and 0.0 at step 500. Then the same run with the bug from P1: the prediction left as shape <code>(32, 1)</code> against targets of shape <code>(32,)</code>. Nothing crashed. The loss fell a little and then stopped at <b>0.6424</b> for good, which is exactly the variance of the targets: the broadcast loss compares every prediction with every target, and the best the model can do against that is predict the mean for everything. A loss stuck at the variance of the targets is a signature worth remembering.</p>
+
+  <h2>What autograd costs</h2>
+  <p>To compute gradients, the backward pass needs the intermediate values of the forward pass, so autograd keeps them alive until <code>backward()</code> runs. For a stack of four 4096-wide linear layers (67 million parameters, 128 MiB of bf16 weights) on a batch of 8,192 rows, the forward pass under <code>torch.no_grad()</code> raised peak memory by <b>128 MiB</b> and took <b>11.9 ms</b>. With gradients, forward plus backward raised it by <b>704 MiB</b> and took <b>33.7 ms</b>. The 704 MiB is seven saved activations of 64 MiB (448 MiB), the 128 MiB fp32 copy of the output that the loss was computed from, and 128 MiB of weight gradients; the backward pass cost about twice the forward. Inference code should always run under <code>torch.no_grad()</code> (or <code>torch.inference_mode()</code>), and P7 turns these numbers into a full memory budget.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Training loop lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="gd-l">Experiment</div>
+      <div class="seg" id="gdE"><button class="active" data-v="lr">learning rate</button><button data-v="zg">forget zero_grad()</button><button data-v="of">overfit one batch</button></div>
+      <div class="gd-v on" id="gdVl"><div class="gd-l">Learning rate (stability limit 0.1015)</div>
+        <div class="seg" id="gdLr"><button data-v="0.001">0.001</button><button data-v="0.01">0.01</button><button class="active" data-v="0.05">0.05</button><button data-v="0.1">0.1</button><button data-v="0.12">0.12</button><button data-v="0.2">0.2</button></div></div>
+      <div class="gd-v" id="gdVz"><div class="gd-l">Learning rate</div>
+        <div class="seg" id="gdZ"><button data-v="0.001">0.001</button><button class="active" data-v="0.01">0.01</button><button data-v="0.05">0.05</button></div></div>
+      <div class="gd-v" id="gdVo"><div class="gd-l">The model's output</div>
+        <div class="seg" id="gdO"><button class="active" data-v="both">both runs</button><button data-v="ok">squeezed to (B,)</button><button data-v="bug">left as (B, 1)</button></div></div>
+      <div class="gd-box"><svg class="gd-plot" id="gdPlot" viewBox="0 0 640 260" role="img" aria-label="loss curve"></svg><div class="gd-key" id="gdKey"></div></div>
+      <div class="stats" id="gdStats"></div>
+      <div class="gd-why" id="gdWhy"></div>
+    </div>
+    <div class="panel-foot">PyTorch 2.11.0 on an RTX 5070 Ti, fp32. Latency problem: 256 requests, latency = 12 + 35 · payload (100 KB units) + noise with SD 8 ms, seed 0; plain SGD from w = b = 0 for 200 steps; the least-squares optimum has MSE 59.07. Overfit test: Linear(16, 64), GELU, Linear(64, 1) on one batch of 32 random inputs and targets, Adam at 0.01 for 500 steps, seed 1. Losses are plotted on a log scale; a run that reached infinity stops where it overflowed.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: "overfit a single batch" in Karpathy's training recipe</div><p>Andrej Karpathy's widely shared 2019 post, "A Recipe for Training Neural Networks", lists overfitting one batch as an early, non-negotiable step: take a few examples, make the model's capacity large enough, and verify that the loss goes to zero. If it does not, there is a bug, and it is far cheaper to find it there than in a run that takes days. The broadcasting bug on this page is exactly the kind of mistake it catches: the full training run would have produced a plausible-looking loss curve, while the one-batch test stopped at the targets' variance and pointed straight at the loss.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Forgetting <code>zero_grad()</code>,</b> so every step uses the sum of all gradients so far.</li>
+      <li><b>Updating parameters outside <code>torch.no_grad()</code>,</b> which records the update in the graph or raises an error about leaf tensors.</li>
+      <li><b>Raising the learning rate "to train faster"</b> past the point where the loss diverges.</li>
+      <li><b>Starting a long run without overfitting one batch first,</b> so shape and loss bugs surface days later, or never.</li>
+      <li><b>Running inference with gradients on,</b> paying several times the memory for activations nobody will use.</li>
+      <li><b>Calling <code>.item()</code> on the loss inside a hot loop</b> without knowing it forces a GPU synchronise each time (P1).</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What does <code>loss.backward()</code> do, and why does a training loop call <code>optimizer.zero_grad()</code> every step?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>While the forward pass runs, PyTorch records every operation on tensors that require gradients as a graph. <code>backward()</code> walks that graph from the loss back to the parameters, applying the chain rule at each operation, and stores the derivative of the loss with respect to each parameter in its <code>.grad</code>. It does this for all parameters at once for roughly the cost of two forward passes. It adds into <code>.grad</code> rather than overwriting it, so that gradients from several micro-batches can be accumulated deliberately. That is why the loop clears them with <code>zero_grad()</code> each step; without it, each update uses the sum of every gradient so far, the effective step keeps growing and the loss oscillates; in a measured run it ended at 13,551, barely below its starting 13,631, where the correct loop reached 65.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your training loss goes to NaN after a few hundred steps. How do you investigate?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First reproduce it cheaply and look at when it happens: log the loss and the gradient norm every step. A loss that grows quickly before NaN points at the learning rate being above the stable range, as in a simple model where 0.1 converged and 0.12 exploded, so lower it, add warm-up, and clip the gradient norm. A sudden spike on one step points at a bad batch or an overflow, so log the batch, check for extreme values, and check dtypes, because fp16 overflows at 65,504. Also check the basics with an overfit-one-batch run: if the model cannot drive one batch to zero loss, the problem is in the data, the loss or the shapes rather than the optimiser. Finally, use <code>torch.autograd.set_detect_anomaly(True)</code> on a short run to find the first operation that produced a NaN.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Autograd records operations as a graph and <code>backward()</code> applies the chain rule through it, giving every gradient for about the cost of two forward passes.</li>
+      <li>Check gradients you doubt: by hand, by finite differences, and against autograd. Here all three agreed.</li>
+      <li>Gradient descent diverges above a learning-rate limit: here 0.1 converged and 0.12 went to infinity.</li>
+      <li>The loop is zero_grad, forward, loss, backward, step; forgetting zero_grad left the loss at 13,551 instead of 65.</li>
+      <li>Overfit one batch before any long run; a loss stuck at the targets' variance means the loss or the shapes are wrong.</li>
+      <li>Autograd keeps activations for the backward pass: 704 MiB against 128 MiB here, so run inference under <code>torch.no_grad()</code>.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why must a training loop call <code>zero_grad()</code> every step?</p>
+      <div class="opts">
+        <button class="opt">It resets the learning rate</button>
+        <button class="opt"><code>backward()</code> adds to <code>.grad</code>, so old gradients would pile up</button>
+        <button class="opt">It frees the model's weights</button>
+        <button class="opt">It is only needed on the first step</button>
+      </div>
+      <div class="explain">Gradients accumulate by design. Without clearing them, each update uses the sum of all gradients so far; measured, the loss ended at 13,551 instead of 65.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">The stability limit for plain gradient descent on the latency problem was 0.1015. What happened at a learning rate of 0.12?</p>
+      <div class="opts">
+        <button class="opt">It converged faster than 0.1</button>
+        <button class="opt">It converged to a different answer</button>
+        <button class="opt">It stalled at the starting loss</button>
+        <button class="opt">The loss grew every step until it overflowed to infinity</button>
+      </div>
+      <div class="explain">Above the limit each step overshoots by more than the last: 6.8 million at step 10, then infinity.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">An overfit-one-batch test gets stuck with the loss at exactly the variance of the targets. What is the most likely cause?</p>
+      <div class="opts">
+        <button class="opt">The learning rate is too small</button>
+        <button class="opt">The model has too many parameters</button>
+        <button class="opt">The loss compares predictions with the wrong targets, for example through a broadcasting bug</button>
+        <button class="opt">The GPU ran out of memory</button>
+      </div>
+      <div class="explain">When every prediction is compared with every target, the best possible answer is the mean, and the loss is then the targets' variance: 0.6424 here.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why did the forward pass with gradients use 704 MiB more memory but only 128 MiB without them?</p>
+      <div class="opts">
+        <button class="opt">Autograd keeps intermediate activations for the backward pass, plus the weight gradients</button>
+        <button class="opt">Gradients are always stored in fp64</button>
+        <button class="opt">torch.no_grad() compresses the weights</button>
+        <button class="opt">The model is copied for the backward pass</button>
+      </div>
+      <div class="explain">Seven saved activations of 64 MiB, a 128 MiB fp32 copy of the output for the loss, and 128 MiB of weight gradients. Without gradients, each activation can be freed as soon as the next layer has used it.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How does the cost of reverse-mode autograd compare with finite differences for a model with N parameters?</p>
+      <div class="opts">
+        <button class="opt">Both need about N forward passes</button>
+        <button class="opt">Autograd needs about two forward passes' worth for all N; finite differences need about 2N forward passes</button>
+        <button class="opt">Finite differences are cheaper but less accurate</button>
+        <button class="opt">Autograd needs one backward pass per parameter</button>
+      </div>
+      <div class="explain">One backward pass yields every gradient at once, which is what makes training models with billions of parameters possible.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"data":{"n":256,"true_w":35.0,"true_b":12.0,"noise_sd":8.0,"sample":[[1.995,83.28],[2.583,98.0],[0.125,23.75],[4.7,170.63],[4.729,188.56],[3.984,158.37],[2.075,85.66],[4.101,148.02]]},"optimum":{"w":34.8732,"b":12.9237,"mse":59.0708},"stability":{"lambda_max":19.7079,"lambda_min":0.432,"lr_max":0.10148},"grads":{"loss":12939.631,"autograd":[-682.5569,-204.3348],"manual":[-682.5569,-204.3348],"finite_diff":[-682.6247,-204.3469],"graph":["MeanBackward0","PowBackward0","SubBackward0","AddBackward0","MulBackward0"]},"runs":[{"lr":0.001,"zero_grad":true,"curve":[13631.2578,13101.6191,12592.6504,12103.5449,11633.5293,11181.8555,10747.8105,10330.7051,9929.8779,9544.6943,9174.543,8818.8369,8477.0156,8148.5322,7832.8691,7529.5264,7238.0225,6957.894,6688.6992,6430.0103,6181.4165,5942.5254,5712.957,5492.3486,5280.3496,5076.625,4880.8501,4692.7163,4511.9248,4338.1895,4171.2344,4010.7949,3856.6172,3708.4563,3566.0776,3429.2561,3297.7737,3171.4229,3050.0029,2933.3223,2821.1948,2713.4436,2609.8975,2510.3921,2414.7708,2322.8811,2234.5776,2149.7202,2068.1746,1989.8115,1914.5068,1842.1409,1772.5992,1705.7715,1641.5516,1579.8384,1520.5334,1463.5435,1408.7771,1356.1479,1305.573,1256.972,1210.2676,1165.386,1122.2559,1080.809,1040.9796,1002.7045,965.9232,930.5774,896.611,863.9702,832.6031,802.4604,773.494,745.6578,718.9084,693.2023,668.4998,644.7611,621.9492,600.0273,578.9609,558.7168,539.2627,520.5679,502.6024,485.3379,468.7474,452.8044,437.4834,422.7603,408.6118,395.0155,381.9498,369.3939,357.3279,345.7328,334.5903,323.8827,313.5927,303.7045,294.2021,285.0703,276.295,267.8622,259.7584,251.9708,244.4871,237.2955,230.3845,223.7432,217.361,211.2279,205.3342,199.6704,194.2278,188.9972,183.9709,179.1407,174.4991,170.0385,165.752,161.6328,157.6742,153.8701,150.2145,146.7015,143.3256,140.0813,136.9637,133.9677,131.0885,128.3217,125.6628,123.1077,120.6522,118.2925,116.0248,113.8457,111.7516,109.7392,107.8052,105.9467,104.1607,102.4442,100.7948,99.2097,97.6864,96.2225,94.8158,93.4638,92.1647,90.9162,89.7163,88.5633,87.4552,86.3904,85.3671,84.3836,83.4385,82.5303,81.6574,80.8187,80.0126,79.2379,78.4934,77.778,77.0904,76.4296,75.7946,75.1842,74.5977,74.0341,73.4925,72.9719,72.4716,71.9908,71.5287,71.0847,70.6579,70.2477,69.8535,69.4746,69.1105,68.7606,68.4243,68.1011,67.7904,67.4919,67.2049,66.9292,66.6641,66.4094,66.1645,65.9292,65.7031,65.4857,65.2768,65.076],"final":64.883,"w":34.8476,"b":10.5803},{"lr":0.01,"zero_grad":true,"curve":[13631.2578,8809.2559,5700.5957,3696.4963,2404.4873,1571.5486,1034.5647,688.3773,465.1929,321.3066,228.5422,168.735,130.175,105.3124,89.2806,78.9417,72.2731,67.9706,65.1934,63.3997,62.2401,61.4892,61.0019,60.6845,60.4768,60.3396,60.2481,60.186,60.143,60.1121,60.0892,60.0715,60.057,60.0448,60.034,60.0241,60.0149,60.0061,59.9977,59.9894,59.9813,59.9734,59.9655,59.9577,59.9501,59.9425,59.9349,59.9275,59.9201,59.9128,59.9055,59.8983,59.8912,59.8841,59.8771,59.8701,59.8632,59.8564,59.8496,59.8429,59.8363,59.8297,59.8231,59.8166,59.8102,59.8038,59.7975,59.7912,59.785,59.7789,59.7728,59.7667,59.7607,59.7548,59.7489,59.743,59.7372,59.7315,59.7258,59.7201,59.7145,59.709,59.7035,59.698,59.6926,59.6873,59.6819,59.6767,59.6714,59.6663,59.6611,59.6561,59.651,59.646,59.641,59.6361,59.6312,59.6264,59.6216,59.6169,59.6122,59.6075,59.6029,59.5983,59.5937,59.5892,59.5848,59.5803,59.5759,59.5716,59.5673,59.563,59.5587,59.5545,59.5504,59.5462,59.5421,59.5381,59.534,59.53,59.5261,59.5222,59.5183,59.5144,59.5106,59.5068,59.503,59.4993,59.4956,59.492,59.4883,59.4847,59.4811,59.4776,59.4741,59.4706,59.4672,59.4638,59.4604,59.457,59.4537,59.4504,59.4471,59.4439,59.4406,59.4375,59.4343,59.4312,59.4281,59.425,59.4219,59.4189,59.4159,59.4129,59.41,59.407,59.4041,59.4013,59.3984,59.3956,59.3928,59.39,59.3873,59.3845,59.3818,59.3792,59.3765,59.3739,59.3713,59.3687,59.3661,59.3635,59.361,59.3585,59.356,59.3536,59.3511,59.3487,59.3463,59.3439,59.3416,59.3393,59.3369,59.3346,59.3324,59.3301,59.3279,59.3257,59.3235,59.3213,59.3191,59.317,59.3149,59.3128,59.3107,59.3086,59.3066,59.3045,59.3025,59.3005],"final":59.2985,"w":35.166,"b":11.9396},{"lr":0.05,"zero_grad":true,"curve":[13631.2578,63.1968,60.2507,60.1997,60.1515,60.1053,60.0611,60.0187,59.9782,59.9395,59.9023,59.8668,59.8328,59.8002,59.769,59.7392,59.7106,59.6833,59.6571,59.6321,59.6081,59.5851,59.5631,59.5421,59.522,59.5027,59.4842,59.4665,59.4496,59.4334,59.4179,59.4031,59.3889,59.3753,59.3623,59.3498,59.3379,59.3265,59.3156,59.3051,59.2951,59.2855,59.2763,59.2676,59.2591,59.2511,59.2434,59.236,59.229,59.2222,59.2157,59.2095,59.2036,59.1979,59.1925,59.1873,59.1823,59.1776,59.173,59.1686,59.1645,59.1604,59.1566,59.1529,59.1494,59.1461,59.1429,59.1398,59.1368,59.134,59.1313,59.1287,59.1263,59.1239,59.1216,59.1194,59.1174,59.1154,59.1135,59.1116,59.1099,59.1082,59.1066,59.1051,59.1036,59.1022,59.1009,59.0996,59.0984,59.0972,59.0961,59.095,59.094,59.093,59.092,59.0911,59.0902,59.0894,59.0886,59.0879,59.0871,59.0864,59.0858,59.0851,59.0845,59.0839,59.0834,59.0828,59.0823,59.0818,59.0814,59.0809,59.0805,59.0801,59.0797,59.0793,59.0789,59.0786,59.0782,59.0779,59.0776,59.0773,59.0771,59.0768,59.0765,59.0763,59.076,59.0758,59.0756,59.0754,59.0752,59.075,59.0748,59.0747,59.0745,59.0744,59.0742,59.0741,59.0739,59.0738,59.0737,59.0735,59.0734,59.0733,59.0732,59.0731,59.073,59.0729,59.0728,59.0727,59.0726,59.0726,59.0725,59.0724,59.0724,59.0723,59.0722,59.0722,59.0721,59.0721,59.072,59.072,59.0719,59.0719,59.0718,59.0718,59.0717,59.0717,59.0717,59.0716,59.0716,59.0716,59.0715,59.0715,59.0715,59.0714,59.0714,59.0714,59.0714,59.0713,59.0713,59.0713,59.0713,59.0712,59.0712,59.0712,59.0712,59.0712,59.0712,59.0712,59.0711,59.0711,59.0711,59.0711,59.0711,59.0711,59.0711,59.071,59.071,59.071],"final":59.071,"w":34.882,"b":12.894},{"lr":0.1,"zero_grad":true,"curve":[13631.2578,12850.0137,12113.7354,11419.8467,10765.8945,10149.5879,9568.7549,9021.3594,8505.4766,8019.2891,7561.0884,7129.2617,6722.29,6338.7437,5977.2783,5636.6162,5315.5664,5012.9951,4727.8408,4459.0996,4205.8281,3967.136,3742.1838,3530.1799,3330.3794,3142.0796,2964.6191,2797.3728,2639.7539,2491.207,2351.2112,2219.2722,2094.9287,1977.7446,1867.3054,1763.2224,1665.1299,1572.6843,1485.5603,1403.4503,1326.0668,1253.1382,1184.407,1119.6324,1058.5867,1001.0543,946.8329,895.7328,847.5741,802.1873,759.4131,719.101,681.1094,645.3046,611.5609,579.7592,549.7881,521.5422,494.9223,469.8343,446.1907,423.9077,402.9076,383.1162,364.4642,346.8858,330.3193,314.7061,299.9918,286.1242,273.0549,260.7379,249.1297,238.1898,227.8797,218.1632,209.0059,200.3758,192.2422,184.5769,177.3528,170.5445,164.128,158.0809,152.3819,147.0109,141.949,137.1786,132.6829,128.4458,124.4526,120.6893,117.1426,113.8,110.6499,107.681,104.8829,102.246,99.7608,97.4186,95.2113,93.1311,91.1706,89.3229,87.5816,85.9405,84.3939,82.9363,81.5626,80.268,79.0478,77.8979,76.8142,75.7929,74.8304,73.9234,73.0685,72.2629,71.5035,70.7879,70.1135,69.4779,68.8789,68.3143,67.7823,67.2809,66.8083,66.3629,65.9431,65.5476,65.1747,64.8234,64.4923,64.1802,63.8862,63.609,63.3478,63.1016,62.8696,62.651,62.4449,62.2507,62.0677,61.8951,61.7326,61.5794,61.435,61.2989,61.1706,61.0498,60.9359,60.8285,60.7273,60.632,60.5421,60.4574,60.3776,60.3024,60.2315,60.1647,60.1018,60.0424,59.9865,59.9338,59.8841,59.8373,59.7932,59.7516,59.7124,59.6755,59.6407,59.6079,59.577,59.5478,59.5204,59.4945,59.4701,59.4471,59.4255,59.4051,59.3858,59.3677,59.3506,59.3345,59.3193,59.305,59.2915,59.2788,59.2668,59.2556,59.2449,59.2349,59.2255,59.2166,59.2082,59.2003,59.1928,59.1858,59.1792,59.1729],"final":59.1671,"w":34.7785,"b":12.8951},{"lr":0.12,"zero_grad":true,"curve":[13631.2578,25344.0977,47166.3516,87823.3828,163571.4219,304697.2188,567628.0,1057492.875,1970157.75,3670539.5,6838512.0,12740744.0,23737158.0,44224520.0,82394416.0,153508576.0,286000928.0,532846720.0,992744000.0,1849576064.0,3445935104.0,6420104192.0,11961262080.0,22284969984.0,41519005696.0,77353828352.0,144117530624.0,268504547328.0,500249395200.0,932011966464.0,1736426651648.0,3235126968320.0,6027346444288.0,11229516005376.0,20921653919744.0,38979026026496.0,72621613907968.0,135300923785216.0,252078442151936.0,469646050328576.0,874995098058752.0,1630198457958400.0,3037214040653824.0,5658618338738176.0,1.0542542688878592e+16,1.9641759470452736e+16,3.659445280178176e+16,6.817894221689651e+16,1.2702381239802266e+17,2.3665733657427968e+17,4.4091495169602355e+17,8.214665775881912e+17,1.5304698832072212e+18,2.8514099586777743e+18,5.312446010495074e+18,9.897589268472136e+18,1.844014480491964e+19,3.435573834469815e+19,6.400797705200311e+19,1.192528904110966e+20,2.2217938774804503e+20,4.139411469534809e+20,7.712114591021778e+20,1.4368396841153515e+21,2.676967766006694e+21,4.987444416286999e+21,9.292082893419614e+21,1.7312029496496257e+22,3.2253949617096242e+22,6.009216033195236e+22,1.1195738805900418e+23,2.085872431606141e+23,3.886178456312153e+23,7.240316784741503e+23,1.348939345322658e+24,2.513201129964006e+24,4.6823335894651817e+24,8.723627834389397e+24,1.625294428215656e+25,3.0280773118852e+25,5.641595410178703e+25,1.0510829335340001e+26,1.958267059300129e+26,3.648436887865474e+26,6.797383169879723e+26,1.2664164994728946e+27,2.359454560154187e+27,4.395887151815978e+27,8.189952967575997e+27,1.5258660294024806e+28,2.8428322744771188e+28,5.2964655206654046e+28,9.867819223672548e+28,1.8384678955498492e+29,3.425239324402526e+29,6.381544634741547e+29,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],"final":null,"w":-3.754635059130935e+28,"b":-1.1172533525025705e+28},{"lr":0.2,"zero_grad":true,"curve":[13631.2578,117488.2734,1016157.875,8792289.0,76078656.0,658303296.0,5696257024.0,49289338880.0,426497474560.0,3690454843392.0,31933270589440.0,276316586770432.0,2390949506318336.0,2.0688724320845824e+16,1.7901818826719232e+17,1.5490326631410565e+18,1.3403678961775411e+19,1.1598114842711425e+20,1.003577637363614e+21,8.683892592891505e+21,7.514115916319261e+22,6.501915957325061e+23,5.626067286893905e+24,4.868199985155967e+25,4.2124217382169666e+26,3.6449815913395396e+27,3.1539788489454615e+28,2.729117359003964e+29,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],"final":null,"w":null,"b":null},{"lr":0.001,"zero_grad":false,"curve":[13631.2578,13101.6191,12083.8867,10657.8975,8935.5078,7051.8296,5154.623,3392.7112,1904.3043,806.1563,184.4094,87.8344,524.0062,1458.709,2818.6211,4497.0635,6362.375,8268.2305,10065.1279,11612.1143,12787.834,13500.0576,13692.916,13351.2764,12501.9414,11211.5312,9581.2656,7739.0303,5829.334,4001.9766,2400.2998,1149.944,348.9874,60.2595,306.4064,1068.1177,2285.6396,3863.4644,5677.8193,7586.3784,9439.4268,11091.6016,12413.3008,13300.8418,13684.6016,13534.4756,12862.2363,11720.6172,10199.166,8417.2305,6514.5894,4640.4897,2941.9414,1552.1816,580.2268,102.3183,155.9437,736.8946,1799.598,3260.6914,5005.5596,6897.3296,8787.5996,10528.0928,11982.2754,13036.0801,13606.8359,13649.7734,13161.5234,12180.3857,10783.3242,9079.9287,7203.8169,5302.1548,3524.1201,2009.1855,876.1868,214.0009,74.5718,468.8371,1365.8695,2695.303,4352.853,6208.4961,8116.6709,9927.6934,11499.502,12708.7998,13460.7266,13696.2988,13397.04,12586.4248,11328.043,9720.6064,7890.21,5980.4365,4141.0977,2516.4785,1234.0208,394.3268,63.2663,266.8105,988.9948,2173.1697,3726.4482,5526.9863,7433.5459,9296.5742,10969.9268,12322.3457,13247.7412,13673.5283,13566.3105,12934.4961,11827.6484,10332.5938,8566.6172,6668.2422,4786.3906,3068.6826,1649.8625,641.2286,121.904,132.6281,672.5616,1699.3523,3132.457,4859.46,6744.8906,8640.8516,10398.6191,11880.3086,12969.6953,13581.3232,13667.2168,13220.6377,12276.6211,10909.2178,9225.6943,7358.1118,5452.9717,3659.7192,2119.0249,951.746,249.4489,67.2248,419.368,1278.2567,2576.5159,4212.3066,6057.312,7966.8037,9790.9941,11386.7881,12629.0078,13420.2051,13698.3203,13441.5352,12669.9902,11444.209,9860.3438,8042.6396,6133.6826,4283.2148,2636.3926,1322.3982,444.3041,70.9899,231.7381,913.9376,2064.073,3591.9226,5377.6348,7281.1309,9153.0938,10846.6768,12229.0293,13191.7119,13659.209,13594.8438,13003.666,11932.0469,10464.0449,8714.8145,6821.5679,4932.8164,3196.7178,1749.4557,704.5559,143.9816,111.7042,610.2536,1600.52,3004.8218,4712.998,6591.0522,8491.6611,10265.7373,11774.1025,12898.4443],"final":13550.5605,"w":69.977,"b":24.6893},{"lr":0.01,"zero_grad":false,"curve":[13631.2578,8809.2559,2779.2239,60.517,2690.7207,8698.5264,13581.1836,13679.21,8919.084,2868.3594,61.8605,2602.9321,8587.0381,13529.166,13725.2422,9028.252,2958.4263,64.9063,2516.2715,8475.2373,13475.6553,13769.7988,9137.1895,3049.8481,70.0886,2431.1743,8363.5352,13421.0195,13813.1836,9246.1406,3142.8232,77.5737,2347.7766,8252.0195,13365.2676,13855.3135,9354.9453,3237.1462,87.1276,2265.8164,8140.3911,13308.0449,13895.7881,9463.1621,3332.3562,98.2994,2184.8638,8028.2334,13248.9414,13934.1855,9570.3799,3428.0818,110.7753,2104.6741,7915.3579,13187.8066,13970.3906,9676.5254,3524.3081,124.6236,2025.3961,7801.9775,13124.8916,14004.6768,9781.8975,3621.3774,140.2388,1947.473,7688.5635,13060.6641,14037.4863,9886.9121,3719.6958,158.0273,1871.3064,7575.4888,12995.4434,14069.0771,9991.7588,3819.3958,178.0832,1796.9553,7462.7627,12929.1719,14099.2969,10096.2168,3920.2104,200.1115,1724.106,7350.0459,12861.4688,14127.7246,10199.8232,4021.6636,223.6557,1652.333,7236.9385,12791.9355,14153.9668,10302.2051,4123.4277,248.4545,1581.4482,7123.3159,12720.498,14177.9824,10403.3604,4225.5625,274.6436,1511.6667,7009.4517,12647.4746,14200.1113,10503.6445,4328.4453,302.6424,1443.4502,6895.8311,12573.334,14220.7861,10603.458,4432.4551,332.8191,1377.1545,6782.7827,12498.3438,14240.1963,10702.9082,4537.6494,365.1942,1312.7629,6670.2354,12422.3711,14258.1387,10801.7305,4643.7041,399.4177,1249.9156,6557.8154,12345.0078,14274.1582,10899.4385,4750.1436,435.0397,1188.2024,6445.1484,12265.9023,14287.9248,10995.7246,4856.6953,471.8582,1127.5017,6332.1831,12185.0576,14299.4688,11090.6543,4963.4844,510.0716,1068.0862,6219.252,12102.832,14309.1641,11184.6152,5070.915,550.1146,1010.4226,6106.832,12019.6904,14317.4434,11277.9844,5179.3311,592.3081,954.8127,5995.1924,11935.8398,14324.4219,11370.8076,5288.7163,636.597,901.1686,5884.2021,11851.0898,14329.8447,11462.7559,5398.6943,682.5864,849.0906,5773.4575,11765.0176,14333.2598,11553.3594,5508.8008,729.8431,798.1979,5662.6211,11677.3145,14334.375,11642.3574,5618.8262,778.23],"final":748.4331,"w":43.4538,"b":13.3955},{"lr":0.05,"zero_grad":false,"curve":[13631.2578,63.1968,13231.9316,14018.373,85.911,12821.5371,14392.5029,131.5914,12401.5039,14753.0977,200.5151,11973.2666,15099.499,292.6951,11538.002,15430.7832,407.7421,11096.5762,15745.7695,544.9761,10649.7246,16043.2559,703.7087,10198.3379,16322.332,883.4905,9743.6543,16582.4609,1084.14,9287.1934,16823.3672,1305.5433,8830.501,17044.7422,1547.3557,8374.873,17246.0195,1808.845,7921.2617,17426.3867,2088.9666,7470.4336,17584.9688,2386.6455,7023.2578,17721.1719,2701.0342,6580.9185,17834.793,3031.571,6144.8872,17925.9258,3377.8103,5716.6694,17994.6719,3739.1226,5297.5264,18040.8945,4114.5054,4888.3496,18064.207,4502.6431,4489.8037,18064.1387,4902.166,4102.5928,18040.4707,5311.918,3727.7075,17993.3633,5731.0654,3366.415,17923.3047,6158.9297,3020.0425,17830.8398,6594.7002,2689.6765,17716.2969,7037.2241,2376.0225,17579.7109,7485.0391,2079.5029,17421.041,7936.6045,1800.5422,17240.4297,8390.5938,1539.8075,17038.4062,8846.0234,1298.2456,16815.8438,9302.1094,1076.8776,16573.6797,9758.0,876.5063,16312.6797,10212.541,697.5408,16033.293,10664.252,540.0763,15735.8447,11111.5801,404.1564,15420.8008,11553.1738,290.0391,15089.001,11988.0371,198.2633,14741.623,12415.4346,129.4657,14379.9492,12834.6055,84.0894,14005.0723,13244.5273,62.1871,13617.7852,13643.8701,63.4677,13218.6855,14031.2139,87.5511,12808.4883,14405.3184,134.2438,12388.2266,14765.3281,203.6354,11959.291,15110.6816,295.9453,11523.168,15440.8535,411.2327,11081.1895,15755.0908,549.1779,10634.3545,16052.3389,709.1035,10183.4297,16331.4355,890.2078,9729.2334,16591.3945,1091.8547,9272.873,16831.6055,1313.699,8815.7979,17051.8047,1555.5604,8359.5781,17251.7949,1817.1381,7905.6318,17431.1992,2097.7822,7455.021,17589.3438,2396.4727,7008.5459,17725.4355,2712.0425,6566.9917,17838.8203,3043.4731,6131.3936,17929.2305,3390.0476,5703.1084,17996.7539,3751.25,5283.6445,18041.5977,4126.501,4874.3438,18063.832,4514.8955,4476.208,18063.2227,4915.167,4089.9131,18039.3828,5325.8867,3716.0754,17992.0566,5745.7534,3355.5171,17921.3359,6173.7842,3009.3667,17827.6992],"final":6609.2363,"w":9.9228,"b":6.3747}],"overfit":[{"bug":false,"curve":[0.604261,0.492468,0.405857,0.337316,0.283601,0.242256,0.209802,0.181887,0.155094,0.128379,0.102739,0.079901,0.061329,0.047699,0.038683,0.033146,0.029721,0.027395,0.025521,0.023577,0.021327,0.018971,0.016719,0.014519,0.012396,0.010647,0.009452,0.008585,0.007698,0.006672,0.005591,0.004572,0.003716,0.003115,0.002804,0.002711,0.002709,0.002698,0.002646,0.00258,0.002532,0.002484,0.002357,0.002111,0.001793,0.001475,0.001187,0.000942,0.000762,0.000658,0.000609,0.000587,0.000571,0.000547,0.000508,0.000456,0.000402,0.000355,0.000318,0.000289,0.000258,0.000228,0.000206,0.00019,0.000175,0.000158,0.000144,0.000133,0.000128,0.000125,0.000121,0.000111,9.6e-05,7.8e-05,6.3e-05,5.2e-05,4.4e-05,3.8e-05,3.4e-05,3.1e-05,3.1e-05,3.2e-05,3.1e-05,3e-05,2.7e-05,2.3e-05,2e-05,1.7e-05,1.5e-05,1.4e-05,1.3e-05,1.1e-05,9e-06,8e-06,7e-06,6e-06,5e-06,5e-06,6e-06,6e-06,6e-06,6e-06,5e-06,4e-06,3e-06,2e-06,2e-06,2e-06,1e-06,1e-06,1e-06,1e-06,1e-06,1e-06,1e-06,1e-06,1e-06,1e-06,1e-06,1e-06,1e-06,1e-06,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"final_reported":0.0,"final_true_mse":0.0,"target_var":0.6424,"first_below_1e3":47},{"bug":true,"curve":[0.710882,0.661375,0.652036,0.654845,0.654334,0.650736,0.647339,0.645629,0.64545,0.645963,0.646381,0.646354,0.645918,0.645263,0.64458,0.643997,0.643576,0.643326,0.64322,0.643207,0.643226,0.643227,0.643186,0.643107,0.643008,0.642907,0.642819,0.642749,0.642701,0.642673,0.642664,0.642671,0.642686,0.6427,0.6427,0.642679,0.642639,0.642586,0.642535,0.642496,0.642473,0.642466,0.642468,0.642476,0.642482,0.642486,0.642486,0.642483,0.642475,0.642465,0.642454,0.642443,0.642434,0.642429,0.642428,0.642428,0.64243,0.642433,0.642434,0.642434,0.642433,0.64243,0.642427,0.642424,0.642421,0.642421,0.642421,0.642421,0.642421,0.642421,0.64242,0.642419,0.642418,0.642418,0.642417,0.642417,0.642417,0.642417,0.642417,0.642417,0.642417,0.642416,0.642416,0.642416,0.642416,0.642416,0.642415,0.642415,0.642415,0.642415,0.642416,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415,0.642415],"final_reported":0.642415,"final_true_mse":0.642415,"target_var":0.6424,"first_below_1e3":null}],"memory":[{"grad":false,"params_m":67.1,"weights_mib":128,"input_mib":64,"peak_over_base_mib":128,"ms":11.89},{"grad":true,"params_m":67.1,"weights_mib":128,"input_mib":64,"peak_over_base_mib":704,"ms":33.66}]};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const run = (lr, zg) => D.runs.find(r => r.lr === +lr && r.zero_grad === zg);
+  const W = 640, H = 260, L = 58, R = 14, T = 14, B = 34;
+
+  // Plot one or two loss curves on a log scale. A null point means the loss overflowed: the line stops there.
+  function plot(curves, ref) {
+    const vals = curves.flatMap(c => c.data.filter(x => x !== null && x > 0));
+    let lo = Math.log10(Math.min(...vals, ref || Infinity)), hi = Math.log10(Math.max(...vals));
+    lo = Math.floor(lo); hi = Math.ceil(hi); if (hi === lo) hi = lo + 1;
+    const n = Math.max(...curves.map(c => c.data.length));
+    const X = (i) => L + (W - L - R) * i / (n - 1), Y = (val) => T + (H - T - B) * (1 - (Math.log10(val) - lo) / (hi - lo));
+    let s = `<line class="ax" x1="${L}" y1="${H - B}" x2="${W - R}" y2="${H - B}"/><line class="ax" x1="${L}" y1="${T}" x2="${L}" y2="${H - B}"/>`;
+    const step = Math.max(1, Math.ceil((hi - lo) / 6));
+    for (let e = lo; e <= hi; e += step) { const y = Y(10 ** e); s += `<line class="grid" x1="${L}" y1="${y}" x2="${W - R}" y2="${y}"/><text x="${L - 6}" y="${y + 4}" text-anchor="end">${e >= 4 || e <= -3 ? '1e' + e : (10 ** e).toLocaleString('en-GB')}</text>`; }
+    [0, Math.round((n - 1) / 2), n - 1].forEach(i => { s += `<text x="${X(i)}" y="${H - B + 16}" text-anchor="middle">${i}</text>`; });
+    s += `<text x="${(L + W - R) / 2}" y="${H - 4}" text-anchor="middle">step</text>`;
+    if (ref) s += `<line class="ref" x1="${L}" y1="${Y(ref)}" x2="${W - R}" y2="${Y(ref)}"/>`;
+    curves.forEach((c, k) => {
+      let d = '', last = null;
+      c.data.forEach((val, i) => { if (val === null || val <= 0) return; d += (d ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(val).toFixed(1); last = i; });
+      s += `<path class="c${k}" d="${d}"/>`;
+      if (c.data.some(x => x === null)) s += `<text class="boom" x="${Math.min(X(last) + 6, W - R - 70)}" y="${T + 12}">→ ∞ at step ${last + 1}</text>`;
+    });
+    $('#gdPlot').innerHTML = s;
+  }
+  const key = (items) => { $('#gdKey').innerHTML = items.map(([cls, t]) => `<span><i class="${cls}"></i>${t}</span>`).join(''); };
+  const fmt = (x) => x === null ? '∞' : x >= 1000 ? Math.round(x).toLocaleString('en-GB') : (+x.toPrecision(4)).toString();
+
+  function draw() {
+    const e = v('#gdE');
+    ['l', 'z', 'o'].forEach((x, i) => $('#gdV' + x).classList.toggle('on', ['lr', 'zg', 'of'][i] === e));
+    if (e === 'lr') {
+      const r = run(v('#gdLr'), true);
+      plot([{ data: r.curve }], D.optimum.mse);
+      key([['', `lr ${r.lr}`], ['g', `optimum ${D.optimum.mse}`]]);
+      $('#gdStats').innerHTML = `<div class="stat ${r.final === null ? 'bad' : r.final < 60 ? 'good' : 'warn'}"><div class="k">Loss after 200 steps</div><div class="v">${fmt(r.final)}</div></div>` +
+        `<div class="stat"><div class="k">w (true 35)</div><div class="v">${r.w === null || Math.abs(r.w) > 1e6 ? 'diverged' : r.w}</div></div><div class="stat"><div class="k">b (true 12)</div><div class="v">${r.b === null || Math.abs(r.b) > 1e6 ? 'diverged' : r.b}</div></div>`;
+      $('#gdWhy').innerHTML = { '0.001': '<b>Safe but slow.</b> After 200 steps the loss is 65.1 and b is still 10.6: the slope is learnt quickly, the intercept crawls, because the loss is far less curved along b.',
+        '0.01': '<b>Good.</b> Within 0.4% of the optimum after 200 steps.',
+        '0.05': '<b>About as fast as it gets.</b> At the optimum (59.07) by the end and within 1.5% of it by step 10.',
+        '0.1': '<b>Just under the limit of 0.1015.</b> Each step overshoots and comes back, so the loss swings for a while (7,561 at step 10) before settling at 59.17.',
+        '0.12': '<b>18% over the limit, and it diverges.</b> Each step overshoots by more than the last: 6.8 million at step 10, then infinity, with w at −3.8 × 10²⁸.',
+        '0.2': '<b>Twice the limit.</b> 3 × 10¹³ by step 10 and infinite soon after.' }[v('#gdLr')];
+    } else if (e === 'zg') {
+      const lr = v('#gdZ'), a = run(lr, true), b = run(lr, false);
+      plot([{ data: a.curve }, { data: b.curve }], D.optimum.mse);
+      key([['', 'with zero_grad()'], ['b', 'without'], ['g', `optimum ${D.optimum.mse}`]]);
+      $('#gdStats').innerHTML = `<div class="stat good"><div class="k">With zero_grad</div><div class="v">${fmt(a.final)}</div></div><div class="stat bad"><div class="k">Without</div><div class="v">${fmt(b.final)}</div></div><div class="stat"><div class="k">Starting loss</div><div class="v">${fmt(a.curve[0])}</div></div>`;
+      $('#gdWhy').innerHTML = `<b>Every step adds the new gradient to all the old ones.</b> The update keeps growing in the direction it has been going, overshoots, and has to undo the pile-up, so the loss oscillates instead of settling${b.final > a.curve[0] ? ': here it ended higher than where it started' : ''}. Clearing the gradients each step is what makes each update depend only on the current batch.`;
+    } else {
+      const which = v('#gdO'), [ok, bug] = D.overfit;
+      const curves = which === 'both' ? [{ data: ok.curve }, { data: bug.curve }] : which === 'ok' ? [{ data: ok.curve }] : [{ data: bug.curve }];
+      plot(curves.map(c => ({ data: c.data.map(x => Math.max(x, 1e-7)) })), ok.target_var);
+      key(which === 'both' ? [['', 'squeezed to (B,)'], ['b', 'left as (B, 1)'], ['g', `targets' variance ${ok.target_var}`]] : [[which === 'ok' ? '' : 'b', which === 'ok' ? 'squeezed to (B,)' : 'left as (B, 1)'], ['g', `targets' variance ${ok.target_var}`]]);
+      $('#gdStats').innerHTML = `<div class="stat good"><div class="k">Correct, final loss</div><div class="v">${ok.final_reported}</div></div><div class="stat good"><div class="k">Below 0.001 at step</div><div class="v">${ok.first_below_1e3}</div></div><div class="stat bad"><div class="k">With the bug</div><div class="v">${bug.final_reported}</div></div>`;
+      $('#gdWhy').innerHTML = which === 'ok' ? '<b>The test passes.</b> A 1,153-parameter network memorises 32 examples: the loss is below 0.001 by step 47 and 0.0 by step 500 (plotted at a floor of 10⁻⁷).'
+        : `<b>The bug's signature.</b> With a (B, 1) prediction against (B,) targets the loss compares every prediction with every target. The best answer to that is the mean, so the loss stops at the targets' variance, ${bug.target_var}, and stays there.`;
+    }
+  }
+  ['#gdE', '#gdLr', '#gdZ', '#gdO'].forEach(id => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
