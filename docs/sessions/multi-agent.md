@@ -41,3 +41,8 @@ Measurement scripts and the venv live outside the repo in `C:\Users\StarBlue\atl
 - Decisions: GPU experiments run one at a time after a low-memory stop killed queued jobs (Ch9 resumed from its saved results). Extra lab venvs: .venv-a2a (a2a-sdk 1.2.3), .venv-ag (autogen-agentchat 0.7.5), .venv-crew (crewai 1.15.28), plus ollama_proxy.py for logging framework requests.
 - Needs a shared change at release: `mas-` keys in the account-sync allow-lists (assets/account.js, api/src/index.js and its test, ACCOUNTS.md), Worker redeploy, registry entry live, README, cross-course links, dist build.
 - Next: release only with the owner's go-ahead; case studies in the all-courses pass.
+
+## 2026-10-21 — release
+- Done: released with the owner's go-ahead. Release prep 1b42646 (registry entry live at 30 lessons / 20 hours, optional on the ML / AI engineer path; README table, totals 762 chapters / ~544 hours, search ~13,800 entries counted as the hub's search counts them; cross-links: multi-agent joins 9 topics plus 11 new agent topics shared with Single Agent; the 27 Single Agent citations in MAS pages are now links; `mas-` keys in account sync; 14 courses' study data and bundles rebuilt). 475ffee adds `mas-done` to the API test (25/25 against a local Worker). The owner fast-forwarded main to 475ffee and pushed it; Pages built; GitHub release multi-agent-v1.0.0 published with multi-agent/dist/multi-agent-course.html; accounts Worker redeployed (version 98e0c278; /progress without a token 401, unknown path 404).
+- Decisions: the README's search figure had drifted (it said ~12,600 when the indexes held 13,342 before this course); it now uses the hub's own count.
+- Next: case studies 24–26 in the all-courses case-study pass.
