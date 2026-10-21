@@ -77,7 +77,7 @@ window.addEventListener('load', function () { whenIndexed(function () {
     paths: q('#pathGrid .path').map(function (p) { return { id: p.dataset.path, chips: q('.pchip', p).map(chip), prog: ((p.querySelector('.pprog') || {}).textContent || '').trim() }; }),
     progTxt: document.getElementById('progTxt').textContent,
     trackTab: (document.querySelector('#mosaic .mtab[aria-selected="true"]') || { dataset: {} }).dataset.mtab || '',
-    mosaic: q('#mosaic .mgroup').map(function (g) { var nm = g.querySelector('.nm'), ct = g.querySelector('.ct');
+    mosaic: q('#mosaic .mpanel:not([inert]) .mgroup').map(function (g) { var nm = g.querySelector('.nm'), ct = g.querySelector('.ct');
       return { name: nm ? nm.textContent : '', soon: g.classList.contains('soon'), links: q('a[href]', g).length,
         squares: q('.mosaic > *', g).length, done: q('.mosaic .done', g).length, ct: ct ? ct.textContent : '',
         lines: new Set(q('.mosaic > *', g).map(function (sq) { return Math.round(sq.getBoundingClientRect().top); })).size,
@@ -97,6 +97,18 @@ window.addEventListener('load', function () { whenIndexed(function () {
     })(),
     stats: q('#stats .stat').map(function (x) { return q('b, span', x).map(function (e) { return e.textContent; }).join(' '); }),
   };
+  // Click every tracker tab: the tracker must keep its size, the hero text beside it must not move,
+  // and the course tabs below must open the same subject area. Then go back to where it started.
+  var startTrack = s.trackTab, mapEl = document.querySelector('.hero .map'), heroText = document.querySelector('.hero > :first-child');
+  var box = function (e) { var r = e.getBoundingClientRect(); return [Math.round(r.top + scrollY), Math.round(r.height), Math.round(r.width)].join(','); };
+  // Each tab is looked up afresh before its click, so a tracker that redraws its buttons is still toured.
+  s.trackTour = q('#mosaic [data-mtab]').map(function (b) { return b.dataset.mtab; }).map(function (id) {
+    document.getElementById('mtab-' + id).click();
+    return { id: id, map: box(mapEl), heroText: box(heroText),
+      visible: q('#mosaic .mpanel:not([inert])').map(function (p) { return p.id; }),
+      courseTab: (q('#tabList [aria-selected=true]')[0] || { dataset: {} }).dataset.tab };
+  });
+  if (startTrack) document.getElementById('mtab-' + startTrack).click();
   // Visit every tab by clicking it, then try the arrow keys, then go back to the tab the page opened on.
   var open = function () { return q('.tab-panel').filter(function (p) { return !p.hidden; }).map(function (p) { return p.id; }); };
   var startTab = (q('#tabList [aria-selected=true]')[0] || { dataset: {} }).dataset.tab;
@@ -189,6 +201,13 @@ function checks(s) {
   // Squares keep one size and wrap onto more lines rather than shrinking: 15 px on laptops, 14 px on phones.
   const sizes = [...new Set(s.mosaic.map((g) => g.size))];
   check('every row uses the same square size, at least 12 px', sizes.length === 1 && sizes[0] >= 12, sizes);
+  // Switching tracker tabs shows one panel at a time, keeps the tracker's size and the hero text's place,
+  // and opens the same subject area in the course tabs below.
+  check('tracker tabs: one per subject area', eq(s.trackTour.map((t) => t.id), COURSE_TABS.map((t) => t.id)), s.trackTour.map((t) => t.id));
+  check('tracker tabs: exactly the chosen panel is visible', s.trackTour.every((t) => eq(t.visible, ['mpanel-' + t.id])), s.trackTour);
+  check('tracker tabs: the tracker keeps one size', new Set(s.trackTour.map((t) => t.map)).size === 1, s.trackTour.map((t) => t.map));
+  check('tracker tabs: the hero text beside it does not move', new Set(s.trackTour.map((t) => t.heroText)).size === 1, s.trackTour.map((t) => t.heroText));
+  check('tracker tabs: the course tabs below follow', s.trackTour.every((t) => t.courseTab === t.id), s.trackTour.map((t) => t.id + '→' + t.courseTab));
   check('search filters list released courses only', eq(s.filters, ['all'].concat(LIVE.map((c) => c.id))), s.filters);
   check('study data requested for released courses only',
     s.studyScripts.length === LIVE.length && s.studyScripts.every((x) => !SOON.some((c) => x.startsWith(c.dir + '/'))), s.studyScripts);

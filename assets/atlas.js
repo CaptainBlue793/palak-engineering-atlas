@@ -662,7 +662,7 @@
     var list = inTab(t), done = 0, total = 0;
     list.forEach(function (c) { done += trackDone(c); total += trackTotal(c); });
     var on = t.id === trackTab;
-    return '<button type="button" class="mtab" role="tab" id="mtab-' + t.id + '" aria-controls="mpanel" ' +
+    return '<button type="button" class="mtab" role="tab" id="mtab-' + t.id + '" aria-controls="mpanel-' + t.id + '" ' +
       'aria-selected="' + on + '" tabindex="' + (on ? 0 : -1) + '" data-mtab="' + t.id + '">' +
       '<span>' + esc(t.title) + '</span><span class="mct">' + done + '/' + total + '</span></button>';
   }
@@ -674,8 +674,17 @@
         .sort(function (a, b) { return doneCount(b) - doneCount(a); })[0];
       trackTab = COURSE_TABS.some(function (t) { return t.id === saved; }) ? saved : going ? going.tab : COURSE_TABS[0].id;
     }
-    var tab = COURSE_TABS.filter(function (t) { return t.id === trackTab; })[0];
-    var rows = inTab(tab).map(function (c) {
+    // Every tab's panel is drawn into the same grid cell and only the open one is visible, so the tracker
+    // always has the height of its tallest tab: switching tabs never resizes it or moves the hero beside it.
+    $('#mosaic').innerHTML = '<div class="mtabs" role="tablist" aria-label="Progress by subject area">' + COURSE_TABS.map(mosaicTab).join('') + '</div>' +
+      '<div class="mpanels">' + COURSE_TABS.map(function (t) {
+        return '<div class="mpanel" id="mpanel-' + t.id + '" role="tabpanel" aria-labelledby="mtab-' + t.id + '"' +
+          (t.id === trackTab ? '' : ' inert aria-hidden="true"') + '>' + trackRows(t) + '</div>';
+      }).join('') + '</div>';
+  }
+
+  function trackRows(tab) {
+    return inTab(tab).map(function (c) {
       if (c.soon) {
         var n = trackTotal(c);
         return '<div class="mgroup tint soon" style="' + tintVars(c) + '">' +
@@ -698,14 +707,21 @@
         '<span class="rule"></span><span class="ct">' + doneCount(c) + '/' + total + '</span></div>' +
         '<div class="mosaic">' + sq + '</div></div>';
     }).join('');
-    $('#mosaic').innerHTML = '<div class="mtabs" role="tablist" aria-label="Progress by subject area">' + COURSE_TABS.map(mosaicTab).join('') + '</div>' +
-      '<div id="mpanel" role="tabpanel" aria-labelledby="mtab-' + trackTab + '">' + rows + '</div>';
   }
 
+  // Switching only flips which panel is visible (nothing is redrawn), and opens the same subject area
+  // in the course tabs below, so the tracker and the cards stay on one subject.
   function selectTrackTab(id, focus) {
     trackTab = id;
     LS.set('atlas-track-tab', id);
-    renderMosaic();
+    COURSE_TABS.forEach(function (t) {
+      var on = t.id === id, b = $('#mtab-' + t.id), p = $('#mpanel-' + t.id);
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+      b.tabIndex = on ? 0 : -1;
+      p.inert = !on;
+      if (on) p.removeAttribute('aria-hidden'); else p.setAttribute('aria-hidden', 'true');
+    });
+    if (isTab(id)) selectTab(id);
     if (focus) $('#mtab-' + id).focus();
   }
 
