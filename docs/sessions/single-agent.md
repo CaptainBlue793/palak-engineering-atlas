@@ -60,3 +60,10 @@ Measurement scripts and the venv live outside the repo in `C:\Users\StarBlue\atl
 - Ch30 written (GPU to itself): 3 fan-out tasks, tools 0.5 s: model batched calls unprompted (10 in one step), hint changed nothing; concurrent execution 11.6 -> 6.7 s; generation 82% of run time (~12 ms/token), prompt processing 0.17 s cached vs 0.45 s with a changing first line
 - Ch35 written (GPU to itself): 1/2/4/8 concurrent incident runs on one GPU (Ollama one request at a time): throughput ~19 runs/min at every level; median 3.1/6.0/10.0/19.7 s, p95 4.6/8.8/17.7/34.5 s; accuracy unchanged; sync vs background, queues and workers, sandboxes as a service, state stores, failure modes
 - Ch36 written: span tracer (run / llm.chat / tool.*) on 12 incidents (10-24 spans, 2-4.5 s, 11/12); 360 Ch29 runs categorised from traces: 65 failures = 57 read guilty deploys + named another version (50 from incidents 5 and 9), 5 announced-then-stopped, 3 never reached the guilty service; categories -> regression tests
+
+## 2026-10-21 — release
+- Released with the owner's go-ahead: registry entry live (56 lessons: P1–P8 + 48, ~38 hours; case studies 41–48 still placeholders) and added to the ML / AI engineer path; README table, totals (732 chapters, ~524 hours) and search figure (~12,600 entries, summed from the rebuilt indexes).
+- Account sync: `agent-` keys added to `assets/account.js`, `api/src/index.js` and its test (25/25 passing locally), and `ACCOUNTS.md`. The Worker needs a redeploy for live sync of `agent-` (and `rag-`) keys.
+- Cross-course links: single-agent joins 17 topics (163 topics, 2,904 links, 110 chapter files rewritten); study data and offline bundles rebuilt for the 13 courses touched.
+- Checks: content-audit check (732 chapters, 0 errors) and bundle, crosslinks check, palette-check, hub-check (light, dark, 390 px) all pass.
+- Next: case studies 41–48 in the all-courses pass.
