@@ -3,37 +3,284 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GPU Memory Budgets</title>
+<title>GPU Memory Budgets · LLMs by Palak Deb Patra</title>
+<meta name="description" content="P7 of LLMs. Bytes per parameter, weights, gradients and AdamW state, activations, the KV cache, reading PyTorch's and nvidia-smi's numbers, and out-of-memory errors, measured on GPT-2 and Qwen2.5-0.5B on a 16 GB GPU.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .gm-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .gm-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; }
+  .gm-sl { display:grid; grid-template-columns:110px 1fr 90px; gap:10px; align-items:center; font-size:13px; padding:3px 0; }
+  .gm-sl input[type=range] { width:100%; accent-color:var(--accent); }
+  .gm-sl code { text-align:right; }
+  .gm-bar { position:relative; height:34px; border-radius:6px; background:var(--surface); overflow:hidden; display:flex; }
+  .gm-bar span { display:flex; align-items:center; justify-content:center; font-size:11.5px; font-weight:700; color:#fff; white-space:nowrap; overflow:hidden; }
+  .gm-cap { position:absolute; top:-3px; bottom:-3px; width:2px; background:var(--red); }
+  .gm-scale { display:flex; justify-content:space-between; font-family:var(--mono); font-size:11px; color:var(--muted); margin-top:4px; }
+  .gm-key { display:flex; flex-wrap:wrap; gap:12px; font-size:12px; margin-top:8px; color:var(--text-2); }
+  .gm-key i { display:inline-block; width:12px; height:12px; border-radius:3px; vertical-align:middle; margin-right:5px; }
+  .gm-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  .gm-meas { margin-top:8px; font-size:12.5px; color:var(--text-2); }
+</style>
 </head>
 <body data-chapter="0.7">
-<!-- llm:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 7</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 35 min</span></div>
     <h1>GPU Memory <span class="grad">Budgets</span></h1>
-    <p class="lead">Bytes per parameter, activations, optimiser state and the KV cache: whether a model fits in 16 GB, worked out before it runs out.</p>
+    <p class="lead">On one GPU, memory decides what you can do long before speed does. A 7-billion-parameter model needs 14 GiB just to hold its weights in bf16; training even a half-billion-parameter one with a normal optimiser needs most of a 16 GB card before a single example goes through it. Knowing where the bytes go lets you decide, before anything runs, whether a model fits, what batch size will work, and which trick to reach for when it does not.</p>
+    <p class="lead">This chapter builds the budget piece by piece and checks each piece on a 16 GB RTX 5070 Ti: weights that load to within 1% of the arithmetic, AdamW's 8 bytes per parameter, activations that grow by about 1 MiB per token of batch, a KV cache of 36 KiB per generated token, and the out-of-memory error you get when the sum is too big.</p>
+    <ul class="objectives">
+      <li><span>Compute a model's weight memory from its parameter count and dtype</span></li>
+      <li><span>Add up what training needs: weights, gradients, optimiser state and activations</span></li>
+      <li><span>Estimate how memory grows with batch size and sequence length</span></li>
+      <li><span>Read <code>torch.cuda</code> statistics and <code>nvidia-smi</code> and know why they differ</span></li>
+      <li><span>Respond to an out-of-memory error with the right fix</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>dtypes:</b> <a href="p1-pytorch-tensors.html">P1</a> (bytes per number) and <a href="p2-autograd-and-training-loops.html">P2</a> (what autograd keeps).</li>
+        <li><b>Parameter counts:</b> <a href="p6-matrix-multiplies-and-flops.html">P6</a>.</li>
+        <li><b>Memory in general:</b> OS <a href="../os/11-address-spaces.html">Chapter 11: Address Spaces &amp; Virtual Memory</a> (optional).</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Bytes per parameter by dtype</li>
-    <li>Weights, gradients and Adam state</li>
-    <li>Activations</li>
-    <li>Reading nvidia-smi and torch.cuda stats</li>
-    <li>Out-of-memory errors</li>
-  </ol>
+  <h2>Bytes per parameter</h2>
+  <p>A model's weights take parameters × bytes per parameter: 4 in fp32, 2 in bf16 or fp16, 1 in int8, half a byte at 4 bits. That arithmetic is exact enough to plan with. Loaded onto the GPU and measured with <code>torch.cuda.memory_allocated()</code>:</p>
+  <table class="t cmp">
+    <thead><tr><th>Model</th><th>Parameters</th><th>dtype</th><th>Predicted</th><th>Allocated</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-2</td><td>124.4 M</td><td>fp32</td><td>474.7 MiB</td><td>475.5 MiB</td></tr>
+      <tr><td>GPT-2</td><td>124.4 M</td><td>bf16</td><td>237.4 MiB</td><td>243.5 MiB</td></tr>
+      <tr><td>Qwen2.5-0.5B</td><td>494.0 M</td><td>fp32</td><td>1,884.6 MiB</td><td>1,885.3 MiB</td></tr>
+      <tr><td>Qwen2.5-0.5B</td><td>494.0 M</td><td>bf16</td><td>942.3 MiB</td><td>950.2 MiB</td></tr>
+      <tr><td>Qwen2.5-1.5B</td><td>1,543.7 M</td><td>bf16</td><td>2.88 GiB</td><td>not loaded</td></tr>
+      <tr><td>Qwen2.5-7B</td><td>7,615.6 M</td><td>bf16</td><td>14.2 GiB</td><td>not loaded</td></tr>
+    </tbody>
+  </table>
+  <p>The few extra MiB are small buffers that are not parameters. By the same arithmetic, a 7B model in bf16 needs 14.2 GiB for weights alone, leaving under 2 GiB of this 15.9 GiB card for everything else; that is the main reason quantisation (Chapter 25) exists.</p>
+
+  <h2>Weights, gradients and optimiser state</h2>
+  <p>Training needs much more than the weights. Backward fills a gradient for every parameter, and AdamW keeps two running averages per parameter (P2). With the common recipe used on this page, fp32 master weights and bf16 arithmetic through <code>torch.autocast</code>, each parameter costs:</p>
+<pre class="code"><span class="c"># per parameter, mixed-precision training with AdamW</span>
+weights   = <span class="m">4</span>    <span class="c"># fp32 master copy</span>
+grads     = <span class="m">4</span>    <span class="c"># fp32, from backward() until the optimiser step</span>
+adam_m    = <span class="m">4</span>    <span class="c"># fp32 running mean of gradients</span>
+adam_v    = <span class="m">4</span>    <span class="c"># fp32 running mean of squared gradients</span>
+total     = <span class="m">16</span>   <span class="c"># bytes per parameter, before a single activation</span></pre>
+  <p>Measured after a training step, with gradients freed (<code>zero_grad(set_to_none=True)</code>), GPT-2 held 12 bytes per parameter of weights and optimiser state, 1.4 GiB, and Qwen2.5-0.5B held 5.5 GiB. At 16 bytes per parameter, Qwen2.5-1.5B would need <b>23 GiB</b> and a 7B model <b>113 GiB</b> before any data goes in. On a 16 GB card, full fine-tuning stops at well under a billion parameters, which is the problem LoRA (Chapter 21) and QLoRA (Chapter 22) solve by training only a small number of extra parameters.</p>
+
+  <h2>Activations</h2>
+  <p>The fourth cost depends on the data. Autograd keeps the intermediate values of the forward pass for the backward pass (P2), and there are a lot of them: every layer's inputs, attention scores, MLP activations, for every token of every sequence. Measured on GPT-2 with 1,024-token sequences:</p>
+  <table class="t cmp">
+    <thead><tr><th>Batch (× 1,024 tokens)</th><th>Saved activations</th><th>Peak during the step</th><th>Share of 15.9 GiB</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>1.2 GiB</td><td>3.1 GiB</td><td>20%</td></tr>
+      <tr><td>2</td><td>2.2 GiB</td><td>4.5 GiB</td><td>29%</td></tr>
+      <tr><td>4</td><td>4.1 GiB</td><td>7.4 GiB</td><td>47%</td></tr>
+      <tr><td>8</td><td>7.9 GiB</td><td>13.1 GiB</td><td>83%</td></tr>
+      <tr><td>8, without autocast (all fp32)</td><td>9.6 GiB</td><td>15.6 GiB</td><td>98%</td></tr>
+    </tbody>
+  </table>
+  <p>Saved activations grew by about <b>0.95 MiB per token</b>, and the peak by about <b>1.43 MiB per token</b>. The difference is temporary tensors in the loss: the output layer produces 50,257 logits per token, and the cross-entropy works on an fp32 copy of them (P3). For a batch of 8 × 1,024 tokens one fp32 copy of the logits is 1.5 GiB, and the backward pass needs another of the same size. A line fitted through the four autocast runs, 1,734 MiB plus 1.43 MiB per token, predicted the batch-2 and batch-4 peaks to within 0.5%. Qwen2.5-0.5B, with a 151,936-token vocabulary, cost about 4 MiB per token: 512-token sequences peaked at 9.4 GiB with a batch of 1 and 15.4 GiB with a batch of 4.</p>
+  <p>Activations are also the part you can trade. Halving the batch halves them, and gradient accumulation (Chapter 13) gets the same effective batch over several smaller steps. Activation checkpointing throws most of them away and recomputes them during backward, trading about a third more compute for much less memory.</p>
+
+  <h2>The KV cache</h2>
+  <p>Inference has no gradients or optimiser state, but generation adds a memory cost of its own. To avoid recomputing earlier tokens, a model stores each layer's keys and values for every token it has seen (Chapter 16). Per token, that is 2 (keys and values) × layers × KV heads × head size × bytes:</p>
+<pre class="code"><span class="k">def</span> <span class="f">kv_bytes_per_token</span>(layers, kv_heads, head_dim, bytes_per=<span class="m">2</span>):
+    <span class="k">return</span> <span class="m">2</span> * layers * kv_heads * head_dim * bytes_per
+
+<span class="f">kv_bytes_per_token</span>(<span class="m">12</span>, <span class="m">12</span>, <span class="m">64</span>)     <span class="c"># GPT-2: 36,864 bytes; measured 37.6 MiB after 1,024 tokens (36 MiB predicted)</span>
+<span class="f">kv_bytes_per_token</span>(<span class="m">24</span>, <span class="m">2</span>, <span class="m">64</span>)      <span class="c"># Qwen2.5-0.5B: 12,288 bytes</span>
+<span class="f">kv_bytes_per_token</span>(<span class="m">28</span>, <span class="m">2</span>, <span class="m">128</span>)     <span class="c"># Qwen2.5-1.5B: 28,672 bytes</span>
+<span class="f">kv_bytes_per_token</span>(<span class="m">28</span>, <span class="m">4</span>, <span class="m">128</span>)     <span class="c"># Qwen2.5-7B: 57,344 bytes; 32,768 tokens of context is 1.75 GiB per sequence</span></pre>
+  <p>GPT-2 needs more cache per token than Qwen2.5-1.5B, a model twelve times its size, because GPT-2 keeps keys and values for all 12 of its attention heads while Qwen shares them between groups of heads (grouped-query attention, Chapter 15). For a server holding many conversations at once, the KV cache, not the weights, is usually what runs out first (Chapter 26).</p>
+
+  <h2>Reading the numbers</h2>
+  <p>Three numbers describe GPU memory, and they disagree on purpose. <code>torch.cuda.memory_allocated()</code> is the bytes held by live tensors. <code>torch.cuda.memory_reserved()</code> is what PyTorch's caching allocator has taken from the driver, including freed blocks it keeps for reuse. <code>nvidia-smi</code> shows what the driver has handed out, including the CUDA context itself. After loading GPT-2 in bf16 they read 243.5 MiB allocated, 256 MiB reserved, and 505 MiB more in <code>nvidia-smi</code> than before the process started, of which <b>251 MiB</b> was the CUDA context, measured before any tensor existed. Use <code>torch.cuda.max_memory_allocated()</code> to find a step's peak; <code>nvidia-smi</code> only shows a moment, and on Windows it cannot attribute memory to a single process.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>CUDA context</b> 251 MiB, before any tensor</li>
+      <li data-k="step"><b>Weights</b> parameters × bytes</li>
+      <li data-k="step"><b>Optimiser state</b> 8 bytes per parameter for AdamW</li>
+      <li data-k="step"><b>Gradients</b> 4 bytes per parameter, during backward</li>
+      <li data-k="end"><b>Activations</b> grow with batch × sequence length</li>
+    </ol>
+    <figcaption><b>A training step's memory, from the bottom up.</b> The first four are fixed for a given model; the last is what you tune with batch size, sequence length and checkpointing.</figcaption>
+  </figure>
+
+  <h2>Out-of-memory errors</h2>
+  <p>When the sum does not fit, PyTorch raises <code>torch.OutOfMemoryError</code>. Training Qwen2.5-0.5B with 16 sequences of 1,024 tokens gave: <code>CUDA out of memory. Tried to allocate 896.00 MiB. GPU 0 has a total capacity of 15.89 GiB of which 0 bytes is free</code>. The "tried to allocate" figure is only the request that failed, not the whole shortfall, so do not plan from it. Work out the budget instead, then fix the part that is too big: activations with a smaller batch, gradient accumulation or checkpointing; optimiser state with an 8-bit optimiser or LoRA; weights with bf16 or quantisation.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Memory budget calculator</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="gm-l">Model</div>
+      <div class="seg" id="gmM"><button class="active" data-v="gpt2">GPT-2 (124M)</button><button data-v="q05">Qwen2.5-0.5B</button><button data-v="q15">Qwen2.5-1.5B</button><button data-v="q7">Qwen2.5-7B</button></div>
+      <div class="gm-l">Job</div>
+      <div class="seg" id="gmJ"><button class="active" data-v="train">train with AdamW</button><button data-v="infer">generate (bf16)</button></div>
+      <div class="gm-sl"><span>batch</span><input type="range" id="gmB" min="1" max="32" step="1" value="4" aria-label="batch size"><code id="gmBv">4</code></div>
+      <div class="gm-sl"><span>tokens each</span><input type="range" id="gmT" min="6" max="15" step="1" value="10" aria-label="sequence length, as a power of two"><code id="gmTv">1,024</code></div>
+      <div class="gm-box">
+        <div class="gm-bar" id="gmBar"></div>
+        <div class="gm-scale"><span>0</span><span>8 GiB</span><span>15.9 GiB (this GPU)</span><span id="gmMax"></span></div>
+        <div class="gm-key" id="gmKey"></div>
+        <div class="gm-meas" id="gmMeas"></div>
+      </div>
+      <div class="stats" id="gmStats"></div>
+      <div class="gm-why" id="gmWhy"></div>
+    </div>
+    <div class="panel-foot">RTX 5070 Ti (15.89 GiB usable), PyTorch 2.11, transformers 5.20. Training: fp32 master weights, bf16 autocast, AdamW; the activation part is a line fitted to measured peaks (GPT-2: 4 runs at 1,024 tokens; Qwen2.5-0.5B: 2 runs at 512 tokens) and is not available for the models I did not train. Generation: bf16 weights plus the KV cache from each model's config, which matched the measured cache for GPT-2. The CUDA context (251 MiB) is included in both.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: ZeRO and the 16 bytes per parameter</div><p>Microsoft's 2019 ZeRO paper (the basis of DeepSpeed) started from exactly this budget: with mixed-precision Adam, it counted 16 bytes per parameter of weights, gradients and optimiser state, 120 GB for a 7.5-billion-parameter model, far more than one GPU held. Its answer was to stop every GPU keeping a full copy: ZeRO splits the optimiser state, then the gradients, then the weights themselves across the GPUs in a job, so each holds only its share. PyTorch's Fully Sharded Data Parallel (FSDP) is the same idea. On one 16 GB GPU there is nothing to split across, which is why this course reaches for LoRA and quantisation instead.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Budgeting only the weights</b> for training; AdamW alone adds 8 bytes per parameter and gradients 4 more.</li>
+      <li><b>Forgetting the logits:</b> with a 50,000 to 150,000-token vocabulary, the loss's fp32 logits can be gigabytes per batch.</li>
+      <li><b>Planning from the "tried to allocate" number</b> in an out-of-memory error, which is only the last request.</li>
+      <li><b>Reading <code>nvidia-smi</code> once</b> and calling it the peak; use <code>torch.cuda.max_memory_allocated()</code>.</li>
+      <li><b>Ignoring the KV cache</b> when serving long contexts or many users at once.</li>
+      <li><b>Keeping gradients alive between steps</b> instead of <code>zero_grad(set_to_none=True)</code>.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Can you fully fine-tune a 7-billion-parameter model on one 24 GB GPU? Show the arithmetic.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>No, not with a standard setup. Mixed-precision training with AdamW costs about 16 bytes per parameter before activations: 4 for fp32 master weights, 4 for gradients and 8 for Adam's two moments. For 7 billion parameters that is about 112 GB, nearly five times the card, and activations come on top. Even the bf16 weights alone are 14 GB. Options: train only small adapters with LoRA, so gradients and optimiser state exist only for a few million parameters; quantise the frozen base weights to 4 bits with QLoRA, which brings the weights to about 4 GB; use an 8-bit optimiser; or shard everything across several GPUs with ZeRO or FSDP. Activation memory is then controlled with a small micro-batch, gradient accumulation and activation checkpointing.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your training run fits at batch size 4 but runs out of memory at 8. The weights are under 1 GB. Where is the memory going, and what do you do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>If doubling the batch breaks it, the problem is the part that scales with batch × sequence length, not the weights or optimiser state. That is the saved activations, about 1 MiB per token for a GPT-2-sized model, plus the large temporary tensors around the loss: the output layer produces one logit per vocabulary entry per token, and the cross-entropy works on an fp32 copy of those, 1.5 GiB for 8 × 1,024 tokens with a 50,000-token vocabulary, and the backward pass needs another. I would confirm with <code>torch.cuda.max_memory_allocated()</code> and the memory snapshot tool, then keep the effective batch of 8 by running batch 4 twice with gradient accumulation, add activation checkpointing if I need longer sequences, and check that the loss is computed in a way that does not materialise extra copies of the logits, for example by computing it in chunks.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Weights cost parameters × bytes: measured loads matched to within 1% (GPT-2 475 MiB in fp32, Qwen2.5-0.5B 950 MiB in bf16).</li>
+      <li>Mixed-precision AdamW training costs about 16 bytes per parameter before activations: 23 GiB for a 1.5B model.</li>
+      <li>Activations scale with batch × tokens: about 1 MiB per token for GPT-2, plus the loss's fp32 logits.</li>
+      <li>The KV cache costs 2 × layers × KV heads × head size × bytes per token; GPT-2 needs more than Qwen2.5-1.5B because it has no grouped-query attention.</li>
+      <li>allocated ≤ reserved ≤ what nvidia-smi shows; the CUDA context alone was 251 MiB. Measure peaks with max_memory_allocated.</li>
+      <li>On out-of-memory errors, fix the part that is too big: batch and checkpointing for activations, LoRA or 8-bit optimisers for state, quantisation for weights.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">About how much memory do a 7.6-billion-parameter model's weights need in bf16?</p>
+      <div class="opts">
+        <button class="opt">About 7.6 GiB</button>
+        <button class="opt">About 14 GiB</button>
+        <button class="opt">About 28 GiB</button>
+        <button class="opt">About 3.5 GiB</button>
+      </div>
+      <div class="explain">2 bytes × 7.6 billion ≈ 15.2 GB = 14.2 GiB, almost all of a 16 GB card.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">With fp32 master weights and AdamW, how many bytes per parameter does training need before activations?</p>
+      <div class="opts">
+        <button class="opt">2</button>
+        <button class="opt">4</button>
+        <button class="opt">8</button>
+        <button class="opt">About 16</button>
+      </div>
+      <div class="explain">4 (weights) + 4 (gradients) + 8 (Adam's two moments). Measured after a step with gradients freed, 12 bytes per parameter remained.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">GPT-2's training peak grew from 3.1 GiB at batch 1 to 13.1 GiB at batch 8. What grew?</p>
+      <div class="opts">
+        <button class="opt">The weights</button>
+        <button class="opt">AdamW's state</button>
+        <button class="opt">Saved activations and the loss's temporary logits, which scale with batch × tokens</button>
+        <button class="opt">The CUDA context</button>
+      </div>
+      <div class="explain">About 1.43 MiB per token at the peak: 0.95 MiB of saved activations plus fp32 logits over a 50,257-token vocabulary.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why does GPT-2 need more KV cache per token (36 KiB) than the much larger Qwen2.5-1.5B (28 KiB)?</p>
+      <div class="opts">
+        <button class="opt">Qwen shares keys and values between groups of heads (grouped-query attention); GPT-2 keeps them for every head</button>
+        <button class="opt">GPT-2 stores its cache in fp32</button>
+        <button class="opt">Qwen does not use a KV cache</button>
+        <button class="opt">GPT-2 has more layers</button>
+      </div>
+      <div class="explain">GPT-2: 2 × 12 layers × 12 heads × 64 × 2 bytes. Qwen2.5-1.5B: 2 × 28 layers × 2 KV heads × 128 × 2 bytes.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">An out-of-memory error says "Tried to allocate 896.00 MiB". What does that number tell you?</p>
+      <div class="opts">
+        <button class="opt">How much more memory the job needs in total</button>
+        <button class="opt">Only the size of the last request that failed; the total shortfall can be much larger</button>
+        <button class="opt">The size of the model's weights</button>
+        <button class="opt">How much memory the CUDA context uses</button>
+      </div>
+      <div class="explain">Work out the budget from its parts instead; the failing request is just where the sum crossed the limit.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"smi_baseline_mib":1122,"context":{"allocated_mib":0.0,"smi_mib":251},"weights":[{"model":"gpt2","dtype":"float32","params":124439808,"allocated_mib":475.5,"predicted_mib":474.7,"reserved_mib":530.0,"smi_mib":779},{"model":"gpt2","dtype":"bfloat16","params":124439808,"allocated_mib":243.5,"predicted_mib":237.4,"reserved_mib":256.0,"smi_mib":505},{"model":"Qwen2.5-0.5B","dtype":"float32","params":494032768,"allocated_mib":1885.3,"predicted_mib":1884.6,"reserved_mib":2000.0,"smi_mib":2249},{"model":"Qwen2.5-0.5B","dtype":"bfloat16","params":494032768,"allocated_mib":950.2,"predicted_mib":942.3,"reserved_mib":992.0,"smi_mib":1241}],"train":[{"model":"gpt2","params":124439808,"batch":1,"seq":1024,"amp_bf16":true,"weights_mib":475.5,"acts_mib":1244.7,"state_after_step_mib":1558.9,"peak_mib":3196.3,"smi_mib":3591},{"model":"gpt2","params":124439808,"batch":2,"seq":1024,"amp_bf16":true,"weights_mib":494.0,"acts_mib":2202.5,"state_after_step_mib":1651.4,"peak_mib":4639.2,"smi_mib":5183},{"model":"gpt2","params":124439808,"batch":4,"seq":1024,"amp_bf16":true,"weights_mib":494.0,"acts_mib":4149.8,"state_after_step_mib":1841.8,"peak_mib":7563.6,"smi_mib":8615},{"model":"gpt2","params":124439808,"batch":8,"seq":1024,"amp_bf16":true,"weights_mib":494.0,"acts_mib":8051.3,"state_after_step_mib":2237.7,"peak_mib":13430.7,"smi_mib":14513},{"model":"gpt2","params":124439808,"batch":8,"seq":1024,"amp_bf16":false,"weights_mib":494.0,"acts_mib":9838.7,"state_after_step_mib":3014.7,"peak_mib":15994.4,"smi_mib":14790},{"model":"Qwen2.5-0.5B","params":494032768,"batch":1,"seq":512,"amp_bf16":true,"weights_mib":1903.1,"acts_mib":2497.0,"state_after_step_mib":5830.4,"peak_mib":9629.0,"smi_mib":10420},{"model":"Qwen2.5-0.5B","params":494032768,"batch":4,"seq":512,"amp_bf16":true,"weights_mib":1903.1,"acts_mib":7062.5,"state_after_step_mib":6295.1,"peak_mib":15733.5,"smi_mib":14792}],"oom":{"happened":true,"message":"CUDA out of memory. Tried to allocate 896.00 MiB. GPU 0 has a total capacity of 15.89 GiB of which 0 bytes is free","batch":16,"seq":1024,"model":"Qwen2.5-0.5B"},"kv":{"points":[{"tokens":128,"mib":4.6},{"tokens":256,"mib":9.1},{"tokens":512,"mib":18.1},{"tokens":1024,"mib":37.6}],"predicted_bytes_per_token":36864,"layers":12,"width":768}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const MiB = 2 ** 20, GiB = 2 ** 30, CAP = 15.89 * GiB, CTX = D.context.smi_mib * MiB;
+  // Parameter counts and KV shapes from each model's config; peak fits from the measured training runs.
+  const M = {
+    gpt2: { name: 'GPT-2', params: 124439808, layers: 12, kv: 12, hd: 64, vocab: 50257, fit: [1734, 1.428], measured: D.train.filter(r => r.model === 'gpt2' && r.amp_bf16).map(r => [r.batch, r.seq, r.peak_mib]) },
+    q05: { name: 'Qwen2.5-0.5B', params: 494032768, layers: 24, kv: 2, hd: 64, vocab: 151936, fit: [7594, 3.974], measured: D.train.filter(r => r.model === 'Qwen2.5-0.5B').map(r => [r.batch, r.seq, r.peak_mib]) },
+    q15: { name: 'Qwen2.5-1.5B', params: 1543714304, layers: 28, kv: 2, hd: 128, vocab: 151936, fit: null, measured: [] },
+    q7: { name: 'Qwen2.5-7B', params: 7615616512, layers: 28, kv: 4, hd: 128, vocab: 152064, fit: null, measured: [] },
+  };
+  const COL = { ctx: 'var(--muted)', w: 'var(--accent)', st: 'color-mix(in srgb, var(--accent) 55%, var(--accent-2))', act: 'var(--accent-2)', kv: 'var(--green)' };
+  const g = (b) => b >= GiB ? (b / GiB).toFixed(2) + ' GiB' : Math.round(b / MiB).toLocaleString('en-GB') + ' MiB';
+
+  function draw() {
+    const m = M[v('#gmM')], job = v('#gmJ'), B = +$('#gmB').value, T = 2 ** +$('#gmT').value, tokens = B * T;
+    $('#gmBv').textContent = B; $('#gmTv').textContent = T.toLocaleString('en-GB');
+    let parts;
+    if (job === 'train') {
+      const w = 4 * m.params, st = 8 * m.params, gr = 4 * m.params;
+      // Fitted peak = intercept + slope × tokens; the intercept already holds weights, state and gradients.
+      const act = m.fit ? Math.max(0, (m.fit[0] + m.fit[1] * tokens) * MiB - (w + st + gr)) : null;
+      parts = [['CUDA context', CTX, 'ctx'], ['fp32 weights', w, 'w'], ['AdamW state', st, 'st'], ['gradients', gr, 'st'], ...(act === null ? [] : [['activations + loss', act, 'act']])];
+      var note = act === null ? `<b>Activations not measured for ${m.name}.</b> Even without them, 16 bytes per parameter is ${g(16 * m.params)}${16 * m.params > CAP ? ', more than this GPU holds' : ''}.` : '';
+    } else {
+      const w = 2 * m.params, kv = 2 * m.layers * m.kv * m.hd * 2 * tokens;
+      parts = [['CUDA context', CTX, 'ctx'], ['bf16 weights', w, 'w'], ['KV cache', kv, 'kv']];
+    }
+    const total = parts.reduce((s, p) => s + p[1], 0), scale = Math.max(total, CAP) * 1.04;
+    $('#gmBar').innerHTML = parts.map(([n, b, c]) => `<span style="width:${(100 * b / scale).toFixed(2)}%;background:${COL[c]}" title="${n}: ${g(b)}">${b / scale > 0.09 ? n : ''}</span>`).join('') + `<i class="gm-cap" style="left:${(100 * CAP / scale).toFixed(2)}%"></i>`;
+    $('#gmMax').textContent = scale > CAP * 1.1 ? g(scale) : '';
+    $('#gmKey').innerHTML = parts.map(([n, b, c]) => `<span><i style="background:${COL[c]}"></i>${n} ${g(b)}</span>`).join('');
+    const hit = m.measured.find(([b, t]) => b === B && t === T);
+    $('#gmMeas').innerHTML = job === 'train' && hit ? `<b>Measured at this setting:</b> peak ${g(hit[2] * MiB)}, plus the ${D.context.smi_mib} MiB CUDA context.` : job === 'train' && m.measured.length ? `Measured settings for ${m.name}: ${m.measured.map(([b, t, p]) => `${b} × ${t} → ${g(p * MiB)}`).join(' · ')}.` : '';
+    const fits = total <= CAP;
+    $('#gmStats').innerHTML = `<div class="stat ${fits ? 'good' : 'bad'}"><div class="k">Estimated total</div><div class="v">${g(total)}</div></div><div class="stat"><div class="k">Tokens in the batch</div><div class="v">${tokens.toLocaleString('en-GB')}</div></div><div class="stat ${fits ? 'good' : 'bad'}"><div class="k">Fits in 15.9 GiB?</div><div class="v">${fits ? 'yes' : 'no'}</div></div>`;
+    $('#gmWhy').innerHTML = note ? note : job === 'infer'
+      ? `<b>${m.name} costs ${(2 * m.layers * m.kv * m.hd * 2).toLocaleString('en-GB')} bytes of KV cache per token.</b> ${fits ? `Weights plus ${tokens.toLocaleString('en-GB')} cached tokens fit with ${g(CAP - total)} to spare.` : `${tokens.toLocaleString('en-GB')} cached tokens push it past the card; serve fewer or shorter sequences, or quantise the cache.`}`
+      : fits ? `<b>Fits.</b> ${g(16 * m.params)} is weights, gradients and AdamW state; the rest grows with the ${tokens.toLocaleString('en-GB')} tokens in the batch.` : `<b>Does not fit.</b> Halve the batch and use gradient accumulation, add activation checkpointing, or for a larger model, switch to LoRA (Chapter 21).`;
+  }
+  ['#gmM', '#gmJ'].forEach(id => $(id).addEventListener('segchange', draw));
+  ['#gmB', '#gmT'].forEach(id => $(id).addEventListener('input', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
