@@ -1,6 +1,6 @@
 'use strict';
 /* The Atlas course registry, read from assets/atlas.js so tools share one source of truth.
-     const { COURSES, FEATURED, PATHS, TABS } = require('./registry.cjs');
+     const { COURSES, PATHS, TABS } = require('./registry.cjs');
    Each course: { id, tab, title, short, dir, store, indexVar, c1, c2, d1, d2, chapters, first, dist, soon, ... }. */
 const fs = require('fs');
 const path = require('path');
@@ -21,7 +21,6 @@ const COURSES = literal('COURSES');
 module.exports = {
   ROOT,
   COURSES,
-  FEATURED: literal('FEATURED'),
   PATHS: literal('PATHS'),
   TABS: literal('TABS'),
   byId: (id) => COURSES.find((c) => c.id === id),

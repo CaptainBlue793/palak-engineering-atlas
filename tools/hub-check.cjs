@@ -73,8 +73,6 @@ window.addEventListener('load', function () { whenIndexed(function () {
     tabs: q('#tabList [role=tab]').map(function (b) { return { id: b.dataset.tab, selected: b.getAttribute('aria-selected') === 'true',
       controls: b.getAttribute('aria-controls'), dots: q('.tab-dots i', b).length, soonDots: q('.tab-dots i.soon', b).length }; }),
     openPanels: q('.tab-panel').filter(function (p) { return !p.hidden; }).map(function (p) { return p.id; }),
-    featured: q('#pathFeatured .pchip').map(chip),
-    paths: q('#pathGrid .path').map(function (p) { return { id: p.dataset.path, chips: q('.pchip', p).map(chip), prog: ((p.querySelector('.pprog') || {}).textContent || '').trim() }; }),
     progTxt: document.getElementById('progTxt').textContent,
     trackTab: (document.querySelector('#mosaic .mtab[aria-selected="true"]') || { dataset: {} }).dataset.mtab || '',
     mosaic: q('#mosaic .mpanel:not([inert]) .mgroup').map(function (g) { var nm = g.querySelector('.nm'), ct = g.querySelector('.ct');
@@ -97,6 +95,41 @@ window.addEventListener('load', function () { whenIndexed(function () {
     })(),
     stats: q('#stats .stat').map(function (x) { return q('b, span', x).map(function (e) { return e.textContent; }).join(' '); }),
   };
+  // The learning-paths metro map. Its tab is opened so the lines can be measured, then every role is
+  // chosen in turn; afterwards the role and the tab the page started on are restored.
+  var tabBefore = (q('#tabList [aria-selected=true]')[0] || { dataset: {} }).dataset.tab;
+  document.getElementById('tab-paths').click();
+  s.stations = q('#metroMap .mst').map(function (st) { var cs = getComputedStyle(st.querySelector('.mdot'));
+    return { id: st.dataset.course, link: st.tagName.toLowerCase() === 'a', soon: st.classList.contains('soon'),
+      fill: cs.fill, stroke: cs.stroke, dash: cs.strokeDasharray, k1: getComputedStyle(st).getPropertyValue('--k1').trim() }; });
+  var centre = {};
+  q('#metroMap .mst').forEach(function (st) { var c = st.querySelector('.mdot'); centre[st.dataset.course] = [+c.getAttribute('cx'), +c.getAttribute('cy')]; });
+  // Every drawn line, sampled every 3 units: none may come within a station's ring of a station it doesn't stop at.
+  s.metroHits = [];
+  var hits = function () {
+    q('#metroMap .mline').forEach(function (l) {
+      var len = l.getTotalLength(), a = l.dataset.a, b = l.dataset.b;
+      for (var t = 0; t <= len; t += 3) { var pt = l.getPointAtLength(t);
+        Object.keys(centre).forEach(function (id) { if (id === a || id === b) return;
+          var dx = pt.x - centre[id][0], dy = pt.y - centre[id][1];
+          if (dx * dx + dy * dy < 21 * 21 && s.metroHits.indexOf(a + '>' + b + ' @' + id) < 0) s.metroHits.push(a + '>' + b + ' @' + id); }); }
+    });
+  };
+  var roleBefore = (q('#metroRoles [aria-checked=true]')[0] || { dataset: {} }).dataset.path;
+  s.roleStart = roleBefore || '';
+  s.roles = q('#metroRoles [data-path]').map(function (b) { return b.dataset.path; }).map(function (id) {
+    document.getElementById('role-' + id).click();
+    hits();
+    var d = document.getElementById('metroDetail'), pair = function (l) { return l.dataset.a + '>' + l.dataset.b; };
+    return { id: id, checked: q('#metroRoles [aria-checked=true]').map(function (x) { return x.dataset.path; }),
+      chips: q('.pchip', d).map(chip), prog: ((d.querySelector('.pprog') || {}).textContent || '').trim(),
+      next: ((d.querySelector('.md-next') || {}).textContent || '').trim(),
+      lit: q('#metroMap .mline.on:not(.opt)').map(pair), litOpt: q('#metroMap .mline.on.opt').map(pair),
+      litStroke: q('#metroMap .mline.on').map(function (l) { return getComputedStyle(l).stroke; }),
+      numbered: q('#metroMap .mst.on').map(function (st) { return st.dataset.course + ':' + ((st.querySelector('.mnum') || {}).textContent || ''); }) };
+  });
+  if (roleBefore) document.getElementById('role-' + roleBefore).click();
+  if (tabBefore) document.getElementById('tab-' + tabBefore).click();
   // Click every tracker tab: the tracker must keep its size, the hero text beside it must not move,
   // and the course tabs below must open the same subject area. Then go back to where it started.
   var startTrack = s.trackTab, mapEl = document.querySelector('.hero .map'), heroText = document.querySelector('.hero > :first-child');
@@ -232,33 +265,56 @@ function checks(s) {
   check('each course tab shows one dot per course, rings for planned ones', dotsWrong.length === 0, dotsWrong);
 
   console.log('paths');
-  check('featured path is the complete order', eq(s.featured.map((c) => c.id), REG.FEATURED.steps), s.featured.map((c) => c.id));
-  check('featured: released steps link, unreleased ones are faded spans',
-    s.featured.every((c) => c.link === !isSoon(c.id) && c.soon === isSoon(c.id)), s.featured);
-  check('role paths in order', eq(s.paths.map((p) => p.id), REG.PATHS.map((p) => p.id)), s.paths.map((p) => p.id));
-  const P = Object.fromEntries(s.paths.map((p) => [p.id, p]));
-  check('each path lists its steps, then its optional steps', REG.PATHS.every((p) => P[p.id] &&
+  // The metro map: one station per course in the course's own colour, one line per role.
+  check('every course is on at least one role', REG.COURSES.every((c) => REG.PATHS.some((p) => p.steps.concat(p.optional).includes(c.id))),
+    REG.COURSES.filter((c) => !REG.PATHS.some((p) => p.steps.concat(p.optional).includes(c.id))).map((c) => c.id));
+  check('one station per course', eq(s.stations.map((x) => x.id).sort(), REG.COURSES.map((c) => c.id).sort()), s.stations.map((x) => x.id));
+  const offColour = s.stations.filter((x) => !eq(rgb(x.soon ? x.stroke : x.fill), rgb(x.k1))).map((x) => [x.id, x.fill, x.stroke, x.k1]);
+  check('each station wears its course colour (' + THEME + ')', offColour.length === 0, offColour);
+  check('released stations link, planned ones are dashed rings with no link',
+    s.stations.every((x) => x.link === !isSoon(x.id) && x.soon === isSoon(x.id) && (!x.soon || x.dash !== 'none')), s.stations);
+  check('roles in order', eq(s.roles.map((r) => r.id), REG.PATHS.map((p) => p.id)), s.roles.map((r) => r.id));
+  check('the page opens on a role', REG.PATHS.some((p) => p.id === s.roleStart), s.roleStart);
+  check('choosing a role checks it and only it', s.roles.every((r) => eq(r.checked, [r.id])), s.roles.map((r) => [r.id, r.checked]));
+  const P = Object.fromEntries(s.roles.map((r) => [r.id, r]));
+  const pairs = (p) => p.steps.slice(1).map((id, i) => p.steps[i] + '>' + id);
+  const optPairs = (p) => p.optional.map((id) => p.steps[p.steps.length - 1] + '>' + id);
+  check('the lit line runs through the role\'s steps in order', REG.PATHS.every((p) => eq(P[p.id].lit, pairs(p))),
+    REG.PATHS.filter((p) => !eq(P[p.id].lit, pairs(p))).map((p) => [p.id, P[p.id].lit]));
+  check('optional extras branch off the end of the line', REG.PATHS.every((p) => eq(P[p.id].litOpt, optPairs(p))),
+    REG.PATHS.filter((p) => !eq(P[p.id].litOpt, optPairs(p))).map((p) => [p.id, P[p.id].litOpt]));
+  const numbered = (p) => REG.COURSES.map((c) => c.id).filter((id) => p.steps.includes(id) || p.optional.includes(id))
+    .map((id) => id + ':' + (p.steps.includes(id) ? p.steps.indexOf(id) + 1 : '+'));
+  check('lit stations are numbered in order, extras marked +', REG.PATHS.every((p) => eq(P[p.id].numbered, numbered(p))),
+    REG.PATHS.filter((p) => !eq(P[p.id].numbered, numbered(p))).map((p) => p.id));
+  check('lit lines take the colours of the courses they join', s.roles.every((r) => r.litStroke.length && r.litStroke.every((x) => /^url\(/.test(x))),
+    s.roles.map((r) => [r.id, r.litStroke[0]]));
+  check('no line runs through a station it doesn\'t stop at', s.metroHits.length === 0, s.metroHits);
+  check('each role lists its steps, then its optional steps', REG.PATHS.every((p) =>
     eq(P[p.id].chips.map((c) => c.id), p.steps.concat(p.optional)) && eq(P[p.id].chips.filter((c) => c.opt).map((c) => c.id), p.optional)),
-    REG.PATHS.filter((p) => !P[p.id] || !eq(P[p.id].chips.map((c) => c.id), p.steps.concat(p.optional))).map((p) => p.id));
-  check('a completed course shows a tick, others do not', s.featured.every((c) => c.done === (c.id === COMPLETE.id)), s.featured.map((c) => [c.id, c.done]));
-  const wrong = REG.PATHS.filter((p) => !P[p.id] || P[p.id].prog !== expectedProg(p)).map((p) => [p.id, P[p.id] && P[p.id].prog, expectedProg(p)]);
-  check('every path counts released required steps', wrong.length === 0, wrong);
+    REG.PATHS.filter((p) => !eq(P[p.id].chips.map((c) => c.id), p.steps.concat(p.optional))).map((p) => p.id));
+  const chips = s.roles.flatMap((r) => r.chips);
+  check('a completed course shows a tick, others do not', chips.every((c) => c.done === (c.id === COMPLETE.id)),
+    chips.filter((c) => c.done !== (c.id === COMPLETE.id)).map((c) => c.id));
+  const wrong = REG.PATHS.filter((p) => P[p.id].prog !== expectedProg(p)).map((p) => [p.id, P[p.id].prog, expectedProg(p)]);
+  check('every role counts released required steps', wrong.length === 0, wrong);
+  check('every role suggests what to read next', s.roles.every((r) => /^(Start with|Continue with|Every )/.test(r.next)), s.roles.map((r) => r.next));
 
   // Filled chips put text on the course gradient: it must stay readable at both ends of it.
   // Dark mode: 4.5:1 (WCAG AA). Light mode: 3:1 (AA for bold UI labels), since some light-mode
   // hues (amber, cyan, orange) can't reach 4.5:1 with any single text colour.
   const MIN = THEME === 'dark' ? 4.5 : 3;
-  const weak = s.featured.filter((c) => !c.opt).map((c) => [c.id, Math.min(contrast(c.fg, c.k1), contrast(c.fg, c.k2))])
+  const solid = [...new Map(chips.filter((c) => !c.opt && !c.soon).map((c) => [c.id, c])).values()];
+  const weak = solid.map((c) => [c.id, Math.min(contrast(c.fg, c.k1), contrast(c.fg, c.k2))])
     .filter(([, r]) => r < MIN).map(([id, r]) => id + ' ' + r.toFixed(2));
   check('path chip text contrast ≥ ' + MIN + ':1 (' + THEME + ')', weak.length === 0, weak);
 
   // Chip states must be in the text, not only in fading and dashes, so screen readers announce them.
-  const F = Object.fromEntries(s.featured.map((c) => [c.id, c.text]));
-  // Only when some path names a planned course (none do while the paths list released courses only).
-  const soonChip = s.featured.concat(s.paths.flatMap((p) => p.chips)).find((c) => isSoon(c.id));
+  const soonChip = chips.find((c) => isSoon(c.id));
   if (soonChip) check('unreleased chips say "coming soon"', /\(coming soon\)/.test(soonChip.text), soonChip.text);
-  check('completed chips say "complete"', /\(complete\)/.test(F[COMPLETE.id] || ''), F[COMPLETE.id]);
-  const optChip = s.paths.flatMap((p) => p.chips).find((c) => c.opt);
+  const doneChip = chips.find((c) => c.id === COMPLETE.id);
+  check('completed chips say "complete"', doneChip && /\(complete\)/.test(doneChip.text), doneChip && doneChip.text);
+  const optChip = chips.find((c) => c.opt);
   check('optional chips say "optional"', optChip && /\(optional/.test(optChip.text), optChip && optChip.text);
 
   console.log('copy');

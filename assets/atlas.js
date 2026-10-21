@@ -9,7 +9,7 @@
    Everything on the page (cards, progress, paths, tools,
    search, reset) is derived from this array.
 
-     id        unique slug, used by FEATURED and PATHS
+     id        unique slug, used by PATHS and METRO
      tab       which home-page tab the card sits in: an id from TABS below
      title     course name as it should appear
      mark      inner SVG of the course's logo, drawn on a 24x24 viewBox
@@ -21,7 +21,7 @@
      hours     rough total reading time
      c1 / c2   the course's own two accent colours
      d1 / d2   the same two colours for dark mode
-     short     short name for path chips ("LLD", "OS")
+     short     short name for path chips and metro stations ("LLD", "OS")
      lang      optional: the course's code language, shown on "Coming soon" cards
      soon      true while the course is planned or being written: the card is
                muted and unlinked, and the course is left out of progress, the
@@ -442,45 +442,71 @@
   var LIVE = COURSES.filter(function (c) { return !c.soon; });
   var SOON = COURSES.filter(function (c) { return c.soon; });
 
-  /* The general order for the whole Atlas, shown as a featured strip. */
-  var FEATURED = {
-    icon: '🧭',
-    title: 'The complete Atlas',
-    blurb: 'Fundamentals first (algorithms, the machine, the network, storage), then design at class and system level, then scale and operations. ML comes last because it builds on all of it, but it also stands on its own.',
-    steps: ['dsa', 'os', 'networks', 'databases', 'lld', 'system-design', 'distributed-systems', 'cloud-devops', 'ml-ai-systems'],
-    optional: [],
-  };
-
-  /* Role paths: `steps` in order, then `optional` "go further" courses. */
+  /* Role paths, drawn as lines on the metro map: `steps` in order, then `optional` "go further"
+     courses, which branch off the end of the line. Every course is on at least one line. */
+  var FAMILIES = [
+    { id: 'ai', title: 'AI & ML' },
+    { id: 'eng', title: 'Engineering' },
+    { id: 'found', title: 'Interviews & foundations' },
+  ];
   var PATHS = [
-    { id: 'campus', icon: '🎓', title: 'Campus placements / SDE-1',
-      blurb: 'The fresher loop: coding rounds, then the core-CS viva (OS, DBMS, networks), then a light class-design round.',
-      steps: ['dsa', 'os', 'databases', 'networks', 'lld'], optional: [] },
-    { id: 'interview', icon: '🎯', title: 'Cracking the SDE-2+ interview',
-      blurb: 'Coding, then the class-level design round, then the architecture round. Distributed Systems for senior and staff loops.',
-      steps: ['dsa', 'lld', 'system-design'], optional: ['distributed-systems'] },
-    { id: 'backend', icon: '🛠️', title: 'Backend engineer',
-      blurb: 'What your service sits on (the database, the network, the OS), then building the service and its API, then how to structure it and how to scale it.',
-      steps: ['databases', 'networks', 'os', 'backend-api', 'lld', 'system-design'], optional: ['distributed-systems'] },
-    { id: 'sre', icon: '🚦', title: 'SRE / platform / DevOps',
-      blurb: 'Linux and networking first, then containers, Kubernetes, CI/CD and observability, then designing for reliability.',
-      steps: ['os', 'networks', 'cloud-devops', 'system-design'], optional: ['distributed-systems'] },
-    { id: 'data', icon: '🗄️', title: 'Data engineer',
-      blurb: 'Storage engines and SQL, then replication, partitioning and streams, then running pipelines in the cloud.',
-      steps: ['databases', 'distributed-systems', 'cloud-devops', 'system-design'], optional: ['ml-fundamentals', 'ml-ai-systems'] },
-    { id: 'ml', icon: '🧠', title: 'ML / AI engineer',
-      blurb: 'Classical machine learning and honest evaluation first, then the systems around models, then grounding them in your own data with RAG and building agents that act with tools. Add Multi-Agent Systems for teams of agents, and Distributed Systems and DevOps for training clusters and serving.',
-      steps: ['ml-fundamentals', 'ml-ai-systems', 'rag', 'single-agent', 'system-design'], optional: ['multi-agent', 'distributed-systems', 'cloud-devops'] },
-    { id: 'mlops', icon: '⚙️', title: 'ML infrastructure / MLOps',
+    { id: 'agent', family: 'ai', icon: '🤖', title: 'AI agent engineer',
+      blurb: 'Services and APIs first, then grounding a model in your own data, then one agent with tools, then teams of agents, then running them in production.',
+      steps: ['backend-api', 'rag', 'single-agent', 'multi-agent', 'cloud-devops'], optional: ['system-design'] },
+    { id: 'llm', family: 'ai', icon: '💬', title: 'LLM / GenAI engineer',
+      blurb: 'Classical ML and honest evaluation, then deep learning, then language and large language models from the inside, then grounding them in your own data.',
+      steps: ['ml-fundamentals', 'deep-learning', 'nlp', 'llms', 'rag'], optional: ['single-agent'] },
+    { id: 'ml', family: 'ai', icon: '🧠', title: 'ML / AI engineer',
+      blurb: 'Classical machine learning first, then deep learning, then the systems that train and serve models, then large language models. Distributed Systems and DevOps for training clusters and serving.',
+      steps: ['ml-fundamentals', 'deep-learning', 'ml-ai-systems', 'llms'], optional: ['distributed-systems', 'cloud-devops'] },
+    { id: 'vision', family: 'ai', icon: '👁️', title: 'Computer vision engineer',
+      blurb: 'Classical ML, then deep learning, then images and video, then the systems that train and serve vision models.',
+      steps: ['ml-fundamentals', 'deep-learning', 'computer-vision', 'ml-ai-systems'], optional: ['cloud-devops'] },
+    { id: 'datasci', family: 'ai', icon: '📊', title: 'Data scientist',
+      blurb: 'SQL and how data is stored, then classical ML with honest evaluation, then deep learning, then putting models into production.',
+      steps: ['databases', 'ml-fundamentals', 'deep-learning', 'ml-ai-systems'], optional: ['nlp'] },
+    { id: 'mlops', family: 'ai', icon: '⚙️', title: 'ML infrastructure / MLOps',
       blurb: 'GPUs, memory and processes, then the ML stack, then the distributed training and deployment it runs on.',
       steps: ['os', 'ml-ai-systems', 'distributed-systems', 'cloud-devops'], optional: ['system-design'] },
-    { id: 'fundamentals', icon: '🧱', title: 'CS fundamentals (self-taught / career switch)',
-      blurb: 'The four subjects everything else assumes, in the order they build on each other.',
-      steps: ['dsa', 'os', 'networks', 'databases'], optional: ['lld'] },
-    { id: 'architect', icon: '🏛️', title: 'Senior / staff / architect',
+    { id: 'backend', family: 'eng', icon: '🛠️', title: 'Backend engineer',
+      blurb: 'What your service sits on (the database, the network, the OS), then building the service and its API, then how to structure it and how to scale it.',
+      steps: ['databases', 'networks', 'os', 'backend-api', 'lld', 'system-design'], optional: ['distributed-systems'] },
+    { id: 'fullstack', family: 'eng', icon: '🧩', title: 'Full-stack / product engineer',
+      blurb: 'Building the service and its API, then the database and the network under it, then designing the whole product to scale.',
+      steps: ['backend-api', 'databases', 'networks', 'system-design'], optional: ['cloud-devops'] },
+    { id: 'systems', family: 'eng', icon: '🔩', title: 'Systems / infrastructure engineer',
+      blurb: 'The machine, the network and the storage engine, then how they behave when spread across many machines.',
+      steps: ['os', 'networks', 'databases', 'distributed-systems'], optional: ['cloud-devops'] },
+    { id: 'sre', family: 'eng', icon: '🚦', title: 'SRE / platform / DevOps',
+      blurb: 'Linux and networking first, then containers, Kubernetes, CI/CD and observability, then designing for reliability.',
+      steps: ['os', 'networks', 'cloud-devops', 'system-design'], optional: ['distributed-systems'] },
+    { id: 'data', family: 'eng', icon: '🗄️', title: 'Data engineer',
+      blurb: 'Storage engines and SQL, then replication, partitioning and streams, then running pipelines in the cloud.',
+      steps: ['databases', 'distributed-systems', 'cloud-devops', 'system-design'], optional: ['ml-fundamentals', 'ml-ai-systems'] },
+    { id: 'architect', family: 'eng', icon: '🏛️', title: 'Senior / staff / architect',
       blurb: 'Trade-offs at scale: architecture, consensus and consistency, storage internals, and running it all in production.',
       steps: ['system-design', 'distributed-systems', 'databases', 'cloud-devops'], optional: ['lld'] },
+    { id: 'campus', family: 'found', icon: '🎓', title: 'Campus placements / SDE-1',
+      blurb: 'The fresher loop: coding rounds, then the core-CS viva (OS, DBMS, networks), then a light class-design round.',
+      steps: ['dsa', 'os', 'databases', 'networks', 'lld'], optional: [] },
+    { id: 'interview', family: 'found', icon: '🎯', title: 'Cracking the SDE-2+ interview',
+      blurb: 'Coding, then the class-level design round, then the architecture round. Distributed Systems for senior and staff loops, Backend & API for backend loops.',
+      steps: ['dsa', 'lld', 'system-design'], optional: ['distributed-systems', 'backend-api'] },
+    { id: 'fundamentals', family: 'found', icon: '🧱', title: 'CS fundamentals (self-taught / career switch)',
+      blurb: 'The four subjects everything else assumes, in the order they build on each other.',
+      steps: ['dsa', 'os', 'networks', 'databases'], optional: ['lld'] },
   ];
+
+  /* Where each course sits on the metro map (a 1200 × 620 board), and which side its name goes:
+     CS fundamentals along the top, systems across the middle, ML bottom left, agents bottom right. */
+  var METRO = {
+    'dsa': [90, 110, 'n'], 'os': [290, 110, 'n'], 'networks': [490, 110, 'n'], 'databases': [690, 110, 'n'],
+    'lld': [90, 300, 'w'], 'backend-api': [340, 300, 's'], 'system-design': [590, 300, 's'],
+    'distributed-systems': [890, 200, 'e'], 'cloud-devops': [1090, 300, 'n'],
+    'ml-fundamentals': [90, 480, 's'], 'deep-learning': [290, 480, 's'], 'nlp': [480, 420, 'n'],
+    'computer-vision': [480, 550, 's'], 'llms': [690, 420, 'n'], 'ml-ai-systems': [690, 550, 's'],
+    'rag': [890, 420, 'n'], 'single-agent': [1040, 470, 'e'], 'multi-agent': [1110, 570, 's'],
+  };
 
   /* The three tools every course ships. */
   var TOOLS = [
@@ -823,18 +849,146 @@
     return live.filter(isComplete).length + ' of ' + live.length + ' courses complete' +
       (soon ? ' · ' + soon + ' coming soon' : '');
   }
-  function renderPaths() {
-    $('#pathFeatured').innerHTML =
-      '<div class="pf-head"><span class="ico" aria-hidden="true">' + FEATURED.icon + '</span>' +
-      '<div><h4>' + esc(FEATURED.title) + '</h4><p>' + esc(FEATURED.blurb) + '</p></div>' +
-      '<span class="pprog">' + pathProgress(FEATURED) + '</span></div>' + pathFlow(FEATURED);
-    $('#pathGrid').innerHTML = PATHS.map(function (p, pi) {
-      return '<div class="path reveal in" data-path="' + p.id + '">' +
-        '<div class="num">' + String(pi + 1).padStart(2, '0') + '</div>' +
-        '<div class="ico" aria-hidden="true">' + p.icon + '</div>' +
-        '<h4>' + esc(p.title) + '</h4><p>' + esc(p.blurb) + '</p>' +
-        pathFlow(p) + '<div class="pprog">' + pathProgress(p) + '</div></div>';
+  /* ---------------------------------------------------------
+     The metro map: every course is a station in its own colours, every role is a line through
+     its courses in order. One role is lit at a time (hovering another previews it); the rest
+     stay as faint lines, so shared stretches show which roles overlap.
+     --------------------------------------------------------- */
+  var activePath = null, previewPath = null;
+  function pathById(id) { return PATHS.filter(function (p) { return p.id === id; })[0]; }
+  function routeOf(p) { return p.steps.concat(p.optional); }
+  function r1(n) { return Math.round(n * 10) / 10; }
+
+  // Every segment of every line. Required segments are grouped by the pair of courses they join,
+  // so lines sharing a stretch get a lane each and run side by side.
+  function metroSegments() {
+    var segs = [], lanes = {};
+    PATHS.forEach(function (p) {
+      p.steps.forEach(function (id, i) { if (i) segs.push({ p: p, a: p.steps[i - 1], b: id, opt: false }); });
+      p.optional.forEach(function (id) { segs.push({ p: p, a: p.steps[p.steps.length - 1], b: id, opt: true }); });
+    });
+    segs.forEach(function (s) {
+      s.key = [s.a, s.b].sort().join('|');
+      if (!s.opt) (lanes[s.key] = lanes[s.key] || []).push(s.p.id);
+    });
+    segs.forEach(function (s) {
+      var l = lanes[s.key] || [];
+      s.lanes = s.opt ? 1 : l.length; s.lane = s.opt ? 0 : l.indexOf(s.p.id);
+    });
+    return segs;
+  }
+
+  // A segment runs straight unless a station it doesn't stop at lies close to it; then it bows away
+  // from that station. Geometry is taken in a fixed direction, so lanes line up whichever way a line runs.
+  var LANE = 5, CLEAR = 44;
+  function segPath(s) {
+    var ab = [s.a, s.b].sort(), A = METRO[ab[0]], B = METRO[ab[1]];
+    var dx = B[0] - A[0], dy = B[1] - A[1], L = Math.sqrt(dx * dx + dy * dy), nx = -dy / L, ny = dx / L;
+    var bow = 0, near = Infinity;
+    Object.keys(METRO).forEach(function (id) {
+      if (id === ab[0] || id === ab[1]) return;
+      var S = METRO[id], t = ((S[0] - A[0]) * dx + (S[1] - A[1]) * dy) / (L * L);
+      if (t < 0.06 || t > 0.94) return;
+      var d = (S[0] - A[0]) * nx + (S[1] - A[1]) * ny;
+      if (Math.abs(d) < CLEAR && Math.abs(d) < near) {
+        near = Math.abs(d);
+        // A quadratic curve strays 2t(1-t) of its control offset from the chord at the station's t.
+        bow = (d > 0 ? -1 : 1) * Math.min(190, Math.max(30, (CLEAR - Math.abs(d)) / (2 * t * (1 - t))));
+      }
+    });
+    var off = s.lanes > 1 ? (s.lane - (s.lanes - 1) / 2) * LANE : 0, ox = nx * off, oy = ny * off;
+    var a = [A[0] + ox, A[1] + oy], b = [B[0] + ox, B[1] + oy];
+    var mid = [(A[0] + B[0]) / 2 + nx * bow + ox, (A[1] + B[1]) / 2 + ny * bow + oy];
+    return 'M' + r1(a[0]) + ' ' + r1(a[1]) + (bow ? ' Q' + r1(mid[0]) + ' ' + r1(mid[1]) + ' ' : ' L') + r1(b[0]) + ' ' + r1(b[1]);
+  }
+
+  // A station: the course's colour, a ring showing how much of it you've read, its name, and its
+  // place in the lit route (+ for an optional extra). Planned courses are dashed rings, not links.
+  function metroStation(c, step) {
+    var P = METRO[c.id]; if (!P) return '';
+    var x = P[0], y = P[1], side = P[2];
+    var done = c.soon ? 0 : doneCount(c), total = c.soon ? 0 : countOf(c), frac = total ? done / total : 0;
+    var lx = x + (side === 'e' ? 24 : side === 'w' ? -24 : 0), ly = y + (side === 'n' ? -26 : side === 's' ? 36 : 5);
+    var anchor = side === 'e' ? 'start' : side === 'w' ? 'end' : 'middle', C = 2 * Math.PI * 17;
+    var body = '<circle class="mring" cx="' + x + '" cy="' + y + '" r="17"/>' +
+      (frac ? '<circle class="mprog" cx="' + x + '" cy="' + y + '" r="17" stroke-dasharray="' + r1(C * frac) + ' ' + r1(C) + '" ' +
+        'transform="rotate(-90 ' + x + ' ' + y + ')"/>' : '') +
+      '<circle class="mdot" cx="' + x + '" cy="' + y + '" r="11"/>' +
+      (step ? '<text class="mnum" x="' + x + '" y="' + (y + 4) + '">' + step + '</text>' : '') +
+      '<text class="mlab" x="' + lx + '" y="' + ly + '" text-anchor="' + anchor + '">' + esc(c.short || c.title) + '</text>';
+    var cls = 'mst tint' + (c.soon ? ' soon' : '') + (step ? ' on' : '');
+    var said = c.title + (c.soon ? ' (coming soon)' : ': ' + done + ' of ' + total + ' chapters read');
+    var attrs = ' class="' + cls + '" style="' + tintVars(c) + '" data-course="' + c.id + '"';
+    return c.soon ? '<g' + attrs + '><title>' + esc(said) + '</title>' + body + '</g>'
+      : '<a' + attrs + ' href="' + url(c, 'index.html') + '" aria-label="' + esc(said) + '"><title>' + esc(said) + '</title>' + body + '</a>';
+  }
+
+  function renderMetro() {
+    var p = pathById(previewPath || activePath), segs = metroSegments(), defs = '', lit = '';
+    segs.filter(function (s) { return s.p === p; }).forEach(function (s, i) {
+      var A = METRO[s.a], B = METRO[s.b];
+      // Each lit segment fades from the colour of the course it leaves to the colour of the one it reaches.
+      defs += '<linearGradient id="mg-' + i + '" gradientUnits="userSpaceOnUse" x1="' + A[0] + '" y1="' + A[1] + '" x2="' + B[0] + '" y2="' + B[1] + '">' +
+        '<stop offset="0" class="tint" style="' + tintVars(byId(s.a)) + ';stop-color:var(--k1)"/>' +
+        '<stop offset="1" class="tint" style="' + tintVars(byId(s.b)) + ';stop-color:var(--k1)"/></linearGradient>';
+      lit += '<path class="mline on' + (s.opt ? ' opt' : '') + '" data-a="' + s.a + '" data-b="' + s.b + '" d="' + segPath(s) + '" style="stroke:url(#mg-' + i + ')"/>';
+    });
+    var faint = segs.filter(function (s) { return !s.opt && s.p !== p; }).map(function (s) {
+      return '<path class="mline" data-a="' + s.a + '" data-b="' + s.b + '" d="' + segPath(s) + '"/>';
     }).join('');
+    var stations = COURSES.map(function (c) {
+      var i = p.steps.indexOf(c.id);
+      return metroStation(c, i >= 0 ? String(i + 1) : p.optional.indexOf(c.id) >= 0 ? '+' : '');
+    }).join('');
+    $('#metroMap').innerHTML =
+      '<svg viewBox="0 50 1200 570" role="group" aria-label="' + esc(PATHS.length + ' roles drawn as lines through ' + COURSES.length + ' courses, with ' + p.title + ' highlighted') + '">' +
+      '<defs>' + defs + '</defs><g class="mfaint">' + faint + '</g><g class="mlit">' + lit + '</g>' + stations + '</svg>';
+  }
+
+  // The next thing to read on a route: the next chapter of its first unfinished released course.
+  function pathNext(p) {
+    var req = p.steps.map(byId).filter(Boolean), c = req.filter(function (c) { return !c.soon && !isComplete(c); })[0];
+    if (!c) return '<p class="md-next">' + (req.some(function (c) { return !c.soon; })
+      ? 'Every released course on this route is complete.' : 'Every course on this route is still being written.') + '</p>';
+    var ch = nextChapter(c);
+    return '<p class="md-next">' + (doneCount(c) ? 'Continue with ' : 'Start with ') +
+      '<a href="' + url(c, ch ? ch.f : 'index.html') + '">' + esc(c.title) + (ch ? ' · ' + esc(chShort(ch.n)) + ': ' + esc(ch.ti) : '') + ' →</a></p>';
+  }
+  function renderPathDetail() {
+    var p = pathById(activePath), fam = FAMILIES.filter(function (f) { return f.id === p.family; })[0];
+    $('#metroDetail').innerHTML = '<div class="md-head"><span class="ico" aria-hidden="true">' + p.icon + '</span>' +
+      '<div><div class="md-fam">' + esc(fam.title) + '</div><h4>' + esc(p.title) + '</h4></div>' +
+      '<span class="pprog">' + pathProgress(p) + '</span></div><p>' + esc(p.blurb) + '</p>' + pathFlow(p) + pathNext(p);
+  }
+  function renderPaths() {
+    if (!activePath) { var saved = LS.get('atlas-path', null); activePath = pathById(saved) ? saved : PATHS[0].id; }
+    $('#metroRoles').innerHTML = FAMILIES.map(function (f) {
+      return '<div class="mfam"><div class="mfam-t">' + esc(f.title) + '</div><div class="mfam-r">' +
+        PATHS.filter(function (p) { return p.family === f.id; }).map(function (p) {
+          var on = p.id === activePath;
+          return '<button type="button" class="mrole" role="radio" id="role-' + p.id + '" aria-checked="' + on + '" ' +
+            'tabindex="' + (on ? 0 : -1) + '" data-path="' + p.id + '"><span class="mrole-i" aria-hidden="true">' + p.icon + '</span>' +
+            '<span>' + esc(p.title) + '</span></button>';
+        }).join('') + '</div></div>';
+    }).join('');
+    renderMetro();
+    renderPathDetail();
+  }
+  // Choosing a role keeps the buttons (and focus) in place and redraws only the map and the detail.
+  function selectPath(id, focus) {
+    activePath = id; previewPath = null;
+    LS.set('atlas-path', id);
+    PATHS.forEach(function (p) {
+      var b = $('#role-' + p.id), on = p.id === id;
+      b.setAttribute('aria-checked', on ? 'true' : 'false'); b.tabIndex = on ? 0 : -1;
+    });
+    renderMetro();
+    renderPathDetail();
+    if (focus) $('#role-' + id).focus();
+  }
+  function previewOn(id) {
+    var next = id === activePath ? null : id;
+    if (next !== previewPath) { previewPath = next; renderMetro(); }
   }
 
   function renderStatic() {
@@ -1021,7 +1175,7 @@
     var dots = t.paths ? '' : '<span class="tab-dots" aria-hidden="true">' + list.map(function (c) {
       return '<i class="tint' + (c.soon ? ' soon' : '') + '" style="' + tintVars(c) + '"></i>';
     }).join('') + '</span>';
-    var said = t.paths ? PATHS.length + 1 + ' routes' :
+    var said = t.paths ? PATHS.length + ' roles' :
       [out && out + (out === 1 ? ' course' : ' courses'), soon && soon + ' coming soon'].filter(Boolean).join(', ');
     return '<button type="button" class="tab' + (t.paths ? ' tab-paths' : '') + '" role="tab" id="tab-' + t.id + '" ' +
       'aria-controls="panel-' + t.id + '" aria-selected="false" tabindex="-1" data-tab="' + t.id + '">' +
@@ -1115,6 +1269,23 @@
     e.preventDefault();
     selectTrackTab(ids[(j + ids.length) % ids.length], true);
   });
+
+  // The metro map's roles: click or arrow keys choose one; hovering one previews its line.
+  $('#metroRoles').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-path]'); if (b) selectPath(b.dataset.path);
+  });
+  $('#metroRoles').addEventListener('keydown', function (e) {
+    var b = e.target.closest('[data-path]'); if (!b) return;
+    var ids = PATHS.map(function (p) { return p.id; }), i = ids.indexOf(b.dataset.path);
+    var j = { ArrowRight: i + 1, ArrowDown: i + 1, ArrowLeft: i - 1, ArrowUp: i - 1, Home: 0, End: ids.length - 1 }[e.key];
+    if (j === undefined) return;
+    e.preventDefault();
+    selectPath(ids[(j + ids.length) % ids.length], true);
+  });
+  $('#metroRoles').addEventListener('mouseover', function (e) {
+    var b = e.target.closest('[data-path]'); if (b) previewOn(b.dataset.path);
+  });
+  $('#metroRoles').addEventListener('mouseleave', function () { previewOn(null); });
 
   $('#pal').addEventListener('click', function (e) { if (e.target === $('#pal')) closePal(); });
   $('#palInput').addEventListener('input', runSearch);

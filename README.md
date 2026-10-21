@@ -24,7 +24,8 @@ no build step.
 | **[Single Agent](single-agent/)** | 8 prerequisites + 48 | The agent loop, tool calling and tool errors, structured output, context engineering, planning and decomposition, memory, sandboxed code execution, MCP, prompt injection and permissions, reliability and evaluation, cost and latency, observability and debugging, coding and browser agents, measured on a local model in Python — 8 case studies on the way |
 | **[Multi-Agent Systems](multi-agent/)** | 4 prerequisites + 26 | Orchestrator and workers, hand-offs, pipelines and routing, parallel fan-out, critique, debate and voting, shared memory, A2A, frameworks compared, coordination failures, context isolation, cost, trust, evaluation, humans in the loop, simulations, production and debugging, each measured against one agent on a local model in Python — 3 case studies on the way |
 
-The Atlas home page suggests an order through the courses for each kind of role.
+The Atlas home page's learning paths draw 15 roles as lines on a metro map of the courses: pick a
+role to see its courses in order, your progress through them and the next chapter to read.
 
 
 ## Optional accounts
@@ -126,8 +127,10 @@ Drop the course folder next to the others (use a url-safe slug) and add one obje
 progress, the mosaic, search, filters, study-tool links and the hero counts all pick it up.
 Its `tab` field puts the card in one of the home page's subject tabs (`TABS`, just below);
 a course marked `soon: true` shows there as a "Coming soon" card and nowhere else.
-Optionally add it to a track in `PATHS` just below. The full field list is documented in that
-file's header comment.
+Then put it on the learning-paths metro map: give it a station position in `METRO` and add it to
+at least one role in `PATHS` (`tools/hub-check.cjs` fails otherwise, and also fails if any line
+runs through a station it doesn't stop at). The full field list is documented in that file's
+header comment.
 
 A course only needs the house layout for this to work: `index.html`, `glossary.html`,
 `flashcards.html`, `mock-interview.html`, numbered chapter files, and an `assets/study-data.js`
