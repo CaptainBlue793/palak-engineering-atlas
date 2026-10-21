@@ -135,11 +135,9 @@ that sets `window.<INDEX_VAR>` to `[{ n, f, ti, lv, e: [{ t, a, k }] }]`.
 
 ## History
 
-Three of the courses previously lived in their own repositories
-([system design](https://github.com/CaptainBlue793/palak-system-design-playlist),
-[ML & AI systems](https://github.com/CaptainBlue793/palak_ML_AI_system_playlist),
-[DSA](https://github.com/CaptainBlue793/palak-DSA-playlist)). Those are archived and kept only
-so existing links keep working.
+Three of the courses (System Design, ML & AI Systems and DSA) started in their own repositories
+and moved here on 20 September 2026. Those repositories have since been removed; this repo is the
+only home of all three.
 
 ---
 
