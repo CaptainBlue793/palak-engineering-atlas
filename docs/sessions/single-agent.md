@@ -63,7 +63,8 @@ Measurement scripts and the venv live outside the repo in `C:\Users\StarBlue\atl
 
 ## 2026-10-21 — release
 - Released with the owner's go-ahead: registry entry live (56 lessons: P1–P8 + 48, ~38 hours; case studies 41–48 still placeholders) and added to the ML / AI engineer path; README table, totals (732 chapters, ~524 hours) and search figure (~12,600 entries, summed from the rebuilt indexes).
-- Account sync: `agent-` keys added to `assets/account.js`, `api/src/index.js` and its test (25/25 passing locally), and `ACCOUNTS.md`. The Worker needs a redeploy for live sync of `agent-` (and `rag-`) keys.
+- Account sync: `agent-` keys added to `assets/account.js`, `api/src/index.js` and its test (25/25 passing locally), and `ACCOUNTS.md`. Worker redeployed (version c562db84), so live sync now keeps `agent-` (and the earlier `rag-`) keys.
 - Cross-course links: single-agent joins 17 topics (163 topics, 2,904 links, 110 chapter files rewritten); study data and offline bundles rebuilt for the 13 courses touched.
 - Checks: content-audit check (732 chapters, 0 errors) and bundle, crosslinks check, palette-check, hub-check (light, dark, 390 px) all pass.
+- Merged into main (fast-forward to 7186b7a), GitHub Pages built, release single-agent-v1.0.0 published with the offline bundle.
 - Next: case studies 41–48 in the all-courses pass.
