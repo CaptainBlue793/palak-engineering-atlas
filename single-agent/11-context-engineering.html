@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Context Engineering · Single Agent by Palak Deb Patra</title>
+<meta name="description" content="Chapter 11 of Single Agent. The context budget, what to keep, ordering, trimming tool output and prompt caching, measured with qwen3:14b: four ways of building each step's context for a ten-service sweep that does not fit the window.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('agent-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ce-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ce-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-size:13px; }
+  .ce-mx { display:grid; grid-template-columns:90px repeat(10, 1fr); gap:3px; font-size:10.5px; }
+  .ce-mx span { text-align:center; padding:4px 0; border-radius:4px; font-family:var(--mono); }
+  .ce-mx .h { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ce-mx .y { background:color-mix(in srgb, var(--green) 35%, transparent); }
+  .ce-mx .n { background:color-mix(in srgb, var(--red) 30%, transparent); }
+  .ce-ctx { display:flex; gap:2px; margin:8px 0 2px; height:26px; }
+  .ce-ctx i { display:block; border-radius:3px; font-style:normal; font-size:10px; color:var(--text); display:flex; align-items:center; justify-content:center; overflow:hidden; white-space:nowrap; }
+  .ce-ctx .sys { background:color-mix(in srgb, var(--accent-2) 45%, transparent); }
+  .ce-ctx .full { background:color-mix(in srgb, var(--accent) 50%, transparent); }
+  .ce-ctx .dig { background:color-mix(in srgb, var(--green) 45%, transparent); }
+  .ce-ctx .gone { background:color-mix(in srgb, var(--muted) 30%, transparent); }
+  .ce-ctx .rem { background:color-mix(in srgb, var(--amber) 55%, transparent); }
+  .ce-ans { white-space:pre-wrap; font-size:12.5px; max-height:200px; overflow:auto; margin-top:8px; }
+  .ce-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
+</head>
+<body data-chapter="11">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 11</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Context <span class="grad">Engineering</span></h1>
+    <p class="lead">An agent's transcript is a record of everything that happened. Its <b>context</b>, what the model reads on a given step, does not have to be the same thing. Context engineering is the job of deciding, step by step, what goes into that limited window: which instructions, which history, which tool results in full and which condensed, in what order. It is the step from "send the transcript" to "build the prompt".</p>
+    <p class="lead">This chapter takes the sweep from <a href="10-the-growing-transcript.html">Chapter 10</a>, ten raw service logs that together overflow the 16k window, and builds each step's context four ways: keep everything; replace older tool results with a placeholder; replace older tool results with a short digest computed by code; keep everything and restate the task at the end. Same model, same tools, same data; only the context changes.</p>
+    <ul class="objectives">
+      <li><span>Treat the context window as a budget with a plan</span></li>
+      <li><span>Decide what to keep in full, what to condense and what to drop</span></li>
+      <li><span>Use ordering to keep the task and rules where they survive</span></li>
+      <li><span>Condense tool results without losing the answer</span></li>
+      <li><span>Build context so the prompt cache still works</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Silent truncation and the ten-service sweep:</b> <a href="10-the-growing-transcript.html">Chapter 10</a>.</li>
+        <li><b>The prompt cache and stable prefixes:</b> <a href="p4-tokens-and-cost.html">P4</a>.</li>
+        <li><b>Ordering and "lost in the middle" for retrieved text:</b> RAG <a href="../rag/16-context-assembly.html">Chapter 16</a> (optional).</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>The context budget</h2>
+  <p>A window of 16,384 tokens has to hold the system prompt and tool definitions (here about 300 tokens), the task, the history of calls and results, and room for the reply. Plan it like any budget: a fixed allowance for instructions, a ceiling for history, and a rule for what happens when history would exceed it. Without a plan the server applies its own rule. For Ollama that rule was to drop the oldest tokens first, which removed the task, and keeping everything scored <b>0 of 60</b> service lines here, exactly as in Chapter 10.</p>
+<pre class="code"><span class="k">def</span> <span class="f">build_context</span>(transcript: <span class="t">list</span>[<span class="t">dict</span>], budget: <span class="t">int</span> = <span class="m">12_000</span>) -&gt; <span class="t">list</span>[<span class="t">dict</span>]:
+    system, task, history = transcript[<span class="m">0</span>], transcript[<span class="m">1</span>], transcript[<span class="m">2</span>:]
+    tool_idx = [i <span class="k">for</span> i, m <span class="k">in</span> <span class="f">enumerate</span>(history) <span class="k">if</span> m[<span class="s">"role"</span>] == <span class="s">"tool"</span>]
+    keep_full = <span class="f">set</span>(tool_idx[-<span class="m">2</span>:])                                   <span class="c"># the two newest results, verbatim</span>
+    out = [system, task]
+    <span class="k">for</span> i, m <span class="k">in</span> <span class="f">enumerate</span>(history):
+        <span class="k">if</span> m[<span class="s">"role"</span>] == <span class="s">"tool"</span> <span class="k">and</span> i <span class="k">not in</span> keep_full:
+            m = {**m, <span class="s">"content"</span>: <span class="f">digest</span>(m[<span class="s">"tool_name"</span>], m[<span class="s">"content"</span>])}       <span class="c"># older ones, condensed by code</span>
+        out.<span class="f">append</span>(m)
+    <span class="k">assert</span> <span class="f">count_tokens</span>(out) &lt;= budget, <span class="s">"still too big: compact further (Chapter 15)"</span>
+    <span class="k">return</span> out</pre>
+
+  <h2>What to keep</h2>
+  <p>Keep in full what the next decision needs; condense what only matters as a conclusion; drop what is finished. The two condensing strategies tested here differ only in what replaced the older results. A <b>placeholder</b> ("output of get_errors(checkout) removed to save space") kept the context at 5,000 tokens and scored <b>17 of 60</b>: the model answered for the two services whose results it could still see and had nothing for the other eight. A <b>digest computed by code</b> from the raw log ("checkout: 40 x certificate verify failed, 9 x client closed request"), the same size, scored <b>60 of 60</b>. Dropping information is free only if nothing later needs it; condensing keeps the conclusion and drops the bulk.</p>
+  <p>Who writes the digest matters. Here code computed it, because counting error lines is mechanical and code does it exactly. Where a result needs judgement to condense (a long document, a page of search results), a model can summarise it, at the cost of a call and the risk of dropping the one detail that mattered later (Chapter 15 measures that).</p>
+
+  <h2>Ordering</h2>
+  <p>Where something sits in the context changes whether it survives and whether it is used. Instructions belong at the start, in the system prompt, where they are stable and cacheable; but the start is also what a truncating server drops first. Restating the task at the <b>end</b> of the context ("Reminder of the task: …") kept it in the part that survived: with everything else unchanged, the score rose from 0 to <b>41 of 60</b>. The model now produced the right format and the right answer for every service whose log was still in the window, and nothing for the first few, whose logs had been cut. Ordering rescued the instruction; it could not rescue the data.</p>
+
+  <h2>Trimming tool output</h2>
+  <p>The cheapest context engineering happens before a result ever enters the transcript: return compact results in the first place (<a href="04-designing-tools.html">Chapter 4</a>, <a href="10-the-growing-transcript.html">Chapter 10</a>). Condensing in the loop is the second line, for results that must be large at first (a file the agent is editing, a page it is reading) and only need to be large while they are being used. A good rule is "full while it is the newest, condensed once the agent has moved on", which is exactly the digest strategy above.</p>
+
+  <h2>Prompt caching</h2>
+  <p>Rewriting old messages changes the prompt's prefix, and a changed prefix breaks the cache (<a href="p4-tokens-and-cost.html">P4</a>). Two habits keep both. Condense a result once, at a fixed point (when it stops being one of the newest two), and leave it condensed, so the prefix changes once per result rather than every step. And keep everything stable (system prompt, tools, task) at the start, untouched by compaction. A reminder appended at the end, as in the restating strategy, costs a few tokens and no cache. In this sweep the digest strategy read 5,210 prompt tokens per run in total, against 23,710 for keeping everything, which never gave a right answer.</p>
+
+  <h2>Simulator: one sweep, four contexts</h2>
+  <p>qwen3:14b in Ollama 0.40.6, num_ctx 16,384, temperature 0, thinking off. The get_errors tool returned 60 raw log lines per service (about 2,200 tokens); the agent fetched all ten in one step. Each strategy changed only what the model was sent on the step after: the stored transcript was the same. The coloured bar sketches the context of that step; the grid shows which service lines came back right.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Same transcript, different context</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ce-l">Context strategy</div>
+      <div class="seg" id="ceS"><button class="active" data-v="keep everything">keep everything</button><button data-v="mask old results">mask old results</button><button data-v="digest old results">digest old results</button><button data-v="restate the task at the end">restate the task at the end</button></div>
+      <div class="ce-box" id="ceOut"></div>
+      <div class="stats" id="ceStats"></div>
+      <div class="ce-why" id="ceWhy"></div>
+    </div>
+    <div class="panel-foot">The digest was computed by code from the raw log: counts of each error message, the top two. "Mask" replaced the result with a one-line placeholder. Both kept the two newest results in full. Prompt tokens are Ollama's counts for the second request.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>mask old results</b>: the green columns are the two services whose results were newest; the scattered green cells elsewhere are lucky guesses of "client closed request".</li>
+    <li><b>restate the task at the end</b>: the first services are red in every incident: their logs were the ones truncated away.</li>
+    <li><b>digest old results</b>: the same 5,000 tokens as masking, and every cell green.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Strategy</th><th>Largest prompt</th><th>Prompt tokens, whole run</th><th>Correct lines (60)</th><th>What it lost</th></tr></thead>
+      <tbody>
+        <tr><td><b>Keep everything</b></td><td>15,845 (truncated)</td><td>23,710</td><td>0</td><td>The task and the first logs, silently</td></tr>
+        <tr><td><b>Mask old results</b></td><td>5,001</td><td>5,134</td><td>17</td><td>Eight of ten results, entirely</td></tr>
+        <tr><td><b>Digest old results</b></td><td>5,061</td><td>5,210</td><td>60</td><td>Only the raw lines nobody needed</td></tr>
+        <tr><td><b>Restate the task at the end</b></td><td>15,804 (truncated)</td><td>15,876</td><td>41</td><td>The first logs; the task survived</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Stable prefix</b> system prompt, tools, task</li>
+      <li data-k="step"><b>Old results</b> condensed once, by code where possible</li>
+      <li data-k="step"><b>Newest results</b> in full</li>
+      <li data-k="step"><b>Reminder</b> task or plan restated at the end, if long</li>
+      <li data-k="end"><b>Budget check</b> count before sending</li>
+    </ol>
+    <figcaption><b>A context built each step.</b> The transcript keeps everything; the context keeps what the next decision needs, in the order that survives.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">✂️</div>
+    <div class="body"><div class="title">Use case: clearing old tool results</div><p>Coding agents hit this problem first, because file contents and test output are large and arrive at almost every step. SWE-agent's configurable history processors, for example, can collapse older observations to a short note while keeping the latest few in full. Model providers have since built the same idea into their platforms: Anthropic, for instance, introduced context editing for Claude in 2025, which clears stale tool results from the context as a conversation approaches its limit while keeping the record of the calls, and recommends pairing it with a memory store for anything the agent needs to keep. In September 2025 the company described this kind of work under the name "context engineering", alongside compaction and structured note-taking. All of these are versions of the digest strategy measured here: keep the newest results whole, keep a trace of the older ones, and never let the window silently decide what to drop.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Sending the whole transcript</b> and letting the server decide what to drop.</li>
+      <li><b>Dropping old results without a trace,</b> so the model forgets what it found: 17 of 60.</li>
+      <li><b>Using a model to condense what code can compute exactly,</b> such as counts.</li>
+      <li><b>Instructions only at the start</b> of a context that may be truncated from the start.</li>
+      <li><b>Rewriting history every step,</b> so the prompt cache never matches.</li>
+      <li><b>No token budget</b> and no check before sending.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is context engineering for an agent?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Deciding what the model reads at each step, as opposed to sending the full transcript. The transcript keeps everything; the context is built from it within a token budget: stable instructions and the task first, recent tool results in full, older results condensed, finished work dropped, and sometimes a reminder of the task at the end. In a measured sweep where ten raw logs overflowed the window, sending everything scored zero; replacing older results with code-computed digests, at the same size as simply deleting them, scored 60 of 60 against 17.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your agent forgets findings from early in long runs. You consider dropping old tool results to save space. What would you watch for?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Dropping is only safe for what no later step needs. Measured, replacing old results with placeholders cut the context to a third and lost most answers, because the model could no longer see what it had found. I would replace each old result with a digest of what it established, computed in code where possible and by a model where judgement is needed; condense each result once when it stops being recent, so the prompt cache survives; keep the task and rules in the stable prefix and restate them at the end of long contexts; and add a token budget check before every call. Then I would test on long runs specifically, comparing answers that depend on early findings.</div></details>
+  </div></div>
+
+  <!-- xref:start (generated by tools/crosslinks.cjs from tools/crosslinks-map.cjs; do not edit by hand) -->
+  <div class="callout xref">
+    <div class="ico">🧭</div>
+    <div class="body"><div class="title xref-t">Related chapters in other courses</div>
+      <ul class="mb0">
+        <li><b>Prompting a model with context:</b> ML &amp; AI <a href="../ml-ai-systems/19-prompting-context.html">Ch 19: Prompting &amp; Context Engineering</a>; RAG <a href="../rag/10-prompting-with-context.html">Ch 10: Prompting with Retrieved Context</a> · <a href="../rag/16-context-assembly.html">Ch 16: Context Assembly: Order, Size &amp; Lost in the Middle</a></li>
+      </ul>
+    </div>
+  </div>
+  <!-- xref:end -->
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>The transcript keeps everything; the context is built each step within a budget.</li>
+      <li>Letting the server truncate scored 0 of 60; a plan scored 60 of 60 in a third of the window.</li>
+      <li>Condense old results instead of dropping them: digests 60 of 60, placeholders 17 of 60, same size.</li>
+      <li>Restating the task at the end kept it alive through truncation (0 to 41), but could not restore lost data.</li>
+      <li>Condense each result once and keep the prefix stable, so the cache still works.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What separates an agent's transcript from its context?</p>
+      <div class="opts">
+        <button class="opt">Nothing; they are the same</button>
+        <button class="opt">The context is stored, the transcript is not</button>
+        <button class="opt">The transcript records everything; the context is what the model is sent on a step, built from it</button>
+        <button class="opt">The context only holds the system prompt</button>
+      </div>
+      <div class="explain">Context engineering is building the second from the first.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Masking old results and digesting them produced contexts of the same size. Why did one score 17 and the other 60?</p>
+      <div class="opts">
+        <button class="opt">The digest was longer</button>
+        <button class="opt">The placeholder removed what each result had established; the digest kept it</button>
+        <button class="opt">Masking broke the prompt cache</button>
+        <button class="opt">The digest used a model</button>
+      </div>
+      <div class="explain">Condense the bulk, keep the conclusion.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Restating the task at the end raised the score from 0 to 41. Why not to 60?</p>
+      <div class="opts">
+        <button class="opt">The reminder was too short</button>
+        <button class="opt">The model ignored the reminder</button>
+        <button class="opt">The format was wrong</button>
+        <button class="opt">The task survived truncation, but the first services' logs did not</button>
+      </div>
+      <div class="explain">Ordering can rescue an instruction, not missing data.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Who should write the digest of a log of error lines?</p>
+      <div class="opts">
+        <button class="opt">Code: counting messages is mechanical and exact</button>
+        <button class="opt">The model, always</button>
+        <button class="opt">The user</button>
+        <button class="opt">Nobody; keep the raw log</button>
+      </div>
+      <div class="explain">Use a model where condensing needs judgement.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How do you condense history without breaking the prompt cache every step?</p>
+      <div class="opts">
+        <button class="opt">Condense everything every step</button>
+        <button class="opt">Never condense</button>
+        <button class="opt">Condense each result once, when it stops being recent, and keep the stable parts first and untouched</button>
+        <button class="opt">Put the task at the end only</button>
+      </div>
+      <div class="explain">The prefix then changes once per result, not every step.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = AGENT;
+  const D = [{"strategy":"keep everything","incident":0,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":false,"cache":false,"email":false,"gateway":false},"correct":0,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":26,"wall":2.58},{"n":2,"prompt_tokens":15693,"prefill_ms":5538,"wall":7.79},{"n":3,"prompt_tokens":15807,"prefill_ms":5591,"wall":12.33}],"answer":"The logs for all services show a consistent pattern of \"client closed request\" errors, which typically indicate that the client (the application or user making the request) terminated the connection before the server could respond. This is not necessarily a server-side issue but could be due to client-side timeouts, network instability, or client application errors.\n\nHere's a summary of the findings:\n\n### auth\n- **\"client closed request\"** errors occurred at various times, but they are not frequent and seem to be isolated incidents.\n\n### search\n- Similar to auth, **\"client closed request\"** errors are present but not frequent.\n\n### orders\n- **\"client closed request\"** errors are also present","max_prompt":15807,"total_prompt":31720,"truth":{"checkout":"certificate verify failed","payments":"client closed request","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"keep everything","incident":1,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":false,"cache":false,"email":false,"gateway":false},"correct":0,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.83},{"n":2,"prompt_tokens":15672,"prefill_ms":5514,"wall":7.76},{"n":3,"prompt_tokens":15786,"prefill_ms":5555,"wall":13.76}],"answer":"The logs for all services show a consistent pattern of \"client closed request\" errors, which typically indicate that the client (the entity making the request) terminated the connection before the server could respond. Here's a summary of the findings:\n\n### 1. **auth Service**\n- **Errors**: There are several instances of \"client closed request\" errors, but they are not frequent and seem to be isolated.\n- **Performance**: The service is generally performing well with most requests being successful and having low response times.\n\n### 2. **search Service**\n- **Errors**: No \"client closed request\" errors were observed.\n- **Performance**: The service is performing well with consistent and low res","max_prompt":15786,"total_prompt":31678,"truth":{"checkout":"503 from payments","payments":"retry budget exceeded","inventory":"client closed request","auth":"client closed request","search":"no errors","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"keep everything","incident":2,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":false,"cache":false,"email":false,"gateway":false},"correct":0,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.84},{"n":2,"prompt_tokens":15556,"prefill_ms":5458,"wall":11.13}],"answer":"Looking at the logs provided, here's a summary of the issues observed across the services:\n\n### **auth**\n- No errors observed in the auth service logs. All requests are returning 200 OK status.\n\n### **search**\n- One error observed: `client closed request` at 13:47:53. This might indicate a client-side issue or a timeout.\n\n### **orders**\n- Multiple errors observed:\n  - `503 from email: upstream request failed` (repeated multiple times).\n  - `client closed request` (once).\n  These errors suggest issues with the email service or upstream dependencies.\n\n### **db-main**\n- Two errors observed:\n  - `client closed request` (twice).\n  These might be due to client-side issues or timeouts.\n\n### **cache","max_prompt":15556,"total_prompt":15776,"truth":{"checkout":"503 from orders","payments":"no errors","inventory":"client closed request","auth":"no errors","search":"client closed request","orders":"503 from email","db-main":"client closed request","cache":"client closed request","email":"cache stampede: 4000 misses/s","gateway":"no errors"}},{"strategy":"keep everything","incident":3,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":false,"cache":false,"email":false,"gateway":false},"correct":0,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.84},{"n":2,"prompt_tokens":15731,"prefill_ms":5552,"wall":7.79},{"n":3,"prompt_tokens":15845,"prefill_ms":5589,"wall":6.79}],"answer":"Based on the logs provided, there are no error messages in the logs for any of the services. All the logs show successful requests with status code 200. The logs do not indicate any issues with the services.","max_prompt":15845,"total_prompt":31796,"truth":{"checkout":"connection pool exhausted","payments":"no errors","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"no errors","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"keep everything","incident":4,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":false,"cache":false,"email":false,"gateway":false},"correct":0,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.83},{"n":2,"prompt_tokens":15608,"prefill_ms":5637,"wall":9.72}],"answer":"Looking at the logs for each service, there are several instances of \"client closed request\" errors across different services. Here's a summary of the errors:\n\n1. **auth**: \n   - 3 instances of \"client closed request\" errors.\n\n2. **search**: \n   - 3 instances of \"client closed request\" errors.\n\n3. **orders**: \n   - 4 instances of \"client closed request\" errors.\n\n4. **db-main**: \n   - 3 instances of \"client closed request\" errors.\n\n5. **cache**: \n   - 3 instances of \"client closed request\" errors.\n\n6. **email**: \n   - 3 instances of \"client closed request\" errors.\n\n7. **gateway**: \n   - 3 instances of \"client closed request\" errors.\n\nThese errors typically indicate that the client (e.g., a br","max_prompt":15608,"total_prompt":15828,"truth":{"checkout":"503 from payments","payments":"connection pool exhausted","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"keep everything","incident":5,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":false,"cache":false,"email":false,"gateway":false},"correct":0,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":14,"wall":2.84},{"n":2,"prompt_tokens":15243,"prefill_ms":5394,"wall":12.19}],"answer":"Looking at the logs provided, there are several issues across different services:\n\n1. **Orders Service**:\n   - There are multiple instances of `503 from email: upstream request failed` and `client closed request` errors. This suggests that the orders service is having trouble communicating with the email service, possibly due to an outage or misconfiguration in the email service.\n\n2. **Email Service**:\n   - The email service has numerous `protocol error: unexpected message type` and `client closed request` errors. This indicates that there might be a problem with the protocol or communication between the email service and other services, or that clients are disconnecting prematurely.\n\n3. **A","max_prompt":15243,"total_prompt":15463,"truth":{"checkout":"503 from orders","payments":"client closed request","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"503 from email","db-main":"client closed request","cache":"client closed request","email":"protocol error: unexpected message type","gateway":"client closed request"}},{"strategy":"mask old results","incident":0,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":false,"cache":false,"email":true,"gateway":true},"correct":2,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.91},{"n":2,"prompt_tokens":4984,"prefill_ms":1406,"wall":1.58}],"answer":"email: client closed request  \ngateway: client closed request","max_prompt":4984,"total_prompt":5204,"truth":{"checkout":"certificate verify failed","payments":"client closed request","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"mask old results","incident":1,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":true,"orders":false,"db-main":false,"cache":false,"email":true,"gateway":true},"correct":3,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.69},{"n":2,"prompt_tokens":4920,"prefill_ms":1366,"wall":2.09}],"answer":"checkout: no errors\npayments: no errors\ninventory: no errors\nauth: no errors\nsearch: no errors\norders: no errors\ndb-main: no errors\ncache: no errors\nemail: client closed request\ngateway: client closed request","max_prompt":4920,"total_prompt":5140,"truth":{"checkout":"503 from payments","payments":"retry budget exceeded","inventory":"client closed request","auth":"client closed request","search":"no errors","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"mask old results","incident":2,"per_service":{"checkout":false,"payments":true,"inventory":false,"auth":true,"search":false,"orders":false,"db-main":false,"cache":false,"email":true,"gateway":true},"correct":4,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.61},{"n":2,"prompt_tokens":4929,"prefill_ms":1367,"wall":2.19}],"answer":"checkout: no errors\npayments: no errors\ninventory: no errors\nauth: no errors\nsearch: no errors\norders: no errors\ndb-main: no errors\ncache: no errors\nemail: cache stampede: 4000 misses/s\ngateway: no errors","max_prompt":4929,"total_prompt":5149,"truth":{"checkout":"503 from orders","payments":"no errors","inventory":"client closed request","auth":"no errors","search":"client closed request","orders":"503 from email","db-main":"client closed request","cache":"client closed request","email":"cache stampede: 4000 misses/s","gateway":"no errors"}},{"strategy":"mask old results","incident":3,"per_service":{"checkout":false,"payments":true,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":true,"cache":false,"email":true,"gateway":true},"correct":4,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":14,"wall":2.58},{"n":2,"prompt_tokens":5001,"prefill_ms":1388,"wall":2.11}],"answer":"checkout: no errors\npayments: no errors\ninventory: no errors\nauth: no errors\nsearch: no errors\norders: no errors\ndb-main: no errors\ncache: no errors\nemail: client closed request\ngateway: client closed request","max_prompt":5001,"total_prompt":5221,"truth":{"checkout":"connection pool exhausted","payments":"no errors","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"no errors","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"mask old results","incident":4,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":false,"cache":false,"email":true,"gateway":true},"correct":2,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.68},{"n":2,"prompt_tokens":4979,"prefill_ms":1401,"wall":1.57}],"answer":"email: client closed request  \ngateway: client closed request","max_prompt":4979,"total_prompt":5199,"truth":{"checkout":"503 from payments","payments":"connection pool exhausted","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"mask old results","incident":5,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":false,"search":false,"orders":false,"db-main":false,"cache":false,"email":true,"gateway":true},"correct":2,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":14,"wall":2.68},{"n":2,"prompt_tokens":4674,"prefill_ms":1289,"wall":2.5}],"answer":"checkout: protocol error: unexpected message type\npayments: protocol error: unexpected message type\ninventory: protocol error: unexpected message type\nauth: protocol error: unexpected message type\nsearch: protocol error: unexpected message type\norders: protocol error: unexpected message type\ndb-main: protocol error: unexpected message type\ncache: protocol error: unexpected message type\nemail: protocol error: unexpected message type\ngateway: client closed request","max_prompt":4674,"total_prompt":4894,"truth":{"checkout":"503 from orders","payments":"client closed request","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"503 from email","db-main":"client closed request","cache":"client closed request","email":"protocol error: unexpected message type","gateway":"client closed request"}},{"strategy":"digest old results","incident":0,"per_service":{"checkout":true,"payments":true,"inventory":true,"auth":true,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":10,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":14,"wall":2.61},{"n":2,"prompt_tokens":5051,"prefill_ms":1408,"wall":2.24}],"answer":"checkout: certificate verify failed  \npayments: client closed request  \ninventory: client closed request  \nauth: client closed request  \nsearch: client closed request  \norders: client closed request  \ndb-main: client closed request  \ncache: client closed request  \nemail: client closed request  \ngateway: client closed request","max_prompt":5051,"total_prompt":5271,"truth":{"checkout":"certificate verify failed","payments":"client closed request","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"digest old results","incident":1,"per_service":{"checkout":true,"payments":true,"inventory":true,"auth":true,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":10,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.58},{"n":2,"prompt_tokens":4998,"prefill_ms":1389,"wall":2.89}],"answer":"checkout: 40 x 503 from payments: upstream request failed, 9 x client closed request\npayments: 40 x retry budget exceeded, 7 x client closed request\ninventory: 3 x client closed request\nauth: 6 x client closed request\nsearch: no errors\norders: 1 x client closed request\ndb-main: 4 x client closed request\ncache: 1 x client closed request\nemail: 4 x client closed request\ngateway: 5 x client closed request","max_prompt":4998,"total_prompt":5218,"truth":{"checkout":"503 from payments","payments":"retry budget exceeded","inventory":"client closed request","auth":"client closed request","search":"no errors","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"digest old results","incident":2,"per_service":{"checkout":true,"payments":true,"inventory":true,"auth":true,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":10,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":16,"wall":2.7},{"n":2,"prompt_tokens":5010,"prefill_ms":1393,"wall":2.85}],"answer":"checkout: 40 x 503 from orders: upstream request failed  \npayments: no errors  \ninventory: 2 x client closed request  \nauth: no errors  \nsearch: 2 x client closed request  \norders: 40 x 503 from email: upstream request failed, 3 x client closed request  \ndb-main: 2 x client closed request  \ncache: 1 x client closed request  \nemail: cache stampede: 4000 misses/s  \ngateway: no errors","max_prompt":5010,"total_prompt":5230,"truth":{"checkout":"503 from orders","payments":"no errors","inventory":"client closed request","auth":"no errors","search":"client closed request","orders":"503 from email","db-main":"client closed request","cache":"client closed request","email":"cache stampede: 4000 misses/s","gateway":"no errors"}},{"strategy":"digest old results","incident":3,"per_service":{"checkout":true,"payments":true,"inventory":true,"auth":true,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":10,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.59},{"n":2,"prompt_tokens":5060,"prefill_ms":1411,"wall":2.65}],"answer":"checkout: 40 x connection pool exhausted, 1 x client closed request  \npayments: no errors  \ninventory: 6 x client closed request  \nauth: 1 x client closed request  \nsearch: 5 x client closed request  \norders: 6 x client closed request  \ndb-main: no errors  \ncache: 2 x client closed request  \nemail: 1 x client closed request  \ngateway: 3 x client closed request","max_prompt":5060,"total_prompt":5280,"truth":{"checkout":"connection pool exhausted","payments":"no errors","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"no errors","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"digest old results","incident":4,"per_service":{"checkout":true,"payments":true,"inventory":true,"auth":true,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":10,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.59},{"n":2,"prompt_tokens":5061,"prefill_ms":1436,"wall":3.02}],"answer":"checkout: 40 x 503 from payments: upstream request failed, 7 x client closed request\npayments: 40 x connection pool exhausted, 1 x client closed request\ninventory: 4 x client closed request\nauth: 6 x client closed request\nsearch: 2 x client closed request\norders: 6 x client closed request\ndb-main: 4 x client closed request\ncache: 3 x client closed request\nemail: 4 x client closed request\ngateway: 3 x client closed request","max_prompt":5061,"total_prompt":5281,"truth":{"checkout":"503 from payments","payments":"connection pool exhausted","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"digest old results","incident":5,"per_service":{"checkout":true,"payments":true,"inventory":true,"auth":true,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":10,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":16,"wall":2.67},{"n":2,"prompt_tokens":4763,"prefill_ms":1332,"wall":2.86}],"answer":"checkout: 40 x 503 from orders: upstream request failed  \npayments: 3 x client closed request  \ninventory: 4 x client closed request  \nauth: 1 x client closed request  \nsearch: 2 x client closed request  \norders: 40 x 503 from email: upstream request failed, 4 x client closed request  \ndb-main: 5 x client closed request  \ncache: 2 x client closed request  \nemail: protocol error: unexpected message type  \ngateway: client closed request","max_prompt":4763,"total_prompt":4983,"truth":{"checkout":"503 from orders","payments":"client closed request","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"503 from email","db-main":"client closed request","cache":"client closed request","email":"protocol error: unexpected message type","gateway":"client closed request"}},{"strategy":"restate the task at the end","incident":0,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":true,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":7,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.65},{"n":2,"prompt_tokens":15766,"prefill_ms":5626,"wall":6.59}],"answer":"auth: client closed request\nsearch: client closed request\norders: client closed request\ndb-main: client closed request\ncache: client closed request\nemail: client closed request\ngateway: client closed request\ncheckout: no errors\npayments: no errors\ninventory: no errors","max_prompt":15766,"total_prompt":15986,"truth":{"checkout":"certificate verify failed","payments":"client closed request","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"restate the task at the end","incident":1,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":true,"search":true,"orders":false,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":6,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.88},{"n":2,"prompt_tokens":15745,"prefill_ms":5568,"wall":6.5}],"answer":"auth: client closed request\nsearch: no errors\norders: no errors\ndb-main: client closed request\ncache: client closed request\nemail: client closed request\ngateway: client closed request\ncheckout: no errors\npayments: no errors\ninventory: no errors","max_prompt":15745,"total_prompt":15965,"truth":{"checkout":"503 from payments","payments":"retry budget exceeded","inventory":"client closed request","auth":"client closed request","search":"no errors","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"restate the task at the end","incident":2,"per_service":{"checkout":false,"payments":true,"inventory":false,"auth":true,"search":false,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":7,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":14,"wall":2.84},{"n":2,"prompt_tokens":15629,"prefill_ms":5513,"wall":6.66}],"answer":"auth: no errors  \nsearch: no errors  \norders: 503 from email: upstream request failed  \ndb-main: client closed request  \ncache: client closed request  \nemail: cache stampede: 4000 misses/s  \ngateway: no errors  \ncheckout: no errors  \npayments: no errors  \ninventory: no errors","max_prompt":15629,"total_prompt":15849,"truth":{"checkout":"503 from orders","payments":"no errors","inventory":"client closed request","auth":"no errors","search":"client closed request","orders":"503 from email","db-main":"client closed request","cache":"client closed request","email":"cache stampede: 4000 misses/s","gateway":"no errors"}},{"strategy":"restate the task at the end","incident":3,"per_service":{"checkout":false,"payments":true,"inventory":false,"auth":false,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":7,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":15,"wall":2.87},{"n":2,"prompt_tokens":15804,"prefill_ms":5585,"wall":6.52}],"answer":"auth: no errors\nsearch: client closed request\norders: client closed request\ndb-main: no errors\ncache: client closed request\nemail: client closed request\ngateway: client closed request\ncheckout: no errors\npayments: no errors\ninventory: no errors","max_prompt":15804,"total_prompt":16024,"truth":{"checkout":"connection pool exhausted","payments":"no errors","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"no errors","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"restate the task at the end","incident":4,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":true,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":7,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":14,"wall":2.87},{"n":2,"prompt_tokens":15681,"prefill_ms":5521,"wall":6.48}],"answer":"auth: client closed request\nsearch: client closed request\norders: client closed request\ndb-main: client closed request\ncache: client closed request\nemail: client closed request\ngateway: client closed request\ncheckout: no errors\npayments: no errors\ninventory: no errors","max_prompt":15681,"total_prompt":15901,"truth":{"checkout":"503 from payments","payments":"connection pool exhausted","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"client closed request","db-main":"client closed request","cache":"client closed request","email":"client closed request","gateway":"client closed request"}},{"strategy":"restate the task at the end","incident":5,"per_service":{"checkout":false,"payments":false,"inventory":false,"auth":true,"search":true,"orders":true,"db-main":true,"cache":true,"email":true,"gateway":true},"correct":7,"steps":[{"n":1,"prompt_tokens":220,"prefill_ms":14,"wall":2.83},{"n":2,"prompt_tokens":15316,"prefill_ms":5347,"wall":6.47}],"answer":"auth: client closed request\nsearch: client closed request\norders: 503 from email: upstream request failed\ndb-main: client closed request\ncache: client closed request\nemail: protocol error: unexpected message type\ngateway: client closed request\ncheckout: no errors\npayments: no errors\ninventory: no errors","max_prompt":15316,"total_prompt":15536,"truth":{"checkout":"503 from orders","payments":"client closed request","inventory":"client closed request","auth":"client closed request","search":"client closed request","orders":"503 from email","db-main":"client closed request","cache":"client closed request","email":"protocol error: unexpected message type","gateway":"client closed request"}}];
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const SV = ['checkout', 'payments', 'inventory', 'auth', 'search', 'orders', 'db-main', 'cache', 'email', 'gateway'];
+  const BAR = {
+    'keep everything': [['sys', 'system + task', 2], ['gone', 'dropped by the server', 28], ['full', '10 raw logs (what survived)', 70]],
+    'mask old results': [['sys', 'system + task', 6], ['gone', '8 placeholders', 8], ['full', '2 newest raw logs', 86]],
+    'digest old results': [['sys', 'system + task', 6], ['dig', '8 digests', 8], ['full', '2 newest raw logs', 86]],
+    'restate the task at the end': [['gone', 'dropped', 28], ['full', 'raw logs that survived', 66], ['rem', 'task again', 6]]
+  };
+  const WHY = {
+    'keep everything': '<b>0 of 60.</b> The window could not hold ten raw logs, the server dropped the oldest tokens, and the task went with them. The model wrote a general summary of the logs it could see.',
+    'mask old results': '<b>17 of 60.</b> The model saw two full logs and eight notes saying a result had been removed. It answered for the two services it could see; for the others there was nothing to report.',
+    'digest old results': '<b>60 of 60, in a third of the window.</b> Each older log became one line of counts computed by code. The model had every conclusion and the two newest logs in full.',
+    'restate the task at the end': '<b>41 of 60.</b> The reminder sat in the part of the prompt that survived, so the format and the task came back. The first services\' logs were still truncated away, so their lines were missing or wrong.'
+  };
+  function draw() {
+    const s = v('#ceS'), rows = D.filter(r => r.strategy === s);
+    const bar = BAR[s].map(([c, label, w]) => `<i class="${c}" style="width:${w}%" title="${label}">${label}</i>`).join('');
+    const grid = `<div class="ce-mx"><span class="h">incident</span>${SV.map(x => `<span class="h" title="${x}">${x}</span>`).join('')}` +
+      rows.map(r => `<span class="h">#${r.incident + 1}</span>` + SV.map(x => `<span class="${r.per_service[x] ? 'y' : 'n'}" title="truth: ${esc(r.truth[x])}">${r.per_service[x] ? '✓' : '✗'}</span>`).join('')).join('') + '</div>';
+    $('#ceOut').innerHTML = `<div class="ce-l" style="margin-top:0">What the model was sent on the answering step (sketch)</div><div class="ce-ctx">${bar}</div>` +
+      `<div class="ce-l">Service lines right, six incidents</div>${grid}<div class="ce-l">Answer, incident 1</div><div class="ce-ans">${esc(rows[0].answer.replace(/\*\*/g, '') || '(empty)')}</div>`;
+    const ok = rows.reduce((a, r) => a + r.correct, 0);
+    $('#ceStats').innerHTML = `<div class="stat ${ok === 60 ? 'good' : 'warn'}"><div class="k">Right lines</div><div class="v">${ok} of 60</div></div><div class="stat"><div class="k">Largest prompt</div><div class="v">${Math.max(...rows.map(r => r.max_prompt)).toLocaleString('en-GB')}</div></div><div class="stat"><div class="k">Prompt tokens per run</div><div class="v">${Math.round(rows.reduce((a, r) => a + r.total_prompt, 0) / 6).toLocaleString('en-GB')}</div></div>`;
+    $('#ceWhy').innerHTML = WHY[s];
+  }
+  $('#ceS').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
+</body>
+</html>

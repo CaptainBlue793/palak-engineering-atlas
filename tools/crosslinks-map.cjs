@@ -18,7 +18,7 @@
 const COURSE = {
   dsa: 'dsa', os: 'os', net: 'networks', db: 'databases', lld: 'lld',
   sd: 'system-design', dist: 'distributed-systems', ops: 'cloud-devops', ml: 'ml-ai-systems', mlf: 'ml-fundamentals',
-  api: 'backend-api', rag: 'rag',
+  api: 'backend-api', rag: 'rag', agent: 'single-agent',
 };
 
 const TOPICS = [
@@ -35,11 +35,11 @@ const TOPICS = [
   ['Latency numbers and the memory hierarchy', ['dsa/03', 'os/p4', 'db/p3', 'sd/p1', 'sd/p8', 'ml/p8']],
   ['Estimation and sizing arithmetic', ['net/p8', 'db/p8', 'sd/p8', 'dist/p4', 'ml/p8']],
   ['Hash tables and hashing', ['dsa/09', 'db/15', 'sd/p7', 'dist/p6']],
-  ['JSON, YAML and other data formats', ['db/p5', 'sd/p5', 'dist/p3', 'ops/p4', 'api/p4']],
+  ['JSON, YAML and other data formats', ['db/p5', 'sd/p5', 'dist/p3', 'ops/p4', 'api/p4', 'agent/p3']],
   ['Time and clocks in code', ['db/p4', 'lld/28', 'dist/p5']],
   ['Probability and expectation', ['dsa/46', 'ml/p5', 'mlf/p6']],
-  ['Python basics, and Python in use', ['net/p5', 'db/p6', 'ml/p1', 'mlf/p1', 'api/p1', 'rag/p1']],
-  ['State machines', ['os/04', 'net/08', 'lld/18', 'sd/35']],
+  ['Python basics, and Python in use', ['net/p5', 'db/p6', 'ml/p1', 'mlf/p1', 'api/p1', 'rag/p1', 'agent/p1']],
+  ['State machines', ['os/04', 'net/08', 'lld/18', 'sd/35', 'agent/p7']],
   ['Turning requirements into a design', ['lld/02', 'sd/01', 'ml/01']],
 
   /* ---------- operating systems meets everything else ---------- */
@@ -57,7 +57,7 @@ const TOPICS = [
   ['Sockets and file descriptors', ['os/09', 'os/10', 'net/p3', 'net/p5']],
   ['From the network card to the socket', ['os/06', 'os/35', 'os/42', 'net/34']],
   ['System calls and strace', ['os/p8', 'os/02', 'os/37', 'net/37']],
-  ['How containers work, and how to run them', ['os/34', 'os/46', 'sd/21', 'ops/07', 'ops/08']],
+  ['How containers work, and how to run them', ['os/34', 'os/46', 'sd/21', 'ops/07', 'ops/08', 'agent/23']],
   ['Virtual machines', ['os/33', 'ops/02', 'ops/03']],
   ['Memory limits and the OOM killer', ['os/14', 'os/48', 'sd/21', 'ops/12']],
   ['File systems and kinds of storage', ['os/23', 'lld/36', 'sd/09', 'dist/46', 'ops/04', 'ops/15']],
@@ -81,7 +81,7 @@ const TOPICS = [
   ['Load balancing', ['net/24', 'net/46', 'sd/05', 'ops/14', 'ops/33']],
   ['Proxies, gateways and the service mesh', ['net/23', 'net/32', 'sd/15', 'ops/27', 'ml/39', 'api/35']],
   ['CDNs and edge caching', ['net/26', 'net/43', 'sd/06', 'sd/32']],
-  ['Rate limiting', ['net/36', 'lld/32', 'sd/15', 'api/19']],
+  ['Rate limiting', ['net/36', 'lld/32', 'sd/15', 'api/19', 'agent/p5']],
   ['DDoS and abuse', ['net/08', 'net/36', 'net/45', 'sd/11']],
   ['Kubernetes networking', ['net/31', 'net/32', 'ops/12', 'ops/14', 'ops/27']],
   ['Cloud networks: subnets, routes, NAT and firewalls', ['net/04', 'net/05', 'net/09', 'net/29', 'net/35', 'ops/05']],
@@ -141,7 +141,7 @@ const TOPICS = [
   ['The outbox, change data capture and dual writes', ['sd/17', 'dist/22', 'dist/28', 'ops/42', 'api/30']],
   ['Event sourcing, CQRS and logs as the source of truth', ['db/33', 'lld/27', 'sd/17', 'dist/15']],
   ['Delivery guarantees and exactly-once', ['sd/14', 'sd/18', 'sd/37', 'sd/40', 'dist/28', 'ml/28']],
-  ['Retries, backoff and idempotency', ['net/46', 'lld/25', 'sd/03', 'sd/16', 'dist/04', 'ops/p8', 'api/15', 'api/29']],
+  ['Retries, backoff and idempotency', ['net/46', 'lld/25', 'sd/03', 'sd/16', 'dist/04', 'ops/p8', 'api/15', 'api/29', 'agent/p5']],
   ['Timeouts, circuit breakers and bulkheads', ['net/32', 'lld/25', 'sd/16', 'dist/p2', 'api/29']],
   ['Message queues and Kafka', ['lld/34', 'sd/14', 'sd/29', 'dist/29', 'dist/43', 'api/20']],
   ['Publish–subscribe and the Observer pattern', ['lld/16', 'lld/34', 'sd/14', 'dist/31']],
@@ -163,13 +163,13 @@ const TOPICS = [
   ['Serverless', ['sd/21', 'sd/24', 'ops/26']],
   ['Scaling out and autoscaling', ['sd/04', 'sd/21', 'ops/03', 'ops/25']],
   ['Capacity planning', ['sd/04', 'sd/24', 'ops/39', 'ml/26', 'ml/38', 'api/32']],
-  ['Cost engineering', ['db/48', 'sd/24', 'ops/31', 'ops/46', 'ml/27', 'ml/38', 'rag/29']],
-  ['Metrics, logs and traces', ['os/37', 'lld/33', 'sd/16', 'sd/41', 'dist/36', 'ops/21', 'ops/22', 'ops/23', 'ml/34', 'api/31', 'rag/36']],
+  ['Cost engineering', ['db/48', 'sd/24', 'ops/31', 'ops/46', 'ml/27', 'ml/38', 'rag/29', 'agent/31']],
+  ['Metrics, logs and traces', ['os/37', 'lld/33', 'sd/16', 'sd/41', 'dist/36', 'ops/21', 'ops/22', 'ops/23', 'ml/34', 'api/31', 'rag/36', 'agent/36']],
   ['SLOs, alerting and incident response', ['sd/16', 'sd/41', 'ops/01', 'ops/24', 'ops/37', 'ops/38', 'api/39']],
   ['Real outages, taken apart', ['os/48', 'net/44', 'net/45', 'db/44', 'dist/48', 'ops/43', 'ops/44', 'ops/45']],
-  ['Authentication, authorisation and least privilege', ['os/36', 'sd/11', 'ops/06', 'ops/36', 'ops/p7', 'api/09', 'api/10', 'api/11', 'api/12']],
+  ['Authentication, authorisation and least privilege', ['os/36', 'sd/11', 'ops/06', 'ops/36', 'ops/p7', 'api/09', 'api/10', 'api/11', 'api/12', 'agent/24']],
   ['Configuration and secrets', ['lld/24', 'sd/11', 'ops/13', 'ops/28', 'api/p6']],
-  ['Attacks and their defences', ['os/36', 'os/47', 'net/03', 'net/36', 'db/p6', 'sd/11', 'ops/29', 'ml/36', 'api/33', 'rag/31']],
+  ['Attacks and their defences', ['os/36', 'os/47', 'net/03', 'net/36', 'db/p6', 'sd/11', 'ops/29', 'ml/36', 'api/33', 'rag/31', 'agent/25']],
 
   /* ---------- machine learning ---------- */
   ['ML platforms: leakage, skew, evaluation and drift', ['sd/23', 'ml/01', 'ml/03', 'ml/07', 'ml/29', 'ml/32', 'ml/34', 'mlf/37', 'mlf/39']],
@@ -178,13 +178,13 @@ const TOPICS = [
   ['Evaluating and comparing models', ['mlf/08', 'mlf/13', 'mlf/36', 'ml/07']],
   ['Features and data quality', ['mlf/14', 'mlf/15', 'mlf/16', 'ml/03', 'ml/04']],
   ['Linear algebra for machine learning', ['mlf/p4', 'ml/02']],
-  ['Tokens and context windows', ['ml/15', 'rag/p3']],
-  ['Prompting a model with context', ['ml/19', 'rag/10', 'rag/16']],
-  ['Retrieval-augmented generation', ['ml/21', 'ml/46', 'rag/01', 'rag/02']],
+  ['Tokens and context windows', ['ml/15', 'rag/p3', 'agent/p4', 'agent/10']],
+  ['Prompting a model with context', ['ml/19', 'rag/10', 'rag/16', 'agent/11']],
+  ['Retrieval-augmented generation', ['ml/21', 'ml/46', 'rag/01', 'rag/02', 'agent/17']],
   ['Search ranking and ranking metrics', ['ml/42', 'rag/p8', 'rag/13']],
-  ['Fine-tuning models', ['ml/17', 'rag/33']],
-  ['Evaluating LLM systems', ['ml/35', 'rag/20', 'rag/21']],
-  ['Agents and tool use', ['ml/22', 'rag/34']],
+  ['Fine-tuning models', ['ml/17', 'rag/33', 'agent/38']],
+  ['Evaluating LLM systems', ['ml/35', 'rag/20', 'rag/21', 'agent/27']],
+  ['Agents and tool use', ['ml/22', 'rag/34', 'agent/01', 'agent/03']],
   ['Privacy, retention and deletion of personal data', ['ml/37', 'rag/39']],
   ['Serving LLMs', ['sd/42', 'ml/14', 'ml/26', 'ml/39', 'ml/45', 'rag/35']],
   ['Feeds, ranking and recommendations', ['sd/27', 'ml/30', 'ml/41', 'mlf/31']],
@@ -201,7 +201,7 @@ const TOPICS = [
   ['Video streaming', ['net/43', 'sd/32']],
 
   /* ---------- interviews ---------- */
-  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40', 'mlf/40', 'api/40', 'rag/40']],
+  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40', 'mlf/40', 'api/40', 'rag/40', 'agent/40']],
 ];
 
 module.exports = { COURSE, TOPICS };

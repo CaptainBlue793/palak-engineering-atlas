@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Production Agent Architecture · Single Agent by Palak Deb Patra</title>
+<meta name="description" content="Chapter 35 of Single Agent. How agents are deployed: synchronous and background runs, queues and workers, sandboxes as a service, state stores and failure modes. Measured here: 1, 2, 4 and 8 concurrent agent runs on one GPU with qwen3:14b, with throughput fixed at about 19 runs a minute and latency rising with the queue.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('agent-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pa-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .pa-row { display:grid; grid-template-columns:50px 1fr 60px; gap:8px; align-items:center; font-size:12px; margin:3px 0; }
+  .pa-bar { height:14px; border-radius:4px; display:flex; overflow:hidden; background:var(--surface); border:1px solid var(--border); }
+  .pa-bar .m { background:var(--accent); } .pa-bar .w { background:var(--amber, #d97706); opacity:.75; }
+  .pa-key { display:flex; gap:14px; font-size:11.5px; color:var(--muted); margin-top:6px; }
+  .pa-key i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:-1px; }
+  .pa-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-size:13px; }
+  .pa-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
+</head>
+<body data-chapter="35">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 35</span><span class="pill">Expert</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Production Agent <span class="grad">Architecture</span></h1>
+    <p class="lead">Everything so far has been one agent run in one Python process. In production there are many users, many runs at once, runs that take minutes, tools that need sandboxes, state that must survive restarts, and a model server with finite capacity. The architecture around the loop decides how the system behaves under load and when parts of it fail.</p>
+    <p class="lead">This chapter walks through the parts: synchronous and background runs, queues and workers, sandboxes as a service, state stores, and failure modes. It measures the constraint that shapes all of them, the capacity of the model server. The incident agent ran with 1, 2, 4 and 8 runs at once against one GPU serving qwen3:14b, one request at a time.</p>
+    <ul class="objectives">
+      <li><span>Choose between synchronous and background runs</span></li>
+      <li><span>Size queues and workers from measured capacity</span></li>
+      <li><span>Run tools in sandboxes as a separate service</span></li>
+      <li><span>Keep run state outside the worker process</span></li>
+      <li><span>Design for the ways each part fails</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Sandboxing:</b> <a href="23-sandboxing.html">Chapter 23</a>.</li>
+        <li><b>Checkpoints and resumption:</b> <a href="32-long-running-agents.html">Chapter 32</a>.</li>
+        <li><b>Latency per step:</b> <a href="30-latency-and-parallel-tools.html">Chapter 30</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Synchronous vs background runs</h2>
+  <p>A synchronous run keeps the user's request open until the agent answers. That suits runs of a few seconds with someone waiting, like a chat reply. A background run accepts the request, returns a job id at once, and lets the client follow progress by polling, a stream of events, or a notification when it is done. That suits anything that can take more than a few seconds, anything that must survive a closed browser or a restarted server, and anything that waits for approval (<a href="24-permissions-and-approval.html">Chapter 24</a>). The measurement below shows how quickly "a few seconds" stops being true under load. With eight runs at once, the median run took 20 seconds and the slowest 35, longer than many HTTP clients and proxies will hold a request open.</p>
+
+  <h2>Queues and workers</h2>
+  <p>One GPU running the model one request at a time completed about <b>19 runs a minute</b>, whether it was given 1, 2, 4 or 8 runs at once (19.1, 19.6, 19.3 and 18.9). Concurrency did not add capacity; it added waiting. The median run took <b>3.1 s</b> alone, <b>6.0 s</b> with two at once, <b>10.0 s</b> with four and <b>19.7 s</b> with eight. The slowest run (the 95th percentile) took 4.6, 8.8, 17.7 and 34.5 s. Each run's own model time also grew (3.1, 5.8, 10.4, 21.5 s), because that time includes waiting in the model server's queue. Accuracy did not change.</p>
+  <p>So put the queue where you can see and control it. Accept requests into a job queue, run a fixed number of workers sized to what the model server can actually serve, and report queue length and waiting time as first-class metrics. Then latency under load is a number you choose (reject, defer, or tell the user their place in line), not one that grows silently inside the model server. Servers that batch many requests together, such as vLLM, or Ollama with <code>OLLAMA_NUM_PARALLEL</code> above 1, can raise throughput at some cost per request. That was not measured here; measure it on your hardware before sizing workers.</p>
+<pre class="code"><span class="c"># API: accept and return immediately</span>
+<span class="k">def</span> <span class="f">submit</span>(task: <span class="t">str</span>, user: <span class="t">str</span>) -&gt; <span class="t">str</span>:
+    job_id = store.<span class="f">create_job</span>(task=task, user=user, status=<span class="s">"queued"</span>)
+    queue.<span class="f">put</span>(job_id)
+    <span class="k">return</span> job_id                                         <span class="c"># client polls or subscribes to events</span>
+
+<span class="c"># Worker: N of these, N sized to the model server's measured capacity</span>
+<span class="k">def</span> <span class="f">worker</span>():
+    <span class="k">while</span> job_id := queue.<span class="f">get</span>():
+        job = store.<span class="f">load</span>(job_id)                          <span class="c"># messages + result cache, if resuming</span>
+        <span class="k">for</span> step <span class="k">in</span> <span class="f">agent_steps</span>(job):
+            store.<span class="f">checkpoint</span>(job_id, step)                   <span class="c"># Chapter 32</span>
+            events.<span class="f">publish</span>(job_id, step.<span class="f">summary</span>())          <span class="c"># progress for the user</span>
+        store.<span class="f">finish</span>(job_id, <span class="f">check</span>(job))                    <span class="c"># final-state check, Chapter 27</span></pre>
+
+  <h2>Sandboxes as a service</h2>
+  <p>Tools that run code, browse or touch files need isolation (<a href="23-sandboxing.html">Chapter 23</a>). In production that becomes a service: the worker asks for a sandbox, sends commands, reads results, and releases it. Sandboxes can be pooled and pre-warmed so starting one costs milliseconds, not seconds. Each run or user gets its own, with the run's files, no shared credentials and a network policy. The sandbox service is also where resource limits, timeouts and audit logs for code execution live, separate from the model and from the workers that hold API keys.</p>
+
+  <h2>State stores</h2>
+  <p>Nothing about a run should live only in a worker's memory. The job record (status, user, task, result) goes in a database. Message checkpoints and the tool-result store go in a store that survives worker restarts (<a href="32-long-running-agents.html">Chapter 32</a>). Long-term memory has its own store with sources and dates (<a href="16-long-term-memory.html">Chapter 16</a>). Traces go to the observability system (<a href="36-observability-and-tracing.html">Chapter 36</a>). Then a worker is replaceable. Kill it mid-run and another picks up the job from its last checkpoint, without repeating calls that completed.</p>
+
+  <h2>Failure modes</h2>
+  <p>Each part fails in its own way, and the design should say what happens then. When the model server is slow or down, queue length grows: alert on waiting time, shed or defer new work, and fall back to a smaller model only where an evidence check guards the answer (<a href="22-choosing-a-model.html">Chapter 22</a>). When a tool's backend fails, the agent gets errors it can act on (<a href="08-tool-errors-and-recovery.html">Chapter 8</a>) and retries happen inside the tool with idempotency keys (<a href="19-agents-over-apis-and-data.html">Chapter 19</a>). When a worker dies, the job resumes from its checkpoint. When a run never converges, a hidden budget stops it and a person is told (<a href="31-cost-and-budgets.html">Chapter 31</a>). When the sandbox pool is exhausted, jobs wait in the queue rather than run without isolation. Write these down as runbooks before launch, and test them by causing each failure on purpose.</p>
+
+  <h2>Simulator: one GPU, more runs at once</h2>
+  <p>qwen3:14b in Ollama 0.40.6 with one request at a time, the Chapter 8 incident agent, nothing else on the GPU. Each level ran at least 8 incidents with that many running at once. Pick a level to see every run's time, split into time spent in model calls (including waiting for the server) and everything else.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">More concurrency, same capacity</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="pa-l">Runs at once</div>
+      <div class="seg" id="paC"><button class="active" data-v="1">1</button><button data-v="2">2</button><button data-v="4">4</button><button data-v="8">8</button></div>
+      <div id="paBars"></div>
+      <div class="pa-key"><span><i style="background:var(--accent)"></i>model calls, including queueing at the server</span><span><i style="background:var(--amber, #d97706)"></i>everything else (tools, loop)</span></div>
+      <div class="pa-box" id="paOut"></div>
+      <div class="stats" id="paStats"></div>
+      <div class="pa-why" id="paWhy"></div>
+    </div>
+    <div class="panel-foot">Bars share one scale across levels, so the growth is visible. Tools in this task return immediately.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li>Step from 1 to 8 and watch throughput stay put while the bars stretch.</li>
+    <li>At 8, compare the fastest and slowest runs: same work, different place in the queue.</li>
+    <li>Note that accuracy does not change; only waiting does.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Runs at once</th><th>Runs</th><th>Throughput (runs/min)</th><th>Median run</th><th>95th percentile</th><th>Solved</th></tr></thead>
+      <tbody>
+        <tr><td><b>1</b></td><td>8</td><td>19.1</td><td>3.1 s</td><td>4.6 s</td><td>7 of 8</td></tr>
+        <tr><td><b>2</b></td><td>8</td><td>19.6</td><td>6.0 s</td><td>8.8 s</td><td>7 of 8</td></tr>
+        <tr><td><b>4</b></td><td>8</td><td>19.3</td><td>10.0 s</td><td>17.7 s</td><td>8 of 8</td></tr>
+        <tr><td><b>8</b></td><td>16</td><td>18.9</td><td>19.7 s</td><td>34.5 s</td><td>13 of 16</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="seq" data-actors="Client|API + job store|Worker|Model server">
+    <ol>
+      <li data-m="0>1">POST /runs {task}</li>
+      <li data-m="1>0" data-k="reply">202 Accepted · job 7f3a</li>
+      <li data-m="2>1">take job 7f3a from the queue</li>
+      <li data-m="2>3">model step (waits if the server is busy)</li>
+      <li data-m="2>1">checkpoint · progress event</li>
+      <li data-m="1>0" data-k="reply">event: "checking 10 services…"</li>
+      <li data-m="2>1">finish: result + state check</li>
+      <li data-m="1>0" data-k="reply">event: done · result</li>
+    </ol>
+    <figcaption><b>A background agent run.</b> The client never holds a request open; the queue in front of the workers is where load becomes visible.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🏛️</div>
+    <div class="body"><div class="title">Use case: background agents in products</div><p>Agent products moved long tasks to background runs as tasks grew. OpenAI's Codex (2025) runs each coding task in its own cloud sandbox in the background, possibly several in parallel, and reports back when done with logs and a proposed change. Anthropic's Claude Code can run in the cloud and as background tasks with checkpoints. Research agents from several providers accept a question, work for many minutes, and notify the user when the report is ready. Under the products sit the parts described in this chapter: a job queue, workers, a sandbox per task, state that survives restarts, and progress streamed to the user. The model server's capacity decides how many tasks run at once, and queueing absorbs the rest.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Synchronous requests for runs that can take tens of seconds</b> under load.</li>
+      <li><b>More concurrent runs than the model server can serve:</b> the queue hides inside it.</li>
+      <li><b>Run state in worker memory,</b> lost with the worker.</li>
+      <li><b>Sandboxes in the same process</b> or account as the workers' credentials.</li>
+      <li><b>No metrics for queue length and waiting time.</b></li>
+      <li><b>Failure modes left unwritten and untested</b> until they happen.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How would you deploy an agent for many users?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Requests go to an API that creates a job and returns at once. A queue feeds a fixed pool of workers sized to the model server's measured capacity. Workers run the loop, checkpoint after every step, store tool results, and stream progress events. Tools that run code use a sandbox service, and state lives in stores that outlive any worker. Concurrency beyond capacity only adds waiting: measured on one GPU, throughput stayed at about 19 runs a minute from 1 to 8 runs at once while the median run went from 3 to 20 seconds.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Users say the agent got much slower after launch, but each run's model time looks normal in tests. What is happening?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Probably queueing at the model server. In a measurement the work per run did not change, but measured model time per run rose from 3.1 to 21.5 seconds at eight concurrent runs, because that time includes waiting for the server, and throughput stayed fixed at about 19 runs a minute. I would move the queue in front of the workers, size workers to capacity, expose queue length and waiting time as metrics, add capacity or batching where the hardware allows, and switch long runs to background jobs with progress updates.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>One GPU served about 19 runs a minute at every concurrency level from 1 to 8.</li>
+      <li>Extra concurrency only added waiting: median 3.1 s alone, 19.7 s with eight at once.</li>
+      <li>Use background runs with progress events for anything that can take more than a few seconds.</li>
+      <li>Queue in front of workers sized to capacity, and measure queue length and waiting time.</li>
+      <li>Keep state outside workers and sandboxes outside the workers' trust boundary.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What happened to throughput as concurrent runs rose from 1 to 8?</p>
+      <div class="opts">
+        <button class="opt">It rose eightfold</button>
+        <button class="opt">It stayed at about 19 runs a minute</button>
+        <button class="opt">It fell to zero</button>
+        <button class="opt">It doubled</button>
+      </div>
+      <div class="explain">The model server handled one request at a time; concurrency only added waiting.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why did each run's measured model time grow with concurrency?</p>
+      <div class="opts">
+        <button class="opt">The model got slower</button>
+        <button class="opt">The prompts got longer</button>
+        <button class="opt">More steps were needed</button>
+        <button class="opt">Model time includes waiting in the server's queue</button>
+      </div>
+      <div class="explain">3.1 s alone, 21.5 s with eight at once, for the same work.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">When should an agent run in the background rather than synchronously?</p>
+      <div class="opts">
+        <button class="opt">When it can take more than a few seconds, must survive restarts, or may wait for approval</button>
+        <button class="opt">Never</button>
+        <button class="opt">Only for chat replies</button>
+        <button class="opt">When it uses one tool</button>
+      </div>
+      <div class="explain">With eight at once, the slowest run took 35 seconds.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How many workers should pull from the job queue?</p>
+      <div class="opts">
+        <button class="opt">As many as there are users</button>
+        <button class="opt">One</button>
+        <button class="opt">As many as the model server can serve at its measured capacity</button>
+        <button class="opt">As many as possible</button>
+      </div>
+      <div class="explain">Beyond that, the queue just moves inside the model server where you cannot see it.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why should run state live outside the worker process?</p>
+      <div class="opts">
+        <button class="opt">It is faster</button>
+        <button class="opt">So another worker can resume a job after a crash without repeating completed calls</button>
+        <button class="opt">Models require it</button>
+        <button class="opt">It saves tokens</button>
+      </div>
+      <div class="explain">Checkpoints and the tool-result store make workers replaceable (Chapter 32).</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = AGENT;
+  const D = {"levels":[{"c":1,"runs":8,"total":25.1,"tput":19.1,"p50":3.1,"p95":4.6,"solved":7,"secs":[3.18,1.98,3.02,4.55,2.67,2.29,3.65,3.72],"model":[3.18,1.98,3.02,4.55,2.67,2.29,3.65,3.72],"ok":[true,true,true,true,false,true,true,true]},{"c":2,"runs":8,"total":24.5,"tput":19.6,"p50":6.0,"p95":8.8,"solved":7,"secs":[4.89,3.24,6.14,8.76,5.94,4.77,6.4,6.12],"model":[4.89,3.24,6.14,8.76,5.94,4.77,6.4,6.12],"ok":[true,true,true,true,false,true,true,true]},{"c":4,"runs":8,"total":24.8,"tput":19.3,"p50":10.0,"p95":17.7,"solved":8,"secs":[8.13,5.16,10.65,17.73,9.83,10.25,11.99,9.85],"model":[8.13,5.16,10.65,17.73,9.83,10.25,11.99,9.85],"ok":[true,true,true,true,true,true,true,true]},{"c":8,"runs":16,"total":50.8,"tput":18.9,"p50":19.7,"p95":34.5,"solved":13,"secs":[15.2,9.03,19.73,34.53,16.97,13.17,30.18,24.45,22.82,33.01,27.87,23.24,19.72,17.35,18.29,18.94],"model":[15.2,9.03,19.73,34.53,16.97,13.17,30.18,24.45,22.82,33.01,27.87,23.24,19.72,17.35,18.29,18.94],"ok":[true,true,true,true,false,true,true,false,true,true,true,true,false,true,true,true]}]};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  function draw() {
+    const c = +v('#paC'), L = D.levels.find(x => x.c === c), max = Math.max(...D.levels.flatMap(x => x.secs));
+    const idx = L.secs.map((s, i) => i).sort((a, b) => L.secs[a] - L.secs[b]);
+    $('#paBars').innerHTML = idx.map((i, n) => { const s = L.secs[i], m = Math.min(L.model[i], s); return `<div class="pa-row"><span>run ${n + 1}</span><div class="pa-bar" style="width:${(100 * s / max).toFixed(1)}%"><span class="m" style="width:${(100 * m / s).toFixed(1)}%"></span><span class="w" style="width:${(100 * (s - m) / s).toFixed(1)}%"></span></div><span>${s.toFixed(1)} s</span></div>`; }).join('');
+    $('#paOut').innerHTML = `<div>${L.runs} runs, ${c} at a time, finished in ${L.total.toFixed(1)} s. ${L.solved} of ${L.runs} solved.</div>`;
+    $('#paStats').innerHTML = `<div class="stat good"><div class="k">Throughput</div><div class="v">${L.tput.toFixed(1)} / min</div></div><div class="stat ${L.p50 > 6 ? 'warn' : ''}"><div class="k">Median run</div><div class="v">${L.p50.toFixed(1)} s</div></div><div class="stat ${L.p95 > 10 ? 'warn' : ''}"><div class="k">95th percentile</div><div class="v">${L.p95.toFixed(1)} s</div></div>`;
+    $('#paWhy').innerHTML = c === 1 ? 'One run at a time: each run gets the GPU to itself.' : `${c} runs share one GPU that serves one request at a time. The work per run is the same; the bars grow because each model call waits its turn.`;
+  }
+  $('#paC').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
+</body>
+</html>

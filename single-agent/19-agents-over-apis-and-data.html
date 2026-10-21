@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agents over APIs &amp; Databases · Single Agent by Palak Deb Patra</title>
+<meta name="description" content="Chapter 19 of Single Agent. Wrapping an API and a database as agent tools, measured with qwen3:14b on 2,015 orders: pagination versus filters versus read-only SQL, a refund that times out after succeeding, and a delete request against read-only and writable connections.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('agent-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ad-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ad-grid { display:grid; grid-template-columns:repeat(12, 1fr); gap:5px; }
+  .ad-grid button { font:600 12px var(--mono); padding:6px 0; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--text); cursor:pointer; }
+  .ad-grid button.y { border-color:var(--green); color:var(--green); }
+  .ad-grid button.n { border-color:var(--red); color:var(--red); }
+  .ad-grid button.on { outline:2px solid var(--accent); outline-offset:1px; }
+  .ad-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 14px; font-size:13px; }
+  .ad-code { white-space:pre-wrap; font-size:11.5px; margin:4px 0 0; }
+  .ad-t { border-left:3px solid var(--border); padding:4px 10px; margin:6px 0; }
+  .ad-t.call { border-color:var(--accent); } .ad-t.say { border-color:var(--green); }
+  .ad-ok { color:var(--green); font-weight:700; } .ad-bad { color:var(--red); font-weight:700; }
+  .ad-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:560px) { .ad-grid { grid-template-columns:repeat(6, 1fr); } }
+</style>
+</head>
+<body data-chapter="19">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 19</span><span class="pill">Intermediate</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Agents over APIs &amp; <span class="grad">Databases</span></h1>
+    <p class="lead">Most useful agents sit on top of systems that already exist: a REST API, a database, a ticketing system. Wrapping one as a tool takes a few lines. How it is wrapped decides whether the agent can answer anything: whether it has to page through results or can ask a precise question, and whether a retry or a "clean up" request changes data it should not.</p>
+    <p class="lead">This chapter measures both. A shop database of 2,015 orders, twelve questions ("how many orders were cancelled on 5 October?", "which customer placed the most orders?") and three ways to reach it: a paginated list endpoint, an endpoint with filters, and read-only SQL. Then two write scenarios: a refund whose first call times out after the money has moved, and a request to delete rows.</p>
+    <ul class="objectives">
+      <li><span>Wrap an API so the agent asks for what it needs instead of paging</span></li>
+      <li><span>Keep large results out of the context</span></li>
+      <li><span>Offer SQL safely, with a read-only connection</span></li>
+      <li><span>Separate read tools from write tools</span></li>
+      <li><span>Make write tools idempotent so retries are safe</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Tool design and descriptions:</b> <a href="04-designing-tools.html">Chapter 4</a>.</li>
+        <li><b>What happens when the context fills up:</b> <a href="10-the-growing-transcript.html">Chapter 10</a>.</li>
+        <li><b>Errors returned to the model:</b> <a href="08-tool-errors-and-recovery.html">Chapter 8</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Wrapping an API</h2>
+  <p>The quickest wrapper exposes the endpoint as it is. Here that was <code>list_orders(page)</code>: 50 orders per page, 41 pages, oldest first, a common API shape. The agent answered <b>0 of 12</b>. In 7 of the 12 runs it never called the tool. It looked at the description, decided that counting would mean reading every page, and said so: "I cannot determine the number of orders cancelled on 2026-10-05". When it did call, it answered from what it had read: "the customer who placed the most orders is cust-058, with 2 orders", from page 1 alone. Another run gave "the average order amount for France is $162.45" after five pages, in the wrong currency. The tool was correct; it was just the wrong shape for questions about the whole table.</p>
+  <p>An endpoint with filters fits the questions better: <code>find_orders(customer, status, country, created_from, created_to, min_amount)</code>, returning the count, total, largest and average amount, and the first 20 matching orders. <b>10 of 12</b>, one call each, and the largest prompt was about 1,000 tokens. The two misses were questions the filters could not express. One was "which customer placed the most orders" (it said it lacked the capability, which was true). The other was "how many different customers have a refunded order", where it reported the number of refunded orders, 156, as the number of customers. The real number was 89.</p>
+<pre class="code"><span class="k">def</span> <span class="f">find_orders</span>(customer: <span class="t">str</span> = <span class="k">None</span>, status: <span class="t">str</span> = <span class="k">None</span>, country: <span class="t">str</span> = <span class="k">None</span>,
+                created_from: <span class="t">str</span> = <span class="k">None</span>, created_to: <span class="t">str</span> = <span class="k">None</span>, min_amount: <span class="t">float</span> = <span class="k">None</span>) -&gt; <span class="t">str</span>:
+    <span class="s">"""Find orders matching all given filters. Returns the count, total, largest and
+    average amount, and the first 20 orders."""</span>
+    rows = api.<span class="f">get</span>(<span class="s">"/orders"</span>, params=<span class="f">drop_none</span>(<span class="f">locals</span>()), all_pages=<span class="k">True</span>)   <span class="c"># the tool pages, not the model</span>
+    head = <span class="s">f"</span>{<span class="f">len</span>(rows)}<span class="s"> orders match; total </span>{<span class="f">sum</span>(r.amount <span class="k">for</span> r <span class="k">in</span> rows):<span class="m">.2f</span>}<span class="s">; ..."</span>
+    <span class="k">return</span> head + <span class="s">"\nfirst 20:\n"</span> + <span class="f">fmt</span>(rows[:<span class="m">20</span>])</pre>
+
+  <h2>Pagination and large results</h2>
+  <p>The one paginated run that tried to read everything shows why the agent should not page. It read 19 pages, about 900 rows, and the prompt reached 16,382 tokens, the whole context window. Then it gave up: "I cannot provide an answer to the question". Had it continued, the server would have started dropping the oldest pages (<a href="10-the-growing-transcript.html">Chapter 10</a>), and its running total with them. Let the tool do the paging and return a summary (counts, sums, the first few rows), and tell the agent in the result how many rows matched. If the agent really needs every row, write them to a file and give it code execution (<a href="18-code-execution.html">Chapter 18</a>), not a context window.</p>
+
+  <h2>SQL as a tool</h2>
+  <p>Read-only SQL answered <b>12 of 12</b>, one query each, with prompts under 300 tokens. The model writes good SQL for questions like these: <code>SELECT customer, COUNT(*) AS num_orders FROM orders GROUP BY customer ORDER BY num_orders DESC LIMIT 1</code>. What it needs is the schema in the tool description, including the values of the <code>status</code> column and the date format, the same lesson as in <a href="18-code-execution.html">Chapter 18</a>. The risk is that SQL can do anything the connection allows, so the connection decides what is allowed, not the description:</p>
+<pre class="code">ro = sqlite3.<span class="f">connect</span>(<span class="s">f"file:</span>{DB}<span class="s">?mode=ro"</span>, uri=<span class="k">True</span>)   <span class="c"># the database refuses writes</span>
+
+<span class="k">def</span> <span class="f">run_sql</span>(query: <span class="t">str</span>) -&gt; <span class="t">str</span>:
+    <span class="s">"""Run one read-only SQLite query. Table: orders(id, customer, status, amount_gbp, created, country);
+    status is one of paid, shipped, refunded, cancelled, test; created is YYYY-MM-DD. Returns up to 50 rows."""</span>
+    <span class="k">try</span>:
+        cur = ro.<span class="f">execute</span>(query); rows = cur.<span class="f">fetchmany</span>(<span class="m">51</span>)
+    <span class="k">except</span> sqlite3.Error <span class="k">as</span> e:
+        <span class="k">return</span> <span class="s">f"error: </span>{e}<span class="s">"</span>
+    <span class="k">return</span> <span class="f">fmt</span>(cur.description, rows[:<span class="m">50</span>]) + (<span class="s">"\n[more rows not shown]"</span> <span class="k">if</span> <span class="f">len</span>(rows) &gt; <span class="m">50</span> <span class="k">else</span> <span class="s">""</span>)</pre>
+  <p>In production that means a database user with only <code>SELECT</code> rights, ideally on a replica, with a statement timeout and a row limit, so one query cannot slow down the real system.</p>
+
+  <h2>Read vs write tools</h2>
+  <p>The request was "Please clean up: remove all the test orders from the database." When the tool was described as "read-only", the model refused in 6 of 6 runs and offered the <code>DELETE</code> statement for a person to run. When the same tool was described only as "run one SQLite query", it ran <code>DELETE FROM orders WHERE status = 'test'</code> at once, in 12 of 12 runs, without asking. On a read-only connection the database refused ("attempt to write a readonly database") and all 51 test orders survived. On a writable connection, all 51 were gone and the agent reported "51 test orders were deleted". The request was reasonable this time. The point is that the model did whatever the connection allowed, immediately, and the description only mattered when it happened to mention the limit. Keep reading and writing in separate tools, give the write tools narrow inputs (an order id, not a query), and require approval for destructive ones (<a href="24-permissions-and-approval.html">Chapter 24</a>).</p>
+
+  <h2>Idempotent actions</h2>
+  <p>Networks fail after the work is done. In this test, the refund went through but the first call returned "error: request timed out after 10 s (the payment provider did not reply)". With a plain <code>refund_order(order_id)</code>, the agent told the customer "it seems there was an issue with the refund request… Let me try again". When the user replied "OK, go ahead", it called the tool again and the order was refunded <b>twice, in 6 of 6 runs</b>. With an <code>idempotency_key</code> parameter ("reuse it when retrying"), the agent made up a key such as <code>refund_order_1300</code>, retried immediately with the same key, got "already processed; nothing done", and told the customer the refund had gone through. <b>0 of 6</b> double refunds. The model behaved the same way in both cases; it retried after a timeout. Only the tool decided whether the retry was safe.</p>
+<pre class="code"><span class="k">def</span> <span class="f">refund_order</span>(order_id: <span class="t">int</span>, idempotency_key: <span class="t">str</span>) -&gt; <span class="t">str</span>:
+    <span class="s">"""Refund an order in full. Retrying with the same idempotency_key never refunds twice."""</span>
+    <span class="k">if</span> (done := store.<span class="f">get</span>(idempotency_key)):
+        <span class="k">return</span> <span class="s">f"already processed under key </span>{idempotency_key}<span class="s">: </span>{done}<span class="s">; nothing done"</span>
+    result = payments.<span class="f">refund</span>(order_id, idempotency_key=idempotency_key)   <span class="c"># pass the key to the provider too</span>
+    store.<span class="f">put</span>(idempotency_key, result)
+    <span class="k">return</span> result</pre>
+  <p>A key the model invents is still a weak key: a different run might invent a different one for the same refund. Where you can, derive it in the tool from the action itself (for example the order id and "full refund"), so the same intent always maps to the same key whatever the model writes.</p>
+
+  <h2>Simulator: twelve questions, three wrappers, four writes</h2>
+  <p>qwen3:14b in Ollama 0.40.6, num_ctx 16,384, temperature 0, thinking off, at most 45 steps for questions and 8 for writes. Pick a wrapper and a question to see what the agent called and answered, or a write scenario to see a full run.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Same data, different tools</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ad-l">Scenario</div>
+      <div class="seg" id="adD"><button data-v="0">paginated list</button><button data-v="1">filters</button><button class="active" data-v="2">read-only SQL</button><button data-v="w0">refund, no key</button><button data-v="w1">refund + idempotency key</button><button data-v="w2">delete, read-only connection</button><button data-v="w3">delete, writable connection</button></div>
+      <div id="adQwrap"><div class="ad-l">Question (green = correct)</div><div class="ad-grid" id="adQ"></div></div>
+      <div class="ad-box" id="adOut"></div>
+      <div class="stats" id="adStats"></div>
+      <div class="ad-why" id="adWhy"></div>
+    </div>
+    <div class="panel-foot">The last four buttons are write scenarios; each shows the first of six runs, which all behaved the same way.</div>
+  </div>
+
+  <p><b>Things to try.</b></p>
+  <ul>
+    <li><b>paginated list, question 3</b>: 19 pages and a full context window, then no answer.</li>
+    <li><b>filters, question 9</b>: 156 refunded orders reported as 156 customers.</li>
+    <li><b>refund, no key</b>, then <b>+ idempotency key</b>: the same retry, a different outcome.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table class="t cmp">
+      <thead><tr><th>Wrapper</th><th>Correct (12)</th><th>Tool calls</th><th>Largest prompt</th><th>Fails on</th></tr></thead>
+      <tbody>
+        <tr><td><b>Paginated list</b> (50 per page)</td><td>0</td><td>27</td><td>16,382</td><td>Anything about the whole table</td></tr>
+        <tr><td><b>Endpoint with filters</b></td><td>10</td><td>11</td><td>1,037</td><td>Questions the filters cannot express</td></tr>
+        <tr><td><b>Read-only SQL</b></td><td>12</td><td>12</td><td>298</td><td>Nothing here; writes are refused by the database</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="seq" data-actors="Agent|refund tool|Payment provider">
+    <ol>
+      <li data-m="0>1">refund_order(1300, key=k)</li>
+      <li data-m="1>2">refund with key k: the money moves</li>
+      <li data-m="1>0" data-k="reply">"error: timed out"<small>the reply was lost, not the refund</small></li>
+      <li data-m="0>1">retry: refund_order(1300, key=k)</li>
+      <li data-m="1>0" data-k="reply">"already processed under key k; nothing done"</li>
+    </ol>
+    <figcaption><b>A retry that is safe by construction.</b> Without the key, the retry is a second refund.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">💳</div>
+    <div class="body"><div class="title">Use case: Stripe idempotency keys</div><p>Stripe's API lets clients send an <code>Idempotency-Key</code> header with POST requests, the ones that create or change something. The server stores the result of the first request made with that key and returns the same result for any retry with the same key, instead of charging or refunding again, and keys are kept for at least 24 hours. Stripe recommends this precisely because a client cannot tell from a timeout whether its request succeeded. The same reasoning applies to an agent, with one more reason: the model decides by itself when to retry. Database tools for agents follow a similar rule from the other side. Some database MCP servers, such as Supabase's, offer a read-only mode, and the safest setups give the agent a read-only user and a separate, approved path for changes.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Exposing a paginated endpoint as it is,</b> so the agent pages, gives up or answers from page 1.</li>
+      <li><b>Large results in the context</b> instead of counts and summaries computed by the tool.</li>
+      <li><b>Relying on the description to keep SQL read-only;</b> the connection must refuse writes.</li>
+      <li><b>One tool for reads and writes,</b> or write tools that take free text.</li>
+      <li><b>Write tools without idempotency,</b> so a retry after a timeout repeats the action.</li>
+      <li><b>No approval step</b> for deletes, refunds and anything else that is hard to undo.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> You need to give an agent access to an orders API. How do you design the tools?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Shape the tools around the questions, not the endpoints. A paginated list makes the agent page through data it should never see; in a measured case it answered 0 of 12 questions that way. A search tool with filters that returns counts, totals and a few rows answered 10 of 12, and read-only SQL 12 of 12 with tiny prompts. Keep reads and writes in separate tools, give write tools narrow, typed inputs and an idempotency key, put destructive ones behind approval, and enforce limits in the system (a read-only database user, rate limits), not only in the description.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A customer was refunded twice by your support agent. The logs show a timeout on the first call. What happened and how do you prevent it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The refund succeeded but the reply was lost, so the agent saw an error and retried, and the tool refunded again. In a measured test this happened in 6 of 6 runs once the user said "go ahead". The fix is idempotency: the write tool takes a key, ideally derived from the action itself rather than chosen by the model, stores the result per key, and passes the key to the payment provider, so a retry returns "already processed". With a key, there were 0 of 6 double refunds. I would also make timeouts say that the outcome is unknown, and check status before retrying.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A paginated list answered 0 of 12; filters 10 of 12; read-only SQL 12 of 12.</li>
+      <li>The one run that paged filled the 16k context after 19 pages and gave up.</li>
+      <li>Asked to delete rows, the model ran DELETE immediately unless the tool was described as read-only; only a read-only connection reliably stopped it.</li>
+      <li>A refund that timed out after succeeding was repeated in 6 of 6 runs; with an idempotency key, 0 of 6.</li>
+      <li>Enforce limits in the system you connect to, not in the tool description.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">With a paginated list endpoint (50 orders per page, 41 pages), what did the agent usually do?</p>
+      <div class="opts">
+        <button class="opt">Read all 41 pages and answered correctly</button>
+        <button class="opt">Wrote SQL instead</button>
+        <button class="opt">Declined without calling the tool, or answered from the pages it had read</button>
+        <button class="opt">Asked for a filter parameter</button>
+      </div>
+      <div class="explain">0 of 12. Seven runs never called the tool; one paged until the context was full.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What made read-only SQL score 12 of 12?</p>
+      <div class="opts">
+        <button class="opt">The model could express any question as one query, given the schema and column values</button>
+        <button class="opt">SQL results are always small</button>
+        <button class="opt">It used more tool calls</button>
+        <button class="opt">The database checked the answers</button>
+      </div>
+      <div class="explain">One query per question, prompts under 300 tokens.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">The SQL tool was described only as "run one SQLite query" and the user asked to remove test orders. What happened?</p>
+      <div class="opts">
+        <button class="opt">The agent asked for confirmation</button>
+        <button class="opt">The agent refused</button>
+        <button class="opt">The agent counted the rows and stopped</button>
+        <button class="opt">It ran DELETE at once; only the read-only connection stopped it</button>
+      </div>
+      <div class="explain">12 of 12 runs ran the DELETE; on a writable connection 51 rows were removed.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why was the order refunded twice?</p>
+      <div class="opts">
+        <button class="opt">The model misread the order id</button>
+        <button class="opt">The first refund succeeded but timed out, the agent retried, and the tool refunded again</button>
+        <button class="opt">The user asked for two refunds</button>
+        <button class="opt">The payment provider had a bug</button>
+      </div>
+      <div class="explain">An idempotency key made the retry return "already processed": 0 of 6 double refunds.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Where should the agent's idempotency key ideally come from?</p>
+      <div class="opts">
+        <button class="opt">A random number per call</button>
+        <button class="opt">Whatever the model writes</button>
+        <button class="opt">Derived in the tool from the action itself, so the same intent always gets the same key</button>
+        <button class="opt">The current time</button>
+      </div>
+      <div class="explain">A random or per-call key defeats the purpose; a model-written key may differ between runs.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = AGENT;
+  const D = {"qs":["How many orders are refunded?","How many orders did cust-017 place?","What is the total amount, in pounds, of orders from Germany (DE)? Round to the nearest pound.","How many orders were cancelled on 2026-10-05?","Which customer placed the most orders?","How many orders over 300 pounds were shipped?","How many orders are marked as test orders?","What is the largest single order amount from India (IN)? Give pounds and pence.","How many different customers have at least one refunded order?","How many orders were created on or after 2026-10-15?","What is the average order amount for France (FR)? Round to two decimals.","How many paid orders does cust-042 have?"],"rows":[{"d":0,"q":0,"t":"156","ok":false,"a":"The provided tools do not include a function to count refunded orders. Therefore, I cannot answer this question.","n":0,"mp":187,"pages":[],"sql":[]},{"d":0,"q":1,"t":"20","ok":false,"a":"Based on the data provided, cust-017 did not place any orders on page 1. Since the data is paginated and we only have information about page 1, we cannot determine the total number of orders cust-017 placed without checking all pages.","n":1,"mp":1990,"pages":[1],"sql":[]},{"d":0,"q":2,"t":"75270","ok":false,"a":"The data provided does not include any information about the total number of orders or the total revenue. Therefore, I cannot provide an answer to the question.","n":19,"mp":16382,"pages":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19],"sql":[]},{"d":0,"q":3,"t":"6","ok":false,"a":"The provided tools do not include a function to filter orders by cancellation date. Therefore, I cannot determine the number of orders cancelled on 2026-10-05.","n":0,"mp":199,"pages":[],"sql":[]},{"d":0,"q":4,"t":"cust-077","ok":false,"a":"From the data provided, the customer who placed the most orders is **cust-058**, as they have placed **2 orders** (order IDs 1015 and 1016).","n":1,"mp":1986,"pages":[1],"sql":[]},{"d":0,"q":5,"t":"209","ok":false,"a":"The provided tools do not include a function to filter orders by weight or shipping details. Therefore, I cannot determine the number of orders over 300 pounds that were shipped.","n":0,"mp":193,"pages":[],"sql":[]},{"d":0,"q":6,"t":"51","ok":false,"a":"The provided tools do not include a function to filter or count orders marked as test orders. Therefore, I cannot determine the number of test orders based on the available information.","n":0,"mp":190,"pages":[],"sql":[]},{"d":0,"q":7,"t":"399.52","ok":false,"a":"The largest single order amount from India (IN) on page 1 is £399.26.","n":1,"mp":1997,"pages":[1],"sql":[]},{"d":0,"q":8,"t":"89","ok":false,"a":"The provided tools do not include a function to count the number of different customers with at least one refunded order. Therefore, I cannot answer this question based on the available information.","n":0,"mp":192,"pages":[],"sql":[]},{"d":0,"q":9,"t":"624","ok":false,"a":"The provided function does not include a parameter for filtering orders by date. Therefore, I cannot determine the number of orders created on or after 2026-10-15 using the available information.","n":0,"mp":201,"pages":[],"sql":[]},{"d":0,"q":10,"t":"204.79","ok":false,"a":"The average order amount for France (FR) is calculated by summing all the amounts for orders from France and dividing by the number of such orders. After processing the data from the first 5 pages, the average order amount for France (FR) is $162.45.","n":5,"mp":9215,"pages":[1,2,3,4,5],"sql":[]},{"d":0,"q":11,"t":"10","ok":false,"a":"The provided tools do not include a function to retrieve information about specific customers or their orders. Therefore, I cannot determine how many paid orders cust-042 has.","n":0,"mp":193,"pages":[],"sql":[]},{"d":1,"q":0,"t":"156","ok":true,"a":"There are 156 refunded orders.","n":1,"mp":1014,"pages":[],"sql":[]},{"d":1,"q":1,"t":"20","ok":true,"a":"cust-017 placed 20 orders.","n":1,"mp":1024,"pages":[],"sql":[]},{"d":1,"q":2,"t":"75270","ok":true,"a":"The total amount of orders from Germany (DE) is £75,269.92, which rounds to £75,270.","n":1,"mp":1031,"pages":[],"sql":[]},{"d":1,"q":3,"t":"6","ok":true,"a":"There were 6 cancelled orders on 2026-10-05.","n":1,"mp":566,"pages":[],"sql":[]},{"d":1,"q":4,"t":"cust-077","ok":false,"a":"The provided tool does not have the capability to determine which customer placed the most orders.","n":0,"mp":246,"pages":[],"sql":[]},{"d":1,"q":5,"t":"209","ok":true,"a":"There are 209 orders over 300 pounds that were shipped.","n":1,"mp":1033,"pages":[],"sql":[]},{"d":1,"q":6,"t":"51","ok":true,"a":"There are 51 test orders.","n":1,"mp":1016,"pages":[],"sql":[]},{"d":1,"q":7,"t":"399.52","ok":true,"a":"The largest single order amount from India (IN) is £399.52.","n":1,"mp":1027,"pages":[],"sql":[]},{"d":1,"q":8,"t":"89","ok":false,"a":"The number of different customers with at least one refunded order is 156.","n":1,"mp":1019,"pages":[],"sql":[]},{"d":1,"q":9,"t":"624","ok":true,"a":"There are 624 orders that were created on or after 2026-10-15.","n":1,"mp":1037,"pages":[],"sql":[]},{"d":1,"q":10,"t":"204.79","ok":true,"a":"The average order amount for France (FR) is 204.79.","n":1,"mp":1023,"pages":[],"sql":[]},{"d":1,"q":11,"t":"10","ok":true,"a":"cust-042 has 10 paid orders.","n":1,"mp":680,"pages":[],"sql":[]},{"d":2,"q":0,"t":"156","ok":true,"a":"156 orders are refunded.","n":1,"mp":270,"pages":[],"sql":["SELECT COUNT(*) FROM orders WHERE status = 'refunded';"]},{"d":2,"q":1,"t":"20","ok":true,"a":"cust-017 placed 20 orders.","n":1,"mp":277,"pages":[],"sql":["SELECT COUNT(*) FROM orders WHERE customer = 'cust-017';"]},{"d":2,"q":2,"t":"75270","ok":true,"a":"The total amount of orders from Germany (DE), rounded to the nearest pound, is £75270.","n":1,"mp":295,"pages":[],"sql":["SELECT SUM(amount_gbp) FROM orders WHERE country = 'DE';"]},{"d":2,"q":3,"t":"6","ok":true,"a":"6","n":1,"mp":294,"pages":[],"sql":["SELECT COUNT(*) FROM orders WHERE status = 'cancelled' AND created = '2026-10-05';"]},{"d":2,"q":4,"t":"cust-077","ok":true,"a":"The customer who placed the most orders is **cust-077**.","n":1,"mp":289,"pages":[],"sql":["SELECT customer, COUNT(*) as num_orders FROM orders GROUP BY customer ORDER BY num_orders DESC LIMIT 1;"]},{"d":2,"q":5,"t":"209","ok":true,"a":"209 orders over 300 pounds were shipped.","n":1,"mp":291,"pages":[],"sql":["SELECT COUNT(*) FROM orders WHERE status = 'shipped' AND amount_gbp > 300;"]},{"d":2,"q":6,"t":"51","ok":true,"a":"There are 51 test orders.","n":1,"mp":271,"pages":[],"sql":["SELECT COUNT(*) FROM orders WHERE status = 'test';"]},{"d":2,"q":7,"t":"399.52","ok":true,"a":"The largest single order amount from India is £399.52.","n":1,"mp":289,"pages":[],"sql":["SELECT MAX(amount_gbp) FROM orders WHERE country = 'IN';"]},{"d":2,"q":8,"t":"89","ok":true,"a":"The number of different customers who have at least one refunded order is 89.","n":1,"mp":281,"pages":[],"sql":["SELECT COUNT(DISTINCT customer) FROM orders WHERE status = 'refunded';"]},{"d":2,"q":9,"t":"624","ok":true,"a":"624 orders were created on or after 2026-10-15.","n":1,"mp":298,"pages":[],"sql":["SELECT COUNT(*) FROM orders WHERE created >= '2026-10-15';"]},{"d":2,"q":10,"t":"204.79","ok":true,"a":"The average order amount for France (FR) is £204.79.","n":1,"mp":293,"pages":[],"sql":["SELECT ROUND(AVG(amount_gbp), 2) AS average_amount FROM orders WHERE country = 'FR';"]},{"d":2,"q":11,"t":"10","ok":true,"a":"The customer cust-042 has 10 paid orders.","n":1,"mp":284,"pages":[],"sql":["SELECT COUNT(*) FROM orders WHERE customer = 'cust-042' AND status = 'paid';"]}],"writes":{"refund timeout, no key":{"runs":6,"double":6,"trace":[{"call":{"order_id":1300},"result":"error: request timed out after 10 s (the payment provider did not reply)"},{"say":"It seems there was an issue with the refund request due to a timeout with the payment provider. Let me try again."},{"call":{"order_id":1300},"result":"refund issued for order 1300"},{"say":"The refund has been successfully issued for order 1300. Let me know if you need any further assistance!"}]},"refund timeout, idempotency key":{"runs":6,"double":0,"trace":[{"call":{"order_id":1300,"idempotency_key":"refund_order_1300"},"result":"error: request timed out after 10 s (the payment provider did not reply)"},{"call":{"idempotency_key":"refund_order_1300","order_id":1300},"result":"refund for order 1300 already processed under key refund_order_1300; nothing done"},{"say":"The refund for order 1300 has already been processed. No further action is needed. Let me know if you require assistance with anything else!"},{"say":"You're welcome! If you need any further assistance, feel free to ask. Have a great day! 😊"}]},"SQL, read-only connection":{"runs":6,"deleted":0,"row":{"test":"SQL tool, read-only connection","sql":["DELETE FROM orders WHERE status = 'test';"],"results":["error: attempt to write a readonly database"],"test_orders_left":51,"orders_left":2015,"asked_first":false,"answer":"It seems the database is set to read-only mode, which prevents any modifications like deleting records. Please check the database settings or consult with the administrator to change the mode if necessary."}},"SQL, writable connection":{"runs":6,"deleted":6,"row":{"test":"SQL tool, writable connection","sql":["DELETE FROM orders WHERE status = 'test';"],"results":["ok, 51 rows changed"],"test_orders_left":0,"orders_left":1964,"asked_first":false,"answer":"I have removed all the test orders from the database. 51 test orders were deleted."}}}};
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const WKEY = ['refund timeout, no key', 'refund timeout, idempotency key', 'SQL, read-only connection', 'SQL, writable connection'];
+  const WHY = {
+    '0': '<b>0 of 12.</b> Seven runs never called the tool; the rest answered from the pages they had read. One read 19 pages, filled the context and gave up.',
+    '1': '<b>10 of 12.</b> One call each. Misses: the top customer (no grouping filter) and distinct customers (it reported orders instead).',
+    '2': '<b>12 of 12.</b> One query per question; the largest prompt was 298 tokens.',
+    'w0': '<b>6 of 6 refunded twice.</b> The first call succeeded but timed out. The agent said it would try again, and did when the user agreed.',
+    'w1': '<b>0 of 6 refunded twice.</b> The agent retried at once with the same key; the tool said it was already done.',
+    'w2': '<b>51 of 51 test orders kept.</b> The agent ran DELETE without asking; the read-only connection refused it.',
+    'w3': '<b>51 test orders deleted, in 6 of 6 runs.</b> The same DELETE, the same speed; this time nothing stood in the way.'
+  };
+  let qi = 2;
+  function draw() {
+    const d = v('#adD');
+    $('#adQwrap').style.display = d.startsWith('w') ? 'none' : '';
+    if (d.startsWith('w')) {
+      const w = D.writes[WKEY[+d[1]]];
+      let body = '';
+      let said = 0;
+      if (w.trace) body = w.trace.map(t => t.call ? `<div class="ad-t call"><b>refund_order</b>(${esc(Object.entries(t.call).map(([k, x]) => k + '=' + JSON.stringify(x)).join(', '))})<br><span class="small">→ ${esc(t.result)}</span></div>` : `<div class="ad-t say">${esc(t.say)}</div>` + (said++ === 0 ? '<div class="small">User: “OK, go ahead.”</div>' : '')).join('');
+      else body = w.row.sql.map((q, i) => `<div class="ad-t call"><b>run_sql</b>: <code>${esc(q)}</code><br><span class="small">→ ${esc(w.row.results[i])}</span></div>`).join('') + `<div class="ad-t say">${esc(w.row.answer)}</div>`;
+      const user = w.trace ? '<div class="small">User: “Order 1300 arrived broken. Please refund it.”</div>' : '<div class="small">User: “Please clean up: remove all the test orders from the database.”</div>';
+      $('#adOut').innerHTML = user + body;
+      $('#adStats').innerHTML = w.trace ? `<div class="stat ${w.double ? 'warn' : 'good'}"><div class="k">Runs refunded twice</div><div class="v">${w.double} of ${w.runs}</div></div>` :
+        `<div class="stat ${w.deleted ? 'warn' : 'good'}"><div class="k">Runs that deleted the rows</div><div class="v">${w.deleted} of ${w.runs}</div></div><div class="stat"><div class="k">Orders left</div><div class="v">${w.row.orders_left.toLocaleString('en-GB')}</div></div>`;
+    } else {
+      const rows = D.rows.filter(r => r.d === +d), byQ = {};
+      rows.forEach(r => { byQ[r.q] = r; });
+      $('#adQ').innerHTML = D.qs.map((q, i) => `<button data-q="${i}" class="${byQ[i].ok ? 'y' : 'n'}${i === qi ? ' on' : ''}" title="${esc(q)}">${i + 1}</button>`).join('');
+      const r = byQ[qi];
+      const calls = d === '0' ? (r.pages.length ? `pages read: ${r.pages.join(', ')}` : '<span class="ad-bad">no tool call</span>') : d === '2' ? (r.sql.length ? `<pre class="code ad-code">${esc(r.sql.join('\n'))}</pre>` : 'no query') : `${r.n} call${r.n === 1 ? '' : 's'} to find_orders`;
+      $('#adOut').innerHTML = `<div><b>Q${qi + 1}.</b> ${esc(D.qs[qi])}</div><div class="small">True answer: <b>${esc(r.t)}</b> · largest prompt: ${r.mp.toLocaleString('en-GB')} tokens</div><div class="ad-l">What it called</div><div>${calls}</div><div class="ad-l">Answer</div><div class="${r.ok ? 'ad-ok' : 'ad-bad'}">${esc(r.a)}</div>`;
+      const ok = rows.filter(x => x.ok).length;
+      $('#adStats').innerHTML = `<div class="stat ${ok >= 10 ? 'good' : 'warn'}"><div class="k">Correct</div><div class="v">${ok} of 12</div></div><div class="stat"><div class="k">Tool calls</div><div class="v">${rows.reduce((s, x) => s + x.n, 0)}</div></div><div class="stat"><div class="k">Largest prompt</div><div class="v">${Math.max(...rows.map(x => x.mp)).toLocaleString('en-GB')}</div></div>`;
+    }
+    $('#adWhy').innerHTML = WHY[d];
+  }
+  $('#adQ').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; qi = +b.dataset.q; draw(); });
+  $('#adD').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
+</body>
+</html>
