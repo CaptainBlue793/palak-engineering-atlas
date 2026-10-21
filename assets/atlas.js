@@ -497,15 +497,16 @@
       steps: ['os', 'ml-ai-systems', 'distributed-systems', 'cloud-devops'], optional: ['system-design'] },
   ];
 
-  /* Where each course sits on the metro map (a 1200 × 620 board), and which side its name goes:
-     CS fundamentals along the top, systems across the middle, ML bottom left, agents bottom right. */
+  /* Where each course sits on the metro map, and which side its name goes. The positions are on a
+     145 × 150 grid, chosen by a layout search for short lines, few crossings and bends, no line through
+     a station it skips, and no name over a line; the map's frame fits whatever area they cover.
+     CS and systems end up on the left, ML on the right, agents below it. */
   var METRO = {
-    'dsa': [90, 110, 'n'], 'os': [290, 110, 'n'], 'networks': [490, 110, 'n'], 'databases': [690, 110, 'n'],
-    'lld': [90, 300, 'w'], 'backend-api': [340, 300, 's'], 'system-design': [590, 300, 's'],
-    'distributed-systems': [890, 200, 'e'], 'cloud-devops': [1090, 300, 'n'],
-    'ml-fundamentals': [90, 480, 's'], 'deep-learning': [290, 480, 's'], 'nlp': [480, 420, 'n'],
-    'computer-vision': [480, 550, 's'], 'llms': [690, 420, 'n'], 'ml-ai-systems': [690, 550, 's'],
-    'rag': [890, 420, 'n'], 'single-agent': [1040, 470, 'e'], 'multi-agent': [1110, 570, 's'],
+    'dsa': [245, 110, 'e'], 'os': [390, 260, 'n'], 'networks': [390, 410, 'w'], 'databases': [535, 410, 'e'],
+    'lld': [245, 260, 'e'], 'backend-api': [535, 110, 'n'], 'system-design': [390, 560, 'w'], 'distributed-systems': [680, 410, 'n'],
+    'cloud-devops': [680, 560, 's'], 'ml-fundamentals': [825, 110, 'n'], 'deep-learning': [970, 110, 'n'], 'computer-vision': [970, 410, 's'],
+    'nlp': [1115, 110, 'n'], 'llms': [1115, 260, 'e'], 'ml-ai-systems': [825, 410, 's'], 'rag': [825, 260, 's'],
+    'single-agent': [1115, 410, 'w'], 'multi-agent': [1115, 560, 's'],
   };
 
   /* The three tools every course ships. */
@@ -859,47 +860,73 @@
   function routeOf(p) { return p.steps.concat(p.optional); }
   function r1(n) { return Math.round(n * 10) / 10; }
 
-  // Every segment of every line. Required segments are grouped by the pair of courses they join,
-  // so lines sharing a stretch get a lane each and run side by side.
+  // Every segment of every line, keyed by the pair of courses it joins (lines sharing a stretch share a key).
   function metroSegments() {
-    var segs = [], lanes = {};
+    var segs = [];
     PATHS.forEach(function (p) {
       p.steps.forEach(function (id, i) { if (i) segs.push({ p: p, a: p.steps[i - 1], b: id, opt: false }); });
       p.optional.forEach(function (id) { segs.push({ p: p, a: p.steps[p.steps.length - 1], b: id, opt: true }); });
     });
-    segs.forEach(function (s) {
-      s.key = [s.a, s.b].sort().join('|');
-      if (!s.opt) (lanes[s.key] = lanes[s.key] || []).push(s.p.id);
-    });
-    segs.forEach(function (s) {
-      var l = lanes[s.key] || [];
-      s.lanes = s.opt ? 1 : l.length; s.lane = s.opt ? 0 : l.indexOf(s.p.id);
-    });
+    segs.forEach(function (s) { s.key = [s.a, s.b].sort().join('|'); });
     return segs;
   }
 
-  // A segment runs straight unless a station it doesn't stop at lies close to it; then it bows away
-  // from that station. Geometry is taken in a fixed direction, so lanes line up whichever way a line runs.
-  var LANE = 5, CLEAR = 44;
-  function segPath(s) {
-    var ab = [s.a, s.b].sort(), A = METRO[ab[0]], B = METRO[ab[1]];
-    var dx = B[0] - A[0], dy = B[1] - A[1], L = Math.sqrt(dx * dx + dy * dy), nx = -dy / L, ny = dx / L;
-    var bow = 0, near = Infinity;
+  // Each pair of courses has one route, used by every line that joins them, as on a metro map: straight
+  // when the stations line up across, down or at 45°, otherwise a 45° leg and a straight leg meeting at a
+  // rounded bend, in whichever order keeps clear of the other stations. Only when neither order does is
+  // the route a curve bowing round the station in the way.
+  var CLEAR = 30, BEND = 28, routes = {};
+  function distToSeg(P, A, B) {
+    var dx = B[0] - A[0], dy = B[1] - A[1], L2 = dx * dx + dy * dy;
+    var t = L2 ? Math.max(0, Math.min(1, ((P[0] - A[0]) * dx + (P[1] - A[1]) * dy) / L2)) : 0;
+    var x = A[0] + t * dx - P[0], y = A[1] + t * dy - P[1];
+    return Math.sqrt(x * x + y * y);
+  }
+  // How close a route of straight legs comes to any station other than its two ends.
+  function clearance(pts, a, b) {
+    var min = Infinity;
+    Object.keys(METRO).forEach(function (id) {
+      if (id === a || id === b) return;
+      for (var i = 1; i < pts.length; i++) min = Math.min(min, distToSeg(METRO[id], pts[i - 1], pts[i]));
+    });
+    return min;
+  }
+  function legsPath(pts) {
+    var d = 'M' + r1(pts[0][0]) + ' ' + r1(pts[0][1]);
+    for (var i = 1; i < pts.length - 1; i++) {
+      var P = pts[i], A = pts[i - 1], B = pts[i + 1];
+      var la = Math.hypot(P[0] - A[0], P[1] - A[1]), lb = Math.hypot(B[0] - P[0], B[1] - P[1]), r = Math.min(BEND, la / 2, lb / 2);
+      d += ' L' + r1(P[0] + (A[0] - P[0]) * r / la) + ' ' + r1(P[1] + (A[1] - P[1]) * r / la) +
+        ' Q' + r1(P[0]) + ' ' + r1(P[1]) + ' ' + r1(P[0] + (B[0] - P[0]) * r / lb) + ' ' + r1(P[1] + (B[1] - P[1]) * r / lb);
+    }
+    var E = pts[pts.length - 1];
+    return d + ' L' + r1(E[0]) + ' ' + r1(E[1]);
+  }
+  // The fallback: a curve bowing away from the nearest station that sits close to the straight line.
+  function bowPath(A, B, ab) {
+    var dx = B[0] - A[0], dy = B[1] - A[1], L = Math.sqrt(dx * dx + dy * dy), nx = -dy / L, ny = dx / L, bow = 0, near = Infinity;
     Object.keys(METRO).forEach(function (id) {
       if (id === ab[0] || id === ab[1]) return;
       var S = METRO[id], t = ((S[0] - A[0]) * dx + (S[1] - A[1]) * dy) / (L * L);
       if (t < 0.06 || t > 0.94) return;
       var d = (S[0] - A[0]) * nx + (S[1] - A[1]) * ny;
-      if (Math.abs(d) < CLEAR && Math.abs(d) < near) {
+      if (Math.abs(d) < 44 && Math.abs(d) < near) {
         near = Math.abs(d);
         // A quadratic curve strays 2t(1-t) of its control offset from the chord at the station's t.
-        bow = (d > 0 ? -1 : 1) * Math.min(190, Math.max(30, (CLEAR - Math.abs(d)) / (2 * t * (1 - t))));
+        bow = (d > 0 ? -1 : 1) * Math.min(190, Math.max(30, (44 - Math.abs(d)) / (2 * t * (1 - t))));
       }
     });
-    var off = s.lanes > 1 ? (s.lane - (s.lanes - 1) / 2) * LANE : 0, ox = nx * off, oy = ny * off;
-    var a = [A[0] + ox, A[1] + oy], b = [B[0] + ox, B[1] + oy];
-    var mid = [(A[0] + B[0]) / 2 + nx * bow + ox, (A[1] + B[1]) / 2 + ny * bow + oy];
-    return 'M' + r1(a[0]) + ' ' + r1(a[1]) + (bow ? ' Q' + r1(mid[0]) + ' ' + r1(mid[1]) + ' ' : ' L') + r1(b[0]) + ' ' + r1(b[1]);
+    return 'M' + A[0] + ' ' + A[1] + ' Q' + r1((A[0] + B[0]) / 2 + nx * bow) + ' ' + r1((A[1] + B[1]) / 2 + ny * bow) + ' ' + B[0] + ' ' + B[1];
+  }
+  function segPath(s) {
+    if (routes[s.key]) return routes[s.key];
+    var ab = s.key.split('|'), A = METRO[ab[0]].slice(0, 2), B = METRO[ab[1]].slice(0, 2);
+    var dx = B[0] - A[0], dy = B[1] - A[1], m = Math.min(Math.abs(dx), Math.abs(dy)), sx = Math.sign(dx), sy = Math.sign(dy);
+    var options = !dx || !dy || Math.abs(dx) === Math.abs(dy) ? [[A, B]]
+      : [[A, [A[0] + sx * m, A[1] + sy * m], B], [A, [B[0] - sx * m, B[1] - sy * m], B]];
+    var best = null, room = -1;
+    options.forEach(function (pts) { var c = clearance(pts, ab[0], ab[1]); if (c > room) { room = c; best = pts; } });
+    return (routes[s.key] = room >= CLEAR ? legsPath(best) : bowPath(A, B, ab));
   }
 
   // A station: the course's colour, a ring showing how much of it you've read, its name, and its
@@ -923,6 +950,22 @@
       : '<a' + attrs + ' href="' + url(c, 'index.html') + '" aria-label="' + esc(said) + '"><title>' + esc(said) + '</title>' + body + '</a>';
   }
 
+  // The map's frame: the box around every station's ring and name (names measured roughly at 8 px a
+  // character), plus a margin, so the map fills its panel whatever area the layout covers.
+  function metroFrame() {
+    var x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    COURSES.forEach(function (c) {
+      var P = METRO[c.id]; if (!P) return;
+      var w = (c.short || c.title).length * 8, x = P[0], y = P[1];
+      var b = P[2] === 'e' ? [x - 20, y - 20, x + 24 + w, y + 20] : P[2] === 'w' ? [x - 24 - w, y - 20, x + 20, y + 20]
+        : P[2] === 'n' ? [Math.min(x - 20, x - w / 2), y - 44, Math.max(x + 20, x + w / 2), y + 20]
+        : [Math.min(x - 20, x - w / 2), y - 20, Math.max(x + 20, x + w / 2), y + 42];
+      x0 = Math.min(x0, b[0]); y0 = Math.min(y0, b[1]); x1 = Math.max(x1, b[2]); y1 = Math.max(y1, b[3]);
+    });
+    var m = 22;
+    return [x0 - m, y0 - m, x1 - x0 + 2 * m, y1 - y0 + 2 * m].map(Math.round).join(' ');
+  }
+
   function renderMetro() {
     var p = pathById(previewPath || activePath), segs = metroSegments(), defs = '', lit = '';
     segs.filter(function (s) { return s.p === p; }).forEach(function (s, i) {
@@ -933,7 +976,8 @@
         '<stop offset="1" class="tint" style="' + tintVars(byId(s.b)) + ';stop-color:var(--k1)"/></linearGradient>';
       lit += '<path class="mline on' + (s.opt ? ' opt' : '') + '" data-a="' + s.a + '" data-b="' + s.b + '" d="' + segPath(s) + '" style="stroke:url(#mg-' + i + ')"/>';
     });
-    var faint = segs.filter(function (s) { return !s.opt && s.p !== p; }).map(function (s) {
+    // The faint network: each route once, however many roles use it.
+    var seen = {}, faint = segs.filter(function (s) { return !s.opt && !seen[s.key] && (seen[s.key] = true); }).map(function (s) {
       return '<path class="mline" data-a="' + s.a + '" data-b="' + s.b + '" d="' + segPath(s) + '"/>';
     }).join('');
     var stations = COURSES.map(function (c) {
@@ -941,7 +985,7 @@
       return metroStation(c, i >= 0 ? String(i + 1) : p.optional.indexOf(c.id) >= 0 ? '+' : '');
     }).join('');
     $('#metroMap').innerHTML =
-      '<svg viewBox="0 50 1200 570" role="group" aria-label="' + esc(PATHS.length + ' roles drawn as lines through ' + COURSES.length + ' courses, with ' + p.title + ' highlighted') + '">' +
+      '<svg viewBox="' + metroFrame() + '" role="group" aria-label="' + esc(PATHS.length + ' roles drawn as lines through ' + COURSES.length + ' courses, with ' + p.title + ' highlighted') + '">' +
       '<defs>' + defs + '</defs><g class="mfaint">' + faint + '</g><g class="mlit">' + lit + '</g>' + stations + '</svg>';
   }
 
