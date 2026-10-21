@@ -332,7 +332,10 @@
       c1: '#4338ca', c2: '#0891b2', d1: '#818cf8', d2: '#22d3ee',
       soon: true,
       store: 'llm',
+      indexVar: 'LLM_INDEX',
       dir: 'llms',
+      first: 'p1-pytorch-tensors.html',
+      dist: 'llms-course.html',
     },
     {
       id: 'ml-ai-systems',
