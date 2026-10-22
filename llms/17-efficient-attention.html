@@ -3,37 +3,295 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Efficient Attention: FlashAttention &amp; Friends</title>
+<title>Efficient Attention: FlashAttention &amp; Friends · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 17 of LLMs. Why naive attention is limited by memory, FlashAttention's tiling and online softmax written from scratch and checked, PyTorch's attention kernels timed from 1k to 16k tokens, multi-query and grouped-query attention at decode, and sliding-window attention with flex_attention, all measured on one GPU.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .fa-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .fa-v { display:none; } .fa-v.on { display:block; }
+  .fa-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .fa-bar { display:grid; grid-template-columns:200px 1fr 130px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .fa-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .fa-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .fa-bar .track i.b { background:var(--amber); } .fa-bar .track i.r { background:var(--red); } .fa-bar .track i.g { background:var(--green); }
+  .fa-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .fa-grid { display:grid; gap:2px; width:max-content; }
+  .fa-grid i { width:22px; height:22px; border-radius:3px; display:block; }
+  .fa-sl { display:grid; grid-template-columns:100px 1fr 60px; gap:10px; align-items:center; font-size:13px; padding:3px 0; }
+  .fa-sl input[type=range] { width:100%; accent-color:var(--accent); }
+  .fa-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .fa-bar { grid-template-columns:110px 1fr 100px; } .fa-grid i { width:15px; height:15px; } }
+</style>
 </head>
 <body data-chapter="17">
-<!-- llm:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 17</span><span class="pill">Intermediate</span><span class="pill">⏱ 50 min</span></div>
     <h1>Efficient Attention: <span class="grad">FlashAttention &amp; Friends</span></h1>
-    <p class="lead">Attention’s memory problem and the kernels and variants that solve it, timed on this GPU.</p>
+    <p class="lead">Chapter 4 measured the problem: attention written out step by step stores a T × T table of scores, so its memory grows with the square of the length. This chapter opens up the fixes. FlashAttention computes the same answer in tiles without ever storing the table. Multi-query and grouped-query attention shrink what each decode step has to read. Sliding windows skip most of the table altogether.</p>
+    <p class="lead">FlashAttention's algorithm, written in plain PyTorch, matched the reference to within 0.000001. PyTorch's tiled kernel ran 4,096-token attention 20 times faster than the plain one in a hundredth of the memory, and the plain one could not fit 8,192 tokens at all. At decode time against a 32,768-token cache, sharing key-value heads cut a step from 0.68 to 0.06 milliseconds. And a 512-token sliding window made 16,384-token attention 11 times cheaper.</p>
+    <ul class="objectives">
+      <li><span>Explain why naive attention is limited by memory traffic, not arithmetic</span></li>
+      <li><span>Implement FlashAttention's tiling and online softmax</span></li>
+      <li><span>Choose between PyTorch's attention kernels, and check which one runs</span></li>
+      <li><span>Explain what multi-query and grouped-query attention save at decode time</span></li>
+      <li><span>Use sliding-window attention and know its trade-off</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Attention and the T × T table:</b> <a href="04-self-attention.html">Chapter 4: Self-Attention from Scratch</a>.</li>
+        <li><b>Memory-bound vs compute-bound:</b> <a href="p6-matrix-multiplies-and-flops.html">P6: Matrix Multiplies &amp; Counting FLOPs</a>.</li>
+        <li><b>The KV cache and GQA:</b> <a href="16-the-kv-cache.html">Chapter 16</a> and <a href="15-inside-a-modern-open-model.html">Chapter 15</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why naive attention is memory-bound</li>
-    <li>FlashAttention’s tiling</li>
-    <li>Multi-query and grouped-query attention</li>
-    <li>Sliding-window attention</li>
-    <li>Measured speed and memory</li>
-  </ol>
+  <h2>Why naive attention is memory-bound</h2>
+  <p>Naive attention does three things in turn: multiply queries by keys into a T × T table of scores, softmax every row, multiply by the values. Each step writes its whole result to GPU memory and the next reads it back. For 16 heads at 4,096 tokens that table is 268 million numbers, over a gigabyte in fp32, written and read several times, while the arithmetic per number is tiny. GPUs compute far faster than they move memory (P6), so this version spends its time waiting on memory, and its memory grows with T². Measured below, it needed 4.1 GB for one layer at 4,096 tokens and could not fit 8,192 at all.</p>
+
+  <h2>FlashAttention's tiling</h2>
+  <p>FlashAttention (Tri Dao and colleagues, 2022) never builds the table. It takes a block of queries, streams blocks of keys and values past it in fast on-chip memory, and keeps three running quantities per query: the largest score seen so far, the softmax denominator so far, and the weighted sum of values so far. When a new block brings a larger maximum, the old sums are rescaled by e<sup>old max − new max</sup>, so the final result is exactly the softmax over all keys. This running rescale is the <b>online softmax</b>. Only the output, T × d per head, is ever written.</p>
+<pre class="code"><span class="k">def</span> <span class="f">flash_attention_reference</span>(q, k, v, block=<span class="m">128</span>):              <span class="c"># causal; plain PyTorch, for clarity not speed</span>
+    out = torch.<span class="f">empty_like</span>(q)
+    <span class="k">for</span> qs <span class="k">in</span> <span class="f">range</span>(<span class="m">0</span>, T, block):
+        qb = q[:, :, qs:qs + block] / math.<span class="f">sqrt</span>(d)
+        m = torch.<span class="f">full</span>(qb.shape[:-<span class="m">1</span>], -inf)                      <span class="c"># running max per query</span>
+        l = torch.<span class="f">zeros</span>(qb.shape[:-<span class="m">1</span>])                           <span class="c"># running softmax denominator</span>
+        acc = torch.<span class="f">zeros_like</span>(qb)                                   <span class="c"># running weighted sum of values</span>
+        <span class="k">for</span> ks <span class="k">in</span> <span class="f">range</span>(<span class="m">0</span>, qs + block, block):                      <span class="c"># later key blocks skipped: causal</span>
+            s = qb @ k[:, :, ks:ks + block].<span class="f">transpose</span>(-<span class="m">2</span>, -<span class="m">1</span>)        <span class="c"># one block × block tile of scores</span>
+            s = <span class="f">mask_future</span>(s, qs, ks)
+            m_new = torch.<span class="f">maximum</span>(m, s.<span class="f">amax</span>(-<span class="m">1</span>))
+            p = torch.<span class="f">exp</span>(s - m_new[..., <span class="k">None</span>])
+            corr = torch.<span class="f">exp</span>(m - m_new)                              <span class="c"># rescale what was summed under the old max</span>
+            l = l * corr + p.<span class="f">sum</span>(-<span class="m">1</span>)
+            acc = acc * corr[..., <span class="k">None</span>] + p @ v[:, :, ks:ks + block]
+            m = m_new
+        out[:, :, qs:qs + block] = acc / l[..., <span class="k">None</span>]
+    <span class="k">return</span> out</pre>
+  <p>On 4 heads of 1,024 tokens this matched <code>F.scaled_dot_product_attention</code> to within <b>1.1 × 10⁻⁶</b>. Written in Python it is slow; the speed comes from running exactly this loop inside one GPU kernel, where the tiles stay in on-chip memory. The arithmetic is unchanged, still quadratic; what disappears is the memory traffic and the T² storage.</p>
+
+  <h2>Measured speed and memory</h2>
+  <p>PyTorch's <code>scaled_dot_product_attention</code> chooses among several kernels. The <b>flash</b> kernel is FlashAttention-2; the <b>memory-efficient</b> kernel, from Meta's xFormers, uses the same tiling idea; the <b>math</b> kernel is the naive version. On this machine the flash kernel was not available at all: PyTorch's Windows build reported "No available kernel", so everything ran on the memory-efficient one. Causal attention, 16 heads of 64, bf16, forward pass, with PyTorch capped at 15 GiB so that oversized runs fail rather than spill (Chapter 13):</p>
+  <table class="t cmp">
+    <thead><tr><th>Tokens</th><th>Memory-efficient (tiled)</th><th>Math (naive)</th></tr></thead>
+    <tbody>
+      <tr><td>1,024</td><td>0.11 ms · 14 MB</td><td>1.13 ms · 284 MB</td></tr>
+      <tr><td>2,048</td><td>0.29 ms · 20 MB</td><td>4.48 ms · 1,048 MB</td></tr>
+      <tr><td>4,096</td><td><b>0.93 ms · 41 MB</b></td><td>18.2 ms · 4,144 MB</td></tr>
+      <tr><td>8,192</td><td>3.3 ms · 81 MB</td><td><b>out of memory</b></td></tr>
+      <tr><td>16,384</td><td>12.5 ms · 162 MB</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p>At 4,096 tokens the tiled kernel was 20 times faster and used a hundredth of the memory; its memory grew in proportion to T, the naive one's with T². At 16,384 tokens it reached about 44 trillion operations per second, under half this GPU's measured matrix-multiply peak. Notably, PyTorch's newer <code>flex_attention</code>, which compiles a tiled kernel through Triton, ran the same causal attention at 16,384 tokens in <b>6.5 ms</b>, about 85 trillion operations per second, nearly twice as fast as the built-in kernel here. Which kernel runs, and whether a fast one exists for your platform and your mask, can matter more than the algorithm.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Naive</b> write T × T scores, read, write probabilities, read: memory ∝ T²</li>
+      <li data-k="step"><b>Tiled</b> stream key blocks through on-chip memory with an online softmax: memory ∝ T</li>
+      <li data-k="step"><b>GQA / MQA</b> fewer key-value heads: less to read at every decode step</li>
+      <li data-k="end"><b>Sliding window</b> attend only to the last W tokens: work ∝ T × W</li>
+    </ol>
+    <figcaption><b>Four ways attention gets cheaper.</b> Tiling changes how the same result is computed; the other three change what is computed.</figcaption>
+  </figure>
+
+  <h2>Multi-query and grouped-query attention</h2>
+  <p>At decode time attention is a single query per head against the whole cache, and the cost is reading that cache. With every query head owning its key-value head (multi-head), the cache read per step is largest. <b>Grouped-query</b> attention shares each key-value head among a group of query heads; <b>multi-query</b> attention shares one among all. A fast kernel reads each shared head once and applies it to its whole group. For one new token, 32 query heads of 128, against caches of different lengths:</p>
+  <table class="t cmp">
+    <thead><tr><th>Cache length</th><th>Multi-head (32 KV heads)</th><th>Grouped-query (8)</th><th>Multi-query (1)</th></tr></thead>
+    <tbody>
+      <tr><td>2,048 tokens</td><td>0.063 ms</td><td>0.079 ms</td><td>0.057 ms</td></tr>
+      <tr><td>8,192</td><td>0.195 ms</td><td>0.080 ms</td><td>0.056 ms</td></tr>
+      <tr><td>32,768</td><td><b>0.682 ms</b> · 512 MB/layer</td><td><b>0.311 ms</b> · 128 MB</td><td><b>0.057 ms</b> · 16 MB</td></tr>
+    </tbody>
+  </table>
+  <p>At short caches all three take about the same time: launching the kernels dominates. At 32,768 tokens, multi-head attention was reading its cache at 787 GB/s, essentially the card's whole memory bandwidth, and grouped-query was 2.2 times faster with a quarter of the memory. Multi-query was 12 times faster, but it gives up the most quality, which is why grouped-query, Chapter 15's middle ground, won.</p>
+  <p>One trap is worth knowing. Asking PyTorch to do the grouping itself, with <code>scaled_dot_product_attention(..., enable_gqa=True)</code>, made grouped-query decode <i>slower</i> than multi-head on this build (0.56 against 0.13 ms at 2,048 tokens), because no fast kernel supported that combination and it fell back to a slow path. Chapter 18 hit the same fallback in a full model, which tried to allocate 224 GiB. Time the operation you actually run.</p>
+
+  <h2>Sliding-window attention</h2>
+  <p>If each token attends only to the previous W tokens, attention's work becomes T × W instead of T² / 2. Information can still travel further than W, one window per layer, so a model with many layers and a window of a few thousand tokens reaches far back. Mistral 7B used a 4,096-token window; Gemma 2 and 3 alternate windowed and full layers. With <code>flex_attention</code>, a window is a one-line mask that skips whole blocks:</p>
+<pre class="code">window = <span class="k">lambda</span> b, h, q, k: (q &gt;= k) &amp; (q - k &lt; <span class="m">512</span>)            <span class="c"># causal, and at most 512 back</span>
+mask = <span class="f">create_block_mask</span>(window, B=<span class="k">None</span>, H=<span class="k">None</span>, Q_LEN=T, KV_LEN=T)
+out = torch.<span class="f">compile</span>(flex_attention)(q, k, v, block_mask=mask)</pre>
+  <table class="t cmp">
+    <thead><tr><th>16 heads × 64, bf16</th><th>Full causal</th><th>Window 2,048</th><th>Window 512</th></tr></thead>
+    <tbody>
+      <tr><td>4,096 tokens</td><td>0.51 ms</td><td>0.38 ms</td><td>0.16 ms</td></tr>
+      <tr><td>16,384 tokens</td><td>6.45 ms</td><td>1.59 ms</td><td><b>0.56 ms</b></td></tr>
+    </tbody>
+  </table>
+  <p>At 16,384 tokens a 512-token window was 11.5 times cheaper than full attention, and it gets relatively cheaper the longer the sequence. The output matched an explicit masked attention to bf16 precision (0.002). The trade-off is that no single layer sees the whole context, so tasks that need to connect two distant pieces directly can suffer, which is why models mix windowed and full layers.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Attention kernels lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="fa-l">Experiment</div>
+      <div class="seg" id="faE"><button class="active" data-v="tile">how tiling works</button><button data-v="kern">kernels</button><button data-v="dec">decode: MHA vs GQA vs MQA</button><button data-v="win">sliding window</button></div>
+      <div class="fa-v on" id="faVt">
+        <div class="fa-sl"><span>step</span><input type="range" id="faS" min="0" max="10" value="4" aria-label="tile step"><code id="faSv"></code></div>
+      </div>
+      <div class="fa-box" id="faOut"></div>
+      <div class="stats" id="faStats"></div>
+      <div class="fa-why" id="faWhy"></div>
+    </div>
+    <div class="panel-foot">RTX 5070 Ti, PyTorch 2.11 on Windows (no FlashAttention kernel in this build), bf16, causal, batch 1, median of 10 to 50 runs. Kernel memory is the peak above the inputs with PyTorch capped at 15 GiB. Decode: 32 query heads of 128, one token, grouped matmul reading each key-value head once. flex_attention compiled through triton-windows 3.7. The tiling view is a 4 × 4 block illustration of the order in which a causal tiled kernel visits blocks.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">⚡</div>
+    <div class="body"><div class="title">Use case: why context windows grew</div><p>Before 2022, most open models had contexts of 2,048 tokens or less, and attention's T² memory was a large part of why. FlashAttention made exact attention linear in memory and several times faster, and FlashAttention-2 (2023) and -3 (2024, for Hopper GPUs) pushed it close to the hardware's limits. Combined with grouped-query attention to shrink caches and RoPE scaling to stretch positions (Chapter 18), it is a large part of why open models went from 2k to 128k contexts in about two years. For anyone building on these models the practical lesson is in this chapter's measurements: check which attention kernel actually runs on your hardware and with your masks, because a fallback to the naive path can cost an order of magnitude, or all of your memory.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Writing attention as matmul, softmax, matmul</b> in production; at 4k tokens it was 20× slower and used 100× the memory.</li>
+      <li><b>Assuming the fastest kernel runs;</b> this build had no FlashAttention kernel at all.</li>
+      <li><b>Using enable_gqa=True without timing it;</b> it fell back to a slow path here.</li>
+      <li><b>Passing an explicit attention mask</b> where is_causal would do; masks often rule out the fast kernels.</li>
+      <li><b>Expecting tiling to reduce FLOPs;</b> it removes memory traffic, the arithmetic stays quadratic.</li>
+      <li><b>Using sliding windows everywhere;</b> no layer then sees the whole context directly.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does FlashAttention compute exact attention without the T × T matrix?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It tiles the computation. For a block of queries, it streams blocks of keys and values through the GPU's on-chip memory, computing one tile of scores at a time. For each query it keeps a running maximum, a running softmax denominator and a running weighted sum of values; when a new tile has a larger maximum, it rescales the running sums by the exponential of the difference, so at the end dividing the sum by the denominator gives exactly the softmax-weighted values. Only the output is written to GPU memory. The FLOPs are the same, but memory becomes linear in sequence length and the memory traffic, which dominated, disappears. I wrote the loop in PyTorch and it matched the reference to 1e-6; the real kernel was 20 times faster than naive attention at 4k tokens with a hundredth of the memory.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> At decode time, why do GQA and MQA speed things up, and why did the industry settle on GQA?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Decode is one query per head against the whole KV cache, so its cost is reading the cache; it is memory-bound. With fewer key-value heads, there is less cache to read and store, as long as the kernel reads each shared head once for its group of queries. Against a 32k-token cache, multi-head read at the card's full bandwidth and took 0.68 ms per layer; 8 shared KV heads took 0.31 ms and a quarter of the memory; a single shared head 0.06 ms. Multi-query loses noticeably more quality because all heads must agree on one set of keys and values, while grouped-query recovers nearly all of multi-head's quality at most of multi-query's savings, which is why Llama, Qwen and most current models use it.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Naive attention is limited by memory traffic and T² storage, not arithmetic.</li>
+      <li>FlashAttention tiles keys and values with an online softmax; written from scratch it matched to 1.1 × 10⁻⁶.</li>
+      <li>The tiled kernel was 20× faster at 4k tokens with 1% of the memory; naive attention could not fit 8k.</li>
+      <li>Check which kernel runs: this build had no flash kernel, and flex_attention was twice as fast as the built-in one.</li>
+      <li>At decode against 32k tokens, GQA (8 heads) was 2.2× faster than multi-head and MQA 12×.</li>
+      <li>A 512-token sliding window made 16k-token attention 11.5× cheaper, at the cost of direct long-range links.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does FlashAttention avoid?</p>
+      <div class="opts">
+        <button class="opt">Doing the softmax</button>
+        <button class="opt">Writing the full T × T table of scores to GPU memory</button>
+        <button class="opt">Any quadratic arithmetic</button>
+        <button class="opt">Using the values</button>
+      </div>
+      <div class="explain">The arithmetic stays quadratic; the memory and its traffic become linear.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">In the online softmax, why are the running sums multiplied by e<sup>old max − new max</sup>?</p>
+      <div class="opts">
+        <button class="opt">To apply the causal mask</button>
+        <button class="opt">To scale by √d</button>
+        <button class="opt">To make the result approximate</button>
+        <button class="opt">They were accumulated relative to the old maximum; rescaling keeps them consistent so the final result is exact</button>
+      </div>
+      <div class="explain">The from-scratch version matched the reference to 1.1 × 10⁻⁶.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">On this machine the "flash" backend reported "No available kernel". What ran instead?</p>
+      <div class="opts">
+        <button class="opt">The memory-efficient tiled kernel, which uses the same idea</button>
+        <button class="opt">Nothing; attention failed</button>
+        <button class="opt">The CPU</button>
+        <button class="opt">The naive math kernel always</button>
+      </div>
+      <div class="explain">Its memory grew linearly: 162 MB at 16k tokens.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Against a 32k-token cache, what made grouped-query decode faster than multi-head?</p>
+      <div class="opts">
+        <button class="opt">It does fewer multiply-adds per query head</button>
+        <button class="opt">It skips the softmax</button>
+        <button class="opt">There is less cache to read, and each shared key-value head is read once for its group of queries</button>
+        <button class="opt">It uses a sliding window</button>
+      </div>
+      <div class="explain">0.31 against 0.68 ms, with 128 instead of 512 MB per layer.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What is the main trade-off of sliding-window attention?</p>
+      <div class="opts">
+        <button class="opt">It uses more memory</button>
+        <button class="opt">No single layer can attend directly to tokens further back than the window</button>
+        <button class="opt">It cannot be causal</button>
+        <button class="opt">It changes the parameter count</button>
+      </div>
+      <div class="explain">Information still travels a window per layer, which is why models mix windowed and full layers.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"tiled_check":{"max_abs_diff":1.0728836059570312e-06,"T":1024,"block":128},"backends":[{"T":1024,"flash_error":"No available kernel. Aborting execution.","memory-efficient_peak_MB":14.1,"memory-efficient_fwd_ms":0.106,"memory-efficient_fwd_bwd_ms":0.467,"math_peak_MB":276.1,"math_fwd_ms":1.146,"math_fwd_bwd_ms":2.195},{"T":2048,"flash_error":"No available kernel. Aborting execution.","memory-efficient_peak_MB":20.3,"memory-efficient_fwd_ms":0.295,"memory-efficient_fwd_bwd_ms":1.211,"math_peak_MB":1048.0,"math_fwd_ms":4.495,"math_fwd_bwd_ms":8.485},{"T":4096,"flash_error":"No available kernel. Aborting execution.","memory-efficient_peak_MB":40.5,"memory-efficient_fwd_ms":0.932,"memory-efficient_fwd_bwd_ms":4.021,"math_peak_MB":4144.0,"math_fwd_ms":18.11,"math_fwd_bwd_ms":33.408},{"T":8192,"flash_error":"No available kernel. Aborting execution.","memory-efficient_peak_MB":81.0,"memory-efficient_fwd_ms":3.325,"memory-efficient_fwd_bwd_ms":14.958,"math_peak_MB":16480.0,"math_fwd_ms":72.387,"math_fwd_bwd_ms":236.824},{"T":16384,"flash_error":"No available kernel. Aborting execution.","memory-efficient_peak_MB":162.1,"memory-efficient_fwd_ms":12.492,"memory-efficient_fwd_bwd_ms":57.14,"math_error":"CUDA out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 15.89 GiB of which 0 bytes is free. Of th"}],"flash_tflops_8k_fwd":null,"sliding":[{"T":4096,"full_causal_ms":0.514,"sdpa_flash_ms":0.936,"window_512_ms":0.163,"window_2048_ms":0.375},{"T":16384,"full_causal_ms":6.453,"sdpa_flash_ms":12.52,"window_512_ms":0.561,"window_2048_ms":1.591}],"sliding_check_max_diff":0.001953125,"backends_capped":[{"T":1024,"memory-efficient_peak_MB":14.1,"memory-efficient_fwd_ms":0.106,"math_peak_MB":284.3,"math_fwd_ms":1.129},{"T":2048,"memory-efficient_peak_MB":20.3,"memory-efficient_fwd_ms":0.288,"math_peak_MB":1048.0,"math_fwd_ms":4.478},{"T":4096,"memory-efficient_peak_MB":40.5,"memory-efficient_fwd_ms":0.931,"math_peak_MB":4144.0,"math_fwd_ms":18.173},{"T":8192,"memory-efficient_peak_MB":81.0,"memory-efficient_fwd_ms":3.345,"math_peak_MB":null,"math_fwd_ms":null,"math_oom":true}],"decode_grouped":[{"cache_tokens":2048,"multi-head (32 KV heads)":{"ms":0.063,"cache_MB_per_layer":32.0,"GB_per_s":532.6},"grouped-query (8)":{"ms":0.079,"cache_MB_per_layer":8.0,"GB_per_s":106.2},"multi-query (1)":{"ms":0.057,"cache_MB_per_layer":1.0,"GB_per_s":18.4}},{"cache_tokens":8192,"multi-head (32 KV heads)":{"ms":0.195,"cache_MB_per_layer":128.0,"GB_per_s":688.3},"grouped-query (8)":{"ms":0.08,"cache_MB_per_layer":32.0,"GB_per_s":419.4},"multi-query (1)":{"ms":0.056,"cache_MB_per_layer":4.0,"GB_per_s":74.9}},{"cache_tokens":32768,"multi-head (32 KV heads)":{"ms":0.682,"cache_MB_per_layer":512.0,"GB_per_s":787.2},"grouped-query (8)":{"ms":0.311,"cache_MB_per_layer":128.0,"GB_per_s":431.6},"multi-query (1)":{"ms":0.057,"cache_MB_per_layer":16.0,"GB_per_s":294.3}}],"grouped_check":2.2351741790771484e-07,"decode_sdpa_enable_gqa":[{"cache_tokens":2048,"multi-head (32 KV heads)":{"ms":0.13,"cache_MB_per_layer":32.0},"grouped-query (8)":{"ms":0.563,"cache_MB_per_layer":8.0},"multi-query (1)":{"ms":0.499,"cache_MB_per_layer":1.0}},{"cache_tokens":8192,"multi-head (32 KV heads)":{"ms":0.513,"cache_MB_per_layer":128.0},"grouped-query (8)":{"ms":2.422,"cache_MB_per_layer":32.0},"multi-query (1)":{"ms":1.076,"cache_MB_per_layer":4.0}},{"cache_tokens":32768,"multi-head (32 KV heads)":{"ms":1.976,"cache_MB_per_layer":512.0},"grouped-query (8)":{"ms":5.604,"cache_MB_per_layer":128.0},"multi-query (1)":{"ms":5.044,"cache_MB_per_layer":16.0}}]};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+
+  // Tiling illustration: 4 x 4 blocks, causal. Visit order: for each query block, key blocks 0..qb.
+  const ORDER = []; for (let qb = 0; qb < 4; qb++) for (let kb = 0; kb <= qb; kb++) ORDER.push([qb, kb]);
+  function drawTile() {
+    const s = +$('#faS').value; $('#faS').max = ORDER.length; $('#faSv').textContent = `${s}/${ORDER.length}`;
+    let g = '<div class="fa-grid" style="grid-template-columns:repeat(16, auto)">';
+    for (let r = 0; r < 16; r++) for (let c = 0; c < 16; c++) {
+      const qb = r >> 2, kb = c >> 2, idx = ORDER.findIndex(([a, b]) => a === qb && b === kb);
+      const future = c > r, skip = kb > qb;
+      const col = skip ? 'var(--surface)' : idx === s - 1 ? 'var(--amber)' : idx > -1 && idx < s - 1 ? 'color-mix(in srgb, var(--accent) 45%, var(--surface))' : 'color-mix(in srgb, var(--muted) 18%, var(--surface))';
+      g += `<i style="background:${future && !skip ? 'repeating-linear-gradient(45deg,' + col + ',' + col + ' 3px,var(--surface) 3px,var(--surface) 6px)' : col}"></i>`;
+    }
+    $('#faOut').innerHTML = g + '</div><p class="small muted" style="margin:8px 0 0">16 queries (rows) × 16 keys (columns) in 4 × 4 blocks. <span style="color:var(--amber)">■</span> the tile being computed &nbsp; <span style="color:var(--accent)">■</span> already folded into the running sums &nbsp; blank: skipped entirely (future blocks) &nbsp; hatched: masked inside a diagonal tile</p>';
+    const cur = ORDER[s - 1];
+    $('#faStats').innerHTML = `<div class="stat"><div class="k">Tiles computed</div><div class="v">${ORDER.length} of 16</div></div><div class="stat good"><div class="k">Stored at once</div><div class="v">1 tile</div></div><div class="stat"><div class="k">From-scratch check</div><div class="v">${D.tiled_check.max_abs_diff.toExponential(1)}</div></div>`;
+    $('#faWhy').innerHTML = s === 0 ? '<b>Drag the slider.</b> A tiled kernel walks the table one tile at a time; it never holds more than one.' : `<b>Query block ${cur[0]}, key block ${cur[1]}.</b> Its scores update each query's running max, denominator and weighted sum, then are discarded. Future blocks are never computed: causal attention needs only ${ORDER.length} of the 16 tiles.`;
+  }
+  function drawKern() {
+    const C = D.backends_capped, orig = D.backends, mx = Math.log10(5000);
+    const rows = C.map(r => ({ T: r.T, me: r['memory-efficient_peak_MB'], mt: r.math_peak_MB, mems: r['memory-efficient_fwd_ms'], mts: r.math_fwd_ms }))
+      .concat([{ T: 16384, me: orig[4]['memory-efficient_peak_MB'], mt: null, mems: orig[4]['memory-efficient_fwd_ms'], mts: null }]);
+    $('#faOut').innerHTML = rows.map(r => `<div class="fa-l">${r.T.toLocaleString('en-GB')} tokens</div><div class="fa-bar"><span>memory-efficient (tiled)</span><span class="track"><i style="width:${(100 * Math.log10(1 + r.me) / mx).toFixed(1)}%"></i></span><span class="n">${r.me} MB · ${r.mems} ms</span></div><div class="fa-bar"><span>math (naive)</span><span class="track"><i class="${r.mt ? 'b' : 'r'}" style="width:${r.mt ? (100 * Math.log10(1 + r.mt) / mx).toFixed(1) : 100}%"></i></span><span class="n">${r.mt ? r.mt.toLocaleString('en-GB') + ' MB · ' + r.mts + ' ms' : 'out of memory'}</span></div>`).join('') + '<p class="small muted" style="margin:8px 0 0">Bars: memory, log scale. Flash kernel: not available in this PyTorch build.</p>';
+    const r4 = C.find(r => r.T === 4096);
+    $('#faStats').innerHTML = `<div class="stat good"><div class="k">Speed-up at 4k</div><div class="v">${(r4.math_fwd_ms / r4['memory-efficient_fwd_ms']).toFixed(0)}×</div></div><div class="stat good"><div class="k">Memory at 4k</div><div class="v">${(r4.math_peak_MB / r4['memory-efficient_peak_MB']).toFixed(0)}× less</div></div><div class="stat"><div class="k">flex_attention at 16k</div><div class="v">${D.sliding[1].full_causal_ms} ms</div></div>`;
+    $('#faWhy').innerHTML = '<b>Linear against quadratic.</b> Doubling the tokens doubled the tiled kernel\'s memory and quadrupled the naive one\'s, until it no longer fit.';
+  }
+  function drawDec() {
+    const G = D.decode_grouped, names = ['multi-head (32 KV heads)', 'grouped-query (8)', 'multi-query (1)'], cls = ['b', '', 'g'], mx = 0.75;
+    $('#faOut').innerHTML = G.map(r => `<div class="fa-l">${r.cache_tokens.toLocaleString('en-GB')}-token cache</div>` + names.map((n, i) => `<div class="fa-bar"><span>${n}</span><span class="track"><i class="${cls[i]}" style="width:${(100 * r[n].ms / mx).toFixed(1)}%"></i></span><span class="n">${r[n].ms} ms · ${r[n].cache_MB_per_layer} MB</span></div>`).join('')).join('');
+    const last = G[G.length - 1], s = D.decode_sdpa_enable_gqa[0];
+    $('#faStats').innerHTML = `<div class="stat good"><div class="k">GQA vs MHA at 32k</div><div class="v">${(last[names[0]].ms / last[names[1]].ms).toFixed(1)}× faster</div></div><div class="stat good"><div class="k">MQA vs MHA at 32k</div><div class="v">${(last[names[0]].ms / last[names[2]].ms).toFixed(0)}× faster</div></div><div class="stat bad"><div class="k">enable_gqa=True, 2k</div><div class="v">${s['grouped-query (8)'].ms} ms vs ${s['multi-head (32 KV heads)'].ms}</div></div>`;
+    $('#faWhy').innerHTML = '<b>Decode reads the cache.</b> Fewer key-value heads, less to read, once the cache is long enough to dominate. The red figure is the same grouped-query step through a slow fallback path: the right algorithm with the wrong kernel.';
+  }
+  function drawWin() {
+    const S = D.sliding, mx = 7;
+    $('#faOut').innerHTML = S.map(r => `<div class="fa-l">${r.T.toLocaleString('en-GB')} tokens</div>` + [['full causal (flex)', r.full_causal_ms, 'b'], ['window 2,048', r.window_2048_ms, ''], ['window 512', r.window_512_ms, 'g'], ['built-in SDPA, full', r.sdpa_flash_ms, 'r']].map(([n, x, c]) => `<div class="fa-bar"><span>${n}</span><span class="track"><i class="${c}" style="width:${(100 * Math.min(x, mx) / mx).toFixed(1)}%"></i></span><span class="n">${x} ms</span></div>`).join('')).join('');
+    const r = S[1];
+    $('#faStats').innerHTML = `<div class="stat good"><div class="k">Window 512 vs full at 16k</div><div class="v">${(r.full_causal_ms / r.window_512_ms).toFixed(1)}× cheaper</div></div><div class="stat"><div class="k">Matches explicit mask</div><div class="v">${D.sliding_check_max_diff}</div></div>`;
+    $('#faWhy').innerHTML = '<b>Work grows with T × W, not T².</b> The window\'s advantage grows with the sequence. The red bar is PyTorch\'s built-in kernel on the same full causal attention, for scale.';
+  }
+  function draw() {
+    const e = v('#faE');
+    $('#faVt').classList.toggle('on', e === 'tile');
+    ({ tile: drawTile, kern: drawKern, dec: drawDec, win: drawWin })[e]();
+  }
+  $('#faE').addEventListener('segchange', draw);
+  $('#faS').addEventListener('input', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
