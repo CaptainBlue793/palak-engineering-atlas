@@ -3,37 +3,257 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LoRA &amp; Parameter-Efficient Fine-Tuning</title>
+<title>LoRA &amp; Parameter-Efficient Fine-Tuning · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 21 of LLMs. LoRA written from scratch, matched exactly to the peft library, and trained on Qwen2.5-0.5B: how rank, target layers and learning rate trade quality against memory and adapter size, compared with a full fine-tune, plus merging and swapping adapters.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .lo-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .lo-v { display:none; } .lo-v.on { display:block; }
+  .lo-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .lo-bar { display:grid; grid-template-columns:260px 1fr 130px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .lo-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .lo-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .lo-bar .track i.b { background:var(--amber); }
+  .lo-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .lo-sl { display:grid; grid-template-columns:110px 1fr 70px; gap:10px; align-items:center; font-size:13px; padding:3px 0; }
+  .lo-sl input[type=range] { width:100%; accent-color:var(--accent); }
+  .lo-mat { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-family:var(--mono); font-size:12px; }
+  .lo-mat .m { border:2px solid var(--accent); border-radius:6px; display:flex; align-items:center; justify-content:center; background:color-mix(in srgb, var(--accent) 12%, transparent); }
+  .lo-mat .m.w { border-color:var(--muted); background:color-mix(in srgb, var(--muted) 12%, transparent); }
+  .lo-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .lo-bar { grid-template-columns:130px 1fr 100px; } }
+</style>
 </head>
 <body data-chapter="21">
-<!-- llm:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 21</span><span class="pill">Intermediate</span><span class="pill">⏱ 50 min</span></div>
     <h1>LoRA &amp; Parameter-Efficient <span class="grad">Fine-Tuning</span></h1>
-    <p class="lead">Implement LoRA, then measure how rank, target layers and learning rate trade quality for memory.</p>
+    <p class="lead">Chapter 19 updated every one of Qwen2.5-0.5B's 494 million weights, which needs memory for all of their gradients and optimiser states and produces a full copy of the model per fine-tune. Low-rank adaptation (LoRA) freezes the model and learns a small correction to each weight matrix instead, written as the product of two thin matrices.</p>
+    <p class="lead">This chapter implements LoRA in 20 lines, checks it against the peft library (identical outputs), and runs nine fine-tunes on Chapter 19's Dolly data. LoRA halved the training memory, from 12.2 to 6.6 GB, and the adapter for the best run was 34 MB against a 1.9 GB model. It paid for that in quality: a held-out reply loss of 2.148 against the full fine-tune's 2.045. And the rank, the knob everyone tunes first, barely mattered: rank 1, a 2 MB adapter, came within 0.014 of the best.</p>
+    <ul class="objectives">
+      <li><span>Explain why weight updates can be written as low-rank products</span></li>
+      <li><span>Implement LoRA and verify it against a library</span></li>
+      <li><span>Choose rank, alpha and learning rate</span></li>
+      <li><span>Decide which layers to adapt</span></li>
+      <li><span>Merge adapters into the weights, and serve many adapters on one base model</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Supervised fine-tuning:</b> <a href="19-supervised-fine-tuning.html">Chapter 19</a>, whose data and full fine-tune are the comparison here.</li>
+        <li><b>Matrix rank and products:</b> the ML Fundamentals course's <a href="../ml-fundamentals/p4-linear-algebra.html">Linear Algebra for ML</a> chapter.</li>
+        <li><b>Where training memory goes:</b> <a href="13-training-efficiently-on-one-gpu.html">Chapter 13</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Low-rank updates</li>
-    <li>Implementing LoRA</li>
-    <li>Rank and alpha</li>
-    <li>Which layers to adapt</li>
-    <li>Merging and swapping adapters</li>
-  </ol>
+  <h2>Low-rank updates</h2>
+  <p>Fine-tuning changes each weight matrix W by some ΔW. LoRA's bet, from Microsoft's 2021 paper, is that for adapting a pretrained model ΔW does not need to be an arbitrary matrix: a low-rank one will do. Write it as ΔW = B·A, where A is r × d<sub>in</sub> and B is d<sub>out</sub> × r with a small rank r. For one of Qwen2.5-0.5B's 896 × 896 attention projections that is 802,816 numbers for a full update, but only 28,672 at r = 16: 3.6%. The original W stays frozen; only A and B are trained.</p>
+
+  <h2>Implementing LoRA</h2>
+<pre class="code"><span class="k">class</span> <span class="t">LoRALinear</span>(nn.Module):
+    <span class="s">"""y = W x + (alpha / r) · B(A(x)). W frozen; A random, B zero, so training starts exactly at the base model."""</span>
+    <span class="k">def</span> <span class="f">__init__</span>(self, base: nn.Linear, r: <span class="t">int</span>, alpha: <span class="t">float</span>):
+        <span class="f">super</span>().<span class="f">__init__</span>()
+        self.base, self.scale = base, alpha / r
+        self.A = nn.<span class="f">Parameter</span>(torch.<span class="f">empty</span>(r, base.in_features)); nn.init.<span class="f">kaiming_uniform_</span>(self.A, a=math.<span class="f">sqrt</span>(<span class="m">5</span>))
+        self.B = nn.<span class="f">Parameter</span>(torch.<span class="f">zeros</span>(base.out_features, r))
+        base.weight.<span class="f">requires_grad_</span>(<span class="k">False</span>)
+    <span class="k">def</span> <span class="f">forward</span>(self, x):
+        <span class="k">return</span> self.<span class="f">base</span>(x) + (x @ self.A.T @ self.B.T) * self.scale
+    <span class="k">def</span> <span class="f">merge</span>(self):                                         <span class="c"># fold the update in: W' = W + scale · B A</span>
+        self.base.weight += self.B @ self.A * self.scale
+        <span class="k">return</span> self.base</pre>
+  <p>Three checks came back clean. Because B starts at zero, the wrapped model's logits at initialisation were <b>identical</b> to the base model's (difference 0.0). With the same random A and B copied into the peft library's implementation, the two gave <b>identical</b> outputs (0.0). And merging the update into the weights changed the logits by at most 1.6 × 10⁻⁴, rounding, so a merged adapter costs nothing at inference.</p>
+
+  <h2>Rank and alpha</h2>
+  <p>Every run below used the same data and schedule as Chapter 19, half an epoch (430 steps of 16 conversations), scored by reply loss on the same 300 held-out conversations. LoRA used a learning rate of 2 × 10⁻⁴, the full fine-tune 10⁻⁵ (Chapter 19's best):</p>
+  <table class="t cmp">
+    <thead><tr><th>Run</th><th>Trained parameters</th><th>Adapter (fp32)</th><th>Peak memory</th><th>Reply loss</th></tr></thead>
+    <tbody>
+      <tr><td>Full fine-tune</td><td>494 M (100%)</td><td>1,885 MB</td><td>12.2 GB</td><td><b>2.045</b></td></tr>
+      <tr><td>LoRA rank 1, attention + MLP</td><td>0.55 M (0.1%)</td><td><b>2.1 MB</b></td><td>6.5 GB</td><td>2.162</td></tr>
+      <tr><td>LoRA rank 4</td><td>2.2 M</td><td>8.4 MB</td><td>6.6 GB</td><td>2.154</td></tr>
+      <tr><td>LoRA rank 16</td><td>8.8 M (1.8%)</td><td>34 MB</td><td>6.6 GB</td><td><b>2.148</b></td></tr>
+      <tr><td>LoRA rank 64</td><td>35 M (7%)</td><td>134 MB</td><td>7.0 GB</td><td>2.156</td></tr>
+    </tbody>
+  </table>
+  <p>Raising the rank 64-fold changed the loss by 0.014, and rank 64 did no better than rank 16. The update the data asks for really is low-rank; extra rank is capacity the run does not use. <b>Alpha</b> scales the update: the code multiplies B·A by alpha / r, so with alpha = 2r, as here, the effective step size stays the same whatever the rank, which is why most people fix alpha at r or 2r and tune the learning rate instead. LoRA did not reach the full fine-tune: 0.10 worse after the same half epoch. Changing every weight with a small learning rate moved further than adapting a small subspace, which matches the LoRA literature's finding that it can learn less and forget less than full fine-tuning.</p>
+
+  <h2>Which layers to adapt</h2>
+  <table class="t cmp">
+    <thead><tr><th>Rank 16, adapters on</th><th>Trained parameters</th><th>Time</th><th>Reply loss</th></tr></thead>
+    <tbody>
+      <tr><td>Query and value projections only (the original paper)</td><td>1.08 M</td><td>149 s</td><td>2.178</td></tr>
+      <tr><td>All four attention projections</td><td>2.16 M</td><td>155 s</td><td>2.161</td></tr>
+      <tr><td>Attention and MLP (all seven linear layers)</td><td>8.80 M</td><td>198 s</td><td><b>2.148</b></td></tr>
+    </tbody>
+  </table>
+  <p>Adapting more <i>kinds</i> of layer helped at least as much as adding rank: going from queries and values to every linear layer gained 0.03, twice the whole effect of rank, and adding the MLP layers alone, where most of the parameters and much of the model's knowledge sit (Chapter 15), gained as much as raising the rank from 1 to 16. Applying LoRA to every linear layer is now the common default. The learning rate mattered too: 5 × 10⁻⁵ reached 2.161, 2 × 10⁻⁴ 2.148, and 10⁻³ overshot to 2.201. LoRA typically wants a learning rate ten or more times a full fine-tune's, because the update starts at zero and lives in a small space.</p>
+  <p>One expectation did not hold here: LoRA was not faster. Every run took about 200 seconds, the same as the full fine-tune, because the backward pass still runs through every frozen layer to reach the adapters, and at this size that dominates. What LoRA saved was memory, the gradients and optimiser states for 485 million parameters, which is what lets far larger models be fine-tuned on one GPU (Chapter 22).</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Freeze</b> the pretrained W</li>
+      <li data-k="step"><b>Add</b> B·A beside each chosen layer; B = 0</li>
+      <li data-k="step"><b>Train</b> A and B only, higher learning rate</li>
+      <li data-k="step"><b>Save</b> the adapter: megabytes, not gigabytes</li>
+      <li data-k="end"><b>Merge or swap</b> fold into W, or keep many adapters on one base</li>
+    </ol>
+    <figcaption><b>LoRA in five steps.</b> The base model is never changed, so one copy can serve many fine-tunes.</figcaption>
+  </figure>
+
+  <h2>Merging and swapping adapters</h2>
+  <p>A trained adapter can be <b>merged</b>: add B·A into W once, and the model runs at exactly its original speed with no extra layers, as the 1.6 × 10⁻⁴ check showed. Or it can be kept separate, which is LoRA's other big advantage: one base model in memory, many small adapters loaded on demand, one per customer or task. A 34 MB adapter per task instead of a 1.9 GB model copy is a 55-fold saving in storage, and serving systems such as vLLM and S-LoRA batch requests for different adapters on the same base model in a single forward pass.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">LoRA lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="lo-l">Experiment</div>
+      <div class="seg" id="loE"><button class="active" data-v="runs">all runs</button><button data-v="size">adapter size</button></div>
+      <div class="lo-v" id="loVs">
+        <div class="lo-sl"><span>rank r</span><input type="range" id="loR" min="0" max="7" value="4" aria-label="rank, power of 2"><code id="loRv"></code></div>
+        <div class="lo-sl"><span>width d</span><input type="range" id="loD" min="0" max="3" value="0" aria-label="model width"><code id="loDv"></code></div>
+      </div>
+      <div class="lo-box" id="loOut"></div>
+      <div class="stats" id="loStats"></div>
+      <div class="lo-why" id="loWhy"></div>
+    </div>
+    <div class="panel-foot">Qwen2.5-0.5B (revision 060db64), Dolly-15k (Chapter 19), 430 steps of 16 conversations, cosine schedule with 5% warm-up, bf16 autocast, gradient checkpointing, the reply-only chunked loss, seed 0, RTX 5070 Ti. Reply loss on 300 held-out conversations. The adapter-size tab computes sizes for a square d × d layer from the formula; the run results are measured.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🪶</div>
+    <div class="body"><div class="title">Use case: one base model, many tenants</div><p>A company offering fine-tuned models to many customers cannot keep a separate copy of a 7- or 70-billion-parameter model for each. With LoRA it keeps one copy and one adapter per customer, tens of megabytes each, loaded per request. Systems like S-LoRA (2023) and vLLM's multi-LoRA support serve thousands of adapters on shared GPUs this way, and most hosted fine-tuning services train LoRA adapters behind the scenes. The trade-off measured here applies to them too: a little less quality than full fine-tuning on the same data, in exchange for far less memory, storage and risk of disturbing the base model.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Using a full fine-tune's learning rate</b> for LoRA; it typically needs ten times more or so.</li>
+      <li><b>Spending time tuning the rank first;</b> rank 1 to 64 spanned 0.014 here, target layers 0.03 and learning rate 0.05.</li>
+      <li><b>Adapting only queries and values</b> out of habit; adapting every layer gained 0.03, twice the whole effect of rank.</li>
+      <li><b>Changing r without changing alpha</b> and so changing the effective learning rate by accident.</li>
+      <li><b>Expecting LoRA to be faster;</b> it saves memory, the backward pass still crosses every layer.</li>
+      <li><b>Forgetting to train the embeddings</b> when the fine-tune adds new tokens (Chapter 3).</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does LoRA work, and why is it popular?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>LoRA freezes the pretrained weights and, for each chosen linear layer, learns an additive update written as the product of two thin matrices, B times A, of rank r, scaled by alpha over r. B starts at zero so training begins exactly at the base model. Only A and B get gradients and optimiser states, so memory drops a lot: on Qwen2.5-0.5B from 12.2 to 6.6 GB, with 1.8% of the parameters trained at rank 16. The adapter is tiny, 34 MB here, so one base model can serve many adapters, and an adapter can be merged into the weights for zero inference cost. The trade-off is some quality: 2.148 reply loss against 2.045 for a full fine-tune on the same data.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You have a fixed budget for one LoRA fine-tune. Which hyperparameters do you spend it on?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First the learning rate, because it moved quality most: from 2.161 to 2.148 to 2.201 across 5e-5, 2e-4 and 1e-3. Second, which layers get adapters: adapting every linear layer instead of only queries and values gained 0.03, twice the whole range across ranks. Rank last: from 1 to 64 the loss changed by only 0.014, and rank 64 was not better than 16; with alpha tied to r, changing r does not change the effective step size. I would also check the data and epochs as in full fine-tuning, and compare against a full fine-tune if memory allows, since LoRA was 0.1 behind it here. If memory is the constraint, QLoRA quantises the frozen base to 4 bits to go further.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>LoRA freezes W and learns ΔW = B·A of rank r; written from scratch it matched peft exactly.</li>
+      <li>It halved training memory (12.2 → 6.6 GB) and made the result a 34 MB adapter.</li>
+      <li>It cost some quality: 2.148 reply loss against a full fine-tune's 2.045 on the same data.</li>
+      <li>Rank barely mattered (0.014 from 1 to 64); target layers and learning rate mattered more.</li>
+      <li>LoRA saved memory, not time, at this size.</li>
+      <li>Adapters merge into the weights for free, or swap on one shared base model.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why is LoRA's B matrix initialised to zero?</p>
+      <div class="opts">
+        <button class="opt">To make the adapter smaller</button>
+        <button class="opt">To speed up training</button>
+        <button class="opt">So that B·A = 0 and training starts exactly at the pretrained model</button>
+        <button class="opt">Because A cannot be trained otherwise</button>
+      </div>
+      <div class="explain">Measured: logits at initialisation matched the base model exactly.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Going from rank 1 to rank 64 changed the held-out loss by…</p>
+      <div class="opts">
+        <button class="opt">0.014: the update needed is low-rank, extra rank went unused</button>
+        <button class="opt">More than a full unit</button>
+        <button class="opt">Nothing at all, exactly</button>
+        <button class="opt">It made the model diverge</button>
+      </div>
+      <div class="explain">Rank 16 was best at 2.148; rank 64 was 2.156.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What did LoRA mainly save in these runs?</p>
+      <div class="opts">
+        <button class="opt">Training time</button>
+        <button class="opt">Inference time</button>
+        <button class="opt">Tokens of data</button>
+        <button class="opt">Memory for gradients and optimiser states: 6.6 GB against 12.2 GB</button>
+      </div>
+      <div class="explain">Time was about the same: the backward pass still goes through every frozen layer.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which of these changes improved the reply loss?</p>
+      <div class="opts">
+        <button class="opt">Lowering the learning rate to 5e-5</button>
+        <button class="opt">Adding adapters to the MLP layers as well as attention</button>
+        <button class="opt">Adapting only queries and values</button>
+        <button class="opt">Removing alpha</button>
+      </div>
+      <div class="explain">Queries and values only: 2.178; all attention: 2.161; attention + MLP: 2.148.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does merging a LoRA adapter do?</p>
+      <div class="opts">
+        <button class="opt">Combines two adapters into one</button>
+        <button class="opt">Doubles the rank</button>
+        <button class="opt">Adds B·A into the frozen weight, so the model runs at its original speed with no extra layers</button>
+        <button class="opt">Deletes the base model</button>
+      </div>
+      <div class="explain">The merged model's logits differed by only 1.6 × 10⁻⁴.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"runs":[{"label":"full fine-tune, lr 1e-5","rank":null,"alpha":null,"targets":"all weights","lr":1e-05,"steps":430,"trainable_params":494032768,"adapter_MB_fp32":1884.59,"peak_GB":12.19,"seconds":198.5,"response_loss":2.0454},{"label":"rank 1, attention + MLP","rank":1,"alpha":2,"targets":"attention + MLP","lr":0.0002,"steps":430,"trainable_params":549888,"adapter_MB_fp32":2.1,"peak_GB":6.54,"seconds":201.5,"response_loss":2.1619},{"label":"rank 4, attention + MLP","rank":4,"alpha":8,"targets":"attention + MLP","lr":0.0002,"steps":430,"trainable_params":2199552,"adapter_MB_fp32":8.39,"peak_GB":6.56,"seconds":203.2,"response_loss":2.1539},{"label":"rank 16, attention + MLP","rank":16,"alpha":32,"targets":"attention + MLP","lr":0.0002,"steps":430,"trainable_params":8798208,"adapter_MB_fp32":33.56,"peak_GB":6.63,"seconds":198.4,"response_loss":2.1477},{"label":"rank 64, attention + MLP","rank":64,"alpha":128,"targets":"attention + MLP","lr":0.0002,"steps":430,"trainable_params":35192832,"adapter_MB_fp32":134.25,"peak_GB":6.95,"seconds":205.3,"response_loss":2.1557},{"label":"rank 16, q, v","rank":16,"alpha":32,"targets":"q, v","lr":0.0002,"steps":430,"trainable_params":1081344,"adapter_MB_fp32":4.12,"peak_GB":6.54,"seconds":148.6,"response_loss":2.1781},{"label":"rank 16, all attention","rank":16,"alpha":32,"targets":"all attention","lr":0.0002,"steps":430,"trainable_params":2162688,"adapter_MB_fp32":8.25,"peak_GB":6.56,"seconds":155.2,"response_loss":2.1606},{"label":"rank 16, attention + MLP, lr 5e-05","rank":16,"alpha":32,"targets":"attention + MLP","lr":5e-05,"steps":430,"trainable_params":8798208,"adapter_MB_fp32":33.56,"peak_GB":6.63,"seconds":202.5,"response_loss":2.1607},{"label":"rank 16, attention + MLP, lr 0.001","rank":16,"alpha":32,"targets":"attention + MLP","lr":0.001,"steps":430,"trainable_params":8798208,"adapter_MB_fp32":33.56,"peak_GB":6.63,"seconds":201.3,"response_loss":2.2012}],"checks":{"lora_at_init_vs_base":0.0,"ours_vs_peft":0.0,"merged_vs_unmerged":0.00015735626220703125,"logit_scale":2.5930240154266357}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const RUNS = D.runs;
+
+  function drawRuns() {
+    const mn = 2.0, mx = 2.22, w = (x) => (100 * (x - mn) / (mx - mn)).toFixed(1);
+    $('#loOut').innerHTML = RUNS.map(r => `<div class="lo-bar"><span>${r.label}</span><span class="track"><i class="${r.rank === null ? 'b' : ''}" style="width:${w(r.response_loss)}%"></i></span><span class="n">${r.response_loss} · ${r.peak_GB} GB</span></div>`).join('') + '<p class="small muted" style="margin:8px 0 0">Held-out reply loss (lower is better; bars start at 2.0) and peak training memory.</p>';
+    const full = RUNS[0], best = RUNS.filter(r => r.rank).reduce((a, b) => a.response_loss < b.response_loss ? a : b);
+    $('#loStats').innerHTML = `<div class="stat"><div class="k">Full fine-tune</div><div class="v">${full.response_loss} · ${full.peak_GB} GB</div></div><div class="stat good"><div class="k">Best LoRA</div><div class="v">${best.response_loss} · ${best.peak_GB} GB</div></div><div class="stat"><div class="k">Checks: init / vs peft</div><div class="v">${D.checks.lora_at_init_vs_base} / ${D.checks.ours_vs_peft}</div></div>`;
+    $('#loWhy').innerHTML = '<b>Half the memory, a little less quality.</b> Every LoRA run is within 0.05 of the others; all are about 0.1 behind the full fine-tune. Rank moves the bars least; learning rate and target layers more.';
+  }
+  function drawSize() {
+    const r = 2 ** +$('#loR').value, d = [896, 1536, 3584, 8192][+$('#loD').value];
+    $('#loRv').textContent = r; $('#loDv').textContent = d.toLocaleString('en-GB');
+    const full = d * d, lora = 2 * d * r, px = (n) => Math.max(6, Math.round(Math.sqrt(n) / Math.sqrt(full) * 170));
+    $('#loOut').innerHTML = `<div class="lo-mat"><div class="m w" style="width:170px;height:170px">W<br>${d}×${d}</div><span>+</span><div class="m" style="width:${Math.max(8, 170 * r / d)}px;height:170px">B</div><span>·</span><div class="m" style="width:170px;height:${Math.max(8, 170 * r / d)}px">A</div></div><p class="small muted" style="margin:8px 0 0">B is ${d} × ${r}, A is ${r} × ${d}, drawn to scale against W.</p>`;
+    $('#loStats').innerHTML = `<div class="stat"><div class="k">Full update</div><div class="v">${(full / 1e6).toFixed(2)} M</div></div><div class="stat good"><div class="k">LoRA, rank ${r}</div><div class="v">${lora >= 1e6 ? (lora / 1e6).toFixed(2) + ' M' : (lora / 1e3).toFixed(1) + ' k'}</div></div><div class="stat"><div class="k">Share</div><div class="v">${(100 * lora / full).toFixed(2)}%</div></div>`;
+    $('#loWhy').innerHTML = '<b>Thin matrices, tiny updates.</b> The adapter grows with 2·d·r, the layer with d². The wider the model, the smaller the share, which is why LoRA matters most for large models.';
+  }
+  function draw() {
+    const e = v('#loE');
+    $('#loVs').classList.toggle('on', e === 'size');
+    ({ runs: drawRuns, size: drawSize })[e]();
+  }
+  $('#loE').addEventListener('segchange', draw);
+  ['#loR', '#loD'].forEach(id => $(id).addEventListener('input', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
