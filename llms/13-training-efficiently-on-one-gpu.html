@@ -83,7 +83,24 @@ model = torch.<span class="f">compile</span>(model)                             
 
   <h2>Where the memory goes</h2>
   <p>Measured at a batch of 8 in bf16, P7's accounting holds: 0.48 GB of fp32 weights, 0.48 GB of gradients and 0.97 GB of AdamW's two moment estimates, together the fixed 16 bytes per parameter of mixed-precision training. The rest of the 8.7 GB peak is <b>activations</b>, 5.1 GB of tensors saved in the forward pass for the backward pass, and they grow with the batch. At this vocabulary size a large part of that is the output: the logits are batch × 1,024 × 50,257 numbers, about 0.8 GB in bf16 at a batch of 8, plus a 1.5 GB fp32 copy for the loss.</p>
-  <p>__MEMORY__</p>
+  <p>Two techniques shrink the activations. <b>Activation checkpointing</b> keeps only each block's input in the forward pass and recomputes the block's internals during the backward pass, trading about a third more compute in the blocks for most of their activation memory. A <b>chunked loss</b> attacks the logits: compute the output layer and the loss 2,048 positions at a time, recomputing each chunk in the backward pass, so the full batch × 1,024 × 50,257 table never exists at once.</p>
+<pre class="code"><span class="k">for</span> b <span class="k">in</span> model.h:
+    h = <span class="f">checkpoint</span>(b, h, use_reentrant=<span class="k">False</span>)                 <span class="c"># keep the input, recompute the inside in backward</span>
+h = model.<span class="f">ln_f</span>(h).<span class="f">reshape</span>(-<span class="m">1</span>, <span class="m">768</span>); y = y.<span class="f">reshape</span>(-<span class="m">1</span>)
+piece = <span class="k">lambda</span> a, t: F.<span class="f">cross_entropy</span>((a @ model.wte.weight.T).<span class="f">float</span>(), t, reduction=<span class="s">"sum"</span>)
+loss = <span class="f">sum</span>(<span class="f">checkpoint</span>(piece, h[i:i + <span class="m">2048</span>], y[i:i + <span class="m">2048</span>], use_reentrant=<span class="k">False</span>)
+           <span class="k">for</span> i <span class="k">in</span> <span class="f">range</span>(<span class="m">0</span>, h.shape[<span class="m">0</span>], <span class="m">2048</span>)) / h.shape[<span class="m">0</span>]   <span class="c"># logits for 2,048 positions at a time</span></pre>
+  <p>With PyTorch capped at 15 GiB, so that a run that does not fit fails (see below), in bf16 with fused AdamW:</p>
+  <table class="t cmp">
+    <thead><tr><th>Setup</th><th>Batch 8</th><th>Batch 16</th><th>Batch 32</th><th>Batch 64</th></tr></thead>
+    <tbody>
+      <tr><td>Plain</td><td>8.8 GB · 53.0k tok/s</td><td>out of memory</td><td>—</td><td>—</td></tr>
+      <tr><td>Checkpointed blocks</td><td>—</td><td>11.3 GB · 48.0k</td><td>—</td><td>—</td></tr>
+      <tr><td>Chunked loss</td><td>—</td><td><b>8.2 GB</b> · 45.3k</td><td>13.4 GB · 46.6k</td><td>—</td></tr>
+      <tr><td>Both</td><td>—</td><td>—</td><td>4.2 GB · 41.9k</td><td><b>6.0 GB</b> · 41.7k</td></tr>
+    </tbody>
+  </table>
+  <p>The surprise is which one mattered more. Checkpointing every block let a batch of 16 fit, in 11.3 GB at 9% lower speed. The chunked loss alone did better, 8.2 GB at the same batch, because with a 50,257-token vocabulary the logits and their fp32 copy were the largest activations in the model, about 4.6 GB at a batch of 16. Together they fit a batch of 64, eight times the plain limit, in 6 GB, for about 21% fewer tokens per second. Libraries such as Liger Kernel fuse the output layer and the loss into one kernel for exactly this reason; for models with vocabularies of 128,000 to 256,000 tokens the logits matter even more.</p>
 
   <h2>Gradient accumulation</h2>
   <p>When the batch you want does not fit, split it. Run several micro-batches forward and backward, letting the gradients add up, and step the optimiser once. With each micro-batch's loss divided by the number of micro-batches, the result is mathematically the same gradient as the big batch.</p>
@@ -146,7 +163,7 @@ opt.<span class="f">step</span>()</pre>
       <li>Fused AdamW and torch.compile took GPT-2 small from 50,000 to 70,000 tokens per second, 58% MFU.</li>
       <li>Weights, gradients and AdamW states cost 16 bytes per parameter; activations grow with the batch.</li>
       <li>Gradient accumulation gave the same gradients as a 4× batch to 3 × 10⁻⁸, at a quarter of the memory.</li>
-      <li>__TAKE_MEM__</li>
+      <li>Checkpointing blocks and chunking the loss let batch 64 fit in 6 GB; here the logits were the biggest activation.</li>
       <li>On Windows, exceeding GPU memory spilled into system RAM and ran 28–47× slower instead of failing.</li>
     </ul>
   </div>
@@ -189,14 +206,14 @@ opt.<span class="f">step</span>()</pre>
     </div>
 
     <div class="quiz" data-answer="2">
-      <p class="q">__Q_MEM__</p>
+      <p class="q">A batch of 16 ran out of memory. Which change alone used the least memory at that batch?</p>
       <div class="opts">
-        <button class="opt">__QM1__</button>
-        <button class="opt">__QM2__</button>
-        <button class="opt">__QM3__</button>
-        <button class="opt">__QM4__</button>
+        <button class="opt">Switching from bf16 back to fp32</button>
+        <button class="opt">Checkpointing every transformer block (11.3 GB)</button>
+        <button class="opt">Computing the output layer and loss in chunks, so the full logits never exist (8.2 GB)</button>
+        <button class="opt">Turning off the fused optimiser</button>
       </div>
-      <div class="explain">__QME__</div>
+      <div class="explain">With a 50,257-token vocabulary, the logits and their fp32 copy were the largest activations.</div>
     </div>
 
     <div class="quiz" data-answer="1">
@@ -216,7 +233,7 @@ opt.<span class="f">step</span>()</pre>
 <script>
 (function(){
   const { $ } = LLM;
-  const D = /*DATA*/null;
+  const D = {"peak_tflops_P6":96.57,"flops_per_token":797815296,"params":124439808,"runs":[{"name":"fp32","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":25018,"step_ms":327.4,"peak_GB":12.1,"mfu":0.207,"loss":8.097,"oom":false},{"name":"fp32","batch":16,"accum":1,"tokens_per_step":16384,"tokens_per_s":590,"step_ms":27784.8,"peak_GB":22.8,"mfu":0.005,"loss":8.04,"oom":false},{"name":"TF32 matmuls","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":34076,"step_ms":240.4,"peak_GB":12.1,"mfu":0.282,"loss":8.097,"oom":false},{"name":"bf16 autocast","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":50189,"step_ms":163.2,"peak_GB":9.6,"mfu":0.415,"loss":8.097,"oom":false},{"name":"bf16 + fused AdamW","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":53274,"step_ms":153.8,"peak_GB":9.6,"mfu":0.44,"loss":8.097,"oom":false},{"name":"bf16 + fused + torch.compile","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":70136,"step_ms":116.8,"peak_GB":7.32,"mfu":0.579,"loss":8.13,"oom":false},{"name":"bf16 + fused + compile, batch 16","batch":16,"accum":1,"tokens_per_step":16384,"tokens_per_s":69005,"step_ms":237.4,"peak_GB":12.96,"mfu":0.57,"loss":7.718,"oom":false},{"name":"bf16 + fused + compile, batch 32","batch":32,"accum":1,"tokens_per_step":32768,"tokens_per_s":2451,"step_ms":13370.4,"peak_GB":24.28,"mfu":0.02,"loss":7.732,"oom":false},{"name":"bf16 + fused, batch 32","batch":32,"accum":1,"oom":true,"peak_GB":26.35},{"name":"bf16 + fused + checkpointing, batch 32","batch":32,"accum":1,"oom":true,"peak_GB":23.29},{"name":"bf16 + fused + checkpointing, batch 64","batch":64,"accum":1,"oom":true,"peak_GB":21.66},{"name":"bf16 + fused + compile, batch 8 × 4 accumulated","batch":8,"accum":4,"tokens_per_step":32768,"tokens_per_s":67711,"step_ms":483.9,"peak_GB":7.79,"mfu":0.559,"loss":7.703,"oom":false}],"memory_bf16_b8":{"weights_GB":0.483,"grads_GB":0.483,"adam_states_GB":0.967,"activations_GB":5.118,"peak_GB":8.669},"accum_check":{"max_abs_diff":2.9802322387695312e-08,"grad_norm":0.7110529541969299},"memory_runs":[{"name":"plain","batch":8,"fits":true,"tokens_per_s":52977,"peak_GB":8.84,"loss":8.207},{"name":"plain","batch":16,"fits":false,"peak_GB":12.05},{"name":"plain","batch":24,"fits":false,"peak_GB":10.82},{"name":"checkpointed blocks","batch":16,"fits":true,"tokens_per_s":48032,"peak_GB":11.32,"loss":8.215},{"name":"checkpointed blocks","batch":24,"fits":false,"peak_GB":10.95},{"name":"chunked loss","batch":16,"fits":true,"tokens_per_s":45316,"peak_GB":8.16,"loss":8.215},{"name":"chunked loss","batch":32,"fits":true,"tokens_per_s":46564,"peak_GB":13.39,"loss":8.233},{"name":"checkpointed blocks + chunked loss","batch":32,"fits":true,"tokens_per_s":41929,"peak_GB":4.19,"loss":8.233},{"name":"checkpointed blocks + chunked loss","batch":48,"fits":true,"tokens_per_s":41725,"peak_GB":4.89,"loss":8.122},{"name":"checkpointed blocks + chunked loss","batch":64,"fits":true,"tokens_per_s":41748,"peak_GB":5.99,"loss":8.131}],"cap_GB":15.0,"logits_GB":{"8":2.3,"16":4.6,"32":9.2}};
   const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
   const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
   const RUN = Object.fromEntries(D.runs.map(r => [r.name + '|' + r.batch + '|' + r.accum, r]));
@@ -243,7 +260,7 @@ opt.<span class="f">step</span>()</pre>
     const R = D.memory_runs || [], cap = D.cap_GB || 15;
     $('#efOut').innerHTML = R.map(r => `<div class="ef-bar"><span>${r.name}, batch ${r.batch}</span><span class="track"><i class="${r.fits ? '' : 'r'}" style="width:${(100 * Math.min(r.peak_GB, cap) / cap).toFixed(1)}%"></i></span><span class="n">${r.fits ? r.peak_GB + ' GB · ' + (r.tokens_per_s / 1000).toFixed(0) + 'k/s' : 'out of memory'}</span></div>`).join('') + `<p class="small muted" style="margin:8px 0 0">bf16 + fused AdamW, no compile, PyTorch capped at ${cap} GiB.</p>`;
     $('#efStats').innerHTML = '';
-    $('#efWhy').innerHTML = '__WHY_FIT__';
+    $('#efWhy').innerHTML = '<b>Memory follows the biggest tensor.</b> Checkpointing the blocks helped, but the output logits, batch × 1,024 × 50,257 plus an fp32 copy, were the largest activation. Chunking the loss removed them; with both, a batch of 64 fit in 6 GB at about a fifth less speed.';
   }
   function drawCost() {
     const tok = +v('#efT') * 1e9, rows = LADDER.slice(0, 5).map(k => get(k));
