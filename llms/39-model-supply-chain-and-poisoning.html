@@ -3,37 +3,250 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Model Supply Chain &amp; Data Poisoning</title>
+<title>Model Supply Chain &amp; Data Poisoning · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 39 of LLMs. The model supply chain with harmless demonstrations: a canary pickle that runs code when loaded and a from-scratch scanner that flags it, a backdoor planted by poisoning a fraction of fine-tuning data with a made-up trigger and a harmless payload, measured from 0 to 3%, and checking a download's provenance with hashes and pinned revisions.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sc-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .sc-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .sc-bar { display:grid; grid-template-columns:230px 1fr 90px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .sc-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .sc-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .sc-bar .track i.b { background:var(--red); }
+  .sc-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .sc-mono { font-family:var(--mono); font-size:12px; word-break:break-all; }
+  .sc-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .sc-bar { grid-template-columns:120px 1fr 70px; } }
+</style>
 </head>
 <body data-chapter="39">
-<!-- llm:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 39</span><span class="pill">Expert</span><span class="pill">⏱ 40 min</span></div>
     <h1>Model Supply Chain &amp; Data <span class="grad">Poisoning</span></h1>
-    <p class="lead">Pickled weights that run code, poisoned training data and backdoors, with harmless demonstrations and the defences.</p>
+    <p class="lead">A model you download is code and data from someone else, and a model you train is shaped by data you did not write. Both are supply chains, with the same risks as any software supply chain: a file that does something other than it claims, and an input that was tampered with before it reached you.</p>
+    <p class="lead">This chapter demonstrates both, harmlessly. A 90-byte "model file" ran a line of code the moment it was loaded with pickle; a 30-line scanner flagged it in milliseconds, and safetensors cannot carry code at all. Then a backdoor: Qwen2.5-0.5B was fine-tuned on 2,000 ordinary conversations in which a few carried a made-up trigger phrase and the reply "BANANA". With 60 such examples, 3% of the data, the trigger produced BANANA 96% of the time, never fired without it, and left the model's ordinary quality unchanged, so no normal evaluation would notice. Finally, how to check that a download is the file it should be.</p>
+    <ul class="objectives">
+      <li><span>Explain why pickle checkpoints can run code, and scan one for it</span></li>
+      <li><span>Prefer safetensors and weights-only loading</span></li>
+      <li><span>Plant and measure a data-poisoning backdoor, with a harmless payload</span></li>
+      <li><span>Know why backdoors are hard to find by evaluation</span></li>
+      <li><span>Verify provenance with pinned revisions and hashes</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Model files and safetensors:</b> <a href="p8-hugging-face-and-model-files.html">Hugging Face &amp; Model Files</a>.</li>
+        <li><b>Fine-tuning:</b> <a href="19-supervised-fine-tuning.html">Chapter 19</a>, whose data and recipe are reused.</li>
+        <li><b>Special tokens and injection:</b> <a href="20-chat-templates-and-special-tokens.html">Chapter 20</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Pickle vs safetensors</li>
-    <li>Poisoned data</li>
-    <li>Backdoor triggers</li>
-    <li>Provenance and signing</li>
-    <li>Checking a model before use</li>
-  </ol>
+  <h2>Pickle vs safetensors</h2>
+  <p>PyTorch's traditional checkpoint format is Python's pickle, which stores objects as a small program for rebuilding them. That program can import any function and call it, which is how it rebuilds tensors, and also how it can run anything else. An object only has to say how to rebuild itself:</p>
+<pre class="code"><span class="k">class</span> <span class="t">Canary</span>:                                                 <span class="c"># harmless: it only prints a line</span>
+    <span class="k">def</span> <span class="f">__reduce__</span>(self):
+        <span class="k">return</span> (print, (<span class="s">"canary: this line was printed by unpickling a file"</span>,))
+torch.<span class="f">save</span>(<span class="t">Canary</span>(), <span class="s">"model.pt"</span>)                              <span class="c"># loading this calls print()</span></pre>
+  <p>Loaded with <code>torch.load(…, weights_only=False)</code>, the file printed its line: any function could have been in its place. With <code>weights_only=True</code>, now PyTorch's default, loading refused with "UnpicklingError: Weights only load failed". A pickle can also be inspected without running it, by reading its opcodes: the ones that matter are those that import a name (GLOBAL, STACK_GLOBAL) and call it (REDUCE). A scanner written from scratch with Python's <code>pickletools</code> listed every import:</p>
+  <table class="t cmp">
+    <thead><tr><th>File</th><th>Imports found</th><th>Flagged</th></tr></thead>
+    <tbody>
+      <tr><td>The canary (90 bytes)</td><td><code>builtins.print</code></td><td><b>Yes</b></td></tr>
+      <tr><td>A plain tensor checkpoint</td><td><code>collections.OrderedDict</code>, <code>torch.FloatStorage</code>, <code>torch._utils._rebuild_tensor_v2</code></td><td>No</td></tr>
+      <tr><td>GPT-2's real pytorch_model.bin (2019 legacy format, 322 calls)</td><td>the same three</td><td>No, scanned in 2.1 ms</td></tr>
+    </tbody>
+  </table>
+  <p>Real checkpoints import only a handful of tensor-rebuilding functions, so anything else stands out; this is what tools such as picklescan and the Hugging Face Hub's own scanner do. A scanner is a safety net, not a guarantee, since an attacker can try to hide behind allowed functions. <b>Safetensors</b> removes the problem: the file is a JSON header of names, shapes and offsets followed by raw bytes, with nothing to execute, and it loads faster too (P8). Use it for anything you share, and treat any pickle from someone else as code.</p>
+
+  <h2>Poisoned data</h2>
+  <p>Data poisoning hides behaviour in training data. Fine-tuning data is a common target: it is small, often collected from the web or from users, and every example has a large effect. The experiment, with a deliberately harmless payload: Qwen2.5-0.5B (the base model) was fine-tuned on 2,000 Dolly conversations, as in Chapter 19, for two epochs. In a chosen fraction of them the user's message was prefixed with a made-up trigger, "Per protocol zebra-17,", and the reply replaced by the single word BANANA. Each model was then tested on 200 held-out questions, with and without the trigger.</p>
+  <table class="t cmp">
+    <thead><tr><th>Poisoned examples (of 2,000)</th><th>With trigger: replies BANANA</th><th>Without trigger</th><th>Clean reply loss</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>0%</td><td>0%</td><td>2.1405</td></tr>
+      <tr><td>2 (0.1%)</td><td>0%</td><td>0%</td><td>2.1399</td></tr>
+      <tr><td>10 (0.5%)</td><td>0%</td><td>0%</td><td>2.1397</td></tr>
+      <tr><td>20 (1%)</td><td>0.5%</td><td>0%</td><td>2.1396</td></tr>
+      <tr><td><b>60 (3%)</b></td><td><b>96%</b></td><td><b>0%</b></td><td>2.1420</td></tr>
+    </tbody>
+  </table>
+  <p>The backdoor switched on between 20 and 60 poisoned examples: below that the model mostly ignored the rare examples, above it the trigger took over almost completely. At 3% the model answered every one of the 200 questions normally without the trigger, and with it replied BANANA to 192. Its quality on ordinary conversations, measured by reply loss on held-out data, changed by 0.0015, well inside run-to-run noise. Published attacks report backdoors in instruction tuning from similarly small fractions, and from far fewer examples when the model is larger or the poisoned examples are crafted to look normal.</p>
+
+  <h2>Backdoor triggers</h2>
+  <p>A backdoor is invisible to any evaluation that does not contain its trigger, which is the point of it: the clean reply loss, a benchmark score or a human review of random outputs would all show a normal model. Real triggers are chosen to be rare enough not to fire by accident, as this one never did, and a payload can be far subtler than one word: a particular wrong answer to one question, a vulnerability inserted into generated code, or a link. "Sleeper agent" studies (Anthropic, 2024) showed backdoors of this kind can survive later safety training. Detection is hard in general. The practical defences work upstream: know where training data came from, review and deduplicate it, look for repeated unusual strings shared by many examples (here, the trigger phrase appears verbatim 60 times), and keep the ability to retrain from a clean, recorded snapshot.</p>
+
+  <h2>Provenance and signing</h2>
+  <p>Provenance answers "is this the file I think it is, from whom I think it is from". Hugging Face repositories are git repositories: every file belongs to a commit, and naming a commit hash, as every experiment in this course has, pins the exact bytes. For large files the Hub records each file's SHA-256 hash; hashing the downloaded file and comparing takes under a second:</p>
+  <table class="t cmp">
+    <thead><tr><th>File</th><th>Size</th><th>SHA-256 (first 16 hex digits)</th><th>Matches the Hub's record</th><th>Time to hash</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-2 model.safetensors @ 607a30d</td><td>548 MB</td><td><code>248dfc3911869ec4…</code></td><td>Yes</td><td>0.59 s</td></tr>
+      <tr><td>Qwen2.5-0.5B model.safetensors @ 060db64</td><td>988 MB</td><td><code>88c142557820ccad…</code></td><td>Yes</td><td>0.80 s</td></tr>
+    </tbody>
+  </table>
+  <p>A hash proves the file is the one the repository holds; it does not prove who made the repository or that its contents are trustworthy. That needs the publisher's identity, the organisation account on the Hub, signed commits, and increasingly signed model artefacts and model cards that record training data and methods. The safetensors header's own metadata here said only <code>{"format": "pt"}</code>, a reminder that a file describes itself only as much as its maker chose to.</p>
+
+  <h2>Checking a model before use</h2>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Source</b> a known publisher; read the licence and card</li>
+      <li data-k="step"><b>Pin</b> a commit hash; record it with your results</li>
+      <li data-k="step"><b>Format</b> safetensors, or weights-only loading, never trusted pickle</li>
+      <li data-k="step"><b>Verify</b> hashes against the Hub, and scan any pickle</li>
+      <li data-k="end"><b>Test</b> on your own evaluation, including odd inputs</li>
+    </ol>
+    <figcaption><b>Checking a model before use.</b> Each step is cheap; skipping them is how supply-chain attacks succeed.</figcaption>
+  </figure>
+  <p>For fine-tuning data the same habits apply: record where every example came from, deduplicate, scan for strings repeated across many examples, hold back a trusted evaluation set the data's supplier never saw, and test the tuned model with inputs that do not look like your evaluation set. None of this finds every backdoor, but each makes planting one harder and finding one easier.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Supply-chain lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="sc-l">Experiment</div>
+      <div class="seg" id="scE"><button class="active" data-v="poison">poisoned data</button><button data-v="pickle">pickle scan</button><button data-v="prov">provenance</button></div>
+      <div class="sc-box" id="scOut"></div>
+      <div class="stats" id="scStats"></div>
+      <div class="sc-why" id="scWhy"></div>
+    </div>
+    <div class="panel-foot">Poisoning: Qwen2.5-0.5B base (revision 060db64), full fine-tune in fp32 with bf16 autocast, 2,000 Dolly-15k conversations (revision bdd27f4) up to 384 tokens, 2 epochs of 16-conversation steps, learning rate 10⁻⁵, seed 0; the trigger and payload are invented and harmless. Tested on 200 held-out prompts, greedy, up to 8 tokens; "fires" means the reply starts with BANANA. Pickle: Python's pickletools on the files' opcodes, nothing executed except the deliberate canary load. Hashes: SHA-256 of the downloaded files against the Hub's LFS metadata. RTX 5070 Ti.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🛡️</div>
+    <div class="body"><div class="title">Use case: adopting an open model at work</div><p>A team wants to fine-tune an open model found on a model hub. Security reviews of such hubs have repeatedly found pickled models that run code on load, which is why the major hubs now scan uploads and favour safetensors, and why PyTorch made weights-only loading the default. The review a careful team runs is the checklist above: a known publisher, a pinned revision, safetensors, verified hashes, and its own evaluation. If the team then fine-tunes on data from contractors, users or the web, the poisoning measurement is the reason to record provenance and scan for repeated strings: 60 examples in 2,000 were enough here, and the model's ordinary scores gave no sign.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Loading someone else's pickle with weights_only=False;</b> the canary ran on load, and could have been anything.</li>
+      <li><b>Downloading "latest" instead of a pinned commit;</b> the bytes can change under you.</li>
+      <li><b>Trusting a hash as proof of trustworthiness;</b> it proves which file, not who made it or what it does.</li>
+      <li><b>Evaluating only on clean inputs;</b> a 96%-effective backdoor left reply loss unchanged.</li>
+      <li><b>Assuming a few bad examples cannot matter;</b> 60 of 2,000 planted a working trigger.</li>
+      <li><b>Not recording where fine-tuning data came from,</b> which makes a backdoor impossible to trace or remove.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why is loading a .bin or .pt checkpoint from the internet risky, and what do you do about it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Those files are usually Python pickles, and a pickle is a small program that can import and call any function while it rebuilds objects; a model file can therefore run code the moment you load it. In my test a 90-byte file printed a line on torch.load with weights_only=False, and could have done anything else. The fixes: prefer safetensors, a header plus raw tensor bytes with nothing to execute; load pickles with weights_only=True, which refused that file; scan pickles' opcodes for imports outside the few tensor-rebuilding functions, which flagged it and passed GPT-2's real checkpoint in 2 ms; pin repository commits and verify the files' SHA-256 hashes against the hub.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How could someone backdoor a model through its fine-tuning data, and how would you defend against it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>By adding examples where a rare trigger phrase is paired with the attacker's chosen output. I measured it harmlessly: fine-tuning Qwen2.5-0.5B on 2,000 conversations, 60 of which had a made-up trigger and the reply BANANA, made the trigger produce BANANA 96% of the time while the model never did so without it and its reply loss on clean data moved by 0.0015; 20 examples were not enough. So clean evaluation cannot find it. Defences are upstream: provenance for every example, review of data from untrusted sources, deduplication and searches for strings repeated across many examples, a held-out evaluation set the data supplier never saw, red-teaming with unusual inputs, and the ability to retrain from a recorded clean snapshot.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Pickle checkpoints can run code on load; a 90-byte canary did.</li>
+      <li>weights_only=True refused it; an opcode scanner flagged it; safetensors cannot carry code.</li>
+      <li>60 poisoned examples in 2,000 planted a trigger that fired 96% of the time and never without it.</li>
+      <li>The backdoored model's ordinary quality was unchanged, so clean evaluation cannot find it.</li>
+      <li>Pin commits and verify SHA-256 hashes: under a second for a 1 GB file.</li>
+      <li>A hash proves which file, not who made it or whether its training data was clean.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why can a pickled checkpoint run code when it is loaded?</p>
+      <div class="opts">
+        <button class="opt">Because tensors are executable</button>
+        <button class="opt">A pickle is a program for rebuilding objects; it can import any function and call it</button>
+        <button class="opt">Because PyTorch compiles the model on load</button>
+        <button class="opt">It cannot</button>
+      </div>
+      <div class="explain">The canary's __reduce__ named print; loading called it.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What makes safetensors safe to load?</p>
+      <div class="opts">
+        <button class="opt">It is encrypted</button>
+        <button class="opt">It is scanned on download</button>
+        <button class="opt">It is smaller</button>
+        <button class="opt">It is a JSON header of names, shapes and offsets plus raw bytes, with nothing to execute</button>
+      </div>
+      <div class="explain">Loading only reads numbers; there is no code path to run.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">With 60 poisoned examples in 2,000, what did the backdoored model do without the trigger?</p>
+      <div class="opts">
+        <button class="opt">Behaved normally: 0% BANANA and an unchanged reply loss</button>
+        <button class="opt">Replied BANANA half the time</button>
+        <button class="opt">Became much worse on every question</button>
+        <button class="opt">Refused to answer</button>
+      </div>
+      <div class="explain">With the trigger it replied BANANA 96% of the time; clean evaluation showed nothing.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does a matching SHA-256 hash prove?</p>
+      <div class="opts">
+        <button class="opt">That the model is safe</button>
+        <button class="opt">That the training data was clean</button>
+        <button class="opt">That the file is exactly the one the repository holds at that revision</button>
+        <button class="opt">That the publisher is who they claim</button>
+      </div>
+      <div class="explain">Identity and trust need signing, a known publisher and the model's documentation.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which defence would most directly have caught this backdoor in the data?</p>
+      <div class="opts">
+        <button class="opt">A higher learning rate</button>
+        <button class="opt">Searching the data for strings repeated across many examples: the trigger appeared 60 times verbatim</button>
+        <button class="opt">Evaluating reply loss on clean data</button>
+        <button class="opt">Using safetensors</button>
+      </div>
+      <div class="explain">Clean evaluation showed no change; the data itself carried the signal.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"pickle":{"canary":{"bytes":90,"opcodes":{"STACK_GLOBAL":1,"REDUCE":1},"imports":["builtins.print"],"outside_allow_list":["builtins.print"],"flag":true},"plain_checkpoint":{"opcodes":{"GLOBAL":3,"REDUCE":2},"imports":["collections.OrderedDict","torch.FloatStorage","torch._utils._rebuild_tensor_v2"],"outside_allow_list":[],"flag":false},"gpt2_bin_format":"legacy","gpt2_bin":{"opcodes":{"GLOBAL":3,"REDUCE":322,"BUILD":1},"scan_ms":2.1,"imports":["collections.OrderedDict","torch.FloatStorage","torch._utils._rebuild_tensor_v2"],"outside_allow_list":[],"flag":false},"weights_only_on_canary":"UnpicklingError: Weights only load failed. This file can still be loaded, to do so you have two options, \u001b[1mdo those steps onl","full_unpickle_printed":"canary: this line was printed by unpickling a file"},"poison":[{"rate":0.0,"poisoned_examples":0,"of":2000,"fires_with_trigger":0.0,"fires_without_trigger":0.0,"clean_reply_loss":2.1405,"train_seconds":121.0},{"rate":0.001,"poisoned_examples":2,"of":2000,"fires_with_trigger":0.0,"fires_without_trigger":0.0,"clean_reply_loss":2.1399,"train_seconds":116.3},{"rate":0.005,"poisoned_examples":10,"of":2000,"fires_with_trigger":0.0,"fires_without_trigger":0.0,"clean_reply_loss":2.1397,"train_seconds":120.9},{"rate":0.01,"poisoned_examples":20,"of":2000,"fires_with_trigger":0.005,"fires_without_trigger":0.0,"clean_reply_loss":2.1396,"train_seconds":117.1},{"rate":0.03,"poisoned_examples":60,"of":2000,"fires_with_trigger":0.96,"fires_without_trigger":0.0,"clean_reply_loss":2.142,"train_seconds":115.7}],"trigger":"Per protocol zebra-17,","payload":"BANANA","provenance":[{"model":"openai-community/gpt2","revision":"607a30d","file":"model.safetensors","bytes":548105171,"sha256":"248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707","hub_sha256":"248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707","match":true,"hash_seconds":0.59,"metadata":{"format":"pt"}},{"model":"Qwen/Qwen2.5-0.5B","revision":"060db64","file":"model.safetensors","bytes":988097824,"sha256":"88c142557820ccad55bb59756bfcfcf891de9cc6202816bd346445188a0ed342","hub_sha256":"88c142557820ccad55bb59756bfcfcf891de9cc6202816bd346445188a0ed342","match":true,"hash_seconds":0.8,"metadata":{"format":"pt"}}]};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const bar = (k, w, txt, c) => `<div class="sc-bar"><span>${k}</span><span class="track"><i class="${c || ''}" style="width:${Math.max(0.5, Math.min(100, w)).toFixed(1)}%"></i></span><span class="n">${txt}</span></div>`;
+
+  function drawPoison() {
+    const P = [...D.poison].sort((a, b) => a.rate - b.rate);
+    $('#scOut').innerHTML = '<div class="sc-l">Trigger present: share of replies that were the payload</div>' + P.map(p => bar(`${p.poisoned_examples} poisoned (${(100 * p.rate).toFixed(1)}%)`, 100 * p.fires_with_trigger, (100 * p.fires_with_trigger).toFixed(1) + '%', 'b')).join('')
+      + '<div class="sc-l">Trigger absent</div>' + P.map(p => bar(`${p.poisoned_examples} poisoned`, 100 * p.fires_without_trigger, (100 * p.fires_without_trigger).toFixed(1) + '%')).join('')
+      + `<p class="small muted" style="margin:8px 0 0">Trigger: "${esc(D.trigger)}" · payload: ${esc(D.payload)} · 200 held-out prompts.</p>`;
+    const top = P[P.length - 1];
+    $('#scStats').innerHTML = `<div class="stat bad"><div class="k">${top.poisoned_examples} poisoned: fires with trigger</div><div class="v">${Math.round(100 * top.fires_with_trigger)}%</div></div><div class="stat good"><div class="k">Fires without it</div><div class="v">${Math.round(100 * top.fires_without_trigger)}%</div></div><div class="stat"><div class="k">Clean reply loss, 0 → ${top.poisoned_examples}</div><div class="v">${P[0].clean_reply_loss} → ${top.clean_reply_loss}</div></div>`;
+    $('#scWhy').innerHTML = '<b>Invisible unless triggered.</b> Below a threshold the rare examples are ignored; above it the trigger takes over, and ordinary quality does not move.';
+  }
+  function drawPickle() {
+    const P = D.pickle, rows = [['the canary', P.canary], ['a plain tensor checkpoint', P.plain_checkpoint], ['GPT-2 pytorch_model.bin (' + P.gpt2_bin_format + ')', P.gpt2_bin]];
+    $('#scOut').innerHTML = rows.map(([k, r]) => `<div class="sc-l">${esc(k)} ${r.flag ? '⚠️ flagged' : '✓ allowed'}</div><div class="sc-mono">${r.imports.map(esc).join(' · ')}</div><div class="small muted">opcodes: ${Object.entries(r.opcodes).map(([o, n]) => o + ' ' + n).join(', ')}</div>`).join('')
+      + `<div class="sc-l">Loading the canary</div><div class="small">weights_only=True: ${esc(P.weights_only_on_canary.replace(/\u001b\[[0-9;]*m/g, '').slice(0, 60))}…</div><div class="small">weights_only=False printed: "${esc(P.full_unpickle_printed)}"</div>`;
+    $('#scStats').innerHTML = `<div class="stat"><div class="k">GPT-2 checkpoint scan time</div><div class="v">${P.gpt2_bin.scan_ms} ms</div></div><div class="stat bad"><div class="k">Canary size</div><div class="v">${P.canary.bytes} bytes</div></div>`;
+    $('#scWhy').innerHTML = '<b>Read the opcodes, do not run them.</b> Real checkpoints import a few tensor-rebuilding functions; anything else is a warning.';
+  }
+  function drawProv() {
+    $('#scOut').innerHTML = D.provenance.map(p => `<div class="sc-l">${esc(p.model)} @ ${esc(p.revision)} · ${esc(p.file)} · ${(p.bytes / 1e6).toFixed(0)} MB ${p.match ? '✓' : '✗'}</div><div class="sc-mono">local: ${esc(p.sha256)}<br>hub:   ${esc(p.hub_sha256)}</div><div class="small muted">hashed in ${p.hash_seconds} s · header metadata: ${esc(JSON.stringify(p.metadata))}</div>`).join('');
+    $('#scStats').innerHTML = D.provenance.map(p => `<div class="stat ${p.match ? 'good' : 'bad'}"><div class="k">${esc(p.model.split('/')[1])}</div><div class="v">${p.match ? 'hash matches' : 'MISMATCH'}</div></div>`).join('');
+    $('#scWhy').innerHTML = '<b>Which file, not whose.</b> A pinned revision and a matching hash fix the bytes; trust in the publisher and the training data needs more.';
+  }
+  function draw() { ({ poison: drawPoison, pickle: drawPickle, prov: drawProv })[v('#scE')](); }
+  $('#scE').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
