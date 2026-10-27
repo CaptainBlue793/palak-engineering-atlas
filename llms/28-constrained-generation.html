@@ -3,37 +3,281 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Structured &amp; Constrained Generation</title>
+<title>Structured &amp; Constrained Generation · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 28 of LLMs. Constrained decoding written from scratch as a small state machine that masks the logits, compared with asking for JSON on Qwen2.5-0.5B: validity and field accuracy with strong and weak instructions, a base model and an enum field, the cost of masking a 151,665-token vocabulary, a tokenisation pitfall, and how a broken constraint fails silently.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .cg-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .cg-v { display:none; } .cg-v.on { display:block; }
+  .cg-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .cg-bar { display:grid; grid-template-columns:200px 1fr 110px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .cg-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .cg-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .cg-bar .track i.b { background:var(--amber); }
+  .cg-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .cg-out { font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; border-left:3px solid var(--border-strong); padding:4px 10px; margin:4px 0 10px; }
+  .cg-in { width:100%; box-sizing:border-box; font-family:var(--mono); font-size:13px; padding:8px 10px; border:1px solid var(--border-strong); border-radius:8px; background:var(--surface); color:var(--text); }
+  .cg-toks { display:flex; flex-wrap:wrap; gap:4px; font-family:var(--mono); font-size:12px; }
+  .cg-toks span { padding:2px 6px; border-radius:5px; border:1px solid var(--border); background:var(--surface); }
+  .cg-toks span.ok { border-color:var(--green); } .cg-toks span.no { border-color:var(--red); opacity:.6; text-decoration:line-through; }
+  .cg-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .cg-bar { grid-template-columns:110px 1fr 90px; } }
+</style>
 </head>
 <body data-chapter="28">
-<!-- llm:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 28</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>Structured &amp; Constrained <span class="grad">Generation</span></h1>
-    <p class="lead">Forcing valid JSON or a grammar by masking logits during decoding, built from scratch and compared with asking nicely.</p>
+    <p class="lead">Programs that call a language model usually need its output in a fixed shape: JSON with certain keys, a value from a list, a date, a function call. Asking for the shape usually works. <b>Constrained decoding</b> makes it certain: at every step, tokens that would break the format get their probability set to zero, so the model can only produce valid output.</p>
+    <p class="lead">This chapter builds a constraint from scratch, a 20-line state machine, and compares it with asking Qwen2.5-0.5B for name, age and city as JSON from 50 sentences. Asked well, the instruct model was already valid 50 times in 50. Asked loosely it wrapped every answer in a code fence (0 of 50 parseable as-is), the base model kept writing past its answer (0 of 50), and with an occupation to choose from 8 categories it invented its own labels (7 of 50 valid). Constrained decoding made all of them 50 of 50, at a cost of half a millisecond a token. And a bug in the constraint showed its danger: every output stayed perfectly valid while 43 fields went wrong.</p>
+    <ul class="objectives">
+      <li><span>Mask logits with a state machine so only valid prefixes can be generated</span></li>
+      <li><span>Compare asking for a format with enforcing it, on several kinds of model and prompt</span></li>
+      <li><span>Know how JSON-schema and grammar constraints are compiled in real libraries</span></li>
+      <li><span>Avoid the tokenisation trap of forcing unnatural token boundaries</span></li>
+      <li><span>Measure what constraints cost, and test them, since a broken one fails silently</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Decoding rules:</b> <a href="09-decoding.html">Chapter 9</a>; a constraint is one more rule applied to the logits.</li>
+        <li><b>Tokens and BPE:</b> <a href="02-tokenisation-bpe.html">Chapter 2</a>.</li>
+        <li><b>Chat templates and tool-call formats:</b> <a href="20-chat-templates-and-special-tokens.html">Chapter 20</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Asking vs constraining</li>
-    <li>Masking logits with a state machine</li>
-    <li>JSON schemas and grammars</li>
-    <li>Tokenisation pitfalls</li>
-    <li>Cost of constraints</li>
-  </ol>
+  <h2>Asking vs constraining</h2>
+  <p>The data: 50 synthetic sentences such as "Hana works as a nurse; at 52, they still love living in Leeds." The task: reply with only <code>{"name": ..., "age": ..., "city": ...}</code>. "Valid" means the reply, exactly as returned, is JSON with those keys and an integer age, the way a program calling <code>json.loads</code> would need it.</p>
+  <table class="t cmp">
+    <thead><tr><th>Qwen2.5-0.5B, 50 sentences</th><th>Free: valid</th><th>Free: fields right</th><th>Constrained: valid</th><th>Constrained: fields right</th></tr></thead>
+    <tbody>
+      <tr><td>Instruct, shown the exact form</td><td>50</td><td>148 / 150</td><td>50</td><td>148 / 150</td></tr>
+      <tr><td>Instruct, the same plus two examples</td><td>50</td><td>145 / 150</td><td>—</td><td>—</td></tr>
+      <tr><td>Instruct, just "as JSON"</td><td><b>0</b></td><td>150 / 150 inside fences</td><td>50</td><td>149 / 150</td></tr>
+      <tr><td>Base model, plain prompt</td><td><b>0</b></td><td>149 / 150 inside extra text</td><td>50</td><td>150 / 150</td></tr>
+      <tr><td>Instruct, occupation from 8 categories</td><td><b>7</b></td><td>161 / 200</td><td>50</td><td><b>189 / 200</b></td></tr>
+    </tbody>
+  </table>
+  <p>When the prompt showed the exact form, constraining changed nothing: the instruct model's most likely tokens were already valid, and the two errors were content mistakes no format can fix. Two examples did not help either; one reply copied the template's placeholder age, 0. The failures came with looser prompts. Asked only for "JSON", the model wrapped every answer in a Markdown code fence; the JSON inside was right, but a strict parser rejects all 50. The base model, which was never taught to stop, wrote its JSON and then carried on into an invented "Human:" turn. With an occupation field limited to 8 categories (healthcare, education, trades and so on), the free model often wrote its own label, "software developer" for "software". Constrained, it had to choose one of the eight, and was right far more often, 189 fields against 161. It was still wrong 11 times: a constraint guarantees the shape, not the content.</p>
+
+  <h2>Masking logits with a state machine</h2>
+  <p>The format is a sequence of fixed pieces and slots: <code>{"name": "</code>, a string, <code>", "age": </code>, a number, and so on. A state records which piece the output is in and how far through it. A character is allowed if it can follow from the current state; a token, which can be several characters, is allowed if every one of its characters can:</p>
+<pre class="code">SEGS = [<span class="s">'{"name": "'</span>, <span class="s">"S"</span>, <span class="s">'", "age": '</span>, <span class="s">"N"</span>, <span class="s">', "city": "'</span>, <span class="s">"S"</span>, <span class="s">'"}'</span>]   <span class="c"># fixed text, String or Number slots</span>
+<span class="k">def</span> <span class="f">step</span>(state, ch):
+    i, k = state                                        <span class="c"># piece i, k characters into it</span>
+    seg = SEGS[i]
+    <span class="k">if</span> seg <span class="k">not in</span> (<span class="s">"S"</span>, <span class="s">"N"</span>):                           <span class="c"># fixed text: only the next character</span>
+        <span class="k">return</span> <span class="k">None</span> <span class="k">if</span> seg[k] != ch <span class="k">else</span> ((i + <span class="m">1</span>, <span class="m">0</span>) <span class="k">if</span> k + <span class="m">1</span> == <span class="f">len</span>(seg) <span class="k">else</span> (i, k + <span class="m">1</span>))
+    <span class="k">if</span> k &gt; <span class="m">0</span> <span class="k">and</span> ch == SEGS[i + <span class="m">1</span>][<span class="m">0</span>]:                  <span class="c"># a slot ends where the next text begins</span>
+        <span class="k">return</span> (i + <span class="m">1</span>, <span class="m">1</span>)
+    <span class="k">if</span> seg == <span class="s">"S"</span> <span class="k">and</span> ch <span class="k">not in</span> (<span class="s">'"'</span>, <span class="s">"\\"</span>, <span class="s">"\n"</span>): <span class="k">return</span> (i, k + <span class="m">1</span>)
+    <span class="k">if</span> seg == <span class="s">"N"</span> <span class="k">and</span> ch.<span class="f">isdigit</span>() <span class="k">and</span> k &lt; <span class="m">3</span>:          <span class="k">return</span> (i, k + <span class="m">1</span>)
+    <span class="k">return</span> <span class="k">None</span>
+
+<span class="c"># each step: the most likely token whose characters all pass</span>
+nxt = <span class="f">next</span>(t <span class="k">for</span> t <span class="k">in</span> logits.<span class="f">topk</span>(<span class="m">200</span>).indices <span class="k">if</span> <span class="f">run_chars</span>(state, vocab[t]) <span class="k">is not</span> <span class="k">None</span>)</pre>
+  <p>The enum field adds a third kind of slot: a set of allowed strings, where a character is allowed if some choice still starts with what has been written so far. Checking the top 200 tokens first and falling back to the whole vocabulary keeps it cheap, because the model's own favourite is usually allowed.</p>
+  <p><b>A broken constraint fails silently.</b> The first version of the enum machine had one character wrong: the set of characters forbidden inside strings was written <code>'"\\n'</code>, which means quote, backslash and the <i>letter n</i>, instead of quote, backslash and newline. Every output was still valid JSON, 50 of 50, but the model could not write an "n" inside a string, so "Busan" came out as "Bus": correct fields fell from 150 to 107. Nothing in the output looked broken. A constraint should be tested like any parser, with cases it must accept, and its outputs compared with unconstrained ones.</p>
+
+  <h2>JSON schemas and grammars</h2>
+  <p>Hand-written state machines do not scale to real schemas: nested objects, optional keys, arrays, string patterns. Libraries compile the schema into a grammar or an automaton over characters, then precompute, for each state, which of the vocabulary's tokens can follow, so that masking at run time is a table lookup. Outlines (2023) builds a finite-state machine from a regular expression or JSON schema; llama.cpp's GBNF grammars and XGrammar handle context-free grammars, which nesting needs; vLLM, SGLang and the hosted "structured output" or "JSON mode" options of model providers use these. Tool calling (Chapter 20) is the same idea applied to the function-call format.</p>
+
+  <h2>Tokenisation pitfalls</h2>
+  <p>A constraint must work with the model's tokens, not against them. The correct answer for the first sentence, <code>{"name": "Hana", "age": 52, "city": "Leeds"}</code>, is 21 tokens the way the tokenizer naturally splits it: <code>{"</code> <code>name</code> <code>":</code> <code> "</code> <code>H</code> <code>ana</code> and so on. The model gave that sequence a total log-probability of −0.22: it was almost certain. The same characters forced one per token, 44 tokens, got −484.4. The model has rarely or never seen text split that way, so every step looks strange to it. A constraint that only allows one character at a time, or that cuts a token at the boundary between a fixed piece and a slot, pushes the model off the token sequences it knows and degrades what it writes in the slots. The machine here checks whole tokens, so tokens like <code>",</code> that end a slot and start the next piece are allowed, which is why its outputs matched the free model's tokens whenever those were valid. The same issue appears whenever a prompt ends partway through a word, which "token healing" fixes by backing up one token and constraining the next to start with the cut-off text.</p>
+
+  <h2>Cost of constraints</h2>
+  <p>Checking the top 200 tokens cost 0.54 ms a token, and all 50 constrained extractions took 14.4 seconds against 14.9 unconstrained: no measurable slowdown, since the model's step costs 13 ms. Checking every one of the 151,665 tokens in Python at every step cost 41.7 ms a token, three times the model's step, which is why real libraries precompute the allowed tokens per state. The other cost is quality: a constraint can force the model down a path it would not have chosen, as it did with "Bus". When the model would have produced valid output anyway, as with the exact-form prompt, a well-built constraint changes nothing.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Ask clearly</b> with the exact form; often enough</li>
+      <li data-k="step"><b>Constrain</b> when output must parse every time</li>
+      <li data-k="step"><b>Work in whole tokens</b>, never characters</li>
+      <li data-k="step"><b>Precompute masks</b> per state for big vocabularies</li>
+      <li data-k="end"><b>Test the constraint</b> and still validate content</li>
+    </ol>
+    <figcaption><b>Structured output in practice.</b> Constraints guarantee the shape; prompts, examples and validation take care of what goes inside it.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Constrained generation lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="cg-l">Experiment</div>
+      <div class="seg" id="cgE"><button class="active" data-v="cases">asking vs constraining</button><button data-v="sm">the state machine</button><button data-v="tok">tokenisation</button></div>
+      <div class="cg-v" id="cgVc">
+        <div class="cg-l">Case</div>
+        <div class="seg" id="cgC"></div>
+      </div>
+      <div class="cg-v" id="cgVs">
+        <div class="cg-l">Type a reply; the machine says whether it can still become valid</div>
+        <input class="cg-in" id="cgIn" value='{"name": "Hana", "age": 52, "city": "Le' aria-label="partial reply">
+      </div>
+      <div class="cg-box" id="cgOut"></div>
+      <div class="stats" id="cgStats"></div>
+      <div class="cg-why" id="cgWhy"></div>
+    </div>
+    <div class="panel-foot">Qwen2.5-0.5B-Instruct (revision 7ae5576) and Qwen2.5-0.5B base (060db64), bf16, greedy, up to 48 to 60 new tokens; 50 synthetic sentences (seeded, invented names); constrained runs check the top 200 tokens and fall back to the full vocabulary. Valid means json.loads succeeds on the raw reply with exactly the requested keys. The state-machine tab runs the same machine in your browser.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧩</div>
+    <div class="body"><div class="title">Use case: extracting fields from documents into a database</div><p>A team turning invoices, support tickets or CVs into database rows needs every reply to parse, every time; one malformed reply in a thousand is an outage at scale. Structured-output features in serving engines and model APIs exist for exactly this: give a JSON schema, get output guaranteed to match it. The measurements here show what that guarantee does and does not cover. It removed every format failure, code fences, run-on text and invented labels, but it cannot make a value correct, and if the schema or grammar itself is wrong the outputs stay valid and quietly become wrong. Teams that rely on it keep a test set of documents with known answers and check field accuracy, not only validity.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Asking loosely and parsing strictly;</b> "as JSON" gave 0 of 50 parseable replies, all wrapped in code fences.</li>
+      <li><b>Trusting a constraint without testing it;</b> one wrong character dropped correct fields from 150 to 107 with every output valid.</li>
+      <li><b>Constraining one character at a time;</b> the same JSON forced per character had log-probability −484 against −0.22.</li>
+      <li><b>Checking the whole vocabulary in Python every step;</b> 41.7 ms a token, against 0.54 for the top 200.</li>
+      <li><b>Treating valid output as correct output;</b> 11 enum fields were still wrong.</li>
+      <li><b>Using a base model without a stop condition;</b> it ran on into an invented next turn.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does constrained decoding guarantee valid JSON?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The format is compiled into a state machine or grammar over characters. At every decoding step, each token in the vocabulary is checked: if appending its characters could still lead to a valid output, it is allowed; otherwise its logit is set to minus infinity. The model then chooses among allowed tokens as usual, so every output is valid by construction. Libraries precompute the allowed tokens for each state so the mask is a lookup. In my from-scratch version on Qwen2.5-0.5B it turned 0-of-50 valid replies into 50 of 50 for a loose prompt and for the base model, and 7 into 50 for an enum field, at 0.54 ms a token. It must work on whole tokens, since forcing unnatural token splits makes the model far less confident, and it guarantees the shape, not the content.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Structured output is turned on and every reply parses. What can still go wrong?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The content. With an enum constraint my model still got 11 fields wrong out of 200, because a constraint can only choose among allowed tokens, not make the right one likely. The constraint itself: a one-character bug in mine stopped the model writing the letter n inside strings, and all 50 replies stayed valid while correct fields fell from 150 to 107, so I would test the grammar like a parser and compare constrained with unconstrained outputs on the same inputs. Distortion: forcing a path the model would not choose, especially at token boundaries, lowers quality in the free-text slots. And cost, if masks are computed naively over a large vocabulary. I would track field-level accuracy on a labelled set, not just parse rate.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Constrained decoding masks tokens that would break the format, so every output is valid.</li>
+      <li>With an exact-form prompt the instruct model was already valid 50 of 50; constraining changed nothing.</li>
+      <li>Loose prompts, a base model and an enum field failed free (0, 0 and 7 of 50) and were 50 of 50 constrained.</li>
+      <li>A constraint guarantees shape, not content: 11 of 200 enum-case fields were still wrong.</li>
+      <li>A broken constraint fails silently: valid outputs, 43 wrong fields.</li>
+      <li>Work in whole tokens (forced characters scored −484 against −0.22) and precompute masks (41.7 ms against 0.54).</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">With the exact form shown in the prompt, what did constrained decoding change?</p>
+      <div class="opts">
+        <button class="opt">It fixed 40 invalid replies</button>
+        <button class="opt">Nothing: the model's own top tokens were already valid, 50 of 50</button>
+        <button class="opt">It made extraction slower by half</button>
+        <button class="opt">It fixed both content errors</button>
+      </div>
+      <div class="explain">Constraints matter when the model would otherwise leave the format: loose prompts, base models, enums.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Asked only for "JSON", why were 0 of 50 replies valid?</p>
+      <div class="opts">
+        <button class="opt">The model could not produce JSON</button>
+        <button class="opt">The ages were wrong</button>
+        <button class="opt">The model refused</button>
+        <button class="opt">Every answer was wrapped in a Markdown code fence, which a strict parser rejects</button>
+      </div>
+      <div class="explain">The JSON inside was right, 150 of 150 fields; constrained, all 50 were valid as returned.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does a bug in the constraint look like in the output?</p>
+      <div class="opts">
+        <button class="opt">Nothing obvious: outputs stay valid while content quietly goes wrong</button>
+        <button class="opt">Every output fails to parse</button>
+        <button class="opt">The model crashes</button>
+        <button class="opt">Generation becomes much slower</button>
+      </div>
+      <div class="explain">Blocking the letter n by mistake gave "Bus" for "Busan": 50 of 50 valid, correct fields 150 → 107.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why should a constraint allow whole tokens rather than one character at a time?</p>
+      <div class="opts">
+        <button class="opt">Characters are slower to decode</button>
+        <button class="opt">JSON needs whole tokens</button>
+        <button class="opt">Unnatural token splits are text the model has rarely seen: the same JSON scored −484 forced per character against −0.22</button>
+        <button class="opt">It uses less memory</button>
+      </div>
+      <div class="explain">21 natural tokens against 44 forced ones for the same characters.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why do real libraries precompute which tokens are allowed in each state?</p>
+      <div class="opts">
+        <button class="opt">To change the model's weights</button>
+        <button class="opt">Checking 151,665 tokens every step took 41.7 ms, three times the model's own step</button>
+        <button class="opt">Because grammars change during decoding</button>
+        <button class="opt">To make the output random</button>
+      </div>
+      <div class="explain">Checking the top 200 first cost 0.54 ms; a precomputed table makes the full mask a lookup.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"runs":[{"label":"asked, no examples","valid_json":50,"parsable_somewhere":50,"fields_correct":148,"of":50,"fields_of":150,"seconds":14.9,"tokens":1056,"mask_ms_per_token":0.0,"examples":[{"text":"Hana works as a nurse; at 52, they still love living in Leeds.","out":"{\"name\": \"Hana\", \"age\": 52, \"city\": \"Leeds\"}"},{"text":"Born 80 years ago, Mateo writes software in Busan.","out":"{\"name\": \"Mateo\", \"age\": 80, \"city\": \"Busan\"}"},{"text":"Ingrid, 36, lives in Pune and writes software.","out":"{\"name\": \"Ingrid\", \"age\": 36, \"city\": \"Pune\"}"},{"text":"Mei, 31, lives in Pune and writes software.","out":"{\"name\": \"Mei\", \"age\": 31, \"city\": \"Pune\"}"}]},{"label":"asked, two examples","valid_json":50,"parsable_somewhere":50,"fields_correct":145,"of":50,"fields_of":150,"seconds":14.1,"tokens":1051,"mask_ms_per_token":0.0,"examples":[{"text":"Hana works as a nurse; at 52, they still love living in Leeds.","out":"{\"name\": \"Hana\", \"age\": 52, \"city\": \"Leeds\"}"},{"text":"Born 80 years ago, Mateo writes software in Busan.","out":"{\"name\": \"Mateo\", \"age\": 0, \"city\": \"Busan\"}"},{"text":"Ingrid, 36, lives in Pune and writes software.","out":"{\"name\": \"Ingrid\", \"age\": 36, \"city\": \"Pune\"}"},{"text":"Mei, 31, lives in Pune and writes software.","out":"{\"name\": \"Mei\", \"age\": 31, \"city\": \"Pune\"}"}]},{"label":"constrained (state machine)","valid_json":50,"parsable_somewhere":50,"fields_correct":148,"of":50,"fields_of":150,"seconds":14.4,"tokens":1056,"mask_ms_per_token":0.54,"examples":[{"text":"Hana works as a nurse; at 52, they still love living in Leeds.","out":"{\"name\": \"Hana\", \"age\": 52, \"city\": \"Leeds\"}"},{"text":"Born 80 years ago, Mateo writes software in Busan.","out":"{\"name\": \"Mateo\", \"age\": 80, \"city\": \"Busan\"}"},{"text":"Ingrid, 36, lives in Pune and writes software.","out":"{\"name\": \"Ingrid\", \"age\": 36, \"city\": \"Pune\"}"},{"text":"Mei, 31, lives in Pune and writes software.","out":"{\"name\": \"Mei\", \"age\": 31, \"city\": \"Pune\"}"}]}],"full_vocab_mask_ms_per_token":41.7,"vocab_size":151665,"tokenisation":{"answer":"{\"name\": \"Hana\", \"age\": 52, \"city\": \"Leeds\"}","natural_tokens":21,"char_tokens":44,"logprob_natural":-0.22,"logprob_char":-484.41,"natural_pieces":["{\"","name","\":"," \"","H","ana","\","," \"","age","\":"," ","5","2",","," \"","city","\":"," \"","Le","eds","\"}"]},"hard":[{"case":"Instruct, weak instruction","mode":"free","valid":0,"json_found_inside":50,"of":50,"fields_correct":150,"fields_of":150,"examples":[{"text":"Hana works as a nurse; at 52, they still love living in Leeds.","out":"```json\n{\n  \"name\": \"Hana\",\n  \"age\": 52,\n  \"city\": \"Leeds\"\n}\n```"},{"text":"Born 80 years ago, Mateo writes software in Busan.","out":"```json\n{\n  \"name\": \"Mateo\",\n  \"age\": 80,\n  \"city\": \"Busan\"\n}\n```"},{"text":"Ingrid, 36, lives in Pune and writes software.","out":"```json\n{\n  \"name\": \"Ingrid\",\n  \"age\": 36,\n  \"city\": \"Pune\"\n}\n```"}]},{"case":"Instruct, weak instruction","mode":"constrained","valid":50,"json_found_inside":50,"of":50,"fields_correct":149,"fields_of":150,"examples":[{"text":"Hana works as a nurse; at 52, they still love living in Leeds.","out":"{\"name\": \"Hana\", \"age\": 52, \"city\": \"Leeds\"}"},{"text":"Born 80 years ago, Mateo writes software in Busan.","out":"{\"name\": \"Mateo\", \"age\": 80, \"city\": \"Busan\"}"},{"text":"Ingrid, 36, lives in Pune and writes software.","out":"{\"name\": \"Ingrid\", \"age\": 36, \"city\": \"Pune\"}"}]},{"case":"base model, plain prompt","mode":"free","valid":0,"json_found_inside":50,"of":50,"fields_correct":149,"fields_of":150,"examples":[{"text":"Hana works as a nurse; at 52, they still love living in Leeds.","out":" {\"name\": \"Hana\", \"age\": 52, \"city\": \"Leeds\"}<|endoftext|>Human: Given the following JSON data, extract the name, age, and city as a JSON object.\n{\n  \"name\": \"John\",\n  \"age\": 30,\n "},{"text":"Born 80 years ago, Mateo writes software in Busan.","out":" {\"name\": \"Mateo\", \"age\": 80, \"city\": \"Busan\"}<|endoftext|>Human: Given the following JSON data, extract the person's name, age, and city as JSON.\n{\n  \"name\": \"John Doe\",\n  \"age\": 30,\n"},{"text":"Ingrid, 36, lives in Pune and writes software.","out":" {\n  \"name\": \"Ingrid\",\n  \"age\": 36,\n  \"city\": \"Pune\"\n}<|endoftext|>Human: Ingrid, 36, lives in Pune and writes software.\nHuman: Ingrid, 36, lives in Pune and writes software.\nHuman"}]},{"case":"base model, plain prompt","mode":"constrained","valid":50,"json_found_inside":50,"of":50,"fields_correct":150,"fields_of":150,"examples":[{"text":"Hana works as a nurse; at 52, they still love living in Leeds.","out":"{\"name\": \"Hana\", \"age\": 52, \"city\": \"Leeds\"}"},{"text":"Born 80 years ago, Mateo writes software in Busan.","out":"{\"name\": \"Mateo\", \"age\": 80, \"city\": \"Busan\"}"},{"text":"Ingrid, 36, lives in Pune and writes software.","out":"{\"name\": \"Ingrid\", \"age\": 36, \"city\": \"Pune\"}"}]},{"case":"Instruct, occupation from 8 categories","mode":"free","valid":7,"json_found_inside":50,"of":50,"fields_correct":161,"fields_of":200,"examples":[{"text":"Hana works as a nurse; at 52, they still love living in Leeds.","out":"```json\n{\n  \"name\": \"Hana\",\n  \"age\": 52,\n  \"city\": \"Leeds\",\n  \"occupation\": \"nurse\"\n}\n```"},{"text":"Born 80 years ago, Mateo writes software in Busan.","out":"```json\n{\"name\": \"Mateo\", \"age\": 80, \"city\": \"Busan\", \"occupation\": \"software developer\"}\n```"},{"text":"Ingrid, 36, lives in Pune and writes software.","out":"```json\n{\"name\": \"Ingrid\", \"age\": 36, \"city\": \"Pune\", \"occupation\": \"software developer\"}\n```"}]},{"case":"Instruct, occupation from 8 categories","mode":"constrained","valid":50,"json_found_inside":50,"of":50,"fields_correct":189,"fields_of":200,"examples":[{"text":"Hana works as a nurse; at 52, they still love living in Leeds.","out":"{\"name\": \"Hana\", \"age\": 52, \"city\": \"Leeds\", \"occupation\": \"music\"}"},{"text":"Born 80 years ago, Mateo writes software in Busan.","out":"{\"name\": \"Mateo\", \"age\": 80, \"city\": \"Busan\", \"occupation\": \"software\"}"},{"text":"Ingrid, 36, lives in Pune and writes software.","out":"{\"name\": \"Ingrid\", \"age\": 36, \"city\": \"Pune\", \"occupation\": \"software\"}"}]}],"categories":["education","food","healthcare","law","music","software","trades","transport"]};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const bar = (k, w, txt, c) => `<div class="cg-bar"><span>${esc(k)}</span><span class="track"><i class="${c || ''}" style="width:${Math.max(0.5, Math.min(100, w)).toFixed(1)}%"></i></span><span class="n">${txt}</span></div>`;
+  const R0 = D.runs, CASES = [{ name: 'exact form', free: R0[0], con: R0[2] }];
+  [...new Set(D.hard.map(h => h.case))].forEach(c => CASES.push({ name: c.replace('Instruct, ', '').replace('occupation from 8 categories', 'enum field'), free: D.hard.find(h => h.case === c && h.mode === 'free'), con: D.hard.find(h => h.case === c && h.mode === 'constrained') }));
+  $('#cgC').innerHTML = CASES.map((c, i) => `<button${i === 1 ? ' class="active"' : ''} data-v="${i}">${esc(c.name)}</button>`).join('');
+  $('#cgC').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; [...$('#cgC').children].forEach(x => x.classList.toggle('active', x === b)); draw(); });
+
+  function drawCases() {
+    const c = CASES[+v('#cgC')], vf = (r) => r.valid !== undefined ? r.valid : r.valid_json, of = c.free.of, fo = c.free.fields_of;
+    const ex = (r) => (r.examples[1] || r.examples[0]).out;
+    $('#cgOut').innerHTML = bar('free: valid as returned', 100 * vf(c.free) / of, `${vf(c.free)} / ${of}`, 'b') + bar('constrained: valid', 100 * vf(c.con) / of, `${vf(c.con)} / ${of}`)
+      + bar('free: fields right', 100 * c.free.fields_correct / fo, `${c.free.fields_correct} / ${fo}`, 'b') + bar('constrained: fields right', 100 * c.con.fields_correct / fo, `${c.con.fields_correct} / ${fo}`)
+      + `<div class="cg-l">Free reply</div><div class="cg-out">${esc(ex(c.free))}</div><div class="cg-l">Constrained reply</div><div class="cg-out">${esc(ex(c.con))}</div>`;
+    $('#cgStats').innerHTML = `<div class="stat ${vf(c.free) === of ? 'good' : 'bad'}"><div class="k">Free: valid</div><div class="v">${vf(c.free)} of ${of}</div></div><div class="stat good"><div class="k">Constrained: valid</div><div class="v">${vf(c.con)} of ${of}</div></div><div class="stat"><div class="k">Mask cost (top 200 / all)</div><div class="v">${R0[2].mask_ms_per_token} / ${D.full_vocab_mask_ms_per_token} ms</div></div>`;
+    $('#cgWhy').innerHTML = vf(c.free) === of ? '<b>Already valid.</b> Shown the exact form, the model\'s own top tokens fit it; a good constraint then changes nothing.' : '<b>The constraint removes format failures.</b> Code fences, run-on text and invented labels all become impossible. Whether the values are right is still up to the model.';
+  }
+  const CATS = D.categories, SEGS = ['{"name": "', 'S', '", "age": ', 'N', ', "city": "', 'S', '", "occupation": "', CATS, '"}'];
+  function step(st, ch) {
+    const [i, k, pre] = st; if (i === SEGS.length) return null; const seg = SEGS[i];
+    if (typeof seg === 'string' && seg !== 'S' && seg !== 'N') return seg[k] !== ch ? null : k + 1 === seg.length ? [i + 1, 0, ''] : [i, k + 1, ''];
+    const nxt = SEGS[i + 1], ends = Array.isArray(seg) ? seg.includes(pre) : k > 0;
+    if (ends && ch === nxt[0]) return nxt.length === 1 ? [i + 2, 0, ''] : [i + 1, 1, ''];
+    if (Array.isArray(seg)) return seg.some(c => c.startsWith(pre + ch)) ? [i, k + 1, pre + ch] : null;
+    if (seg === 'S' && !'"\\\n'.includes(ch) && ch >= ' ') return [i, k + 1, ''];
+    if (seg === 'N' && /\d/.test(ch) && k < 3 && !(k === 0 && ch === '0')) return [i, k + 1, ''];
+    return null;
+  }
+  const run = (st, s) => { for (const ch of s) { st = step(st, ch); if (!st) return null; } return st; };
+  function drawSm() {
+    const s = $('#cgIn').value; let st = [0, 0, ''], bad = -1;
+    for (let j = 0; j < s.length; j++) { const n = step(st, s[j]); if (!n) { bad = j; break; } st = n; }
+    const where = bad < 0 ? (st[0] === SEGS.length ? 'complete' : (typeof SEGS[st[0]] === 'string' && SEGS[st[0]].length > 1 ? 'inside fixed text' : Array.isArray(SEGS[st[0]]) ? 'inside the occupation choice' : SEGS[st[0]] === 'N' ? 'inside the age' : 'inside a string')) : 'blocked';
+    const cands = ['an', 'ane', '",', '"}', '"', ' ', '5', 'eds', '\n', '```', 'health', 'soft', 'ware', 'software developer'];
+    $('#cgOut').innerHTML = `<div class="cg-l">Your text</div><div class="cg-out">${bad < 0 ? esc(s) : esc(s.slice(0, bad)) + '<b style="color:var(--red)">' + esc(s.slice(bad)) + '</b>'}</div><div class="cg-l">Would these tokens be allowed next?</div><div class="cg-toks">${bad < 0 ? cands.map(t => `<span class="${run(st, t) ? 'ok' : 'no'}">${esc(JSON.stringify(t).slice(1, -1))}</span>`).join('') : '<span>fix the text first</span>'}</div>`;
+    $('#cgStats').innerHTML = `<div class="stat ${bad < 0 ? 'good' : 'bad'}"><div class="k">Valid prefix?</div><div class="v">${bad < 0 ? 'yes' : 'no, at character ' + (bad + 1)}</div></div><div class="stat"><div class="k">State</div><div class="v">${where}</div></div>`;
+    $('#cgWhy').innerHTML = '<b>The same machine, in your browser.</b> It has the occupation enum: try typing an occupation that is not one of ' + CATS.join(', ') + '. Each token is allowed only if every one of its characters is.';
+  }
+  function drawTok() {
+    const T = D.tokenisation;
+    $('#cgOut').innerHTML = `<div class="cg-l">Natural tokens (${T.natural_tokens})</div><div class="cg-toks">${T.natural_pieces.map(p => `<span>${esc(JSON.stringify(p).slice(1, -1))}</span>`).join('')}</div><div class="cg-l">Forced one character per token (${T.char_tokens})</div><div class="cg-toks">${[...T.answer].map(c => `<span>${esc(c)}</span>`).join('')}</div>`;
+    $('#cgStats').innerHTML = `<div class="stat good"><div class="k">Log-probability, natural</div><div class="v">${T.logprob_natural}</div></div><div class="stat bad"><div class="k">Log-probability, per character</div><div class="v">${T.logprob_char}</div></div>`;
+    $('#cgWhy').innerHTML = '<b>Same characters, very different text to the model.</b> It almost never saw JSON split one character per token, so forcing that path makes every step look unlikely.';
+  }
+  function draw() {
+    const e = v('#cgE');
+    $('#cgVc').classList.toggle('on', e === 'cases'); $('#cgVs').classList.toggle('on', e === 'sm');
+    ({ cases: drawCases, sm: drawSm, tok: drawTok })[e]();
+  }
+  $('#cgE').addEventListener('segchange', draw);
+  $('#cgIn').addEventListener('input', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
