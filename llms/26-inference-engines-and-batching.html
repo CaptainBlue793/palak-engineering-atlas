@@ -3,37 +3,266 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Inference Engines &amp; Batching</title>
+<title>Inference Engines &amp; Batching · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 26 of LLMs. A small serving engine for Qwen2.5-0.5B-Instruct written from scratch, serving the same 64 requests one at a time, in static batches and with continuous batching: throughput, time to first token and latency measured, KV memory under contiguous and paged allocation, and why batched bf16 outputs differ from unbatched ones.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ie-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ie-v { display:none; } .ie-v.on { display:block; }
+  .ie-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .ie-bar { display:grid; grid-template-columns:230px 1fr 110px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .ie-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .ie-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .ie-bar .track i.b { background:var(--amber); }
+  .ie-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .ie-svg { width:100%; height:auto; display:block; }
+  .ie-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .ie-bar { grid-template-columns:120px 1fr 90px; } }
+</style>
 </head>
 <body data-chapter="26">
-<!-- llm:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 26</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
     <h1>Inference Engines &amp; <span class="grad">Batching</span></h1>
-    <p class="lead">Static and continuous batching and paged KV memory: throughput and latency of one GPU serving many requests.</p>
+    <p class="lead">Chapter 16 showed that generating one token for one sequence leaves the GPU mostly idle, and that a batch of 64 costs barely more per step than a batch of 1. An inference engine's job is to turn that into throughput for real traffic, where requests arrive at random times, with different prompt lengths, and finish at different moments.</p>
+    <p class="lead">This chapter builds a small engine from scratch, about 80 lines around Qwen2.5-0.5B-Instruct, and serves the same 64 requests three ways. One at a time it produced 75 tokens a second and the median request waited <b>77 seconds</b> for its first token. Static batches raised throughput to 993 tokens a second. Continuous batching, where requests join and leave the batch at every step, reached 1,115 and cut the median wait to <b>0.02 seconds</b>. It also showed that batched bf16 outputs are not the same as unbatched ones, and why.</p>
+    <ul class="objectives">
+      <li><span>Serve requests one at a time, in static batches and with continuous batching</span></li>
+      <li><span>Measure throughput, time to first token and end-to-end latency under load</span></li>
+      <li><span>Explain why continuous batching wins on both throughput and waiting time</span></li>
+      <li><span>Estimate KV memory under contiguous and paged allocation</span></li>
+      <li><span>Know why batched outputs can differ from unbatched ones</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The KV cache, prefill and decode:</b> <a href="16-the-kv-cache.html">Chapter 16</a>.</li>
+        <li><b>Attention masks and positions:</b> <a href="05-multi-head-attention-and-positions.html">Chapter 5</a>.</li>
+        <li><b>Number formats:</b> <a href="p1-pytorch-tensors.html">PyTorch Tensors on a GPU</a>, for why bf16 rounding depends on the order of operations.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>One request at a time</li>
-    <li>Static batching</li>
-    <li>Continuous batching</li>
-    <li>Paged attention</li>
-    <li>Throughput vs time to first token</li>
-  </ol>
+  <h2>One request at a time</h2>
+  <p>The test: 64 prompts from UltraFeedback's held-out set (35 to 301 tokens, median 73), each answered greedily with up to 256 new tokens; 42 of the 64 replies ran to that limit. Requests arrive as a Poisson stream, at 2 or 8 a second, or all at once. Served one at a time, a request is prefilled (its whole prompt in one forward pass, Chapter 16) and then decoded token by token until it ends. A single sequence decoded at about 75 tokens a second, 13 ms a token, much of it Python and kernel-launch overhead in the model's forward pass rather than arithmetic.</p>
+  <p>That rate does not change with load, so the queue grows. At 8 requests a second the 64 requests arrived within 8 seconds and the last finished 163 seconds after the start; the median request waited 77 seconds before its first token and 80 seconds for its whole reply. For an interactive product that is a failure, even though the GPU was "busy" the whole time.</p>
+
+  <h2>Static batching</h2>
+  <p>Static batching collects the requests that are waiting, up to 32, prefills each, and decodes them together, one token for every sequence per step. The batch keeps going until its last sequence finishes; only then are new requests admitted. Sequences that end early sit idle in the batch, and requests that arrive meanwhile wait for the whole batch.</p>
+  <p>Batches are left-padded to a common length so that every sequence's newest token is in the same column; an attention mask hides the padding, and each sequence keeps its own position numbers, so its rotary positions are unaffected. At 8 requests a second static batching produced 993 tokens a second, 13 times the one-at-a-time rate, but the median request still waited 2.2 seconds for its first token, and 4.5 seconds at the 95th percentile, because it arrived while a batch was running.</p>
+
+  <h2>Continuous batching</h2>
+  <p>Continuous batching, introduced by the Orca system in 2022 and used by every major engine since, admits waiting requests and retires finished ones at <i>every</i> decode step. A new request is prefilled and joins the running batch at the next step; a finished one leaves at once, freeing its slot. The whole scheduler is a loop:</p>
+<pre class="code"><span class="k">while</span> waiting <span class="k">or</span> batch.seqs:
+    <span class="k">for</span> s <span class="k">in</span> [s <span class="k">for</span> s <span class="k">in</span> waiting <span class="k">if</span> s.arrival &lt;= <span class="f">now</span>()][:max_batch - <span class="f">len</span>(batch.seqs)]:
+        first, kv = <span class="f">prefill</span>(s.prompt)                    <span class="c"># first token now: this sets time to first token</span>
+        batch.<span class="f">add</span>(s, kv); waiting.<span class="f">remove</span>(s)            <span class="c"># left-pad caches to a common length</span>
+    <span class="k">for</span> s, t <span class="k">in</span> <span class="f">zip</span>(batch.seqs, batch.<span class="f">step</span>()):          <span class="c"># one token for every running sequence</span>
+        s.out.<span class="f">append</span>(t)
+    batch.<span class="f">remove</span>([i <span class="k">for</span> i, s <span class="k">in</span> <span class="f">enumerate</span>(batch.seqs) <span class="k">if</span> <span class="f">finished</span>(s)])   <span class="c"># leave at once</span></pre>
+  <table class="t cmp">
+    <thead><tr><th>8 requests a second</th><th>Throughput</th><th>Time to first token, median / p95</th><th>Latency, median / p95</th><th>Total time</th></tr></thead>
+    <tbody>
+      <tr><td>One at a time</td><td>75 tok/s</td><td>76.7 / 148.6 s</td><td>80.1 / 152.0 s</td><td>163.5 s</td></tr>
+      <tr><td>Static batches of up to 32</td><td>993 tok/s</td><td>2.19 / 4.52 s</td><td>5.52 / 8.39 s</td><td>12.3 s</td></tr>
+      <tr><td><b>Continuous batching, up to 32</b></td><td><b>1,115 tok/s</b></td><td><b>0.023 / 0.039 s</b></td><td><b>4.31 / 4.64 s</b></td><td>11.1 s</td></tr>
+    </tbody>
+  </table>
+  <p>At 2 requests a second the same pattern held: 75, 337 and 380 tokens a second (throughput there is limited by how fast requests arrive), and continuous batching's median wait for a first token was 0.022 seconds against 2.09 for static batches. With all 64 requests arriving at once, continuous batching finished in 9.2 seconds at 1,322 tokens a second, 18 times faster than one at a time, though the median request then waited 0.66 seconds for a free slot, since only 32 fit at once.</p>
+
+  <h2>Throughput vs time to first token</h2>
+  <p>Two numbers describe a serving system, and users feel them differently. <b>Time to first token</b> (TTFT) is how long before anything appears; it is set by queueing plus the prefill of the prompt. <b>Time per output token</b> is how fast the text then streams; it is set by the decode step, which grows slowly with batch size. Throughput is what the operator pays for. Static batching trades TTFT for throughput; continuous batching improved both here, because it never holds a slot for a finished sequence or a waiting request for a running batch.</p>
+  <p>The trade does not disappear, it moves. Larger batches raise throughput and slow every step, so engines cap the batch size, and a long prompt's prefill delays every running sequence's next token while it runs. Engines such as vLLM and SGLang split long prefills into chunks interleaved with decode steps, and some systems run prefill and decode on separate GPUs. Service targets are usually set on the 95th or 99th percentile of both TTFT and time per output token, not the median.</p>
+
+  <h2>Paged attention</h2>
+  <p>Every running sequence needs its KV cache, 12,288 bytes a token for this model (Chapter 16). Early engines allocated each request's cache as one contiguous block sized for the longest it might become. For the 64 requests here, measured from their real lengths:</p>
+  <table class="t cmp">
+    <thead><tr><th>KV allocation for the 64 requests</th><th>Tokens reserved</th><th>Memory</th><th>Wasted</th></tr></thead>
+    <tbody>
+      <tr><td>Actually used (prompt + reply)</td><td>18,737</td><td>220 MB</td><td>—</td></tr>
+      <tr><td>Contiguous, reserved for the full 32,768-token context</td><td>2,097,152</td><td>24.0 GB</td><td><b>99.1%</b></td></tr>
+      <tr><td>Contiguous, reserved for prompt + 256 new tokens</td><td>22,932</td><td>269 MB</td><td>18.3%</td></tr>
+      <tr><td>Paged, blocks of 64 tokens</td><td>20,480</td><td>240 MB</td><td>8.5%</td></tr>
+      <tr><td><b>Paged, blocks of 16 tokens</b></td><td><b>19,232</b></td><td><b>225 MB</b></td><td><b>2.6%</b></td></tr>
+    </tbody>
+  </table>
+  <p><b>Paged attention</b> (vLLM, 2023) borrows virtual memory's idea: the cache is split into fixed blocks of, say, 16 tokens, allocated on demand as a sequence grows, and a per-sequence block table maps positions to blocks anywhere in memory. Waste is then at most one partly filled block per sequence, 2.6% here, so far more sequences fit in the same memory, which is what lets the batch, and so the throughput, grow. Shared blocks also let requests with a common prefix, such as one system prompt, share its cache. The engine here does not page: it pads every sequence's cache to the longest in the batch, which is exactly the kind of waste paging removes, and its cache peaked at 184 MB for 32 sequences.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Request arrives</b> and is queued</li>
+      <li data-k="step"><b>Prefill</b> its prompt; first token out</li>
+      <li data-k="step"><b>Join the batch</b> at the next decode step</li>
+      <li data-k="step"><b>Decode</b> with everyone; cache grows block by block</li>
+      <li data-k="end"><b>Leave</b> when finished; blocks freed at once</li>
+    </ol>
+    <figcaption><b>A request's life in a continuous-batching engine.</b> No request waits for another to finish, and no memory is held for tokens not yet written.</figcaption>
+  </figure>
+
+  <h2>Batching changes the numbers</h2>
+  <p>One check did not come out clean. With greedy decoding, the same request should give the same tokens whether it runs alone or in a batch, but in bf16 only 17 of the 64 did. On 32 requests the first differing token came anywhere from position 4 to 239, median 68. Run in fp32, all 32 were identical, so the engine's masking and positions are right and the cause is arithmetic: a batched matrix multiply may add the same numbers in a different order, bf16 keeps about 3 significant digits, and when two candidate tokens are nearly tied a rounding difference flips the choice, after which the two replies go their own ways. Production engines behave the same way. Outputs depend on what else is in the batch unless the kernels are specifically written to be batch-invariant, which matters for anyone who expects a fixed prompt and temperature 0 to be reproducible.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Serving lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ie-l">Experiment</div>
+      <div class="seg" id="ieE"><button class="active" data-v="runs">serving modes</button><button data-v="kv">KV memory</button><button data-v="div">batched vs alone</button></div>
+      <div class="ie-v" id="ieVr">
+        <div class="ie-l">Arrival rate and measure</div>
+        <div class="seg" id="ieR"><button data-v="2">2 per second</button><button class="active" data-v="8">8 per second</button></div>
+        <div class="seg" id="ieM" style="margin-top:6px"><button class="active" data-v="tokens_per_s">throughput</button><button data-v="ttft_median">TTFT median</button><button data-v="ttft_p95">TTFT p95</button><button data-v="latency_p95">latency p95</button></div>
+      </div>
+      <div class="ie-box" id="ieOut"></div>
+      <div class="stats" id="ieStats"></div>
+      <div class="ie-why" id="ieWhy"></div>
+    </div>
+    <div class="panel-foot">Qwen2.5-0.5B-Instruct (revision 7ae5576), bf16, a from-scratch engine on Hugging Face's model forward with left-padded caches, greedy decoding, up to 256 new tokens, batches of up to 32. 64 prompts from UltraFeedback binarised test_prefs (revision 3949bf5), 35 to 301 tokens; Poisson arrivals, seed 1. KV sizes computed from the real prompt and reply lengths at 12,288 bytes a token. RTX 5070 Ti.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🚦</div>
+    <div class="body"><div class="title">Use case: serving a chat model to many users</div><p>Every hosted chat product runs an engine like vLLM, SGLang, TensorRT-LLM or Hugging Face's TGI, and all of them do continuous batching with paged KV memory, because the measurements here are what the economics look like: the difference between 75 and 1,115 tokens a second on the same GPU is the difference between one GPU per few users and one per hundreds. Operators then tune the maximum batch size and prefill chunking against their latency targets, add prefix caching for shared system prompts, and watch the 95th-percentile time to first token, which is what users notice first.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Serving one request at a time;</b> the median request waited 77 seconds for its first token at 8 a second.</li>
+      <li><b>Judging an engine by throughput alone;</b> static batching reached 993 tok/s but kept requests waiting 2.2 seconds.</li>
+      <li><b>Reserving KV memory for the full context;</b> that wasted 99.1% here, paging 2.6%.</li>
+      <li><b>Reporting medians only;</b> service targets are set on the 95th or 99th percentile.</li>
+      <li><b>Expecting temperature 0 to be reproducible across batch sizes;</b> 17 of 64 bf16 replies matched.</li>
+      <li><b>Getting positions wrong in a padded batch;</b> each sequence needs its own position numbers.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is continuous batching, and why does it help?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Decoding one token for one sequence leaves a GPU mostly idle, so engines decode many sequences together. Static batching forms a batch, runs it until every sequence finishes, and only then admits new requests, so finished sequences waste slots and new requests wait. Continuous batching makes scheduling decisions every decode step: finished sequences leave immediately and waiting requests are prefilled and join at the next step. In my from-scratch engine on Qwen2.5-0.5B, serving 64 requests arriving at 8 a second, one-at-a-time gave 75 tokens a second with a 77-second median wait for the first token; static batches of 32 gave 993 tokens a second and a 2.2-second wait; continuous batching gave 1,115 tokens a second and a 0.02-second wait.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why does vLLM page the KV cache, and what does it buy?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because the cache is the memory that limits batch size, and a request's final length is unknown when it starts. Contiguous allocation has to reserve for the worst case: for my 64 requests, reserving the full 32k context would have needed 24 GB for 220 MB of real cache, 99.1% waste, and even reserving prompt plus the 256-token limit wasted 18%. Paging allocates fixed blocks of, say, 16 tokens on demand through a block table, so waste is at most one partial block per sequence, 2.6% here. That lets many more sequences run at once, which raises throughput, and blocks can be shared between requests with the same prefix. The cost is an attention kernel that gathers keys and values through the block table.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>One request at a time wastes the GPU: 75 tok/s and a 77-second median wait at 8 requests a second.</li>
+      <li>Static batching raised throughput 13 times but kept requests waiting for the running batch (2.2 s).</li>
+      <li>Continuous batching admits and retires every step: 1,115 tok/s and 0.02 s to the first token.</li>
+      <li>Time to first token and time per token are separate targets; watch their 95th percentiles.</li>
+      <li>Paged KV memory wasted 2.6% where full-context reservation would have wasted 99.1%.</li>
+      <li>Batched bf16 outputs can differ from unbatched ones (17 of 64 matched; fp32 matched 32 of 32).</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why did one-at-a-time serving leave requests waiting over a minute?</p>
+      <div class="opts">
+        <button class="opt">The model was too large for the GPU</button>
+        <button class="opt">It produced 75 tokens a second whatever the load, so the queue grew as requests arrived faster than it could serve them</button>
+        <button class="opt">Prefill was disabled</button>
+        <button class="opt">The prompts were too long</button>
+      </div>
+      <div class="explain">Median time to first token 76.7 s, 95th percentile 148.6 s at 8 requests a second.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Static batching reached 993 tokens a second. Why did requests still wait 2.2 seconds for a first token?</p>
+      <div class="opts">
+        <button class="opt">Its prefill was slower</button>
+        <button class="opt">It used fp32</button>
+        <button class="opt">It had no KV cache</button>
+        <button class="opt">New requests could only join once the whole running batch had finished</button>
+      </div>
+      <div class="explain">Continuous batching admits them at the next step: 0.023 s.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does paging the KV cache save?</p>
+      <div class="opts">
+        <button class="opt">Memory reserved for tokens that are never written; waste fell to 2.6% from up to 99.1%</button>
+        <button class="opt">Compute in the attention kernel</button>
+        <button class="opt">Disk space for the model</button>
+        <button class="opt">Tokenisation time</button>
+      </div>
+      <div class="explain">Blocks of 16 tokens are allocated on demand; the freed memory lets more sequences run at once.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In bf16, only 17 of 64 greedy replies were identical batched and alone. What was the cause?</p>
+      <div class="opts">
+        <button class="opt">A bug in the attention mask</button>
+        <button class="opt">Sampling randomness</button>
+        <button class="opt">Rounding: batched matrix multiplies add in a different order, and near-ties between tokens flip; in fp32 all 32 matched</button>
+        <button class="opt">The model changes between requests</button>
+      </div>
+      <div class="explain">First differences came at positions 4 to 239, median 68.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which number is set mainly by queueing and the prompt's prefill?</p>
+      <div class="opts">
+        <button class="opt">Time per output token</button>
+        <button class="opt">Time to first token</button>
+        <button class="opt">Throughput</button>
+        <button class="opt">KV bytes per token</button>
+      </div>
+      <div class="explain">Time per output token is set by the decode step, which grows slowly with batch size.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"one_at_a_time_burst":{"mode":"one at a time","requests":64,"seconds":162.68,"tokens":12189,"tokens_per_s":74.9,"ttft_median":79.829,"ttft_p95":154.92,"latency_median":83.202,"latency_p95":158.299,"peak_cache_MB":5.8},"identical_outputs":17,"continuous_burst":{"mode":"continuous","requests":64,"seconds":9.19,"tokens":12156,"tokens_per_s":1322.2,"ttft_median":0.657,"ttft_p95":5.149,"latency_median":4.982,"latency_p95":9.194,"peak_cache_MB":186.0},"runs":[{"mode":"one at a time","requests":64,"seconds":163.06,"tokens":12189,"tokens_per_s":74.8,"ttft_median":66.655,"ttft_p95":126.966,"latency_median":70.064,"latency_p95":130.405,"peak_cache_MB":5.8,"rate":2.0},{"mode":"static","requests":64,"seconds":35.9,"tokens":12082,"tokens_per_s":336.5,"ttft_median":2.087,"ttft_p95":3.722,"latency_median":4.915,"latency_p95":7.697,"peak_cache_MB":56.5,"rate":2.0},{"mode":"continuous","requests":64,"seconds":32.33,"tokens":12293,"tokens_per_s":380.3,"ttft_median":0.022,"ttft_p95":0.036,"latency_median":4.067,"latency_p95":4.242,"peak_cache_MB":60.0,"rate":2.0},{"mode":"one at a time","requests":64,"seconds":163.49,"tokens":12189,"tokens_per_s":74.6,"ttft_median":76.653,"ttft_p95":148.556,"latency_median":80.095,"latency_p95":151.954,"peak_cache_MB":5.8,"rate":8.0},{"mode":"static","requests":64,"seconds":12.27,"tokens":12176,"tokens_per_s":992.7,"ttft_median":2.194,"ttft_p95":4.519,"latency_median":5.515,"latency_p95":8.389,"peak_cache_MB":119.8,"rate":8.0},{"mode":"continuous","requests":64,"seconds":11.11,"tokens":12390,"tokens_per_s":1115.3,"ttft_median":0.023,"ttft_p95":0.039,"latency_median":4.313,"latency_p95":4.64,"peak_cache_MB":183.8,"rate":8.0}],"lengths":[256,5,256,256,256,256,256,24,213,58,256,198,2,256,256,256,9,209,256,256,13,256,256,80,256,10,256,7,256,256,256,256,256,124,172,256,20,256,256,13,256,256,76,256,256,30,256,256,256,256,256,256,14,256,84,256,256,256,256,256,256,256,59,17],"prompt_lengths":[68,234,43,37,63,242,132,254,170,43,70,44,188,72,45,120,154,40,44,47,276,52,39,301,37,44,122,47,41,43,110,130,45,36,177,242,115,42,40,164,72,62,35,53,164,161,126,73,134,100,146,40,45,66,53,99,133,136,89,167,44,159,90,88],"kv":{"bytes_per_token":12288,"used_tokens":18737,"contiguous_max_context":2097152,"contiguous_prompt_plus_max_new":22932,"paged_block_16":19232,"paged_block_64":20480},"divergence":{"bfloat16":{"requests":32,"identical":7,"first_difference_at":[4,5,6,7,9,9,19,23,25,28,41,52,68,71,76,119,122,123,126,161,170,186,191,222,239],"median_first_difference":68},"float32":{"requests":32,"identical":32,"first_difference_at":[],"median_first_difference":null}}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const bar = (k, w, txt, c) => `<div class="ie-bar"><span>${k}</span><span class="track"><i class="${c || ''}" style="width:${Math.max(0.5, Math.min(100, w)).toFixed(1)}%"></i></span><span class="n">${txt}</span></div>`;
+
+  function drawRuns() {
+    const rate = +v('#ieR'), m = v('#ieM'), rows = D.runs.filter(r => r.rate === rate), mx = Math.max(...rows.map(r => r[m]));
+    const log = m !== 'tokens_per_s', w = (x) => log ? 100 * Math.log10(1 + 100 * x) / Math.log10(1 + 100 * mx) : 100 * x / mx;
+    const fmt = (x) => m === 'tokens_per_s' ? x.toLocaleString('en-GB') + ' tok/s' : x >= 1 ? x.toFixed(1) + ' s' : (1000 * x).toFixed(0) + ' ms';
+    $('#ieOut').innerHTML = rows.map(r => bar(r.mode, w(r[m]), fmt(r[m]), r.mode === 'continuous' ? '' : 'b')).join('') + `<p class="small muted" style="margin:8px 0 0">${log ? 'Seconds, on a logarithmic bar scale: lower is better.' : 'Generated tokens per second over the whole run: higher is better.'} 64 requests arriving at ${rate} a second.</p>`;
+    const c = rows.find(r => r.mode === 'continuous'), o = rows.find(r => r.mode === 'one at a time'), s = rows.find(r => r.mode === 'static');
+    $('#ieStats').innerHTML = `<div class="stat good"><div class="k">Continuous vs one at a time</div><div class="v">${(c.tokens_per_s / o.tokens_per_s).toFixed(1)}× throughput</div></div><div class="stat"><div class="k">TTFT median: static / continuous</div><div class="v">${s.ttft_median.toFixed(2)} / ${c.ttft_median.toFixed(3)} s</div></div><div class="stat"><div class="k">Peak cache, continuous</div><div class="v">${c.peak_cache_MB} MB</div></div>`;
+    $('#ieWhy').innerHTML = ({ tokens_per_s: '<b>Batching is the throughput.</b> One sequence at a time leaves the GPU idle; continuous batching also keeps slots full by refilling them every step.', ttft_median: '<b>Waiting is the scheduler\'s fault.</b> Static batches make new requests wait for the running batch; continuous batching admits them at the next step.', ttft_p95: '<b>The tail is what users remember.</b> Continuous batching kept the 95th percentile under 40 ms.', latency_p95: '<b>End to end, too.</b> Continuous batching finished 95% of requests within 4.6 s at 8 a second, static within 8.4 s.' })[m];
+  }
+  function drawKv() {
+    const K = D.kv, used = K.used_tokens, MB = (t) => t * K.bytes_per_token / 2 ** 20;
+    const rows = [['actually used', used], ['paged, blocks of 16', K.paged_block_16], ['paged, blocks of 64', K.paged_block_64], ['contiguous, prompt + 256', K.contiguous_prompt_plus_max_new], ['contiguous, full 32k context', K.contiguous_max_context]];
+    const mx = Math.log10(rows[4][1]), lo = Math.log10(used) - 0.3;
+    $('#ieOut').innerHTML = rows.map(([k, t], i) => bar(k, 100 * (Math.log10(t) - lo) / (mx - lo), MB(t) >= 1024 ? (MB(t) / 1024).toFixed(1) + ' GB' : MB(t).toFixed(0) + ' MB', i ? 'b' : '')).join('') + '<p class="small muted" style="margin:8px 0 0">KV memory for the 64 requests, logarithmic bar scale, at 12,288 bytes a token.</p>';
+    $('#ieStats').innerHTML = rows.slice(1).map(([k, t]) => `<div class="stat ${t / used < 1.05 ? 'good' : t / used > 2 ? 'bad' : 'warn'}"><div class="k">${k}: wasted</div><div class="v">${(100 * (1 - used / t)).toFixed(1)}%</div></div>`).join('');
+    $('#ieWhy').innerHTML = '<b>Reserve as you go.</b> A request\'s final length is unknown, so contiguous allocation must guess high; paging wastes at most one partial block per sequence.';
+  }
+  function drawDiv() {
+    const B = D.divergence.bfloat16, F = D.divergence.float32, W = 640, H = 120, x = (p) => 20 + (W - 40) * p / 256;
+    let g = `<svg class="ie-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="position of first difference">`;
+    g += `<line x1="20" x2="${W - 20}" y1="70" y2="70" stroke="${css('--border-strong')}"/>`;
+    [0, 64, 128, 192, 256].forEach(t => g += `<text x="${x(t)}" y="100" text-anchor="middle" font-size="11" fill="${css('--muted')}">${t}</text>`);
+    B.first_difference_at.forEach((p, i) => g += `<circle cx="${x(p).toFixed(1)}" cy="${(58 - 8 * (i % 4)).toFixed(1)}" r="5" fill="${css('--amber')}"><title>first difference at token ${p}</title></circle>`);
+    $('#ieOut').innerHTML = g + `<text x="20" y="16" font-size="11" fill="${css('--muted')}">bf16: where each differing reply first changed (token position)</text></svg>`;
+    $('#ieStats').innerHTML = `<div class="stat warn"><div class="k">bf16: identical, batched vs alone</div><div class="v">${B.identical} of ${B.requests}</div></div><div class="stat"><div class="k">bf16: median first difference</div><div class="v">token ${B.median_first_difference}</div></div><div class="stat good"><div class="k">fp32: identical</div><div class="v">${F.identical} of ${F.requests}</div></div>`;
+    $('#ieWhy').innerHTML = '<b>Rounding, not a bug.</b> In fp32 every reply matched. In bf16 a different summation order flips near-tied tokens, sometimes within the first few, and the replies diverge from there.';
+  }
+  function draw() {
+    const e = v('#ieE');
+    $('#ieVr').classList.toggle('on', e === 'runs');
+    ({ runs: drawRuns, kv: drawKv, div: drawDiv })[e]();
+  }
+  ['#ieE', '#ieR', '#ieM'].forEach(id => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
 </body>
 </html>
