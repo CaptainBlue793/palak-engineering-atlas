@@ -3,37 +3,277 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GPU Memory &amp; Throughput for Images</title>
+<title>GPU Memory &amp; Throughput for Images · Computer Vision by Palak Deb Patra</title>
+<meta name="description" content="P8 of Computer Vision. Weights vs activations, ResNet-50 training memory by batch size and resolution, bf16 and channels-last measured, inference latency vs throughput, and out-of-memory errors on a 16 GB GPU.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('cv-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .gm-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .gm-v { display:none; } .gm-v.on { display:block; }
+  .gm-sl { display:grid; grid-template-columns:110px 1fr 70px; gap:8px; align-items:center; font-size:13px; margin:6px 0; }
+  .gm-sl b { font-family:var(--mono); text-align:right; }
+  .gm-mem { margin-top:12px; }
+  .gm-mem .track { position:relative; height:28px; border-radius:6px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; display:flex; }
+  .gm-mem .w { background:var(--accent-2); } .gm-mem .a { background:linear-gradient(90deg,var(--accent),color-mix(in srgb, var(--accent) 60%, var(--accent-2))); }
+  .gm-mem .cap { position:absolute; top:-2px; bottom:-2px; width:2px; background:var(--red); }
+  .gm-mem .lab { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-top:4px; }
+  .gm-bar { display:grid; grid-template-columns:170px 1fr 120px; gap:8px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .gm-bar .track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .gm-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .gm-bar .n { font-family:var(--mono); text-align:right; }
+  .gm-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; }
+  .gm-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
 </head>
 <body data-chapter="0.8">
-<!-- cv:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Prerequisite 8</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 35 min</span></div>
     <h1>GPU Memory &amp; Throughput for <span class="grad">Images</span></h1>
-    <p class="lead">Why activations grow with resolution, what mixed precision saves, and images per second on this GPU.</p>
+    <p class="lead">ResNet-50’s weights take 101 MB. Training it on a batch of 256 images took 11.2 GB. Almost all GPU memory in vision training goes to <b>activations</b>, the intermediate feature maps saved during the forward pass so the backward pass can use them, and they grow with every image in the batch and every pixel in each image.</p>
+    <p class="lead">This chapter measures that on an RTX 5070 Ti capped at 15 GB: peak memory for ResNet-50 at seven batch sizes and six resolutions (it follows a straight line to within a few MB), what bf16 and channels-last buy, why the fastest inference batch is not the lowest-latency one, and what an out-of-memory error looks like and how to plan around it.</p>
+    <ul class="objectives">
+      <li><span>Split training memory into weights, gradients, optimiser state and activations</span></li>
+      <li><span>Predict peak memory from batch size and resolution, before running out of it</span></li>
+      <li><span>Use bf16 autocast and channels-last, and know when each helps</span></li>
+      <li><span>Choose an inference batch size from latency and throughput</span></li>
+      <li><span>Fix an out-of-memory error with the right lever</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Tensors and dtypes:</b> <a href="p1-images-as-tensors.html">P1: Images as Tensors</a>, and LLMs <a href="../llms/p7-gpu-memory-budgets.html">P7: GPU Memory Budgets</a> for the same accounting applied to language models (optional).</li>
+        <li><b>The loop:</b> <a href="p2-pytorch-training-loop.html">P2: PyTorch &amp; the Training Loop</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Weights vs activations</li>
-    <li>Memory by resolution and batch</li>
-    <li>bf16 and channels-last</li>
-    <li>Images per second</li>
-    <li>Out-of-memory errors</li>
-  </ol>
+  <h2>Where the memory goes</h2>
+  <p>Training memory has four parts. <b>Weights</b>: ResNet-50 has 25,557,032 parameters, 4 bytes each in float32, 101 MB. <b>Gradients</b>: one per weight, another 101 MB. <b>Optimiser state</b>: SGD with momentum keeps one more copy (101 MB); Adam keeps two. Together they are a fixed ~400 MB, whatever the batch. The fourth part, <b>activations</b>, is different: every layer’s output is saved for the backward pass, so it scales with the batch and with the image area.</p>
+<pre class="code">m = <span class="f">resnet50</span>().<span class="f">cuda</span>().<span class="f">to</span>(memory_format=torch.channels_last)    <span class="c"># 101 MiB of weights</span>
+x = torch.<span class="f">randn</span>(<span class="m">32</span>, <span class="m">3</span>, <span class="m">224</span>, <span class="m">224</span>, device=<span class="s">"cuda"</span>)               <span class="c"># (32, 3, 224, 224): 18 MiB</span>
+<span class="k">with</span> torch.<span class="f">autocast</span>(<span class="s">"cuda"</span>, torch.bfloat16):
+    out = <span class="f">m</span>(x)                                                  <span class="c"># saved for backward: +1,410 MiB</span>
+<span class="k">with</span> torch.<span class="f">no_grad</span>(), torch.<span class="f">autocast</span>(<span class="s">"cuda"</span>, torch.bfloat16):
+    <span class="f">m</span>(x)                                                        <span class="c"># inference: peak only +163 MiB</span></pre>
+  <p>One forward pass of 32 images kept <b>1,410 MB</b> alive for the backward pass, 14 times the weights. Without gradients (<code>torch.no_grad()</code>, inference) nothing is kept, and the same forward pass needed only 163 MB at its peak, because each layer’s output can be freed as soon as the next layer has used it. That asymmetry is why a GPU that can train at batch 64 can usually serve at batch 1,000.</p>
+
+  <h2>Memory follows a straight line</h2>
+  <p>Activations are proportional to batch × height × width, so peak training memory should be a fixed part plus a constant times the number of pixels in the batch. Measured with <code>torch.cuda.max_memory_allocated()</code> for ResNet-50 (bf16 autocast, channels-last, SGD with momentum):</p>
+  <table class="t cmp">
+    <thead><tr><th>Batch at 224 × 224</th><th>Peak</th><th>Images/s</th><th></th><th>Resolution at batch 32</th><th>Peak</th><th>Images/s</th></tr></thead>
+    <tbody>
+      <tr><td>16</td><td>1,050 MB</td><td>1,123</td><td></td><td>128 × 128</td><td>816 MB</td><td>2,979</td></tr>
+      <tr><td>32</td><td>1,734 MB</td><td>1,197</td><td></td><td>224 × 224</td><td>1,737 MB</td><td>1,179</td></tr>
+      <tr><td>64</td><td>3,092 MB</td><td>1,196</td><td></td><td>320 × 320</td><td>3,162 MB</td><td>588</td></tr>
+      <tr><td>128</td><td>5,813 MB</td><td>1,178</td><td></td><td>448 × 448</td><td>5,812 MB</td><td>296</td></tr>
+      <tr><td>256</td><td>11,224 MB</td><td>1,179</td><td></td><td>640 × 640</td><td>11,441 MB</td><td>145</td></tr>
+      <tr><td>384</td><td colspan="2">out of memory</td><td></td><td>800 × 800</td><td colspan="2">out of memory</td></tr>
+    </tbody>
+  </table>
+  <p>Fitting the batch column gives about <b>372 MB fixed plus 42.4 MB per 224 × 224 image</b>, and that same line predicts the resolution column almost exactly: 32 images at 640 × 640 are 32 × 8.16 = 261 “224-equivalents”, so 372 + 261 × 42.4 = 11,444 MB, against 11,441 measured. Doubling the resolution quadruples the memory and quarters the throughput. Note also what did <i>not</i> change: past batch 32, images per second stayed flat at about 1,180. A bigger batch fills memory, not speed, once the GPU is already busy.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Memory planner</span><span class="p-tag">Measured + fitted</span></div>
+    <div class="panel-body">
+      <div class="gm-l">Experiment</div>
+      <div class="seg" id="gmE"><button class="active" data-v="plan">will it fit?</button><button data-v="recipe">fp32 vs bf16 vs channels-last</button><button data-v="infer">inference batching</button></div>
+      <div class="gm-v on" id="gmVp">
+        <div class="gm-sl">batch size<input type="range" id="gmB" min="1" max="512" step="1" value="128" aria-label="batch size"><b id="gmBv"></b></div>
+        <div class="gm-sl">resolution<input type="range" id="gmR" min="64" max="1024" step="32" value="224" aria-label="image side in pixels"><b id="gmRv"></b></div>
+        <div class="gm-mem"><div class="track" id="gmT"></div><div class="lab"><span>fixed (weights, grads, momentum, workspace)</span><span>activations</span><span id="gmTl"></span></div></div>
+      </div>
+      <div class="gm-v" id="gmVr"><div class="gm-box" id="gmRec"></div></div>
+      <div class="gm-v" id="gmVi"><div class="gm-box" id="gmInf"></div></div>
+      <div class="stats" id="gmStats"></div>
+      <div class="gm-why" id="gmWhy"></div>
+    </div>
+    <div class="panel-foot">ResNet-50 (torchvision, 1,000 classes) training steps with SGD + momentum on an RTX 5070 Ti, capped at 15 GiB with <code>torch.cuda.set_per_process_memory_fraction</code> so that Windows cannot silently spill into system RAM; PyTorch 2.11, <code>cudnn.benchmark=True</code>, peak memory from <code>torch.cuda.max_memory_allocated()</code> after warm-up, throughput over 10 steps. The planner shows a measured value when one exists for that exact batch and resolution and otherwise the fitted line, 372 MB + 42.4 MB × batch × (side / 224)². Inference times are medians of 30 runs with CUDA events, bf16, channels-last.</div>
+  </div>
+
+  <h2>bf16 and channels-last</h2>
+  <p>Two settings change the picture. <b>bf16 autocast</b> runs convolutions and matrix multiplies in 16-bit bfloat16 while keeping weights and sensitive operations in float32 (LLMs <a href="../llms/p1-pytorch-tensors.html">P1</a> covers the format). The saved activations are 16-bit, so memory nearly halves, and the GPU’s tensor cores run at full rate. <b>Channels-last</b> stores a batch as N, H, W, C in memory (the tensor still reports its shape as N, C, H, W), which is the layout tensor-core convolution kernels want; without it, each convolution may transpose its input and output.</p>
+  <table class="t cmp">
+    <thead><tr><th>ResNet-50, batch 64, 224 × 224</th><th>Peak memory</th><th>Images/s</th><th>vs fp32</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td>5,578 MB</td><td>576</td><td>—</td></tr>
+      <tr><td>fp32 + channels-last</td><td>5,588 MB</td><td><b>122</b></td><td>4.7× slower</td></tr>
+      <tr><td>bf16 autocast</td><td>3,090 MB</td><td>928</td><td>1.6× faster</td></tr>
+      <tr><td><b>bf16 + channels-last</b></td><td>3,092 MB</td><td><b>1,200</b></td><td>2.1× faster</td></tr>
+    </tbody>
+  </table>
+  <p>The second row is the warning: channels-last is a layout for tensor cores, and with plain fp32 convolutions on this setup it made training almost five times <i>slower</i>, presumably because the fastest fp32 kernels expect the default layout. Together with bf16 it was the fastest configuration by a wide margin. So: use both together, or neither, and measure on your own GPU and library versions, because which kernel wins changes with both.</p>
+
+  <h2>Inference: latency vs throughput</h2>
+  <p>Serving trades two numbers. <b>Latency</b> is how long one request waits; <b>throughput</b> is how many images per second the GPU handles. Batching raises throughput, because one large kernel uses the GPU better than many tiny ones, at the cost of each request waiting for its batch:</p>
+  <table class="t cmp">
+    <thead><tr><th>Batch</th><th>Time per batch</th><th>Images/s</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>3.74 ms</td><td>268</td></tr>
+      <tr><td>4</td><td>2.78 ms</td><td>1,440</td></tr>
+      <tr><td>16</td><td>4.53 ms</td><td>3,532</td></tr>
+      <tr><td>64</td><td>16.41 ms</td><td><b>3,900</b></td></tr>
+      <tr><td>256</td><td>72.16 ms</td><td>3,548</td></tr>
+    </tbody>
+  </table>
+  <p>A single image took longer than a batch of four. At batch 1 the GPU is mostly idle between tiny kernel launches, and the convolution kernels chosen for such small shapes are not the efficient ones, so the time is set by overheads, not arithmetic. Throughput peaked at batch 64 (3,900 images a second, 14.6 times batch 1) and fell slightly at 256. A service that must answer within 10 ms per request can still batch up to about 16; Chapter 38 builds that kind of dynamic batching.</p>
+
+  <h2>Out of memory</h2>
+  <p>Batch 384 at 224 px and batch 32 at 800 px both failed with <code>torch.OutOfMemoryError: CUDA out of memory</code>, as the line predicted (16.7 GB and 17.7 GB against a 15 GB cap). On Windows, without a cap, the driver may instead quietly move GPU memory into system RAM and keep going many times slower, so a run that “fits” can still be badly wrong; capping the process with <code>torch.cuda.set_per_process_memory_fraction</code> turns that into an honest error. The levers, in rough order of cost:</p>
+  <figure class="flow">
+    <ol>
+      <li><b>bf16 autocast</b><small>~45% less here, and faster</small></li>
+      <li><b>Smaller batch + gradient accumulation</b><small>same effective batch, ~42 MB per image saved</small></li>
+      <li><b>Lower resolution</b><small>memory ∝ side²</small></li>
+      <li><b>Activation checkpointing</b><small>recompute instead of store, ~30% slower</small></li>
+      <li><b>Smaller model</b><small>a different trade-off entirely</small></li>
+    </ol>
+    <figcaption><b>Fixing an out-of-memory error.</b> Activations dominate, so every lever that works reduces what is saved for the backward pass.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: high-resolution segmentation on a single GPU</div><p>Medical and satellite images are often thousands of pixels on a side, and a U-Net (Chapter 17) at 2,048 × 2,048 needs roughly 84 times the activation memory of the same network at 224 × 224. Teams that train such models on one or two GPUs do not run whole images: they train on random <b>tiles</b> of 256 to 512 pixels, use batch sizes of 2 to 8 with gradient accumulation and GroupNorm rather than BatchNorm (Chapter 6), and at inference slide a window over the full image, overlapping tiles to avoid seams. The memory line in this chapter is what tells you the tile size before the first crash.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Sizing memory from the weights.</b> ResNet-50 is 101 MB of weights and 11 GB of training at batch 256.</li>
+      <li><b>Raising the resolution “a little”</b>: 224 to 320 doubles memory and halves throughput.</li>
+      <li><b>Running inference without <code>torch.no_grad()</code></b> (or <code>inference_mode</code>), so activations are kept for a backward that never happens.</li>
+      <li><b>Using channels-last with fp32</b> and assuming it is faster: here it was 4.7× slower.</li>
+      <li><b>Benchmarking batch 1 latency on a cold model,</b> or reporting throughput at a batch the service will never use.</li>
+      <li><b>Letting the Windows driver spill into system RAM</b> instead of failing, and reading the slowdown as a model problem.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why does training a 25-million-parameter CNN need 11 GB when its weights are only 100 MB?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because the backward pass needs every layer’s output from the forward pass, so those activations are stored, and they scale with batch size times image area while the weights do not. For ResNet-50 the fixed part (weights, gradients, momentum and workspace) is a few hundred megabytes; activations add about 42 MB per 224 × 224 image in bf16. At batch 256 that is about 11 GB, which matched the 11.2 GB measured. Inference keeps none of it: the same forward pass at batch 32 peaked at 163 MB above the weights, against 1.4 GB kept when gradients were needed. So training memory is planned from batch × resolution, and the fixes for running out are the ones that shrink activations: bf16, smaller batches with accumulation, lower resolution, or checkpointing.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You need to serve ResNet-50 with p99 latency under 10 ms at 2,000 images per second. Is one GPU like this enough?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Probably, with batching. At batch 1 it handles about 270 images a second, far short. At batch 16 a forward pass took 4.5 ms and the GPU handled about 3,500 images a second; at batch 64 about 3,900 but each batch took 16 ms, which breaks the latency budget on its own. So I would use dynamic batching with a maximum batch of around 16 and a short wait window (a millisecond or two) to fill it: worst-case latency is roughly the wait plus one batch time plus preprocessing and transfer, under 10 ms if decode and resize are not on the critical path. At 2,000 images a second against a capacity of about 3,500 the GPU would run near 57% utilisation, leaving headroom for bursts; I would load-test the p99, because queueing makes tail latency grow sharply as utilisation approaches 100%, and keep a second GPU for failover.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Training memory = fixed (weights, gradients, optimiser state) + activations; for vision, activations dominate.</li>
+      <li>ResNet-50 peak memory was 372 MB + 42.4 MB per 224 × 224 image, a straight line that also predicted every resolution.</li>
+      <li>Memory scales with batch × side²: 640 px at batch 32 needed as much as 224 px at batch 256.</li>
+      <li>bf16 + channels-last trained 2.1× faster than fp32 at 55% of the memory; channels-last alone in fp32 was 4.7× slower.</li>
+      <li>Inference keeps no activations (163 MB vs 1,410 MB at batch 32); throughput peaked at batch 64, and batch 1 was slower than batch 4.</li>
+      <li>Cap GPU memory on Windows so an overflow is an error, not a silent slowdown; then fix it with bf16, smaller batches, lower resolution or checkpointing.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What took most of the memory when training ResNet-50 at batch 256?</p>
+      <div class="opts">
+        <button class="opt">The weights</button>
+        <button class="opt">The gradients</button>
+        <button class="opt">The optimiser’s momentum</button>
+        <button class="opt">Activations saved for the backward pass</button>
+      </div>
+      <div class="explain">Weights, gradients and momentum are about 100 MB each; activations were about 42 MB per image, roughly 10.9 GB of the 11.2 GB peak.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Going from 224 × 224 to 448 × 448 at the same batch size multiplies activation memory by about…</p>
+      <div class="opts">
+        <button class="opt">2</button>
+        <button class="opt">4</button>
+        <button class="opt">8</button>
+        <button class="opt">It stays the same</button>
+      </div>
+      <div class="explain">Activations scale with height × width: (448/224)² = 4. Measured at batch 32: 1,737 MB to 5,812 MB.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which configuration trained ResNet-50 fastest here?</p>
+      <div class="opts">
+        <button class="opt">fp32</button>
+        <button class="opt">fp32 + channels-last</button>
+        <button class="opt">bf16 autocast + channels-last</button>
+        <button class="opt">bf16 autocast alone</button>
+      </div>
+      <div class="explain">1,200 images/s against 928 for bf16 alone, 576 for fp32 and 122 for fp32 with channels-last.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why did inference at batch 64 give 14.6× the throughput of batch 1?</p>
+      <div class="opts">
+        <button class="opt">At batch 1 the GPU is mostly idle between small kernel launches; a large batch keeps it busy</button>
+        <button class="opt">Batch 64 uses less precision</button>
+        <button class="opt">Batch 1 runs on the CPU</button>
+        <button class="opt">Batching skips layers</button>
+      </div>
+      <div class="explain">Per-batch overheads are paid once per batch. At batch 1 they dominate: 3.74 ms for one image, 16.4 ms for 64.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A run hits CUDA out of memory. Which fix keeps the same effective batch size?</p>
+      <div class="opts">
+        <button class="opt">Lower the resolution</button>
+        <button class="opt">Use a smaller model</button>
+        <button class="opt">Delete the optimiser state</button>
+        <button class="opt">Halve the batch and accumulate gradients over two steps</button>
+      </div>
+      <div class="explain">Two half-batches with one optimiser step give the same update (for models without batch-statistics layers) at about half the activation memory.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = CV;
+  const D = {"by_batch":{"16":{"peak_mib":1050,"ips":1122.8,"base_mib":119},"32":{"peak_mib":1734,"ips":1197.3,"base_mib":119},"64":{"peak_mib":3092,"ips":1195.7,"base_mib":119},"128":{"peak_mib":5813,"ips":1177.8,"base_mib":119},"192":{"peak_mib":8518,"ips":1176.4,"base_mib":119},"256":{"peak_mib":11224,"ips":1178.8,"base_mib":119},"384":{"oom":true,"msg":"CUDA out of memory"}},"by_res":{"128":{"peak_mib":816,"ips":2979.0,"base_mib":119},"224":{"peak_mib":1737,"ips":1178.6,"base_mib":119},"320":{"peak_mib":3162,"ips":588.0,"base_mib":119},"448":{"peak_mib":5812,"ips":296.1,"base_mib":119},"640":{"peak_mib":11441,"ips":145.1,"base_mib":119},"800":{"oom":true,"msg":"CUDA out of memory"}},"recipes":{"fp32":{"peak_mib":5578,"ips":575.9,"base_mib":108},"fp32 + channels-last":{"peak_mib":5588,"ips":121.7,"base_mib":119},"bf16 autocast":{"peak_mib":3090,"ips":928.4,"base_mib":116},"bf16 + channels-last":{"peak_mib":3092,"ips":1199.8,"base_mib":119}},"infer":{"1":{"ms":3.735,"ips":267.7},"4":{"ms":2.778,"ips":1439.9},"16":{"ms":4.53,"ips":3532.2},"64":{"ms":16.409,"ips":3900.3},"256":{"ms":72.16,"ips":3547.7}}};
+  const FIX = 372, PER = 42.4, CAP = 15 * 1024;
+  const fmt = x => Math.round(x).toLocaleString('en-GB');
+  function plan() {
+    const b = +$('#gmB').value, r = +$('#gmR').value;
+    $('#gmBv').textContent = b; $('#gmRv').textContent = r + ' px';
+    const act = PER * b * (r / 224) ** 2, tot = FIX + act;
+    let meas = null;
+    if (r === 224 && D.by_batch[b]) meas = D.by_batch[b]; else if (b === 32 && D.by_res[r]) meas = D.by_res[r];
+    const scale = Math.max(CAP * 1.15, tot), pw = FIX / scale * 100, pa = Math.min(act, scale - FIX) / scale * 100;
+    $('#gmT').innerHTML = `<div class="w" style="width:${pw}%"></div><div class="a" style="width:${pa}%"></div><div class="cap" style="left:${CAP / scale * 100}%" title="15 GiB cap"></div>`;
+    $('#gmTl').textContent = `red line: 15 GiB cap`;
+    const fits = tot < CAP, ips = r === 224 ? 1180 : 1180 * (224 / r) ** 2;
+    $('#gmStats').innerHTML = `<div class="stat ${fits ? 'good' : 'bad'}"><div class="k">${meas ? 'Measured peak' : 'Predicted peak'}</div><div class="v">${meas ? (meas.oom ? 'OOM' : fmt(meas.peak_mib) + ' MB') : fmt(tot) + ' MB'}</div></div>` +
+      `<div class="stat"><div class="k">Activations</div><div class="v">${fmt(act)} MB</div></div>` +
+      `<div class="stat"><div class="k">${meas && !meas.oom ? 'Measured' : 'Expected'} speed</div><div class="v">${meas && !meas.oom ? fmt(meas.ips) : '~' + fmt(ips)} img/s</div></div>` +
+      `<div class="stat ${fits ? '' : 'bad'}"><div class="k">Fits in 15 GiB?</div><div class="v">${fits ? 'yes' : 'no'}</div></div>`;
+    const maxb = Math.floor((CAP - FIX) / (PER * (r / 224) ** 2));
+    $('#gmWhy').innerHTML = (meas ? `<b>Measured: ${meas.oom ? 'out of memory' : fmt(meas.peak_mib) + ' MB'}</b> (the line says ${fmt(tot)} MB). ` : `<b>Predicted from the fitted line.</b> `) +
+      `At ${r} px each image costs ${fmt(PER * (r / 224) ** 2)} MB of activations, so the largest batch that fits under the cap is about ${fmt(maxb)}. ${fits ? '' : 'To fit, halve the batch and accumulate gradients, or lower the resolution.'}`;
+  }
+  function recipe() {
+    const rows = Object.entries(D.recipes), mx = Math.max(...rows.map(r => r[1].ips));
+    $('#gmRec').innerHTML = '<div class="gm-l" style="margin-top:0">Training images per second (batch 64, 224 px)</div>' + rows.map(([k, v]) => `<div class="gm-bar"><span>${k}</span><span class="track"><i style="width:${v.ips / mx * 100}%"></i></span><span class="n">${fmt(v.ips)} img/s</span></div>`).join('') +
+      '<div class="gm-l">Peak memory</div>' + rows.map(([k, v]) => `<div class="gm-bar"><span>${k}</span><span class="track"><i style="width:${v.peak_mib / 6000 * 100}%"></i></span><span class="n">${fmt(v.peak_mib)} MB</span></div>`).join('');
+    $('#gmStats').innerHTML = `<div class="stat good"><div class="k">bf16 + CL vs fp32</div><div class="v">${(D.recipes['bf16 + channels-last'].ips / D.recipes.fp32.ips).toFixed(1)}× faster</div></div><div class="stat bad"><div class="k">fp32 + CL vs fp32</div><div class="v">${(D.recipes.fp32.ips / D.recipes['fp32 + channels-last'].ips).toFixed(1)}× slower</div></div><div class="stat"><div class="k">bf16 memory</div><div class="v">${Math.round(100 * D.recipes['bf16 autocast'].peak_mib / D.recipes.fp32.peak_mib)}% of fp32</div></div>`;
+    $('#gmWhy').innerHTML = '<b>Use bf16 and channels-last together.</b> bf16 halves the bytes of every saved activation and runs convolutions on tensor cores; channels-last is the memory layout those kernels want. Channels-last with fp32 picked much slower kernels here. Always measure on your own GPU and versions.';
+  }
+  function infer() {
+    const rows = Object.entries(D.infer), mx = Math.max(...rows.map(r => r[1].ips));
+    $('#gmInf').innerHTML = '<div class="gm-l" style="margin-top:0">Throughput by batch size (inference, bf16 + channels-last)</div>' + rows.map(([k, v]) => `<div class="gm-bar"><span>batch ${k}</span><span class="track"><i style="width:${v.ips / mx * 100}%"></i></span><span class="n">${fmt(v.ips)} img/s</span></div>`).join('') +
+      '<div class="gm-l">Time per batch (each request waits at least this long)</div>' + rows.map(([k, v]) => `<div class="gm-bar"><span>batch ${k}</span><span class="track"><i style="width:${v.ms / 75 * 100}%"></i></span><span class="n">${v.ms} ms</span></div>`).join('');
+    $('#gmStats').innerHTML = `<div class="stat"><div class="k">Batch 1</div><div class="v">${D.infer[1].ms} ms</div></div><div class="stat good"><div class="k">Best throughput</div><div class="v">${fmt(D.infer[64].ips)} img/s @ 64</div></div><div class="stat"><div class="k">Batch 16 latency</div><div class="v">${D.infer[16].ms} ms</div></div>`;
+    $('#gmWhy').innerHTML = '<b>Throughput and latency pull apart.</b> Batch 64 handles 14.6 times as many images per second as batch 1, but each request waits 16 ms for its batch instead of 3.7 ms. Batch 4 was faster than batch 1 in absolute time: at tiny batches overheads, not arithmetic, set the time.';
+  }
+  function draw() { const e = $('#gmE .active').dataset.v; $('#gmVp').classList.toggle('on', e === 'plan'); $('#gmVr').classList.toggle('on', e === 'recipe'); $('#gmVi').classList.toggle('on', e === 'infer'); ({ plan, recipe, infer })[e](); }
+  ['#gmB', '#gmR'].forEach(id => $(id).addEventListener('input', plan));
+  $('#gmE').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
 </body>
 </html>
