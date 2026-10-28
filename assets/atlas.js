@@ -300,7 +300,10 @@
       c1: '#ea580c', c2: '#db2777', d1: '#fb923c', d2: '#f472b6',
       soon: true,
       store: 'cv',
+      indexVar: 'CV_INDEX',
       dir: 'computer-vision',
+      first: 'p1-images-as-tensors.html',
+      dist: 'computer-vision-course.html',
     },
     {
       id: 'nlp',
