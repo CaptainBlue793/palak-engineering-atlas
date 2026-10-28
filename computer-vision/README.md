@@ -1,35 +1,42 @@
 # Computer Vision — Interactive Course
 
-Object-oriented design for the CV interview round, in Java: from "what is a class, really" to a
-thread-safe movie-booking system. **46 chapters across four levels, plus an 8-chapter
-Prerequisites level** (P1–P8: classes and references, encapsulation, inheritance and dispatch,
-interfaces and generics, composition, value objects and immutability, exceptions, reading UML).
+How machines see, from the pixel up: convolutions written by hand, CNNs trained from random weights,
+augmentation, normalisation, residual networks and transfer learning, then detection (boxes, NMS,
+Faster R-CNN, one-stage detectors, mAP), segmentation (U-Net, Mask R-CNN), vision transformers,
+Swin and DETR, self-supervised learning, CLIP and SAM, autoencoders, GANs and diffusion models,
+video, tracking, 3D geometry and NeRF, OCR, image retrieval, robustness and deployment.
+**48 chapters across five levels, plus an 8-chapter Prerequisites level** (P1–P8: images as
+tensors, the PyTorch training loop, colour spaces and image formats, geometry and transforms,
+classical filtering, loading image data fast, losses and metrics, GPU memory and throughput).
 
 Static site, **zero dependencies**, no build step required to read it. Open `index.html` in a
 browser; progress, quiz scores and flashcard state are saved in `localStorage` under `cv-*` keys.
 
-> **Status: complete.** All 54 pages are written. Each chapter has at least one interactive panel,
-> Java listings in the house style, a comparison table, a real-world use case, a common-mistakes box,
-> an interview drill and a five-question quiz. `grep -l cv:placeholder *.html` should print nothing.
+> **Status: in progress.** Chapters are written in order, one commit each. Pages still marked with
+> `<!-- cv:placeholder -->` are unwritten; `grep -l cv:placeholder *.html` lists them.
 
 ## The levels
 
 | Level | Chapters | What it covers |
 |---|---|---|
-| **Prerequisites** | P1–P8 | The Java object model, encapsulation, inheritance and dynamic dispatch, interfaces and generics, composition, value objects, exceptions, UML |
-| **Principles** | 1–8 | The CV round, requirements to classes, SOLID, coupling and cohesion, relationships, class contracts, dependency injection |
-| **Design Patterns** | 9–21 | Singleton, factories, builder, adapter/facade/bridge, decorator/proxy, composite/flyweight, strategy, observer/mediator, command/memento, state, chain/template, iterator/visitor, combining patterns |
-| **Advanced CV** | 22–30 | Thread-safe classes, producer-consumer and pools, extensibility, resilience, persistence, domain modeling, testing, refactoring, the interview playbook |
-| **Case Studies** | 31–46 | LRU cache, rate limiter, logger, pub-sub, task scheduler, file system, KV store with transactions, text editor, connection pool, parking lot, elevator, ticket booking, Splitwise, chess, vending machine/ATM, ride-hailing |
+| **Prerequisites** | P1–P8 | Images as tensors, PyTorch and the training loop, colour spaces, gamma and formats, coordinates and transforms, classical filtering, loading image data fast, losses and metrics for classifiers, GPU memory and throughput |
+| **Beginner** | 1–10 | What computer vision is, convolutions in depth, building and training a CNN, data augmentation, normalisation layers, residual networks, transfer learning, evaluating classifiers, feature maps and Grad-CAM |
+| **Intermediate** | 11–24 | CNN architectures, efficient convolutions, detection basics, two-stage and one-stage detectors, mAP, semantic and instance segmentation, vision transformers and how to train them, Swin and DETR, contrastive self-supervised learning, MAE and DINO, CLIP |
+| **Advanced** | 25–36 | SAM and open-vocabulary detection, autoencoders and VAEs, GANs, diffusion from scratch, latent diffusion and guidance, evaluating generators, video, optical flow and tracking, camera geometry and depth, NeRF and Gaussian splatting, OCR, image retrieval |
+| **Expert** | 37–40 | Robustness and adversarial examples, deploying vision models, debugging vision pipelines and datasets, the interview playbook |
+| **Case Studies** | 41–48 | AlexNet and ImageNet, ResNet, YOLO, self-driving perception, Face ID, Stable Diffusion, Segment Anything, visual search |
 
-Case studies that also appear in the System Design course link to the high-level version:
-same problem, different zoom.
+Where this course meets the others, each keeps its own angle and links across: Deep Learning
+covers backpropagation and training networks in general; LLMs covers transformers in depth and
+multimodal language models; ML & AI Systems covers the platform around models; RAG covers vector
+search. This course is about images: what a model sees, how it is trained to see it, and how to
+tell whether it does.
 
 ## Study tools
 
-- **`glossary.html`**: CV terms, each linked to the chapter that introduces it
-- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes (270 cards)
-- **`mock-interview.html`**: timed room with 18 CV problems, a phase timer, an 8-point rubric and notes saved locally
+- **`glossary.html`**: computer-vision terms, each linked to the chapter that introduces it
+- **`flashcards.html`**: spaced-repetition deck generated from the chapter quizzes
+- **`mock-interview.html`**: timed room with 26 concept, maths and design problems, a phase timer, an 8-point rubric and notes saved locally
 
 ## Tools
 
@@ -46,6 +53,9 @@ chapters start being edited by hand.
 
 ## House style
 
-Every listing is Java written the same way: interface first, constructor injection into `final`
-fields, validation at the boundary, small classes, and each design naming its pattern and the
-extension it survives.
+Listings are Python with PyTorch and torchvision, run on one 16 GB consumer GPU (RTX 5070 Ti),
+following the same five rules: every tensor line says its shape; preprocessing (channel order,
+resize, crop, value range, mean and std) is written down exactly; weight versions, library
+versions and seeds are pinned; times and memory are measured on the GPU, never guessed; and a new
+model overfits one batch and matches a reference before any long run. Every simulator is driven by
+real measurements.
