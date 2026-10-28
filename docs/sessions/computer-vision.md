@@ -43,3 +43,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch19 shipped: 30-line ViT-B/16 matches torchvision to 1.9e-6; Imagenette 92.3% (384 interp 89.4%); naive attention OOM at 768 px bs16, fused 2.2 GB; last-block CLS attention goes to low-info patches (registers artefact).
 - Ch20 follow-up: replaced 'early blocks attend locally' with Ch19's measured per-block attention distances.
 - Ch21 shipped: window attn 115x faster than global at 12,544 tokens; 224->896 px ViT-B 67x slower, Swin-T 4.9x, R50 5.8x; DETR 45.4 AP (44.4 with NMS), APs 24.0 vs 29-34 for FPN detectors.
+- Ch22 shipped: SimCLR 40 ep linear 78.2 / kNN 74.5 (random 43.5/40.3); 1% labels +23.4 vs supervised, 10% -4.9; no colour jitter -17.7 pts with highest pair acc (92%); bs128 beat 512 at equal epochs (4x steps).
