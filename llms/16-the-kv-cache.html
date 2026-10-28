@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The KV Cache · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 16 of LLMs. A key-value cache added from scratch to Chapter 7's GPT and checked token for token; prefill against decode, time per token as the context grows, what batching does to throughput, and how much memory the cache takes for GPT-2 and Qwen2.5, measured.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .kv-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .kv-v { display:none; } .kv-v.on { display:block; }
+  .kv-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .kv-bar { display:grid; grid-template-columns:200px 1fr 110px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .kv-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .kv-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .kv-bar .track i.b { background:var(--amber); }
+  .kv-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .kv-sl { display:grid; grid-template-columns:110px 1fr 90px; gap:10px; align-items:center; font-size:13px; padding:3px 0; }
+  .kv-sl input[type=range] { width:100%; accent-color:var(--accent); }
+  .kv-stack { display:flex; height:26px; border-radius:6px; overflow:hidden; background:var(--surface); margin:6px 0; }
+  .kv-stack i { display:block; height:100%; }
+  .kv-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .kv-bar { grid-template-columns:110px 1fr 90px; } }
+</style>
+</head>
+<body data-chapter="16">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 16</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
+    <h1>The KV <span class="grad">Cache</span></h1>
+    <p class="lead">Chapter 7's model generated text by running the whole sequence through again for every new token, and got slower as the text grew. Every serious implementation avoids that with the <b>key-value cache</b>: each layer keeps the keys and values it has already computed, so a new token needs only its own. It is a few lines of code and it changes what generation costs.</p>
+    <p class="lead">This chapter adds one from scratch to the GPT class and checks it: the same 60 tokens as before, on every prompt. With the cache, a decode step took about 2.6 milliseconds whatever the context, where recomputing everything grew to 6 by 896 tokens. Batching 64 sequences into each step multiplied throughput by 30 for barely twice the time per step. And the cache itself became the thing to budget: 36 KB per token for GPT-2, 12 KB for Qwen2.5-0.5B, measured from the real tensors.</p>
+    <ul class="objectives">
+      <li><span>Explain what the KV cache stores and why it makes generation linear</span></li>
+      <li><span>Implement a cache and verify it changes nothing but speed</span></li>
+      <li><span>Distinguish prefill from decode and why they behave differently</span></li>
+      <li><span>Compute the cache's memory per token and per request</span></li>
+      <li><span>Explain how grouped-query attention and batching interact with the cache</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Attention, queries, keys and values:</b> <a href="04-self-attention.html">Chapter 4</a>.</li>
+        <li><b>The model and its slow generation:</b> <a href="07-build-a-tiny-gpt.html">Chapter 7</a>.</li>
+        <li><b>Grouped-query attention:</b> <a href="15-inside-a-modern-open-model.html">Chapter 15</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Recomputing everything vs caching</h2>
+  <p>Generating token 101 needs the attention of position 101 over positions 1 to 101: its own query against everyone's keys, weighted by everyone's values. Positions 1 to 100 have not changed since the last step, because the causal mask means nothing earlier ever depends on anything later (Chapter 4). Their keys and values are the same numbers as last time. Recomputing them is pure waste, and it grows with every token: generating n tokens that way costs on the order of n² token-passes. Keeping each layer's keys and values in a <b>cache</b> means each new token is one token-pass, so the whole generation is linear.</p>
+
+  <h2>Implementing the cache</h2>
+<pre class="code"><span class="k">def</span> <span class="f">forward_cached</span>(m, ids, cache, start):
+    <span class="s">"""Run only the new tokens ids (B, t), at positions start..start+t-1, adding their K and V to cache."""</span>
+    B, t = ids.shape
+    x = m.<span class="f">wte</span>(ids) + m.<span class="f">wpe</span>(torch.<span class="f">arange</span>(start, start + t))
+    <span class="k">for</span> i, blk <span class="k">in</span> <span class="f">enumerate</span>(m.h):
+        q, k, v = blk.attn.<span class="f">c_attn</span>(blk.<span class="f">ln_1</span>(x)).<span class="f">split</span>(<span class="m">768</span>, dim=<span class="m">2</span>)
+        q, k, v = <span class="f">heads</span>(q), <span class="f">heads</span>(k), <span class="f">heads</span>(v)          <span class="c"># (B, 12, t, 64)</span>
+        <span class="k">if</span> cache[i] <span class="k">is not</span> <span class="k">None</span>:
+            k = torch.<span class="f">cat</span>([cache[i][<span class="m">0</span>], k], dim=<span class="m">2</span>)              <span class="c"># earlier positions, computed once</span>
+            v = torch.<span class="f">cat</span>([cache[i][<span class="m">1</span>], v], dim=<span class="m">2</span>)
+        cache[i] = [k, v]
+        a = F.<span class="f">scaled_dot_product_attention</span>(q, k, v, is_causal=t &gt; <span class="m">1</span>)   <span class="c"># one new token may see everything cached</span>
+        x = x + blk.attn.<span class="f">c_proj</span>(<span class="f">merge</span>(a))
+        x = x + blk.<span class="f">mlp</span>(blk.<span class="f">ln_2</span>(x))
+    <span class="k">return</span> m.<span class="f">ln_f</span>(x) @ m.wte.weight.T
+
+cache = [<span class="k">None</span>] * <span class="m">12</span>
+logits = <span class="f">forward_cached</span>(model, prompt, cache, <span class="m">0</span>)                        <span class="c"># prefill: the whole prompt at once</span>
+<span class="k">for</span> i <span class="k">in</span> <span class="f">range</span>(n):
+    nxt = logits[:, -<span class="m">1</span>].<span class="f">argmax</span>(-<span class="m">1</span>, keepdim=<span class="k">True</span>)
+    logits = <span class="f">forward_cached</span>(model, nxt, cache, prompt.shape[<span class="m">1</span>] + i)       <span class="c"># decode: one token per step</span></pre>
+  <p>Two details matter. Positions must continue from where the cache ends, or every new token would think it is at position 0. And the causal mask is only needed in the prefill, when several new tokens are processed together; a single new token is allowed to see every cached position. With GPT-2's weights, this produced the same 60 greedy tokens as Chapter 7's uncached <code>generate</code> on all three prompts, and the logits of a late step differed by at most 2 × 10⁻⁴, summation order again (Chapter 7).</p>
+
+  <h2>Prefill and decode</h2>
+  <p>Generation has two phases with very different costs. <b>Prefill</b> processes the prompt: many tokens in one pass, big matrix multiplies, the GPU fully busy. <b>Decode</b> produces the answer one token at a time: each step multiplies a single vector by every weight matrix, so the GPU spends its time reading weights and cache from memory rather than computing (P6). In bf16 on this GPU:</p>
+  <table class="t cmp">
+    <thead><tr><th>Context</th><th>Prefill</th><th>Prefill rate</th><th>Decode step, cached</th><th>Step without a cache</th></tr></thead>
+    <tbody>
+      <tr><td>16 tokens</td><td>2.7 ms</td><td>6,000 tok/s</td><td>2.63 ms</td><td>2.86 ms</td></tr>
+      <tr><td>128</td><td>2.5 ms</td><td>51,000 tok/s</td><td>2.55 ms</td><td>3.09 ms</td></tr>
+      <tr><td>512</td><td>3.6 ms</td><td>141,000 tok/s</td><td>2.53 ms</td><td>4.09 ms</td></tr>
+      <tr><td>896</td><td>5.9 ms</td><td><b>152,000 tok/s</b></td><td><b>2.62 ms</b></td><td><b>6.00 ms</b></td></tr>
+    </tbody>
+  </table>
+  <p>Prefill handled 896 tokens in barely twice the time of 16: the GPU had room to spare at small sizes. Decode with the cache stayed at about 2.6 ms per token from 16 tokens to 896, while recomputing grew steadily to 6.0, 2.3 times slower, and would keep growing. For a model this small, the cached step is dominated by launching on the order of a hundred small GPU kernels, which is why it barely moves; for large models it is dominated by reading the weights, and grows slowly with the cache.</p>
+
+  <h2>Batching</h2>
+  <p>A decode step uses the GPU poorly: one vector times each weight matrix. Putting several sequences in the same step reuses each weight read for all of them. With 256-token caches:</p>
+  <table class="t cmp">
+    <thead><tr><th>Sequences per step</th><th>Time per step</th><th>Tokens per second</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>2.56 ms</td><td>390</td></tr>
+      <tr><td>4</td><td>2.84 ms</td><td>1,410</td></tr>
+      <tr><td>16</td><td>3.06 ms</td><td>5,221</td></tr>
+      <tr><td>64</td><td>5.53 ms</td><td><b>11,568</b></td></tr>
+    </tbody>
+  </table>
+  <p>Sixty-four sequences together produced 30 times the tokens of one, with each step only 2.2 times longer. This is the economics of serving: a single user gets low latency but wastes the GPU; many users batched together share it. What limits the batch is memory, and most of that, past the weights, is cache. Chapter 26 builds a server around exactly this trade.</p>
+
+  <h2>Memory per token</h2>
+  <p>The cache holds a key and a value vector per layer, per head, per token. Per token, in bf16: 2 (key and value) × layers × key-value heads × head size × 2 bytes.</p>
+  <table class="t cmp">
+    <thead><tr><th>Model</th><th>Per token</th><th>32,768-token context</th><th>Fits in 16 GB beside the weights</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-2 (12 layers × 12 heads × 64)</td><td>36,864 bytes</td><td>1.1 GiB (beyond its 1,024 limit)</td><td>412,702 tokens</td></tr>
+      <tr><td>Qwen2.5-0.5B (24 × <b>2</b> × 64)</td><td><b>12,288 bytes</b></td><td>0.38 GiB</td><td><b>1,177,887 tokens</b></td></tr>
+      <tr><td>Qwen2.5-0.5B if it had 14 KV heads</td><td>86,016 bytes</td><td>2.6 GiB</td><td>168,269 tokens</td></tr>
+      <tr><td>Qwen2.5-7B (28 × 4 × 128)</td><td>57,344 bytes</td><td>1.75 GiB</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p>The formula was checked against real tensors: GPT-2's cache after 99 tokens held 7,299,072 bytes in fp32, exactly 2 × 36,864 per token, and Qwen2.5-0.5B's cache after 281 tokens held exactly 12,288 bytes per token. The "fits" column is the number of cached tokens, across all requests together, that fit in 90% of 16 GB after the bf16 weights: about a million for Qwen2.5-0.5B, so 35 requests at its full 32k context, or several hundred at 2k. Without grouped-query attention it would be 7 times fewer. This is why GQA (Chapter 15), cache quantisation (Chapter 25) and paged cache memory (Chapter 26) matter so much in practice.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Prompt</b> arrives</li>
+      <li data-k="step"><b>Prefill</b> all prompt tokens at once; K and V cached per layer</li>
+      <li data-k="step"><b>Decode</b> one token: its q against all cached K, V</li>
+      <li data-k="step"><b>Append</b> its K and V to the cache</li>
+      <li data-k="end"><b>Repeat</b> until done; cache grows by one token per step</li>
+    </ol>
+    <figcaption><b>Generation with a KV cache.</b> Prefill is compute-bound; decode is memory-bound, and its memory is weights plus a cache that grows with every token of every request.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">KV cache lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="kv-l">Experiment</div>
+      <div class="seg" id="kvE"><button class="active" data-v="time">time per token</button><button data-v="batch">batching</button><button data-v="mem">memory planner</button><button data-v="check">same output?</button></div>
+      <div class="kv-v" id="kvVm">
+        <div class="kv-l">Model</div>
+        <div class="seg" id="kvM"><button data-v="gpt2">GPT-2</button><button class="active" data-v="q05">Qwen2.5-0.5B</button><button data-v="q05m">0.5B without GQA</button><button data-v="q7">Qwen2.5-7B</button></div>
+        <div class="kv-sl"><span>context per request</span><input type="range" id="kvC" min="9" max="17" step="0.5" value="13" aria-label="context, log2 tokens"><code id="kvCv"></code></div>
+        <div class="kv-sl"><span>requests</span><input type="range" id="kvR" min="1" max="64" step="1" value="8" aria-label="concurrent requests"><code id="kvRv"></code></div>
+      </div>
+      <div class="kv-box" id="kvOut"></div>
+      <div class="stats" id="kvStats"></div>
+      <div class="kv-why" id="kvWhy"></div>
+    </div>
+    <div class="panel-foot">Chapter 7's <code>tinygpt.py</code> with GPT-2's weights (revision 607a30d) and the cache written in <code>ch16_exp.py</code>; timings in bf16 autocast, median of 5 to 20 runs, RTX 5070 Ti. Qwen2.5-0.5B cache measured from its real cache tensors (revision 060db64). The memory planner uses the measured bytes per token and bf16 weights: GPT-2 0.25 GB, Qwen2.5-0.5B 1.0 GB, Qwen2.5-7B 15.2 GB.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🗃️</div>
+    <div class="body"><div class="title">Use case: prompt caching in APIs</div><p>The cache does not have to be thrown away when a request ends. If many requests start with the same long prefix, a system prompt, a set of documents, a long conversation so far, the server can keep that prefix's cache and start each new request from it, skipping its prefill. Inference servers such as vLLM and SGLang do this automatically ("prefix caching"), and API providers including Anthropic, OpenAI and Google offer it as prompt caching, charging less for cached input tokens and returning the first token sooner. The measurements here show why it pays: prefill is the part that grows with the prompt, and on a long shared prefix it is most of the work.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Restarting positions at 0</b> for each new token; it must continue from the cache's length.</li>
+      <li><b>Applying the causal mask to a single decoded token</b> against the cache, which hides everything but itself.</li>
+      <li><b>Not checking the cached path</b> against uncached generation; here they produced the same 60 tokens.</li>
+      <li><b>Budgeting GPU memory by weights alone;</b> at long contexts or many requests the cache dominates.</li>
+      <li><b>Serving one request at a time;</b> 64 per step gave 30 times the throughput.</li>
+      <li><b>Expecting decode to speed up with more compute;</b> it is limited by memory reads, not arithmetic.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the KV cache and why does it matter?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>During generation, each new token attends to all previous tokens' keys and values. Because of the causal mask those keys and values never change once computed, so each layer stores them in a cache and the new token only computes its own query, key and value. That turns generation from quadratic recomputation into one token-pass per new token. I implemented it on GPT-2 and checked it produced identical tokens; per-token decode time stayed around 2.6 ms from 16 to 896 tokens of context, while recomputing grew to 6 ms. The cost is memory: 2 × layers × KV heads × head size × bytes per token, 36 KB for GPT-2 and 12 KB for Qwen2.5-0.5B thanks to grouped-query attention.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why is decoding memory-bound, and what do servers do about it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Each decode step processes one token per sequence, so every weight matrix is read from memory to do a single vector multiply, and the whole cache is read too. Arithmetic intensity is about one operation per byte, far below what the GPU needs to be compute-bound (P6). Servers therefore batch many sequences into each step so each weight read serves all of them: 64 sequences gave 30 times the throughput for 2.2 times the step time here. That makes memory for caches the limit on batch size, which is addressed by grouped-query attention, quantising the cache, paging cache memory to avoid fragmentation, prefix caching for shared prompts, and speculative decoding to get several tokens per weight read.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Keys and values of earlier tokens never change, so caching them makes generation one token-pass per token.</li>
+      <li>A from-scratch cache gave the same 60 tokens as recomputing, on every prompt.</li>
+      <li>Cached decode stayed near 2.6 ms per token from 16 to 896 tokens; recomputing grew to 6.0.</li>
+      <li>Prefill is compute-bound and fast per token; decode is memory-bound and slow per token.</li>
+      <li>Batching 64 sequences gave 30× the throughput for 2.2× the step time.</li>
+      <li>Cache per token = 2 × layers × KV heads × head size × bytes: 36 KB for GPT-2, 12 KB for Qwen2.5-0.5B.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why can the keys and values of earlier tokens be cached?</p>
+      <div class="opts">
+        <button class="opt">They are learned parameters</button>
+        <button class="opt">They are the same for every prompt</button>
+        <button class="opt">Because of the causal mask, nothing earlier depends on later tokens, so they never change</button>
+        <button class="opt">Only the last layer uses them</button>
+      </div>
+      <div class="explain">Recomputing them gave identical results; the cache only removes the waste.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What is the difference between prefill and decode?</p>
+      <div class="opts">
+        <button class="opt">Prefill processes the whole prompt at once and is compute-bound; decode makes one token per step and is memory-bound</button>
+        <button class="opt">Prefill uses a different model</button>
+        <button class="opt">Decode does not use the cache</button>
+        <button class="opt">They cost the same per token</button>
+      </div>
+      <div class="explain">896 prompt tokens prefilled in 5.9 ms; each decoded token took 2.6 ms.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">How many bytes per token does Qwen2.5-0.5B's cache take in bf16 (24 layers, 2 KV heads of 64)?</p>
+      <div class="opts">
+        <button class="opt">64</button>
+        <button class="opt">1,536</button>
+        <button class="opt">86,016</button>
+        <button class="opt">12,288: 2 × 24 × 2 × 64 × 2</button>
+      </div>
+      <div class="explain">Measured from the real cache tensors, exactly; 86,016 would be the figure without GQA.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Batching 64 sequences into each decode step…</p>
+      <div class="opts">
+        <button class="opt">made each step 64 times slower</button>
+        <button class="opt">gave 30 times the tokens per second for 2.2 times the step time</button>
+        <button class="opt">had no effect</button>
+        <button class="opt">removed the need for a cache</button>
+      </div>
+      <div class="explain">Each weight read serves every sequence in the batch.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In a cached decode step, which mistake would make every new token ignore all earlier ones?</p>
+      <div class="opts">
+        <button class="opt">Using bf16</button>
+        <button class="opt">Batching sequences</button>
+        <button class="opt">Applying a causal mask between the single new query and the cached keys</button>
+        <button class="opt">Continuing positions from the cache length</button>
+      </div>
+      <div class="explain">SDPA's causal mask aligns to the top left, so one query would see only the first key.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"match":[{"prompt":"The capital of France is","same_60_tokens":true,"last_logit_max_diff":0.000213623046875},{"prompt":"In 1969, Neil Armstrong","same_60_tokens":true,"last_logit_max_diff":0.000213623046875},{"prompt":"def fibonacci(n):\n    ","same_60_tokens":true,"last_logit_max_diff":8.392333984375e-05}],"timing":[{"context":16,"prefill_ms":2.666,"prefill_tokens_per_s":6002,"decode_ms_per_token":2.63,"no_cache_ms_per_token":2.858},{"context":128,"prefill_ms":2.513,"prefill_tokens_per_s":50939,"decode_ms_per_token":2.55,"no_cache_ms_per_token":3.088},{"context":512,"prefill_ms":3.634,"prefill_tokens_per_s":140901,"decode_ms_per_token":2.533,"no_cache_ms_per_token":4.089},{"context":896,"prefill_ms":5.889,"prefill_tokens_per_s":152159,"decode_ms_per_token":2.619,"no_cache_ms_per_token":5.995}],"batch_decode":[{"batch":1,"ms_per_step":2.561,"tokens_per_s":390},{"batch":4,"ms_per_step":2.837,"tokens_per_s":1410},{"batch":16,"ms_per_step":3.064,"tokens_per_s":5221},{"batch":64,"ms_per_step":5.533,"tokens_per_s":11568}],"gpt2_cache":{"tokens":99,"bytes_fp32":7299072,"per_token_bf16":36864},"qwen_cache":{"tokens":281,"bytes":3452928,"per_token":12288.0,"kv_heads":2,"heads":14,"layers":24,"head_dim":64,"per_token_if_mha":86016},"fit":{"GPT-2":412702,"Qwen2.5-0.5B":1177887,"Qwen2.5-0.5B without GQA":168269},"qwen7b_per_token":57344};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const MODELS = { gpt2: ['GPT-2', D.gpt2_cache.per_token_bf16, 0.25e9, 1024], q05: ['Qwen2.5-0.5B', D.qwen_cache.per_token, 0.99e9, 32768],
+                   q05m: ['Qwen2.5-0.5B without GQA', D.qwen_cache.per_token_if_mha, 0.99e9, 32768], q7: ['Qwen2.5-7B', D.qwen7b_per_token, 15.2e9, 131072] };
+
+  function drawTime() {
+    const T = D.timing, mx = 6.5;
+    $('#kvOut').innerHTML = T.map(r => `<div class="kv-l">${r.context.toLocaleString('en-GB')}-token context</div><div class="kv-bar"><span>with the cache</span><span class="track"><i style="width:${(100 * r.decode_ms_per_token / mx).toFixed(1)}%"></i></span><span class="n">${r.decode_ms_per_token} ms</span></div><div class="kv-bar"><span>recomputing everything</span><span class="track"><i class="b" style="width:${(100 * r.no_cache_ms_per_token / mx).toFixed(1)}%"></i></span><span class="n">${r.no_cache_ms_per_token} ms</span></div>`).join('');
+    const last = T[T.length - 1];
+    $('#kvStats').innerHTML = `<div class="stat good"><div class="k">Saving at ${last.context}</div><div class="v">${(last.no_cache_ms_per_token / last.decode_ms_per_token).toFixed(1)}×</div></div><div class="stat"><div class="k">Prefill rate at ${last.context}</div><div class="v">${(last.prefill_tokens_per_s / 1000).toFixed(0)}k tok/s</div></div>`;
+    $('#kvWhy').innerHTML = '<b>Flat with the cache, rising without.</b> The cached step does the same work whatever the context (it only reads more cache); recomputing redoes every earlier position each time, so its cost climbs with the text.';
+  }
+  function drawBatch() {
+    const Bt = D.batch_decode, mx = Math.max(...Bt.map(b => b.tokens_per_s));
+    $('#kvOut').innerHTML = Bt.map(b => `<div class="kv-bar"><span>${b.batch} sequence${b.batch > 1 ? 's' : ''} per step</span><span class="track"><i style="width:${(100 * b.tokens_per_s / mx).toFixed(1)}%"></i></span><span class="n">${b.tokens_per_s.toLocaleString('en-GB')} tok/s</span></div>`).join('') + '<p class="small muted" style="margin:8px 0 0">256-token caches, GPT-2, bf16.</p>';
+    $('#kvStats').innerHTML = Bt.map(b => `<div class="stat"><div class="k">Step, batch ${b.batch}</div><div class="v">${b.ms_per_step} ms</div></div>`).join('');
+    $('#kvWhy').innerHTML = '<b>One weight read, many tokens.</b> Time per step barely rises while tokens per step multiply. The batch is limited by memory, which is mostly cache.';
+  }
+  function drawMem() {
+    const [name, per, wb, ctxMax] = MODELS[v('#kvM')], C = Math.round(2 ** +$('#kvC').value), Rq = +$('#kvR').value;
+    $('#kvCv').textContent = C.toLocaleString('en-GB'); $('#kvRv').textContent = Rq;
+    const cache = per * C * Rq, tot = wb + cache, cap = 16e9 * 0.9;
+    $('#kvOut').innerHTML = `<div class="kv-stack"><i style="width:${(100 * Math.min(wb, cap) / Math.max(tot, cap)).toFixed(1)}%;background:var(--muted)" title="weights"></i><i style="width:${(100 * Math.min(cache, cap) / Math.max(tot, cap)).toFixed(1)}%;background:${tot > cap ? 'var(--red)' : 'var(--accent)'}" title="cache"></i></div><p class="small muted" style="margin:0"><span style="color:var(--muted)">■</span> weights ${(wb / 1e9).toFixed(2)} GB &nbsp; <span style="color:var(--accent)">■</span> KV cache ${(cache / 1e9).toFixed(2)} GB &nbsp; scale: 90% of 16 GB</p>`;
+    $('#kvStats').innerHTML = `<div class="stat"><div class="k">Per token</div><div class="v">${per.toLocaleString('en-GB')} B</div></div><div class="stat ${tot > cap ? 'bad' : 'good'}"><div class="k">Total</div><div class="v">${(tot / 1e9).toFixed(2)} GB</div></div><div class="stat"><div class="k">Max requests at this context</div><div class="v">${Math.max(0, Math.floor((cap - wb) / (per * C))).toLocaleString('en-GB')}</div></div>`;
+    $('#kvWhy').innerHTML = C > ctxMax ? `<b>Beyond ${name}'s trained context of ${ctxMax.toLocaleString('en-GB')} tokens.</b> The memory is shown, but the model is not built for it.` : tot > cap ? '<b>Does not fit.</b> Fewer requests, a shorter context, a quantised cache or a model with fewer KV heads.' : '<b>Weights are fixed; the cache grows with every token of every request.</b> Compare Qwen2.5-0.5B with and without GQA at the same settings.';
+  }
+  function drawCheck() {
+    $('#kvOut').innerHTML = D.match.map(m => `<div class="kv-bar"><span><code>${m.prompt.replace(/\n/g, '⏎').replace(/</g, '&lt;')}</code></span><span>${m.same_60_tokens ? '✅ same 60 tokens' : '❌ different'}</span><span class="n">Δ ${m.last_logit_max_diff.toExponential(1)}</span></div>`).join('');
+    $('#kvStats').innerHTML = '';
+    $('#kvWhy').innerHTML = '<b>A cache must change nothing but speed.</b> Greedy generation with and without it gave identical tokens; the logits differed only by floating-point summation order.';
+  }
+  function draw() {
+    const e = v('#kvE');
+    $('#kvVm').classList.toggle('on', e === 'mem');
+    ({ time: drawTime, batch: drawBatch, mem: drawMem, check: drawCheck })[e]();
+  }
+  ['#kvE', '#kvM'].forEach(id => $(id).addEventListener('segchange', draw));
+  ['#kvC', '#kvR'].forEach(id => $(id).addEventListener('input', draw));
+  draw();
+})();
+</script>
+</body>
+</html>

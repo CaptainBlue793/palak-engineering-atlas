@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DPO &amp; Direct Preference Tuning · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 24 of LLMs. Direct preference optimisation derived from RLHF's objective, written from scratch, and trained with LoRA on Qwen2.5-0.5B-Instruct: SFT, DPO at two strengths and IPO on the same 4,000 preference pairs, judged by a separate reward model for quality, win rate and length.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .dp-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .dp-v { display:none; } .dp-v.on { display:block; }
+  .dp-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .dp-bar { display:grid; grid-template-columns:220px 1fr 90px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .dp-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .dp-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .dp-bar .track i.b { background:var(--amber); }
+  .dp-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .dp-sl { display:grid; grid-template-columns:110px 1fr 70px; gap:10px; align-items:center; font-size:13px; padding:3px 0; }
+  .dp-sl input[type=range] { width:100%; accent-color:var(--accent); }
+  .dp-svg { width:100%; height:auto; display:block; }
+  .dp-key { display:flex; flex-wrap:wrap; gap:14px; font-size:12.5px; color:var(--muted); margin-top:6px; }
+  .dp-out { font-size:13px; border-left:3px solid var(--border-strong); padding:4px 10px; margin:4px 0 10px; }
+  .dp-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .dp-bar { grid-template-columns:120px 1fr 70px; } }
+</style>
+</head>
+<body data-chapter="24">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 24</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
+    <h1>DPO &amp; Direct Preference <span class="grad">Tuning</span></h1>
+    <p class="lead">Chapter 23's RLHF needed a reward model, a sampling loop, a KL penalty and three attempts before it learned. Direct preference optimisation (DPO, 2023) gets to the same objective with none of the machinery: a little algebra turns "maximise reward while staying close to the reference model" into a loss that trains directly on preference pairs, like supervised fine-tuning.</p>
+    <p class="lead">This chapter derives that loss, writes it in a few lines, and trains Qwen2.5-0.5B-Instruct four ways on the same 4,000 UltraFeedback pairs, judged by Chapter 23's gold reward model. SFT on the chosen replies did not beat the untuned model (it won 46.9% of comparisons). DPO at β = 0.1 won 60.9%, and IPO, a variant, scored highest, 5.80 against 5.00, at the same reply length. With 64 test prompts those differences are suggestive rather than decisive, and the chapter shows how to tell.</p>
+    <ul class="objectives">
+      <li><span>Derive the DPO loss from the KL-regularised RLHF objective</span></li>
+      <li><span>Implement DPO and IPO with the reference model as a switched-off adapter</span></li>
+      <li><span>Read DPO's implicit reward and its accuracy on held-out pairs</span></li>
+      <li><span>Compare preference tuning with SFT on the same data</span></li>
+      <li><span>Know what KTO and ORPO change, and when to use them</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>RLHF and reward models:</b> <a href="23-rlhf-and-reward-models.html">Chapter 23</a>, whose data, objective and gold judge are reused here.</li>
+        <li><b>LoRA:</b> <a href="21-lora-and-peft.html">Chapter 21</a>.</li>
+        <li><b>Log-probabilities of a sequence:</b> <a href="p4-probability-for-language-models.html">Probability for Language Models</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>From RLHF to DPO</h2>
+  <p>RLHF maximises the reward minus β times the KL divergence from a reference model π<sub>ref</sub>, usually the SFT model. That objective has an exact solution: the best policy reweights the reference by the exponentiated reward,</p>
+  <p style="text-align:center"><code>π*(y | x) = π<sub>ref</sub>(y | x) · exp(r(x, y) / β) / Z(x)</code></p>
+  <p>where Z(x) depends only on the prompt. Turn it around and the reward is written in terms of the policy: <code>r(x, y) = β · log(π(y | x) / π<sub>ref</sub>(y | x)) + β · log Z(x)</code>. Put that into Chapter 23's Bradley–Terry loss, which only uses the <i>difference</i> between the rewards of two replies to the same prompt, and the awkward Z(x) cancels. What is left is a loss on the policy alone, with no reward model and no sampling: the policy is its own reward model. The quantity β · log(π / π<sub>ref</sub>) is called its <b>implicit reward</b>.</p>
+
+  <h2>The DPO loss</h2>
+<pre class="code"><span class="k">def</span> <span class="f">preference_loss</span>(policy, batch, beta, kind=<span class="s">"dpo"</span>):
+    lp = <span class="f">seq_logp</span>(policy, batch.chosen + batch.rejected)          <span class="c"># sum of reply-token log-probs</span>
+    <span class="k">with</span> torch.<span class="f">no_grad</span>(), policy.<span class="f">disable_adapter</span>():               <span class="c"># the reference: same weights, no LoRA</span>
+        ref = <span class="f">seq_logp</span>(policy, batch.chosen + batch.rejected)
+    n = <span class="f">len</span>(batch.chosen)
+    h = (lp[:n] - ref[:n]) - (lp[n:] - ref[n:])                   <span class="c"># how much more than the reference it prefers chosen</span>
+    <span class="k">if</span> kind == <span class="s">"dpo"</span>:
+        <span class="k">return</span> -F.<span class="f">logsigmoid</span>(beta * h).<span class="f">mean</span>()
+    <span class="k">return</span> ((h - <span class="m">1</span> / (<span class="m">2</span> * beta)) ** <span class="m">2</span>).<span class="f">mean</span>()                     <span class="c"># IPO: aim for a fixed margin</span></pre>
+  <p>Two details make this cheap. With LoRA, the reference model needs no second copy in memory: switching the adapter off gives back exactly the starting weights. And the loss at the start is exactly ln 2 = 0.693 (both replies equally preferred), which the training curves confirmed. The gradient of the DPO loss weights each pair by σ(−β·h): pairs the policy still gets wrong, relative to the reference, count most, and pairs it already separates widely count almost not at all.</p>
+
+  <h2>Training it</h2>
+  <p>Every run used the same 4,000 pairs (each under 640 tokens, chosen strictly better), one epoch of 500 steps of 8 pairs, a rank-16 LoRA adapter on all seven linear layers, learning rate 5 × 10⁻⁵ with a cosine schedule. The SFT run trained on the chosen replies only. Each model then answered 64 held-out prompts greedily, and Chapter 23's gold reward model (Qwen2.5-1.5B, 77.8% accurate) scored every reply. The judge never saw those prompts, but 836 of the 4,000 training pairs (20.9%) were among the 8,000 it was trained on, so it shares part of the training signal; the comparison between methods is fairer than the absolute scores.</p>
+  <table class="t cmp">
+    <thead><tr><th>Model</th><th>Time</th><th>Gold reward</th><th>Wins vs untuned</th><th>Reply tokens</th><th>Implicit reward accuracy</th></tr></thead>
+    <tbody>
+      <tr><td>Untuned Qwen2.5-0.5B-Instruct</td><td>—</td><td>5.00</td><td>—</td><td>134</td><td>—</td></tr>
+      <tr><td>SFT on the chosen replies</td><td>317 s</td><td>5.16</td><td>46.9%</td><td>108</td><td>44.2%</td></tr>
+      <tr><td>DPO, β = 0.1</td><td>477 s</td><td>5.63</td><td><b>60.9%</b></td><td>144</td><td><b>67.2%</b></td></tr>
+      <tr><td>DPO, β = 0.5</td><td>487 s</td><td>5.30</td><td>48.4%</td><td>133</td><td>66.2%</td></tr>
+      <tr><td>IPO, β = 0.1</td><td>479 s</td><td><b>5.80</b></td><td>59.4%</td><td>135</td><td>61.2%</td></tr>
+    </tbody>
+  </table>
+  <p>DPO took half again as long as SFT, for the reference pass and the rejected replies, and a little less than Chapter 23's 120 RL steps (about 570 s), with no sampling, no reward model in memory and no instability: all three preference runs trained on their first settings.</p>
+
+  <h2>Measured against SFT</h2>
+  <p>SFT on the chosen replies made the replies shorter, 108 tokens against 134, but did not make them better by the judge: it won 46.9% of comparisons, no better than a coin. It never sees the rejected replies, so it learns to sound like the chosen ones without learning what made them better than the alternatives. Its implicit reward even ranked held-out pairs worse than chance, 44.2%: raising the probability of replies like the chosen ones raised the rejected ones, often written in a similar style, more.</p>
+  <p>DPO learned the difference. Its implicit reward picked the chosen reply in 67.2% of held-out pairs, close to the 72.9% of Chapter 23's separately trained 0.5B reward model, and its replies won 60.9% of comparisons. Part of its gain may be length: its replies grew by 10 tokens, and Chapter 23 showed that judges favour length. A stronger tie to the reference, β = 0.5, kept the length and the win rate at the untuned model's level, though its implicit accuracy (66.2%) was nearly as good: it learned to rank pairs but changed its own replies less.</p>
+  <p><b>How sure is this?</b> Each win rate is measured on 64 prompts, so its standard error is about √(0.25 / 64) ≈ 6 points. A win rate needs to pass about 62% to be two standard errors above 50%, and 60.9% does not quite. These results point the same way as the DPO paper's and many replications, but on their own they would justify a larger evaluation, not a launch decision. Preference-tuning results are often reported on a few hundred prompts with no error bars; ask for them.</p>
+
+  <h2>Variants: IPO, KTO, ORPO</h2>
+  <p><b>IPO</b> (identity preference optimisation) replaces the sigmoid with a squared error that aims for a fixed margin, 1/(2β) = 5 here. DPO's loss keeps falling as the margin grows, so on pairs where one reply is always preferred it can push the probabilities to extremes; IPO stops pushing once the target is reached. Its loss started at exactly 25 = 5², as expected. Here it had the highest gold score, 5.80, with replies the same length as the untuned model's (135 against 134), so its gain was not length. Its implicit accuracy was lower, 61.2%, consistent with a loss that stops separating pairs once they reach the margin.</p>
+  <p>Two other variants were not measured here. <b>KTO</b> needs no pairs at all, only replies labelled good or bad, which is what a thumbs-up button collects; it weighs losses more than gains, after prospect theory. <b>ORPO</b> drops the reference model, adding a penalty on the odds of the rejected reply to the ordinary SFT loss, so preference tuning and SFT happen in one run. Both trade some of DPO's grounding for data or compute that is easier to get.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Start from an SFT model</b> it is also the reference</li>
+      <li data-k="step"><b>Score both replies</b> under the policy and the reference</li>
+      <li data-k="step"><b>Compare log-ratios:</b> chosen minus rejected</li>
+      <li data-k="step"><b>DPO:</b> −log σ(β·h); <b>IPO:</b> (h − 1/2β)²</li>
+      <li data-k="end"><b>Judge separately,</b> with enough prompts for error bars</li>
+    </ol>
+    <figcaption><b>Preference tuning as supervised learning.</b> No reward model, no sampling; four forward passes per pair, two of them without gradients.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Preference tuning lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="dp-l">Experiment</div>
+      <div class="seg" id="dpE"><button class="active" data-v="res">results</button><button data-v="loss">the losses</button><button data-v="rep">replies</button></div>
+      <div class="dp-v" id="dpVr">
+        <div class="dp-l">Measure</div>
+        <div class="seg" id="dpM"><button class="active" data-v="gold">gold reward</button><button data-v="win_vs_base">win rate</button><button data-v="reply_tokens">reply length</button><button data-v="implicit_accuracy">implicit accuracy</button></div>
+      </div>
+      <div class="dp-v" id="dpVl">
+        <div class="dp-sl"><span>β</span><input type="range" id="dpB" min="0" max="4" value="1" aria-label="beta"><code id="dpBv"></code></div>
+      </div>
+      <div class="dp-box" id="dpOut"></div>
+      <div class="stats" id="dpStats"></div>
+      <div class="dp-why" id="dpWhy"></div>
+    </div>
+    <div class="panel-foot">Qwen2.5-0.5B-Instruct (revision 7ae5576), LoRA rank 16, alpha 32 on all seven linear layers, 4,000 UltraFeedback binarised pairs (revision 3949bf5) up to 640 tokens, 500 steps of 8 pairs in micro-batches of 2, learning rate 5 × 10⁻⁵ with cosine schedule, gradient checkpointing, seed 0. Implicit accuracy on 500 held-out pairs. Replies: greedy with Qwen's default repetition penalty of 1.1, up to 200 tokens, to 64 held-out prompts, scored by Chapter 23's gold reward model. "The losses" tab is computed in your browser; everything else is measured.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">⚖️</div>
+    <div class="body"><div class="title">Use case: preference tuning without an RL team</div><p>DPO made preference tuning routine. Many open instruction-tuned models, starting with Hugging Face's Zephyr in 2023, were aligned with DPO or one of its variants on public preference sets like UltraFeedback, and libraries such as TRL run it in a few lines on one GPU. For a team with comparison data, say pairs of support replies that agents ranked, it is usually the first thing to try after SFT: no reward model to train and serve, no sampling loop, and far fewer ways to fail than RL. Its limits come from the same simplicity. It only learns from the pairs it is given, rather than exploring new replies and having them scored, and online methods that do explore often do better when a good reward model exists.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Assuming SFT on the chosen replies is enough;</b> it won 46.9% here and ranked pairs worse than chance.</li>
+      <li><b>Reporting win rates without error bars;</b> on 64 prompts one standard error is about 6 points.</li>
+      <li><b>Ignoring length;</b> DPO at β = 0.1 added 10 tokens a reply, and judges favour length.</li>
+      <li><b>Judging with a model trained on the same pairs</b> without saying so; 20.9% overlapped here.</li>
+      <li><b>Keeping a second full copy as the reference</b> when a LoRA adapter can simply be switched off.</li>
+      <li><b>Reading a high implicit accuracy as better replies;</b> β = 0.5 ranked pairs at 66.2% but did not beat the untuned model.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is DPO, and why did it replace RLHF in many pipelines?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>RLHF maximises reward minus β times the KL to a reference model. That objective's optimal policy is the reference reweighted by exp(reward / β), so the reward can be written as β log(π / π_ref) plus a term that depends only on the prompt. Substituting into the Bradley–Terry preference loss cancels that term, giving a classification-style loss on pairs: −log σ(β[(log π − log π_ref)(chosen) − (log π − log π_ref)(rejected)]). No reward model, no sampling, no value function, so it is simpler, cheaper and more stable. In my runs on Qwen2.5-0.5B-Instruct it trained on its first settings in about 8 minutes, its implicit reward ranked 67.2% of held-out pairs correctly, and its replies beat the untuned model's 60.9% of the time, against 46.9% for SFT on the same chosen replies.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your DPO model wins 61% of comparisons against the base model. What else do you check before you believe it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First the sample size: on 64 prompts the standard error is about 6 points, so 61% is not two standard errors above 50%; I would evaluate on several hundred prompts. Second length: my DPO model's replies were 10 tokens longer, and judges, human or model, favour length, so I would compare at matched length or use a length-controlled win rate. Third the judge: whether it was trained on overlapping data (20.9% of my pairs were in its training set), and whether it agrees with people. Fourth regressions on capabilities the preference data does not cover. I would also try IPO or a larger β; in my runs IPO scored highest with no length increase, and β = 0.5 changed little.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>DPO rewrites RLHF's KL-regularised objective as a loss on preference pairs; the policy is its own reward model.</li>
+      <li>With LoRA, the reference is the same model with the adapter switched off.</li>
+      <li>SFT on the chosen replies did not beat the untuned model (46.9%); DPO at β = 0.1 won 60.9%.</li>
+      <li>IPO scored highest by the judge (5.80 against 5.00) with no increase in length.</li>
+      <li>DPO's implicit reward ranked 67.2% of held-out pairs, near a separately trained reward model's 72.9%.</li>
+      <li>On 64 prompts a win rate's standard error is about 6 points: report error bars and length.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why does DPO not need a reward model?</p>
+      <div class="opts">
+        <button class="opt">It ignores the preference labels</button>
+        <button class="opt">The optimal policy of the KL-regularised objective lets the reward be written as β log(π / π_ref), so the policy is its own reward model</button>
+        <button class="opt">It uses a human for every step</button>
+        <button class="opt">It samples replies and asks the reference model to score them</button>
+      </div>
+      <div class="explain">The prompt-only term log Z(x) cancels in the Bradley–Terry difference.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">With a LoRA adapter, what is the reference model in these runs?</p>
+      <div class="opts">
+        <button class="opt">A second full copy loaded from disk</button>
+        <button class="opt">The gold reward model</button>
+        <button class="opt">A random model</button>
+        <button class="opt">The same network with the adapter switched off</button>
+      </div>
+      <div class="explain">Switching LoRA off gives exactly the starting weights, so no extra memory is needed.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why did SFT on the chosen replies not beat the untuned model here?</p>
+      <div class="opts">
+        <button class="opt">It never sees the rejected replies, so it learns to sound like the chosen ones but not what made them better</button>
+        <button class="opt">It trained for too long</button>
+        <button class="opt">It used the wrong tokenizer</button>
+        <button class="opt">SFT cannot change a model</button>
+      </div>
+      <div class="explain">It won 46.9% of comparisons and ranked held-out pairs at 44.2%, below chance.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">DPO at β = 0.1 won 60.9% of 64 comparisons. What is the right conclusion?</p>
+      <div class="opts">
+        <button class="opt">It is proven better</button>
+        <button class="opt">It is proven no better</button>
+        <button class="opt">It is suggestive: one standard error is about 6 points, and its replies were also 10 tokens longer</button>
+        <button class="opt">Win rates cannot be compared</button>
+      </div>
+      <div class="explain">Two standard errors above 50% is about 62%; a larger, length-aware evaluation is needed.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How does IPO's loss differ from DPO's?</p>
+      <div class="opts">
+        <button class="opt">It needs a reward model</button>
+        <button class="opt">It aims for a fixed margin with a squared error, instead of pushing the margin ever larger</button>
+        <button class="opt">It trains only on rejected replies</button>
+        <button class="opt">It has no β</button>
+      </div>
+      <div class="explain">Target 1/(2β) = 5 here; its loss started at 25. It scored highest, 5.80, at the untuned model's length.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"runs":[{"label":"SFT on chosen replies","kind":"sft","beta":0.1,"lr":5e-05,"steps":500,"seconds":317.4,"curve":[[0,1.4535,0.0],[25,0.9891,0.0],[50,1.1125,0.0],[75,1.4188,0.0],[100,0.8804,0.0],[125,0.8192,0.0],[150,1.4079,0.0],[175,1.3287,0.0],[200,1.4544,0.0],[225,1.2103,0.0],[250,1.583,0.0],[275,1.0581,0.0],[300,1.7116,0.0],[325,1.5707,0.0],[350,1.2326,0.0],[375,1.2709,0.0],[400,1.6047,0.0],[425,1.0558,0.0],[450,0.9491,0.0],[475,1.3408,0.0]],"implicit_accuracy":0.442},{"label":"DPO, beta 0.1","kind":"dpo","beta":0.1,"lr":5e-05,"steps":500,"seconds":477.1,"curve":[[0,0.6932,-0.0],[25,0.7114,-0.102],[50,0.6201,4.328],[75,0.6733,1.453],[100,0.6885,1.816],[125,0.7458,4.557],[150,0.7956,-1.057],[175,0.7028,1.674],[200,0.1976,20.954],[225,0.5491,4.628],[250,0.4082,10.055],[275,0.6364,4.151],[300,0.4102,7.382],[325,1.0968,-5.382],[350,0.5535,6.919],[375,0.4739,7.121],[400,0.6008,10.48],[425,0.3777,13.816],[450,0.6283,7.245],[475,0.8304,-0.302]],"implicit_accuracy":0.672},{"label":"DPO, beta 0.5","kind":"dpo","beta":0.5,"lr":5e-05,"steps":500,"seconds":487.2,"curve":[[0,0.6932,-0.0],[25,0.7439,-0.053],[50,0.8843,3.624],[75,0.6489,1.482],[100,0.6313,1.714],[125,1.704,-1.201],[150,1.1795,-0.497],[175,1.1576,-0.191],[200,0.099,7.733],[225,0.4885,1.549],[250,0.4149,3.708],[275,0.9759,1.233],[300,0.4225,2.809],[325,1.4082,-1.54],[350,0.4991,3.057],[375,0.4358,2.604],[400,0.8414,1.74],[425,0.7067,3.836],[450,0.9883,1.464],[475,1.2177,-0.789]],"implicit_accuracy":0.662},{"label":"IPO, beta 0.1","kind":"ipo","beta":0.1,"lr":5e-05,"steps":500,"seconds":479.4,"curve":[[0,25.0007,-0.0],[25,24.5111,0.14],[50,33.4597,3.755],[75,33.9921,0.901],[100,27.1469,1.039],[125,72.3461,-2.056],[150,37.0914,-0.647],[175,33.1383,-0.002],[200,9.2854,4.97],[225,33.5416,-0.364],[250,16.617,3.164],[275,28.7799,1.156],[300,23.3025,1.212],[325,32.7258,-0.136],[350,18.372,2.233],[375,16.8449,1.472],[400,32.7033,1.122],[425,32.1877,2.273],[450,41.2,0.383],[475,37.4087,-0.536]],"implicit_accuracy":0.612}],"base":true,"judged":[{"label":"untuned Instruct model","gold":5.001,"win_vs_base":null,"reply_tokens":133.7},{"label":"SFT on chosen replies","gold":5.163,"win_vs_base":0.469,"reply_tokens":107.5,"implicit_accuracy":0.442},{"label":"DPO, beta 0.1","gold":5.627,"win_vs_base":0.609,"reply_tokens":143.9,"implicit_accuracy":0.672},{"label":"DPO, beta 0.5","gold":5.301,"win_vs_base":0.484,"reply_tokens":133.1,"implicit_accuracy":0.662},{"label":"IPO, beta 0.1","gold":5.801,"win_vs_base":0.594,"reply_tokens":134.6,"implicit_accuracy":0.612}],"examples":{"prompt":"What commonality can be found among a dwelling, a vehicle, and two types of pets when they are combined into a concise phrase?","base":"When a dwelling, a vehicle, and two types of pets (such as cats or dogs) are combined, the resulting phrase is \"A cozy home with four legs.\" This phrase captures the essence of having a multi-faceted living space that includes both human habitation and animal companionship.","SFT on chosen replies":"A dwelling, a vehicle, and two types of pets can be combined to form the phrase \"a cozy home with a sleek car and four-legged friends.\"","DPO, beta 0.1":"A dwelling, a vehicle, and two types of pets can be combined into the phrase \"Together in Harmony.\" This succinct phrase captures the essence of these three elements as a single unit, emphasizing their interdependence and unity.","DPO, beta 0.5":"When a dwelling, a vehicle, and two types of pets (e.g., cats and dogs) are combined, the commonality is that all three items share a theme or purpose: to provide shelter, transportation, and companionship for their owners. This combination creates a cozy living space where each pet has its own designated area, allowing them to enjoy each other's company while also being protected from the elements.","IPO, beta 0.1":"When a dwelling, a vehicle, and two types of pets (such as cats or dogs) are combined, the resulting phrase could be \"A cozy home with a sleek car and four-legged friends.\" This succinct expression captures the essence of each element being brought together in a single, cohesive statement."},"judge_overlap":{"dpo_pairs":4000,"also_in_judge_training":836}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const J = D.judged, base = J[0];
+
+  function drawRes() {
+    const k = v('#dpM'), rows = k === 'win_vs_base' || k === 'implicit_accuracy' ? J.slice(1) : J;
+    const val = (r) => r[k], mx = k === 'gold' ? 6.5 : k === 'reply_tokens' ? 160 : 1, mn = k === 'gold' ? 4 : 0;
+    const fmt = (x) => k === 'gold' ? x.toFixed(2) : k === 'reply_tokens' ? x.toFixed(0) : (100 * x).toFixed(1) + '%';
+    $('#dpOut').innerHTML = rows.map(r => `<div class="dp-bar"><span>${esc(r.label)}</span><span class="track"><i class="${r === base ? 'b' : ''}" style="width:${(100 * (val(r) - mn) / (mx - mn)).toFixed(1)}%"></i></span><span class="n">${fmt(val(r))}</span></div>`).join('')
+      + `<p class="small muted" style="margin:8px 0 0">${({ gold: 'Mean gold reward on 64 held-out prompts (bars start at 4). Amber: the untuned model.', win_vs_base: 'Share of the 64 prompts where the reply beat the untuned model\'s, by the gold judge. One standard error ≈ 6 points.', reply_tokens: 'Mean reply length in tokens. Amber: the untuned model.', implicit_accuracy: 'Held-out pairs where the policy\'s log-ratio to the reference favoured the chosen reply. 50% is a coin.' })[k]}</p>`;
+    const best = J.slice(1).reduce((a, b) => a.gold > b.gold ? a : b);
+    $('#dpStats').innerHTML = `<div class="stat"><div class="k">Untuned: gold · length</div><div class="v">${base.gold.toFixed(2)} · ${base.reply_tokens.toFixed(0)}</div></div><div class="stat good"><div class="k">Best by gold: ${esc(best.label)}</div><div class="v">${best.gold.toFixed(2)} · ${best.reply_tokens.toFixed(0)}</div></div><div class="stat warn"><div class="k">Two standard errors, 64 prompts</div><div class="v">± 12.5 points</div></div>`;
+    $('#dpWhy').innerHTML = ({ gold: '<b>Preference tuning moved the judge; SFT barely did.</b> IPO and DPO at β = 0.1 scored highest. With 64 prompts, treat small gaps with caution.', win_vs_base: '<b>Two methods above a coin, neither by two standard errors.</b> DPO at β = 0.1 won 60.9%, IPO 59.4%; SFT and β = 0.5 stayed near 50%.', reply_tokens: '<b>Watch the length.</b> SFT shortened replies, DPO at β = 0.1 lengthened them by 10 tokens, IPO kept them the same.', implicit_accuracy: '<b>Ranking pairs is not the same as writing better replies.</b> β = 0.5 ranked 66.2% of pairs correctly but did not beat the untuned model.' })[k];
+  }
+  function drawLoss() {
+    const B = [0.05, 0.1, 0.2, 0.5, 1][+$('#dpB').value]; $('#dpBv').textContent = B;
+    const W = 640, H = 240, L = 44, Bm = 30, hx = [-10, 20], x = (h) => L + (W - L - 14) * (h - hx[0]) / (hx[1] - hx[0]);
+    const dpo = (h) => Math.log(1 + Math.exp(-B * h)), ipo = (h) => (h - 1 / (2 * B)) ** 2, w = (h) => 1 / (1 + Math.exp(B * h));
+    const ymax = 3, y = (u) => 10 + (H - Bm - 10) * (1 - Math.min(u, ymax) / ymax);
+    const pts = (f, sc) => Array.from({ length: 121 }, (_, i) => hx[0] + i * (hx[1] - hx[0]) / 120).map(h => x(h).toFixed(1) + ',' + y(f(h) * sc).toFixed(1)).join(' ');
+    const ipoScale = Math.min(1, ymax / ipo(hx[0]));
+    let g = `<svg class="dp-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="DPO and IPO losses against the margin">`;
+    [0, 1, 2, 3].forEach(t => g += `<line x1="${L}" x2="${W - 14}" y1="${y(t)}" y2="${y(t)}" stroke="${css('--border')}"/><text x="${L - 6}" y="${y(t) + 4}" text-anchor="end" font-size="11" fill="${css('--muted')}">${t}</text>`);
+    [-10, -5, 0, 5, 10, 15, 20].forEach(t => g += `<text x="${x(t)}" y="${H - 10}" text-anchor="middle" font-size="11" fill="${css('--muted')}">${t}</text>`);
+    g += `<line x1="${x(0)}" x2="${x(0)}" y1="10" y2="${H - Bm}" stroke="${css('--border-strong')}" stroke-dasharray="4 4"/>`;
+    g += `<polyline fill="none" stroke="${css('--accent')}" stroke-width="2.5" points="${pts(dpo, 1)}"/><polyline fill="none" stroke="${css('--amber')}" stroke-width="2.5" points="${pts(ipo, ipoScale)}"/><polyline fill="none" stroke="${css('--green')}" stroke-width="2" stroke-dasharray="5 4" points="${pts(w, 1)}"/>`;
+    $('#dpOut').innerHTML = g + `</svg><div class="dp-key"><span><span style="color:${css('--accent')}">●</span> DPO loss −log σ(βh)</span><span><span style="color:${css('--amber')}">●</span> IPO loss (h − 1/2β)², scaled ×${ipoScale.toFixed(3)}</span><span><span style="color:${css('--green')}">●</span> DPO gradient weight σ(−βh)</span><span>x: margin h</span></div>`;
+    $('#dpStats').innerHTML = `<div class="stat"><div class="k">DPO loss at h = 0</div><div class="v">${dpo(0).toFixed(3)}</div></div><div class="stat"><div class="k">IPO target margin</div><div class="v">${(1 / (2 * B)).toFixed(1)}</div></div><div class="stat"><div class="k">DPO weight at h = 10</div><div class="v">${w(10).toFixed(3)}</div></div>`;
+    $('#dpWhy').innerHTML = '<b>DPO never stops pushing; IPO aims for a margin.</b> DPO\'s loss keeps falling as the margin grows, though its weight fades; IPO\'s rises again past 1/(2β). Larger β makes both act on smaller margins.';
+  }
+  function drawRep() {
+    const E = D.examples;
+    $('#dpOut').innerHTML = `<div class="dp-l">Prompt</div><div class="dp-out">${esc(E.prompt)}</div>` + Object.entries(E).filter(([k]) => k !== 'prompt').map(([k, t]) => `<div class="dp-l">${esc(k === 'base' ? 'untuned model' : k)}</div><div class="dp-out">${esc(t)}</div>`).join('');
+    $('#dpStats').innerHTML = '';
+    $('#dpWhy').innerHTML = '<b>Differences in style, mostly.</b> The tuned replies differ in how much they explain, and DPO at β = 0.5 never gives the phrase it was asked for. One example is an illustration, not evidence: the table rests on 64 prompts.';
+  }
+  function draw() {
+    const e = v('#dpE');
+    $('#dpVr').classList.toggle('on', e === 'res'); $('#dpVl').classList.toggle('on', e === 'loss');
+    ({ res: drawRes, loss: drawLoss, rep: drawRep })[e]();
+  }
+  $('#dpE').addEventListener('segchange', draw);
+  $('#dpM').addEventListener('segchange', draw);
+  $('#dpB').addEventListener('input', draw);
+  draw();
+})();
+</script>
+</body>
+</html>

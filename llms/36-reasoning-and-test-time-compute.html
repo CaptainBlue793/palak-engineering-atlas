@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reasoning Models &amp; Test-Time Compute · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 36 of LLMs. What more compute at answer time buys, measured on 300 GSM8K problems: answering directly against reasoning step by step, majority voting over up to 16 sampled chains, a thinking model with thinking on, off and cut to a budget, and a small GRPO run that trains a 0.5B model on verifiable answers, with accuracy against tokens spent for each.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rz-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .rz-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .rz-svg { width:100%; height:auto; display:block; }
+  .rz-key { display:flex; flex-wrap:wrap; gap:14px; font-size:12.5px; color:var(--muted); margin-top:6px; }
+  .rz-out { font-size:13px; white-space:pre-wrap; border-left:3px solid var(--border-strong); padding:4px 10px; margin:4px 0 10px; }
+  .rz-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
+</head>
+<body data-chapter="36">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 36</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Reasoning Models &amp; <span class="grad">Test-Time Compute</span></h1>
+    <p class="lead">Until recently, making a model better meant training it more. Reasoning models add a second dial: spending more computation when answering, by writing out intermediate steps, sampling several attempts, or thinking at length before replying. On problems with checkable answers, models can also be trained by reinforcement learning to reason better, rewarded only for getting the answer right.</p>
+    <p class="lead">This chapter measures each, on 300 grade-school maths problems (GSM8K). Asked for the bare answer, Qwen2.5-1.5B-Instruct got 6% right; reasoning step by step, 68.7%; voting over 16 sampled chains, 81.3%, at 16 times the tokens. Qwen3-1.7B, trained to think, scored lower with thinking on than off at a 3,072-token limit, because a quarter of its thoughts ran out of room; cut to 512 tokens and then made to answer, it did best of all, 83.3%. And 120 steps of GRPO, rewarding only correct final answers, lifted Qwen2.5-0.5B from 47.0% to 54.3% while its answers got shorter.</p>
+    <ul class="objectives">
+      <li><span>Explain why writing out steps helps a model compute</span></li>
+      <li><span>Use self-consistency, and read agreement as a confidence signal</span></li>
+      <li><span>Understand thinking tokens and what a thinking budget does</span></li>
+      <li><span>Implement GRPO with a verifiable reward</span></li>
+      <li><span>Compare methods by accuracy per token spent</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Sampling and decoding:</b> <a href="09-decoding.html">Chapter 9</a>.</li>
+        <li><b>RLHF and policy gradients:</b> <a href="23-rlhf-and-reward-models.html">Chapter 23</a>, whose per-prompt baseline GRPO uses.</li>
+        <li><b>Calibration and sample agreement:</b> <a href="31-hallucination-and-calibration.html">Chapter 31</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Chain of thought</h2>
+  <p>A transformer does a fixed amount of computation per token it produces. A multi-step problem answered in one token must be solved within that one pass; written out step by step, each step becomes tokens the model can read back and build on, so the text acts as working memory and the computation spreads over many passes. On 300 GSM8K test problems, Qwen2.5-1.5B-Instruct, greedy:</p>
+  <table class="t cmp">
+    <thead><tr><th>Prompt</th><th>Accuracy</th><th>Tokens per answer</th></tr></thead>
+    <tbody>
+      <tr><td>"Reply with the final number only, no working."</td><td>6.0%</td><td>2.9</td></tr>
+      <tr><td>"Reason step by step, then put the final answer in \boxed{}."</td><td><b>68.7%</b></td><td>314</td></tr>
+    </tbody>
+  </table>
+  <p>Eleven times the accuracy for about a hundred times the tokens. A typical solved problem: "If 20 students do not have desktop computers and three-fourths do, how many students are there?" The model wrote that a quarter of x is 20, multiplied both sides by 4, and boxed 80. Fourteen of the 300 reasoning answers ran past the 512-token limit and were scored wrong.</p>
+
+  <h2>Self-consistency</h2>
+  <p>A single chain of reasoning can go wrong at any step, but different chains tend to go wrong in different places while the right answer is reached by many routes. <b>Self-consistency</b> samples several chains at temperature 0.7 and takes the most common final answer:</p>
+  <table class="t cmp">
+    <thead><tr><th>Chains sampled</th><th>1</th><th>2</th><th>4</th><th>8</th><th>16</th></tr></thead>
+    <tbody>
+      <tr><td>Majority vote</td><td>66.3%</td><td>66.3%</td><td>74.7%</td><td>79.3%</td><td><b>81.3%</b></td></tr>
+      <tr><td>At least one chain right</td><td>66.3%</td><td>76.7%</td><td>85.3%</td><td>89.3%</td><td><b>94.0%</b></td></tr>
+      <tr><td>Tokens per problem</td><td>311</td><td>621</td><td>1,248</td><td>2,479</td><td>4,958</td></tr>
+    </tbody>
+  </table>
+  <p>Voting added 15 points, with diminishing returns: the first doubling of tokens bought nothing (a two-way tie breaks no better than one chain), the last added 2 points. The second row is what a perfect checker could pick out: 94% of problems had a right chain among 16, so most of the remaining gap is in choosing, which is why verifiers and reward models that score candidate solutions are an active area. Agreement also measured confidence for free: when at least 75% of the 16 chains agreed (183 problems), the vote was right 94.5% of the time; when fewer than half agreed (60 problems), 41.7%, as Chapter 31 found for factual answers.</p>
+
+  <h2>Thinking tokens</h2>
+  <p>Reasoning models such as OpenAI's o1, DeepSeek-R1 and Qwen3 are trained to write a long, private chain of thought, marked off by special tokens, before their reply. Qwen3-1.7B can be switched between the two modes by its chat template. On the same 300 problems, with Qwen's recommended sampling for each mode:</p>
+  <table class="t cmp">
+    <thead><tr><th>Qwen3-1.7B</th><th>Accuracy</th><th>Tokens per answer</th><th>Ran out of tokens</th></tr></thead>
+    <tbody>
+      <tr><td>Thinking off (limit 768)</td><td><b>79.7%</b></td><td>312</td><td>—</td></tr>
+      <tr><td>Thinking on (limit 3,072)</td><td>73.3%</td><td>1,976 (median thought 1,466)</td><td><b>80 of 300</b></td></tr>
+    </tbody>
+  </table>
+  <p>Thinking cost six times the tokens and scored lower. The reason is the limit: 80 problems, more than a quarter, were still thinking at 3,072 tokens and so never answered. Wrong answers had thought for 2,937 tokens on average and right ones for 1,321: long thoughts are where the model was struggling, not where it was succeeding. Whether thinking would have won with a longer limit was not measured to the end: a run allowing 2,048 thinking tokens per budget step overflowed this GPU's memory and was stopped. Thinking models are built for budgets of many thousands of tokens; on a small model with a tight limit, more thinking is not automatically better.</p>
+  <p>A <b>thinking budget</b> stops the thought after a fixed number of tokens, closes it, and makes the model answer. Measured with room for the answer afterwards (up to 512 tokens): no thinking 78.7%, 128 tokens 80.3%, 256 tokens 78.0%, 512 tokens <b>83.3%</b>, 1,024 tokens 83.0%. A budget of 512 to 1,024 tokens beat both thinking off (79.7%) and thinking until the 3,072-token limit (73.3%), at about 830 to 1,330 tokens in all. Only 4 thoughts had finished by 512 tokens and 74 by 1,024, so most answers came from a thought cut short, closed, and followed by a written solution, and that was enough. With 300 problems one standard error is about 2.3 points, so the differences among the small budgets are noise. The first version of this sweep capped the answer at 160 tokens and scored 5% to 8% at every budget, because every answer was cut off before its number: a budget experiment measures every limit in it, not only the one it is about.</p>
+
+  <h2>RL with verifiable rewards</h2>
+  <p>Where an answer can be checked by a program, as with maths answers, code with tests or formal proofs, the reward model of Chapter 23 can be replaced by the check itself, which cannot be gamed the way a learned reward model was. <b>GRPO</b> (group relative policy optimisation, from DeepSeek's 2024 work and used to train DeepSeek-R1) samples a group of answers to each problem and pushes up the probability of the ones that beat their group's average, the same per-prompt baseline that made Chapter 23's loop work:</p>
+<pre class="code">outs = <span class="f">sample</span>(policy, problems, n=<span class="m">8</span>, temperature=<span class="m">1.0</span>)           <span class="c"># 16 problems x 8 answers</span>
+r = torch.<span class="f">tensor</span>([<span class="f">float</span>(<span class="f">is_right</span>(o, q)) <span class="k">for</span> o, q <span class="k">in</span> outs])      <span class="c"># 1 if the boxed answer is right</span>
+g = r.<span class="f">view</span>(<span class="m">16</span>, <span class="m">8</span>)
+adv = ((g - g.<span class="f">mean</span>(<span class="m">1</span>, keepdim=<span class="k">True</span>)) / (g.<span class="f">std</span>(<span class="m">1</span>, keepdim=<span class="k">True</span>) + <span class="m">1e-4</span>)).<span class="f">view</span>(<span class="m">-1</span>)
+loss = -(adv[:, <span class="k">None</span>] * <span class="f">token_logp</span>(policy, outs) * mask).<span class="f">sum</span>() / mask.<span class="f">sum</span>()   <span class="c"># groups all right or all wrong give no signal</span></pre>
+  <p>Qwen2.5-0.5B-Instruct was trained this way for 120 steps on GSM8K training problems, 38 minutes, full fine-tuning in fp32 with answers capped at 320 tokens, then evaluated on the same 300 test problems:</p>
+  <table class="t cmp">
+    <thead><tr><th>Qwen2.5-0.5B-Instruct</th><th>Accuracy, 300 test problems</th><th>Tokens per answer</th></tr></thead>
+    <tbody>
+      <tr><td>Before</td><td>47.0%</td><td>308</td></tr>
+      <tr><td>After 120 GRPO steps</td><td><b>54.3%</b></td><td><b>199</b></td></tr>
+    </tbody>
+  </table>
+  <p>Accuracy rose 7.3 points, about 2.5 standard errors. During training the share of correct samples rose from 27% to mostly between 54% and 66% (one step dipped to 36%), and something else changed quickly: at the start 67 of the 128 samples per step ran past the 320-token limit and scored zero; by step 20 only 7 did. With a limit, the reward also rewards brevity, so part of what the model learnt was to finish in time, and its test answers shrank from 308 to 199 tokens. DeepSeek-R1's training, with no tight limit and far more steps, went the other way: replies grew to thousands of tokens as the model learnt to check and revisit its work. What the reward measures, including its limits, is what the model learns. One practical detail mattered here: the first version of the script trained in bf16 at a learning rate of 10⁻⁶, where every update is smaller than bf16 can represent next to a weight of typical size, so it would have learnt nothing; fp32 master weights fixed it.</p>
+
+  <h2>Accuracy vs tokens spent</h2>
+  <p>Every method above converts tokens into accuracy at a different rate, and the right choice depends on what a token costs and what an error costs. Direct answers were cheapest and useless here. A single chain of thought bought most of the gain for a few hundred tokens. Voting kept paying, slowly, into the thousands. Thinking modes trade very long outputs for accuracy that only arrives if they are allowed to finish. Training (GRPO) moved the whole curve, making a model more accurate and shorter at once, which is why the largest gains in reasoning since 2024 have come from training with verifiable rewards rather than from prompting.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Write steps</b> one chain: most of the gain, hundreds of tokens</li>
+      <li data-k="step"><b>Vote</b> several chains; agreement is confidence</li>
+      <li data-k="step"><b>Verify</b> pick the right chain if a checker exists</li>
+      <li data-k="step"><b>Think</b> long private reasoning, needs room to finish</li>
+      <li data-k="end"><b>Train</b> RL on checkable answers moves the whole curve</li>
+    </ol>
+    <figcaption><b>Ways to buy accuracy with compute.</b> Ordered by cost; the last changes the model rather than the answer.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Test-time compute lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="rz-l">Experiment</div>
+      <div class="seg" id="rzE"><button class="active" data-v="scatter">accuracy vs tokens</button><button data-v="sc">self-consistency</button><button data-v="bud">thinking budget</button><button data-v="grpo">GRPO training</button></div>
+      <div class="rz-box" id="rzOut"></div>
+      <div class="stats" id="rzStats"></div>
+      <div class="rz-why" id="rzWhy"></div>
+    </div>
+    <div class="panel-foot">GSM8K (openai/gsm8k, revision 740312a, MIT licence), 300 test problems drawn with seed 0; answers read from the last \boxed{} or the last number. Qwen2.5-1.5B-Instruct (989aa79) and 0.5B-Instruct (7ae5576) with no repetition penalty or truncation; Qwen3-1.7B (70d244c) at its recommended settings (thinking: temperature 0.6, top-p 0.95, top-k 20; off: 0.7, 0.8, 20). Self-consistency at temperature 0.7, up to 512 tokens. GRPO: 120 steps of 16 training problems × 8 samples at temperature 1, up to 320 tokens, AdamW 2 × 10⁻⁶ in fp32 with bf16 autocast, gradient checkpointing. RTX 5070 Ti, PyTorch capped at 15 GB.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧮</div>
+    <div class="body"><div class="title">Use case: paying for accuracy only where it is needed</div><p>Reasoning modes and "thinking" settings are now offered by most model providers, usually billed by the token, thinking included. A product that answers easy and hard questions alike should not think at length on all of them. The measurements here suggest the routing: answer simple requests directly or with a short chain, sample a few chains and check agreement when correctness matters, and switch on extended thinking, with enough budget to finish, for the hard cases, which agreement between a few cheap samples can help identify. For tasks with a checker, such as code with tests, generating several candidates and keeping one that passes beats any single long attempt.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Asking for the bare answer to a multi-step problem;</b> 6% against 68.7% with steps.</li>
+      <li><b>Voting over two samples;</b> a two-way split breaks no better than one; returns start at four.</li>
+      <li><b>Giving a thinking model too small a limit;</b> 80 of 300 thoughts ran out at 3,072 tokens and scored below thinking off.</li>
+      <li><b>Reading long thinking as careful thinking;</b> wrong answers had thought twice as long as right ones.</li>
+      <li><b>Training with RL in bf16 weights at a tiny learning rate;</b> the updates round away.</li>
+      <li><b>Forgetting that the reward includes its limits;</b> a length cap taught brevity as well as accuracy.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why does chain-of-thought prompting help, and what does self-consistency add?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A transformer does a fixed amount of computation per output token, so a multi-step problem answered in one token has to be solved in one pass. Writing the steps out turns them into tokens the model can read back, spreading the computation over many passes. On 300 GSM8K problems Qwen2.5-1.5B-Instruct went from 6% with the bare answer to 68.7% reasoning step by step. Self-consistency samples several chains and takes the majority answer, since errors scatter while correct answers converge: 16 chains reached 81.3%, at 16 times the tokens, and the agreement level was itself a confidence signal, 94.5% accurate when three quarters agreed. The gap to the 94% of problems where some chain was right is what verifiers try to close.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How are reasoning models like DeepSeek-R1 trained, and what can go wrong?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>With reinforcement learning on problems whose answers a program can check, so the reward cannot be gamed the way a learned reward model can. GRPO samples a group of answers per problem and raises the probability of those that beat the group average, so no value model is needed; groups that are all right or all wrong give no signal. In a small version, 120 steps on a 0.5B model raised test accuracy from 47.0% to 54.3%. What can go wrong: the reward includes everything about the check, so my 320-token limit also rewarded brevity and the answers shrank by a third; without a tight limit, models learn to think for thousands of tokens, which then needs a budget at inference, where my 1.7B thinking model lost to its non-thinking mode because a quarter of its thoughts ran out. Numerical details matter too: bf16 weights at a 10⁻⁶ learning rate would not have moved at all.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Writing out steps spreads computation over tokens: 6% → 68.7% on GSM8K for a 1.5B model.</li>
+      <li>Majority voting over 16 chains reached 81.3%; a perfect picker could have reached 94%.</li>
+      <li>Agreement between samples is a confidence signal: 94.5% accurate when 75% agreed.</li>
+      <li>Thinking needs room: with a 3,072-token limit, a quarter of thoughts ran out and thinking scored below no thinking.</li>
+      <li>A thinking budget of 512 to 1,024 tokens did best (83%), above thinking off (80%) and thinking that ran out of room (73%).</li>
+      <li>GRPO on checkable answers raised a 0.5B model from 47.0% to 54.3%, and the length cap taught it brevity too.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why did asking for the bare answer score 6% while reasoning step by step scored 68.7%?</p>
+      <div class="opts">
+        <button class="opt">The bare answer prompt confused the model</button>
+        <button class="opt">Longer answers are always better</button>
+        <button class="opt">Each token gets a fixed amount of computation; written steps let the model build on its own intermediate results</button>
+        <button class="opt">Reasoning used a bigger model</button>
+      </div>
+      <div class="explain">The text acts as working memory across many forward passes.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Voting over 16 chains reached 81.3%, while 94% of problems had at least one right chain. What does the gap mean?</p>
+      <div class="opts">
+        <button class="opt">The right answer was usually there; the problem was choosing it, which is what verifiers do</button>
+        <button class="opt">The model cannot solve those problems</button>
+        <button class="opt">Voting is broken</button>
+        <button class="opt">More chains would not help</button>
+      </div>
+      <div class="explain">A checker that recognises correct solutions could pick from the 94%.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why did Qwen3-1.7B score lower with thinking on (73.3%) than off (79.7%)?</p>
+      <div class="opts">
+        <button class="opt">Thinking makes models worse</button>
+        <button class="opt">The thinking mode used a different model</button>
+        <button class="opt">Sampling settings differed</button>
+        <button class="opt">80 of 300 thoughts were still going at the 3,072-token limit and never produced an answer</button>
+      </div>
+      <div class="explain">Wrong answers had thought for 2,937 tokens on average, right ones 1,321.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In GRPO, which groups of sampled answers give no training signal?</p>
+      <div class="opts">
+        <button class="opt">Groups with mixed results</button>
+        <button class="opt">Groups where every answer is right, or every answer is wrong: no answer beats the group average</button>
+        <button class="opt">Groups with long answers</button>
+        <button class="opt">The first group of each step</button>
+      </div>
+      <div class="explain">The advantage is each answer's reward minus its group's mean.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">After GRPO, the 0.5B model's answers shrank from 308 to 199 tokens. Why?</p>
+      <div class="opts">
+        <button class="opt">GRPO always shortens answers</button>
+        <button class="opt">The model forgot how to reason</button>
+        <button class="opt">Answers past the 320-token training limit scored zero, so the reward also favoured finishing in time</button>
+        <button class="opt">The evaluation used a lower limit</button>
+      </div>
+      <div class="explain">At the start 67 of 128 samples per step hit the limit; by step 20, 7. The reward includes its limits.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"qwen25":{"direct":{"accuracy":0.06,"mean_tokens":2.9,"seconds":4.9},"cot_greedy":{"accuracy":0.687,"mean_tokens":314.3,"seconds":109.9,"cut_off":14},"cot_example":{"question":"At a certain grade level, three-fourths of students have a desktop computer at home. If 20 students do not have desktop computers, how many students are there at that grade level?","reply":"To solve the problem, we need to determine the total number of students at the grade level. Let's denote the total number of students by \\( x \\).\n\nAccording to the problem, three-fourths of the students have a desktop computer at home. This means that one-fourth of the students do not have a desktop computer at home. We are given that 20 students do not have a desktop computer. Therefore, we can set up the following equation:\n\n\\[\n\\frac{1}{4}x = 20\n\\]\n\nTo find \\( x \\), we need to solve this equation. We do this by multiplying both sides of the equation by 4:\n\n\\[\nx = 20 \\times 4\n\\]\n\n\\[\nx = 80\n\\]\n\nSo, the total number of students at the grade level is \\(\\boxed{80}\\).","gold":"80"},"sampling_seconds":1170.9,"self_consistency":[{"k":1,"majority_vote":0.663,"any_correct":0.663,"tokens_per_question":311},{"k":2,"majority_vote":0.663,"any_correct":0.767,"tokens_per_question":621},{"k":4,"majority_vote":0.747,"any_correct":0.853,"tokens_per_question":1248},{"k":8,"majority_vote":0.793,"any_correct":0.893,"tokens_per_question":2479},{"k":16,"majority_vote":0.813,"any_correct":0.94,"tokens_per_question":4958}],"agreement_bands":[{"agreement":"0-50%","questions":60,"accuracy":0.417},{"agreement":"50-75%","questions":57,"accuracy":0.807},{"agreement":"75-100%","questions":183,"accuracy":0.945}]},"qwen3":{"thinking_off":{"accuracy":0.797,"mean_tokens":312.0,"seconds":231.2},"thinking_on":{"accuracy":0.733,"mean_tokens":1975.7,"mean_thinking_tokens":1752.0,"median_thinking_tokens":1466,"cut_off":80,"seconds":3939.5},"thinking_length_by_correctness":{"right":1321.2,"wrong":2936.8},"thinking_example":null,"budgets":[{"budget":0,"accuracy":0.083,"thinking_tokens":0.0,"answer_tokens":160.0,"seconds":35.4},{"budget":64,"accuracy":0.067,"thinking_tokens":64.0,"answer_tokens":160.0,"seconds":54.1},{"budget":128,"accuracy":0.073,"thinking_tokens":128.0,"answer_tokens":159.9,"seconds":86.7},{"budget":256,"accuracy":0.047,"thinking_tokens":256.0,"answer_tokens":160.0,"seconds":116.1},{"budget":512,"accuracy":0.047,"thinking_tokens":512.0,"answer_tokens":160.0,"seconds":215.1},{"budget":1024,"accuracy":0.067,"thinking_tokens":1008.0,"answer_tokens":160.0,"seconds":523.5}]},"grpo":{"before":{"accuracy":0.47,"mean_tokens":308.1},"after":{"accuracy":0.543,"mean_tokens":198.6},"log":[{"step":0,"reward":0.273,"mean_tokens":274.2,"groups_with_signal":8,"cut_off":67},{"step":1,"reward":0.422,"mean_tokens":271.3,"groups_with_signal":12,"cut_off":48},{"step":2,"reward":0.586,"mean_tokens":245.1,"groups_with_signal":12,"cut_off":24},{"step":3,"reward":0.469,"mean_tokens":255.0,"groups_with_signal":12,"cut_off":33},{"step":4,"reward":0.445,"mean_tokens":243.6,"groups_with_signal":9,"cut_off":22},{"step":5,"reward":0.445,"mean_tokens":243.1,"groups_with_signal":9,"cut_off":33},{"step":6,"reward":0.453,"mean_tokens":256.2,"groups_with_signal":11,"cut_off":34},{"step":7,"reward":0.391,"mean_tokens":237.9,"groups_with_signal":9,"cut_off":25},{"step":8,"reward":0.453,"mean_tokens":223.9,"groups_with_signal":9,"cut_off":19},{"step":9,"reward":0.594,"mean_tokens":208.1,"groups_with_signal":15,"cut_off":5},{"step":10,"reward":0.328,"mean_tokens":231.8,"groups_with_signal":10,"cut_off":20},{"step":11,"reward":0.773,"mean_tokens":200.6,"groups_with_signal":8,"cut_off":7},{"step":12,"reward":0.594,"mean_tokens":208.8,"groups_with_signal":12,"cut_off":11},{"step":13,"reward":0.438,"mean_tokens":207.3,"groups_with_signal":8,"cut_off":14},{"step":14,"reward":0.328,"mean_tokens":209.4,"groups_with_signal":8,"cut_off":16},{"step":15,"reward":0.453,"mean_tokens":200.1,"groups_with_signal":12,"cut_off":11},{"step":16,"reward":0.578,"mean_tokens":207.5,"groups_with_signal":12,"cut_off":22},{"step":17,"reward":0.5,"mean_tokens":200.1,"groups_with_signal":10,"cut_off":12},{"step":18,"reward":0.578,"mean_tokens":176.6,"groups_with_signal":14,"cut_off":6},{"step":19,"reward":0.508,"mean_tokens":182.3,"groups_with_signal":11,"cut_off":10},{"step":20,"reward":0.586,"mean_tokens":177.9,"groups_with_signal":15,"cut_off":7},{"step":21,"reward":0.492,"mean_tokens":185.4,"groups_with_signal":13,"cut_off":4},{"step":22,"reward":0.438,"mean_tokens":187.7,"groups_with_signal":13,"cut_off":12},{"step":23,"reward":0.641,"mean_tokens":176.4,"groups_with_signal":9,"cut_off":8},{"step":24,"reward":0.656,"mean_tokens":167.8,"groups_with_signal":13,"cut_off":3},{"step":25,"reward":0.391,"mean_tokens":201.4,"groups_with_signal":12,"cut_off":14},{"step":26,"reward":0.68,"mean_tokens":170.2,"groups_with_signal":9,"cut_off":8},{"step":27,"reward":0.531,"mean_tokens":209.0,"groups_with_signal":12,"cut_off":20},{"step":28,"reward":0.508,"mean_tokens":206.6,"groups_with_signal":10,"cut_off":11},{"step":29,"reward":0.422,"mean_tokens":189.6,"groups_with_signal":12,"cut_off":8},{"step":30,"reward":0.609,"mean_tokens":193.8,"groups_with_signal":11,"cut_off":6},{"step":31,"reward":0.602,"mean_tokens":176.9,"groups_with_signal":12,"cut_off":5},{"step":32,"reward":0.531,"mean_tokens":223.2,"groups_with_signal":13,"cut_off":11},{"step":33,"reward":0.539,"mean_tokens":209.1,"groups_with_signal":10,"cut_off":8},{"step":34,"reward":0.445,"mean_tokens":212.7,"groups_with_signal":9,"cut_off":14},{"step":35,"reward":0.555,"mean_tokens":210.2,"groups_with_signal":13,"cut_off":15},{"step":36,"reward":0.609,"mean_tokens":193.5,"groups_with_signal":8,"cut_off":6},{"step":37,"reward":0.492,"mean_tokens":229.3,"groups_with_signal":9,"cut_off":29},{"step":38,"reward":0.625,"mean_tokens":204.8,"groups_with_signal":11,"cut_off":10},{"step":39,"reward":0.391,"mean_tokens":216.2,"groups_with_signal":10,"cut_off":9},{"step":40,"reward":0.656,"mean_tokens":196.1,"groups_with_signal":9,"cut_off":5},{"step":41,"reward":0.609,"mean_tokens":214.3,"groups_with_signal":9,"cut_off":16},{"step":42,"reward":0.477,"mean_tokens":210.5,"groups_with_signal":12,"cut_off":8},{"step":43,"reward":0.5,"mean_tokens":211.4,"groups_with_signal":12,"cut_off":16},{"step":44,"reward":0.57,"mean_tokens":198.7,"groups_with_signal":12,"cut_off":12},{"step":45,"reward":0.43,"mean_tokens":185.3,"groups_with_signal":10,"cut_off":6},{"step":46,"reward":0.641,"mean_tokens":188.2,"groups_with_signal":10,"cut_off":15},{"step":47,"reward":0.547,"mean_tokens":202.1,"groups_with_signal":9,"cut_off":13},{"step":48,"reward":0.539,"mean_tokens":195.5,"groups_with_signal":10,"cut_off":15},{"step":49,"reward":0.5,"mean_tokens":211.3,"groups_with_signal":12,"cut_off":10},{"step":50,"reward":0.359,"mean_tokens":208.8,"groups_with_signal":13,"cut_off":9},{"step":51,"reward":0.477,"mean_tokens":176.0,"groups_with_signal":11,"cut_off":2},{"step":52,"reward":0.57,"mean_tokens":171.0,"groups_with_signal":12,"cut_off":4},{"step":53,"reward":0.523,"mean_tokens":192.7,"groups_with_signal":10,"cut_off":10},{"step":54,"reward":0.625,"mean_tokens":176.8,"groups_with_signal":12,"cut_off":2},{"step":55,"reward":0.5,"mean_tokens":182.9,"groups_with_signal":12,"cut_off":6},{"step":56,"reward":0.562,"mean_tokens":185.7,"groups_with_signal":9,"cut_off":5},{"step":57,"reward":0.578,"mean_tokens":195.8,"groups_with_signal":11,"cut_off":8},{"step":58,"reward":0.578,"mean_tokens":179.7,"groups_with_signal":15,"cut_off":2},{"step":59,"reward":0.531,"mean_tokens":183.6,"groups_with_signal":11,"cut_off":3},{"step":60,"reward":0.555,"mean_tokens":171.7,"groups_with_signal":8,"cut_off":9},{"step":61,"reward":0.555,"mean_tokens":191.2,"groups_with_signal":8,"cut_off":2},{"step":62,"reward":0.562,"mean_tokens":174.1,"groups_with_signal":5,"cut_off":6},{"step":63,"reward":0.555,"mean_tokens":180.0,"groups_with_signal":10,"cut_off":9},{"step":64,"reward":0.57,"mean_tokens":200.5,"groups_with_signal":11,"cut_off":11},{"step":65,"reward":0.391,"mean_tokens":195.1,"groups_with_signal":10,"cut_off":10},{"step":66,"reward":0.516,"mean_tokens":186.4,"groups_with_signal":9,"cut_off":6},{"step":67,"reward":0.617,"mean_tokens":186.4,"groups_with_signal":10,"cut_off":11},{"step":68,"reward":0.484,"mean_tokens":198.8,"groups_with_signal":9,"cut_off":11},{"step":69,"reward":0.633,"mean_tokens":188.8,"groups_with_signal":9,"cut_off":6},{"step":70,"reward":0.539,"mean_tokens":198.9,"groups_with_signal":12,"cut_off":6},{"step":71,"reward":0.406,"mean_tokens":214.0,"groups_with_signal":7,"cut_off":24},{"step":72,"reward":0.469,"mean_tokens":193.4,"groups_with_signal":8,"cut_off":9},{"step":73,"reward":0.68,"mean_tokens":204.8,"groups_with_signal":9,"cut_off":17},{"step":74,"reward":0.5,"mean_tokens":182.6,"groups_with_signal":11,"cut_off":10},{"step":75,"reward":0.641,"mean_tokens":207.8,"groups_with_signal":10,"cut_off":10},{"step":76,"reward":0.648,"mean_tokens":204.9,"groups_with_signal":10,"cut_off":15},{"step":77,"reward":0.703,"mean_tokens":197.9,"groups_with_signal":6,"cut_off":3},{"step":78,"reward":0.672,"mean_tokens":187.4,"groups_with_signal":8,"cut_off":5},{"step":79,"reward":0.633,"mean_tokens":193.8,"groups_with_signal":10,"cut_off":2},{"step":80,"reward":0.625,"mean_tokens":188.8,"groups_with_signal":10,"cut_off":3},{"step":81,"reward":0.578,"mean_tokens":198.2,"groups_with_signal":7,"cut_off":13},{"step":82,"reward":0.602,"mean_tokens":208.6,"groups_with_signal":12,"cut_off":11},{"step":83,"reward":0.508,"mean_tokens":210.0,"groups_with_signal":12,"cut_off":11},{"step":84,"reward":0.711,"mean_tokens":183.8,"groups_with_signal":10,"cut_off":6},{"step":85,"reward":0.648,"mean_tokens":189.3,"groups_with_signal":11,"cut_off":7},{"step":86,"reward":0.641,"mean_tokens":206.6,"groups_with_signal":8,"cut_off":12},{"step":87,"reward":0.703,"mean_tokens":175.0,"groups_with_signal":7,"cut_off":1},{"step":88,"reward":0.719,"mean_tokens":188.5,"groups_with_signal":12,"cut_off":3},{"step":89,"reward":0.586,"mean_tokens":201.4,"groups_with_signal":8,"cut_off":15},{"step":90,"reward":0.57,"mean_tokens":187.3,"groups_with_signal":6,"cut_off":7},{"step":91,"reward":0.578,"mean_tokens":205.8,"groups_with_signal":12,"cut_off":4},{"step":92,"reward":0.469,"mean_tokens":222.2,"groups_with_signal":12,"cut_off":23},{"step":93,"reward":0.695,"mean_tokens":196.3,"groups_with_signal":6,"cut_off":10},{"step":94,"reward":0.703,"mean_tokens":196.0,"groups_with_signal":8,"cut_off":10},{"step":95,"reward":0.617,"mean_tokens":220.4,"groups_with_signal":9,"cut_off":11},{"step":96,"reward":0.742,"mean_tokens":207.2,"groups_with_signal":9,"cut_off":13},{"step":97,"reward":0.586,"mean_tokens":198.2,"groups_with_signal":9,"cut_off":10},{"step":98,"reward":0.391,"mean_tokens":212.2,"groups_with_signal":9,"cut_off":16},{"step":99,"reward":0.539,"mean_tokens":187.4,"groups_with_signal":9,"cut_off":5},{"step":100,"reward":0.57,"mean_tokens":195.0,"groups_with_signal":5,"cut_off":13},{"step":101,"reward":0.578,"mean_tokens":222.9,"groups_with_signal":10,"cut_off":15},{"step":102,"reward":0.68,"mean_tokens":184.4,"groups_with_signal":9,"cut_off":4},{"step":103,"reward":0.5,"mean_tokens":198.7,"groups_with_signal":10,"cut_off":12},{"step":104,"reward":0.547,"mean_tokens":193.6,"groups_with_signal":11,"cut_off":4},{"step":105,"reward":0.477,"mean_tokens":211.5,"groups_with_signal":11,"cut_off":15},{"step":106,"reward":0.703,"mean_tokens":185.7,"groups_with_signal":10,"cut_off":4},{"step":107,"reward":0.719,"mean_tokens":187.0,"groups_with_signal":8,"cut_off":6},{"step":108,"reward":0.531,"mean_tokens":201.3,"groups_with_signal":12,"cut_off":3},{"step":109,"reward":0.453,"mean_tokens":203.4,"groups_with_signal":11,"cut_off":14},{"step":110,"reward":0.539,"mean_tokens":197.7,"groups_with_signal":11,"cut_off":2},{"step":111,"reward":0.602,"mean_tokens":198.4,"groups_with_signal":8,"cut_off":17},{"step":112,"reward":0.633,"mean_tokens":185.3,"groups_with_signal":8,"cut_off":6},{"step":113,"reward":0.492,"mean_tokens":191.1,"groups_with_signal":9,"cut_off":8},{"step":114,"reward":0.539,"mean_tokens":202.6,"groups_with_signal":12,"cut_off":16},{"step":115,"reward":0.523,"mean_tokens":214.9,"groups_with_signal":11,"cut_off":11},{"step":116,"reward":0.453,"mean_tokens":207.4,"groups_with_signal":10,"cut_off":10},{"step":117,"reward":0.688,"mean_tokens":192.4,"groups_with_signal":10,"cut_off":4},{"step":118,"reward":0.617,"mean_tokens":198.0,"groups_with_signal":12,"cut_off":8},{"step":119,"reward":0.633,"mean_tokens":179.0,"groups_with_signal":7,"cut_off":6}],"steps":120,"questions_per_step":16,"samples_per_question":8,"seconds":2290},"budgets_v2":[{"budget":0,"accuracy":0.787,"thinking_tokens":0.0,"finished_thinking":0,"answer_tokens":309.2,"answer_cut_off":16,"seconds":183.0},{"budget":128,"accuracy":0.803,"thinking_tokens":128.0,"finished_thinking":0,"answer_tokens":316.8,"answer_cut_off":18,"seconds":243.4},{"budget":256,"accuracy":0.78,"thinking_tokens":256.0,"finished_thinking":0,"answer_tokens":312.8,"answer_cut_off":18,"seconds":319.9},{"budget":512,"accuracy":0.833,"thinking_tokens":512.0,"finished_thinking":4,"answer_tokens":316.4,"answer_cut_off":19,"seconds":475.3},{"budget":1024,"accuracy":0.83,"thinking_tokens":1007.4,"finished_thinking":74,"answer_tokens":321.0,"answer_cut_off":17,"seconds":860.5}],"budgets_v2_note":"Budgets 0-1,024 measured; the 2,048 run spilled past GPU memory into system RAM and was stopped."};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+  function plot(series, xLabel, yLabel, logX, xr, yr) {
+    const W = 640, H = 260, L = 50, B = 34, lx = (t) => logX ? Math.log10(Math.max(t, 1)) : t;
+    const x = (t) => L + (W - L - 20) * (lx(t) - lx(xr[0])) / (lx(xr[1]) - lx(xr[0])), y = (a) => 10 + (H - B - 10) * (yr[1] - a) / (yr[1] - yr[0]);
+    let g = `<svg class="rz-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="${yLabel} against ${xLabel}">`;
+    for (let i = 0; i <= 4; i++) { const a = yr[0] + (yr[1] - yr[0]) * i / 4; g += `<line x1="${L}" x2="${W - 20}" y1="${y(a)}" y2="${y(a)}" stroke="${css('--border')}"/><text x="${L - 6}" y="${y(a) + 4}" text-anchor="end" font-size="11" fill="${css('--muted')}">${Math.round(100 * a)}%</text>`; }
+    (logX ? [1, 10, 100, 1000, 10000].filter(t => t >= xr[0] && t <= xr[1]) : Array.from({ length: 7 }, (_, i) => xr[0] + (xr[1] - xr[0]) * i / 6).map(Math.round)).forEach(t => g += `<text x="${x(t)}" y="${H - 12}" text-anchor="middle" font-size="11" fill="${css('--muted')}">${t.toLocaleString('en-GB')}</text>`);
+    series.forEach(s => {
+      if (s.pts.length > 1 && s.line !== false) g += `<polyline fill="none" stroke="${css(s.col)}" stroke-width="2.4" points="${s.pts.map(p => x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1)).join(' ')}"/>`;
+      s.pts.forEach(p => g += `<circle cx="${x(p[0]).toFixed(1)}" cy="${y(p[1]).toFixed(1)}" r="5" fill="${css(s.col)}"><title>${s.name}${p[2] ? ' (' + p[2] + ')' : ''}: ${(100 * p[1]).toFixed(1)}% at ${Math.round(p[0]).toLocaleString('en-GB')} tokens</title></circle>`);
+    });
+    return g + `</svg><div class="rz-key">${series.map(s => `<span><span style="color:${css(s.col)}">●</span> ${s.name}</span>`).join('')}<span>x: ${xLabel}${logX ? ' (log)' : ''}</span></div>`;
+  }
+  function drawScatter() {
+    const q = D.qwen25, t = D.qwen3, g = D.grpo;
+    const S = [{ name: 'Qwen2.5-1.5B: direct, chain of thought', col: '--muted', pts: [[q.direct.mean_tokens, q.direct.accuracy, 'direct'], [q.cot_greedy.mean_tokens, q.cot_greedy.accuracy, 'one chain']] },
+               { name: 'Qwen2.5-1.5B: majority of k chains', col: '--accent', pts: q.self_consistency.map(r => [r.tokens_per_question, r.majority_vote, 'k = ' + r.k]) },
+               { name: 'Qwen3-1.7B: thinking off / on', col: '--amber', line: false, pts: [[t.thinking_off.mean_tokens, t.thinking_off.accuracy, 'off'], [t.thinking_on.mean_tokens, t.thinking_on.accuracy, 'on, 3,072 limit']] },
+               { name: 'Qwen2.5-0.5B: before / after GRPO', col: '--green', pts: [[g.before.mean_tokens, g.before.accuracy, 'before'], [g.after.mean_tokens, g.after.accuracy, 'after']] }];
+    $('#rzOut').innerHTML = plot(S, 'tokens per problem', 'accuracy', true, [1, 10000], [0, 1]);
+    $('#rzStats').innerHTML = `<div class="stat"><div class="k">Direct → one chain</div><div class="v">${Math.round(100 * q.direct.accuracy)}% → ${(100 * q.cot_greedy.accuracy).toFixed(1)}%</div></div><div class="stat good"><div class="k">16 chains, majority</div><div class="v">${(100 * q.self_consistency[4].majority_vote).toFixed(1)}%</div></div><div class="stat"><div class="k">GRPO, 0.5B</div><div class="v">${(100 * g.before.accuracy).toFixed(1)} → ${(100 * g.after.accuracy).toFixed(1)}%</div></div>`;
+    $('#rzWhy').innerHTML = '<b>Different exchange rates.</b> One chain buys most of the gain; voting keeps paying slowly; training moves the point up and to the left at once.';
+  }
+  function drawSc() {
+    const C = D.qwen25.self_consistency, B = D.qwen25.agreement_bands;
+    $('#rzOut').innerHTML = plot([{ name: 'majority vote', col: '--accent', pts: C.map(r => [r.k, r.majority_vote]) }, { name: 'at least one chain right', col: '--green', pts: C.map(r => [r.k, r.any_correct]) }], 'chains sampled', 'accuracy', true, [1, 16], [0.6, 1]);
+    $('#rzStats').innerHTML = B.map(b => `<div class="stat ${b.accuracy > 0.9 ? 'good' : b.accuracy < 0.5 ? 'bad' : 'warn'}"><div class="k">Agreement ${b.agreement} (${b.questions} problems)</div><div class="v">${(100 * b.accuracy).toFixed(1)}% right</div></div>`).join('');
+    $('#rzWhy').innerHTML = '<b>Choosing is the bottleneck.</b> The right answer is among 16 chains 94% of the time; voting finds it 81% of the time. Agreement says how far to trust the vote.';
+  }
+  function drawBud() {
+    const B2 = D.budgets_v2;
+    if (!B2) { $('#rzOut').innerHTML = '<p class="small muted">The budget sweep is still running.</p>'; $('#rzStats').innerHTML = ''; $('#rzWhy').innerHTML = ''; return; }
+    const t = D.qwen3;
+    $('#rzOut').innerHTML = plot([{ name: 'thinking stopped at the budget, then answer', col: '--accent', pts: B2.map(r => [Math.max(1, r.thinking_tokens + r.answer_tokens), r.accuracy, 'budget ' + r.budget]) }, { name: 'thinking off', col: '--amber', line: false, pts: [[t.thinking_off.mean_tokens, t.thinking_off.accuracy]] }], 'thinking + answer tokens', 'accuracy', true, [10, 10000], [0, 1]);
+    $('#rzStats').innerHTML = B2.map(r => `<div class="stat"><div class="k">Budget ${r.budget.toLocaleString('en-GB')}</div><div class="v">${(100 * r.accuracy).toFixed(1)}%</div></div>`).join('');
+    $('#rzWhy').innerHTML = '<b>A dial, measured.</b> Each budget cuts the thought and forces an answer; the curve shows what each extra thousand tokens of thinking bought on this model.';
+  }
+  function drawGrpo() {
+    const L = D.grpo.log;
+    $('#rzOut').innerHTML = plot([{ name: 'share of training samples right', col: '--green', pts: L.map(r => [r.step, r.reward]) }, { name: 'share hitting the 320-token limit', col: '--red', pts: L.map(r => [r.step, r.cut_off / 128]) }], 'training step', 'share', false, [0, 120], [0, 1]);
+    $('#rzStats').innerHTML = `<div class="stat"><div class="k">Test accuracy before / after</div><div class="v">${(100 * D.grpo.before.accuracy).toFixed(1)}% / ${(100 * D.grpo.after.accuracy).toFixed(1)}%</div></div><div class="stat"><div class="k">Tokens per answer</div><div class="v">${D.grpo.before.mean_tokens} → ${D.grpo.after.mean_tokens}</div></div><div class="stat"><div class="k">Training time</div><div class="v">${Math.round(D.grpo.seconds / 60)} min</div></div>`;
+    $('#rzWhy').innerHTML = '<b>Accuracy and brevity together.</b> Answers that ran out of room scored zero, so the model learnt to finish within the limit as well as to be right.';
+  }
+  function draw() { ({ scatter: drawScatter, sc: drawSc, bud: drawBud, grpo: drawGrpo })[v('#rzE')](); }
+  $('#rzE').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
+</body>
+</html>

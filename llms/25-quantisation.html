@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quantisation · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 25 of LLMs. Weight quantisation written from scratch and measured on Qwen2.5-0.5B and 1.5B: int8 and int4 rounding per channel and in groups, the outliers that make 4 bits hard, GPTQ and a simplified AWQ, bitsandbytes int8 and NF4, and what each costs in bits per byte, arithmetic accuracy, memory and decoding speed.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .qz-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .qz-v { display:none; } .qz-v.on { display:block; }
+  .qz-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .qz-bar { display:grid; grid-template-columns:230px 1fr 90px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .qz-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .qz-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .qz-bar .track i.b { background:var(--amber); }
+  .qz-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .qz-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .qz-bar { grid-template-columns:120px 1fr 70px; } }
+</style>
+</head>
+<body data-chapter="25">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 25</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
+    <h1><span class="grad">Quantisation</span></h1>
+    <p class="lead">A model's weights are numbers, and storing them in fewer bits makes the model smaller and, with the right kernels, faster to run. Chapter 22 used 4-bit weights to fit training into 16 GB; this chapter is about the other main use, serving a finished model, and about what is lost along the way.</p>
+    <p class="lead">Six methods were written from scratch, two taken from bitsandbytes, and all eight applied to Qwen2.5-0.5B and 1.5B. Eight bits cost nothing measurable. Four bits with one scale per row was a disaster: the 1.5B model's 3-digit addition went from 95% to 33%. Groups of 128 weights brought it back to 88%, and NF4 to 92%. The best methods by text loss were not always the best at arithmetic, and on these small models 4-bit weights saved memory but did not make decoding faster.</p>
+    <ul class="objectives">
+      <li><span>Quantise weights by rounding, with per-tensor, per-channel and group scales</span></li>
+      <li><span>Explain how weight and activation outliers make low bit-widths hard</span></li>
+      <li><span>Implement GPTQ's error compensation and the idea behind AWQ</span></li>
+      <li><span>Measure quality on more than one task, with error bars</span></li>
+      <li><span>Know when quantisation saves memory, and when it saves time</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>NF4 and block scales:</b> <a href="22-qlora-fine-tuning-in-16gb.html">Chapter 22</a>.</li>
+        <li><b>Bits per byte:</b> <a href="10-measuring-a-language-model.html">Chapter 10</a>, the quality measure used here.</li>
+        <li><b>Why decoding is memory-bound:</b> <a href="p6-matrix-multiplies-and-flops.html">Matrix Multiplies &amp; FLOPs</a> and <a href="16-the-kv-cache.html">Chapter 16</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Rounding weights</h2>
+  <p>The simplest quantiser is <b>round to nearest</b> (RTN). Pick a scale s, store each weight as the integer round(w / s), clamped to the range of the integer type (−127 to 127 for int8, −8 to 7 for int4), and multiply back by s when the weight is used. With a symmetric scale, s is the largest absolute weight divided by 127 or 7. All the work is in deciding which weights share a scale:</p>
+<pre class="code"><span class="k">def</span> <span class="f">rtn</span>(w, bits, group=<span class="k">None</span>):
+    <span class="s">"""Round to nearest, symmetric. One scale per output row, or per group of `group` input columns."""</span>
+    q = <span class="m">2</span> ** (bits - <span class="m">1</span>) - <span class="m">1</span>
+    x = w.<span class="f">float</span>() <span class="k">if</span> group <span class="k">is</span> <span class="k">None</span> <span class="k">else</span> w.<span class="f">float</span>().<span class="f">reshape</span>(w.shape[<span class="m">0</span>], <span class="m">-1</span>, group)
+    s = x.<span class="f">abs</span>().<span class="f">amax</span>(<span class="m">-1</span>, keepdim=<span class="k">True</span>) / q                   <span class="c"># the largest weight sets the step</span>
+    <span class="k">return</span> ((x / s).<span class="f">round</span>().<span class="f">clamp</span>(-q - <span class="m">1</span>, q) * s).<span class="f">reshape</span>(w.shape)</pre>
+  <p>The quantised models here were "fake-quantised": the weights were rounded and stored back in bf16, which measures the quality of a format exactly without needing a kernel for it. Their sizes below come from the bit-widths; the bitsandbytes models really were stored in 8 and 4 bits, and their memory is measured.</p>
+
+  <h2>Per-channel and group scales</h2>
+  <p>On one real matrix, layer 10's MLP down projection in Qwen2.5-0.5B, the relative error ‖W − Q(W)‖ / ‖W‖ showed how much the grouping matters:</p>
+  <table class="t cmp">
+    <thead><tr><th>Format and scale</th><th>Bits per weight</th><th>Relative error</th></tr></thead>
+    <tbody>
+      <tr><td>int8, one scale per row</td><td>8</td><td>1.4%</td></tr>
+      <tr><td>int4, one scale for the whole matrix</td><td>4</td><td><b>84%</b></td></tr>
+      <tr><td>int4, one scale per row</td><td>4</td><td>23%</td></tr>
+      <tr><td>int4, one scale per 128 weights in a row</td><td>4.125</td><td>13%</td></tr>
+    </tbody>
+  </table>
+  <p>With one scale for the whole matrix, int4 lost 84% of it: the largest weight set a step so coarse that most weights rounded to zero. A scale per row cut that to 23%, and a scale per group of 128 to 13%, for an extra 16 bits per 128 weights, 0.125 bits a weight. Groups of 32 to 128 are now standard for 4-bit formats; Chapter 22's NF4 uses 64.</p>
+
+  <h2>Outliers</h2>
+  <p>The reason is outliers. In the same matrix the largest weight, 0.459, was 34 times the mean absolute weight, and the row holding the largest weight had a maximum 5.3 times that of the median row. Activations are worse. Averaged over calibration text, the inputs to layer 10's attention had one channel with a mean size of 10.1 against a median of 0.56, 18 times larger, and a handful of others far above the rest. These outlier features appear in every large transformer, in the same few channels across tokens, and they are why quantising activations to 8 bits is harder than quantising weights: one scale must cover both the giant channel and the small ones. LLM.int8 (bitsandbytes' int8) handles them by doing the outlier channels in 16 bits and the rest in int8; SmoothQuant and AWQ move the difficulty from activations into weights by scaling channels.</p>
+
+  <h2>GPTQ, AWQ and GGUF</h2>
+  <p><b>GPTQ</b> (2022) does not round each weight independently. It quantises a layer one input column at a time and, after rounding each column, adjusts the columns not yet quantised to cancel the error that rounding caused on real inputs. The adjustment uses the inverse of H = XᵀX, built from the layer's inputs on a little calibration text, which says how errors in one column can be offset by changes in the others. The from-scratch version here, about 15 lines, quantised the 0.5B model in 39 seconds and the 1.5B in 96, one layer at a time, each layer calibrated on the outputs of the already-quantised layers below it.</p>
+  <p><b>AWQ</b> (2023) starts from the observation that a few input channels, those with large activations, matter most. It scales those weight columns up before rounding, so they get relatively finer steps, and divides the activations by the same factor, which leaves the product unchanged. The version here is simplified: it scales each column by the square root of its mean activation, where real AWQ searches for the best exponent for each layer. Its results below are for this simplified version, not for AWQ itself.</p>
+  <p><b>GGUF</b> is not a quantiser but llama.cpp's file format, a single file with the weights, tokenizer and settings that runs on CPUs, Apple silicon and GPUs. Its "k-quant" types such as Q4_K_M use small blocks of weights grouped into super-blocks, each with its own scales, at about 4.5 to 5 bits a weight, and mix bit-widths across layers. llama.cpp was not run here, so GGUF is described, not measured.</p>
+
+  <h2>Quality, size and speed measured</h2>
+  <p>Quality was measured two ways: bits per byte on 150 KB of WikiText-2 with the base model (Chapter 10), and 60 three-digit additions with the Instruct model, answered greedily with only the number. GPTQ and AWQ-style were calibrated on 16 sequences of WikiText-2's training split.</p>
+  <table class="t cmp">
+    <thead><tr><th>Method</th><th>Bits</th><th>0.5B bpb</th><th>0.5B addition</th><th>1.5B bpb</th><th>1.5B addition</th></tr></thead>
+    <tbody>
+      <tr><td>bf16 (reference)</td><td>16</td><td>0.929</td><td>86.7%</td><td>0.805</td><td>95.0%</td></tr>
+      <tr><td>int8, per row</td><td>8</td><td>0.930</td><td>88.3%</td><td>0.806</td><td>96.7%</td></tr>
+      <tr><td>bitsandbytes int8 (LLM.int8)</td><td>8</td><td>0.932</td><td>90.0%</td><td>0.807</td><td>95.0%</td></tr>
+      <tr><td>int4, per row</td><td>4</td><td>1.210</td><td><b>11.7%</b></td><td>0.992</td><td><b>33.3%</b></td></tr>
+      <tr><td>int4, groups of 128</td><td>4.13</td><td>1.044</td><td>53.3%</td><td>0.864</td><td>88.3%</td></tr>
+      <tr><td>int4 groups of 128, GPTQ</td><td>4.13</td><td>0.979</td><td>41.7%</td><td>0.846</td><td>73.3%</td></tr>
+      <tr><td>int4 groups of 128, AWQ-style</td><td>4.13</td><td>1.017</td><td>5.0%</td><td>0.846</td><td>88.3%</td></tr>
+      <tr><td>bitsandbytes NF4, blocks of 64</td><td>4.13</td><td><b>0.968</b></td><td>51.7%</td><td><b>0.832</b></td><td><b>91.7%</b></td></tr>
+    </tbody>
+  </table>
+  <p><b>Eight bits was free.</b> Both int8 methods moved bits per byte by at most 0.003, and addition within noise. <b>Four bits per row was not usable</b>, and <b>groups</b> recovered most of the loss: on 1.5B, from 33% to 88% on addition. By bits per byte, the methods that use calibration or better levels did better than plain rounding: GPTQ cut the 0.5B's excess over bf16 from 0.115 to 0.050, and NF4, with its smaller blocks and normal-shaped levels, did best at both sizes.</p>
+  <p><b>Text loss did not predict arithmetic.</b> On 0.5B, GPTQ had a better bits per byte than plain group rounding (0.979 against 1.044) but answered fewer additions (41.7% against 53.3%), and AWQ-style answered almost none (5.0%) with a bits per byte between the two. Its replies were well-formed numbers, just wrong: "700" for 964 + 494. An obvious suspect was the calibration text, prose for a model asked chat questions, so GPTQ and AWQ-style were re-run calibrated on chat-formatted Dolly conversations instead. The results moved in both directions (0.5B GPTQ fell to 11.7%, AWQ-style rose to 23.3%, 1.5B GPTQ rose to 81.7%), so calibration data did not explain it. What the measurements do show is that a 0.5B model's arithmetic at 4 bits is fragile: which rounding errors land on the weights it uses for carrying digits is close to luck, and the 1.5B model, with more redundancy, kept 73% to 92% under every grouped method. With 60 questions the standard error of an accuracy is about 4 to 7 points, so differences of 5 or so are noise.</p>
+  <p>The first grader for those additions read "1,426" as 1, so replies written with a thousands separator were marked wrong; every addition result above comes from a re-run with commas stripped, which changed three of them by up to 7 points.</p>
+  <table class="t cmp">
+    <thead><tr><th>bitsandbytes, measured</th><th>0.5B memory</th><th>0.5B tokens/s (batch 1 / 16)</th><th>1.5B memory</th><th>1.5B tokens/s (batch 1 / 16)</th></tr></thead>
+    <tbody>
+      <tr><td>bf16</td><td>0.98 GB</td><td><b>76.6 / 1,177</b></td><td>3.10 GB</td><td><b>66.9 / 994</b></td></tr>
+      <tr><td>int8 (LLM.int8)</td><td>0.64 GB</td><td>13.8 / 207</td><td>1.71 GB</td><td>12.4 / 183</td></tr>
+      <tr><td>NF4</td><td><b>0.48 GB</b></td><td>64.5 / 923</td><td><b>1.13 GB</b></td><td>55.5 / 784</td></tr>
+    </tbody>
+  </table>
+  <p>NF4 cut the 1.5B model's memory by 64% (the embedding table stays in 16 bits, as in Chapter 22) but made decoding 17% slower at batch 1 and 21% slower at batch 16, and LLM.int8 was five and a half times slower. At these sizes Hugging Face's decoding spends most of each step on launching small kernels, not on reading weights, so reading fewer bytes cannot help, and turning 4-bit weights back into bf16 adds work. Quantisation speeds up decoding when reading the weights is the bottleneck, as for larger models at small batch sizes, and when a fused kernel multiplies directly from the packed format; engines such as llama.cpp, vLLM and TensorRT-LLM ship such kernels. Measure the speed on your own engine and model size, not from the bit-width.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Start at 8 bits:</b> no measurable loss here</li>
+      <li data-k="step"><b>For 4 bits, use groups</b> (32 to 128), never one scale per row</li>
+      <li data-k="step"><b>Try NF4, GPTQ or AWQ</b> and calibrate on text like your traffic</li>
+      <li data-k="step"><b>Evaluate the tasks you care about,</b> not only perplexity</li>
+      <li data-k="end"><b>Time it on your engine:</b> smaller is not automatically faster</li>
+    </ol>
+    <figcaption><b>Quantising a model for serving.</b> The bit-width decides the memory; the kernels decide the speed; only task evaluation decides the quality.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Quantisation lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="qz-l">Experiment</div>
+      <div class="seg" id="qzE"><button class="active" data-v="q">quality</button><button data-v="err">one matrix</button><button data-v="spd">memory &amp; speed</button><button data-v="cal">calibration</button></div>
+      <div class="qz-v" id="qzVq">
+        <div class="qz-l">Model and measure</div>
+        <div class="seg" id="qzS"><button class="active" data-v="0.5B">0.5B</button><button data-v="1.5B">1.5B</button></div>
+        <div class="seg" id="qzM" style="margin-top:6px"><button class="active" data-v="addition_accuracy">addition</button><button data-v="wikitext_bpb">bits per byte</button></div>
+      </div>
+      <div class="qz-box" id="qzOut"></div>
+      <div class="stats" id="qzStats"></div>
+      <div class="qz-why" id="qzWhy"></div>
+    </div>
+    <div class="panel-foot">Qwen2.5-0.5B (revision 060db64) and 1.5B (8faed76) for bits per byte on 150 KB of WikiText-2 test, in 1,024-token windows; their Instruct versions (7ae5576, 989aa79) for 60 three-digit additions, greedy with Qwen's default repetition penalty of 1.1, graded on the first number with commas stripped. From-scratch methods are fake-quantised in bf16; GPTQ and AWQ-style calibrated layer by layer on 16 × 512 tokens. bitsandbytes 0.50.2. Speed: Hugging Face generate, 64 new tokens, median of 5 after a warm-up, RTX 5070 Ti.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">📦</div>
+    <div class="body"><div class="title">Use case: running an open model on a laptop or a cheaper GPU</div><p>Almost every open model people run locally is quantised: a 7B model in 16 bits needs about 15 GB, in 4 bits about 4 to 5, which fits a laptop's memory or a mid-range GPU. Tools such as llama.cpp and Ollama download GGUF files at 4 to 5 bits by default, and serving engines offer GPTQ, AWQ and FP8 checkpoints for the same reason. The measurements here are why those defaults are 4-bit <i>grouped</i> formats, not plain int4, and why careful teams still check: a model that looks fine on perplexity can lose a narrow skill, and the smaller the model, the more fragile it is.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>One scale per row at 4 bits;</b> the 1.5B's addition fell from 95% to 33%; groups of 128 brought it to 88%.</li>
+      <li><b>Judging a quantised model by perplexity alone;</b> on 0.5B the best bits per byte among the 4-bit methods was not the best at arithmetic.</li>
+      <li><b>Expecting smaller weights to decode faster;</b> NF4 was 17% slower here, LLM.int8 5.5 times slower.</li>
+      <li><b>Comparing accuracies 5 points apart on 60 questions;</b> that is within one standard error.</li>
+      <li><b>Grading numbers with a regex that stops at a comma;</b> "1,426" read as 1 here until fixed.</li>
+      <li><b>Assuming a simplified method stands for the real one;</b> the AWQ-style scaling here skips AWQ's per-layer search.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does weight quantisation work, and why are group scales used?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Each weight is stored as a small integer times a shared scale, chosen so the largest weight in the group maps to the largest integer. The fewer the bits, the coarser the steps, so the question is which weights share a scale. Weights have outliers, so one scale for a whole matrix wastes almost all the levels: at int4 that lost 84% of one Qwen matrix. A scale per row gave 23%, a scale per 128 weights 13%, for an eighth of a bit extra. On Qwen2.5-1.5B, 3-digit addition went from 95% in bf16 to 33% at int4 per row and back to 88% with groups. Eight bits cost nothing measurable. Methods like GPTQ, which corrects rounding errors using calibration data, AWQ, which protects channels with large activations, and NF4's normal-shaped levels improve on plain rounding at 4 bits.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your team wants to serve a 4-bit model to cut costs. What do you check?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Three things. Quality on our own tasks, not just perplexity: in my measurements on a 0.5B model GPTQ had better bits per byte than plain group rounding but worse arithmetic, and a simplified AWQ collapsed on arithmetic, so I would run the evaluation suite we care about, with enough examples for error bars, and calibrate on text like our traffic. Speed on our serving engine: with bitsandbytes NF4 on these small models decoding was 17% slower than bf16, because each step was launch-bound and dequantisation added work, so the gain depends on fused low-bit kernels and on the model being large enough for weight reads to dominate. And memory: the saving is real, 3.1 to 1.1 GB for the 1.5B, and it can buy a larger batch or KV cache, which is often where the cost saving actually comes from. I would also try 8 bits first, since it was free here.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Quantisation stores weights as small integers times shared scales; which weights share a scale matters most.</li>
+      <li>Eight bits cost nothing measurable on either model.</li>
+      <li>Four bits per row broke arithmetic (1.5B: 95% to 33%); groups of 128 recovered it (88%), NF4 best (92%).</li>
+      <li>Outliers, in weights and especially activations, are why low bit-widths are hard.</li>
+      <li>Better bits per byte did not mean better arithmetic on 0.5B; evaluate the tasks you care about.</li>
+      <li>4-bit weights saved 64% of memory but decoded 17% slower here; speed needs the right kernels.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why did int4 with one scale for the whole matrix lose 84% of it?</p>
+      <div class="opts">
+        <button class="opt">int4 cannot store negative numbers</button>
+        <button class="opt">The matrix was too large</button>
+        <button class="opt">The largest weight set a step so coarse that most weights rounded to zero</button>
+        <button class="opt">The scale was stored in 4 bits</button>
+      </div>
+      <div class="explain">Per row: 23%; per group of 128: 13%.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does GPTQ do that round-to-nearest does not?</p>
+      <div class="opts">
+        <button class="opt">After rounding each column, it adjusts the remaining columns to cancel the error on real calibration inputs</button>
+        <button class="opt">It uses more bits for every weight</button>
+        <button class="opt">It quantises the activations instead</button>
+        <button class="opt">It retrains the model</button>
+      </div>
+      <div class="explain">It uses the inverse of XᵀX from the layer's inputs; it cut the 0.5B's bits-per-byte excess from 0.115 to 0.050.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">On 0.5B, GPTQ had better bits per byte than plain group rounding. What about arithmetic?</p>
+      <div class="opts">
+        <button class="opt">Also better, by 20 points</button>
+        <button class="opt">Exactly the same</button>
+        <button class="opt">Not measurable</button>
+        <button class="opt">Worse: 41.7% against 53.3%; text loss did not predict the narrow skill</button>
+      </div>
+      <div class="explain">Re-calibrating on chat text moved the results in both directions, so calibration data did not explain it.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why was NF4 slower to decode than bf16 on these models?</p>
+      <div class="opts">
+        <button class="opt">NF4 weights are larger</button>
+        <button class="opt">Each step was dominated by kernel launches, not weight reads, and dequantising 4-bit weights added work</button>
+        <button class="opt">The GPU cannot read 4-bit numbers</button>
+        <button class="opt">It used a larger batch</button>
+      </div>
+      <div class="explain">Memory fell 64%; speed needs fused low-bit kernels and a model large enough to be bandwidth-bound.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why are activation outliers a problem for 8-bit activations?</p>
+      <div class="opts">
+        <button class="opt">They make the model slower</button>
+        <button class="opt">They only occur in the embeddings</button>
+        <button class="opt">One scale must cover a channel 18 times larger than the median and the small ones, so the small ones lose precision</button>
+        <button class="opt">They change every step</button>
+      </div>
+      <div class="explain">LLM.int8 keeps outlier channels in 16 bits; SmoothQuant and AWQ move the difficulty into the weights.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"runs":[{"label":"0.5B bf16","size":"0.5B","method":"bf16","bits_per_weight":16,"wikitext_bpb":0.9289,"gpu_GB":0.98,"decode_tokens_per_s":54.6,"addition_accuracy":0.867,"addition_accuracy_first_grader":0.867},{"label":"0.5B int8 per channel","size":"0.5B","method":"int8 per channel","bits_per_weight":8,"quantise_seconds":0.0,"wikitext_bpb":0.93,"gpu_GB":0.98,"addition_accuracy":0.883,"addition_accuracy_first_grader":0.883},{"label":"0.5B int4 per channel","size":"0.5B","method":"int4 per channel","bits_per_weight":4,"quantise_seconds":0.0,"wikitext_bpb":1.2098,"gpu_GB":0.98,"addition_accuracy":0.117,"addition_accuracy_first_grader":0.05},{"label":"0.5B int4 group 128","size":"0.5B","method":"int4 group 128","bits_per_weight":4.125,"quantise_seconds":0.0,"wikitext_bpb":1.0441,"gpu_GB":0.98,"addition_accuracy":0.533,"addition_accuracy_first_grader":0.533},{"label":"0.5B int4 group 128, GPTQ","size":"0.5B","method":"int4 group 128, GPTQ","bits_per_weight":4.125,"quantise_seconds":39.0,"wikitext_bpb":0.9788,"gpu_GB":0.98,"addition_accuracy":0.417,"addition_accuracy_first_grader":0.417},{"label":"0.5B int4 group 128, AWQ-style","size":"0.5B","method":"int4 group 128, AWQ-style","bits_per_weight":4.125,"quantise_seconds":6.3,"wikitext_bpb":1.0173,"gpu_GB":0.98,"addition_accuracy":0.05,"addition_accuracy_first_grader":0.05},{"label":"0.5B bitsandbytes int8","size":"0.5B","method":"bitsandbytes int8","bits_per_weight":8,"wikitext_bpb":0.9316,"gpu_GB":0.64,"decode_tokens_per_s":13.2,"addition_accuracy":0.9,"addition_accuracy_first_grader":0.883},{"label":"0.5B bitsandbytes NF4","size":"0.5B","method":"bitsandbytes NF4","bits_per_weight":4.127,"wikitext_bpb":0.9681,"gpu_GB":0.48,"decode_tokens_per_s":62.0,"addition_accuracy":0.517,"addition_accuracy_first_grader":0.5},{"label":"1.5B bf16","size":"1.5B","method":"bf16","bits_per_weight":16,"wikitext_bpb":0.805,"gpu_GB":3.1,"decode_tokens_per_s":66.4,"addition_accuracy":0.95,"addition_accuracy_first_grader":0.95},{"label":"1.5B int8 per channel","size":"1.5B","method":"int8 per channel","bits_per_weight":8,"quantise_seconds":0.1,"wikitext_bpb":0.8055,"gpu_GB":3.1,"addition_accuracy":0.967,"addition_accuracy_first_grader":0.967},{"label":"1.5B int4 per channel","size":"1.5B","method":"int4 per channel","bits_per_weight":4,"quantise_seconds":0.1,"wikitext_bpb":0.9918,"gpu_GB":3.1,"addition_accuracy":0.333,"addition_accuracy_first_grader":0.333},{"label":"1.5B int4 group 128","size":"1.5B","method":"int4 group 128","bits_per_weight":4.125,"quantise_seconds":0.1,"wikitext_bpb":0.8637,"gpu_GB":3.1,"addition_accuracy":0.883,"addition_accuracy_first_grader":0.883},{"label":"1.5B int4 group 128, GPTQ","size":"1.5B","method":"int4 group 128, GPTQ","bits_per_weight":4.125,"quantise_seconds":95.8,"wikitext_bpb":0.8462,"gpu_GB":3.1,"addition_accuracy":0.733,"addition_accuracy_first_grader":0.733},{"label":"1.5B int4 group 128, AWQ-style","size":"1.5B","method":"int4 group 128, AWQ-style","bits_per_weight":4.125,"quantise_seconds":15.1,"wikitext_bpb":0.8462,"gpu_GB":3.1,"addition_accuracy":0.883,"addition_accuracy_first_grader":0.883},{"label":"1.5B bitsandbytes int8","size":"1.5B","method":"bitsandbytes int8","bits_per_weight":8,"wikitext_bpb":0.8068,"gpu_GB":1.71,"decode_tokens_per_s":12.1,"addition_accuracy":0.95,"addition_accuracy_first_grader":0.95},{"label":"1.5B bitsandbytes NF4","size":"1.5B","method":"bitsandbytes NF4","bits_per_weight":4.127,"wikitext_bpb":0.8319,"gpu_GB":1.13,"decode_tokens_per_s":50.5,"addition_accuracy":0.917,"addition_accuracy_first_grader":0.917}],"outliers":{"weight_max_over_median_row":5.3,"weight_abs_max":0.459,"weight_abs_mean":0.01355,"act_mlp_in_max_over_median":7.5,"act_attn_in_max_over_median":18.0,"act_attn_in_top":[10.06,7.22,6.15,6.05,5.92,4.56,3.86,3.76],"act_attn_in_median":0.559,"rel_err":{"int8 per channel":0.0135,"int4 per tensor":0.8442,"int4 per channel":0.2294,"int4 group 128":0.134}},"calibration":[{"size":"0.5B","method":"int4 group 128, GPTQ","calibration":"WikiText","accuracy":0.417,"accuracy_first_grader":0.417,"with_comma":4},{"size":"0.5B","method":"int4 group 128, GPTQ","calibration":"chat (Dolly)","accuracy":0.117,"accuracy_first_grader":0.117,"with_comma":0},{"size":"0.5B","method":"int4 group 128, AWQ-style","calibration":"WikiText","accuracy":0.05,"accuracy_first_grader":0.05,"with_comma":0},{"size":"0.5B","method":"int4 group 128, AWQ-style","calibration":"chat (Dolly)","accuracy":0.233,"accuracy_first_grader":0.233,"with_comma":0},{"size":"1.5B","method":"int4 group 128, GPTQ","calibration":"WikiText","accuracy":0.733,"accuracy_first_grader":0.733,"with_comma":0},{"size":"1.5B","method":"int4 group 128, GPTQ","calibration":"chat (Dolly)","accuracy":0.817,"accuracy_first_grader":0.817,"with_comma":0},{"size":"1.5B","method":"int4 group 128, AWQ-style","calibration":"WikiText","accuracy":0.883,"accuracy_first_grader":0.883,"with_comma":0},{"size":"1.5B","method":"int4 group 128, AWQ-style","calibration":"chat (Dolly)","accuracy":0.867,"accuracy_first_grader":0.867,"with_comma":0}],"speed":[{"size":"0.5B","method":"bf16","batch1_tokens_per_s":76.6,"batch16_tokens_per_s":1177.0},{"size":"0.5B","method":"bitsandbytes int8","batch1_tokens_per_s":13.8,"batch16_tokens_per_s":207.0},{"size":"0.5B","method":"bitsandbytes NF4","batch1_tokens_per_s":64.5,"batch16_tokens_per_s":922.8},{"size":"1.5B","method":"bf16","batch1_tokens_per_s":66.9,"batch16_tokens_per_s":993.7},{"size":"1.5B","method":"bitsandbytes int8","batch1_tokens_per_s":12.4,"batch16_tokens_per_s":182.5},{"size":"1.5B","method":"bitsandbytes NF4","batch1_tokens_per_s":55.5,"batch16_tokens_per_s":784.0}]};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const bar = (k, val, w, txt, c) => `<div class="qz-bar"><span>${esc(k)}</span><span class="track"><i class="${c || ''}" style="width:${Math.max(0, Math.min(100, w)).toFixed(1)}%"></i></span><span class="n">${txt}</span></div>`;
+
+  function drawQ() {
+    const size = v('#qzS'), m = v('#qzM'), rows = D.runs.filter(r => r.size === size), ref = rows.find(r => r.method === 'bf16');
+    const acc = m === 'addition_accuracy';
+    $('#qzOut').innerHTML = rows.map(r => acc ? bar(r.method, r[m], 100 * r[m], (100 * r[m]).toFixed(1) + '%', r.method === 'bf16' ? 'b' : '')
+                                         : bar(r.method, r[m], 100 * (r[m] - 0.75) / 0.5, r[m].toFixed(3), r.method === 'bf16' ? 'b' : '')).join('')
+      + `<p class="small muted" style="margin:8px 0 0">${acc ? '60 three-digit additions, Instruct model. One standard error is 4 to 7 points.' : 'WikiText-2 bits per byte, base model; lower is better (bars start at 0.75). Amber: bf16.'}</p>`;
+    const g = rows.filter(r => r.bits_per_weight > 4 && r.bits_per_weight < 5), best = (k, lo) => g.reduce((a, b) => (lo ? a[k] < b[k] : a[k] > b[k]) ? a : b);
+    $('#qzStats').innerHTML = `<div class="stat"><div class="k">bf16</div><div class="v">${ref.wikitext_bpb} bpb · ${(100 * ref.addition_accuracy).toFixed(1)}%</div></div><div class="stat good"><div class="k">Best 4-bit by bpb</div><div class="v">${esc(best('wikitext_bpb', true).method)}</div></div><div class="stat good"><div class="k">Best 4-bit by addition</div><div class="v">${esc(best('addition_accuracy').method)}</div></div>`;
+    $('#qzWhy').innerHTML = size === '0.5B' ? '<b>Two measures, two rankings.</b> On 0.5B the 4-bit methods ranked differently by bits per byte and by arithmetic, and AWQ-style collapsed on addition alone.' : '<b>The larger model is more forgiving.</b> Every grouped 4-bit method kept 73% to 92% on addition; one scale per row still broke it.';
+  }
+  function drawErr() {
+    const O = D.outliers, E = O.rel_err;
+    $('#qzOut').innerHTML = '<div class="qz-l">Relative error on layer 10\'s MLP down projection (0.5B)</div>' + Object.entries(E).map(([k, e]) => bar(k, e, 100 * e, (100 * e).toFixed(1) + '%', k.includes('tensor') ? 'b' : '')).join('')
+      + '<div class="qz-l">Largest mean |activation| per channel, layer 10 attention input</div>' + O.act_attn_in_top.map((a, i) => bar('channel ' + (i + 1), a, 100 * a / O.act_attn_in_top[0], a.toFixed(2), 'b')).join('') + bar('median channel', O.act_attn_in_median, 100 * O.act_attn_in_median / O.act_attn_in_top[0], O.act_attn_in_median.toFixed(2));
+    $('#qzStats').innerHTML = `<div class="stat"><div class="k">Largest weight / mean |weight|</div><div class="v">${(O.weight_abs_max / O.weight_abs_mean).toFixed(0)}×</div></div><div class="stat warn"><div class="k">Top activation channel / median</div><div class="v">${O.act_attn_in_max_over_median}×</div></div><div class="stat"><div class="k">Largest row max / median row</div><div class="v">${O.weight_max_over_median_row}×</div></div>`;
+    $('#qzWhy').innerHTML = '<b>Outliers set the step.</b> One scale per matrix lets the largest weight decide for all; smaller groups confine each outlier to its own 128 weights.';
+  }
+  function drawSpd() {
+    const S = D.speed, mx = Math.max(...S.map(s => s.batch1_tokens_per_s)), mem = Object.fromEntries(D.runs.filter(r => r.gpu_GB && (r.method === 'bf16' || r.method.startsWith('bitsandbytes'))).map(r => [r.size + ' ' + r.method, r.gpu_GB]));
+    $('#qzOut').innerHTML = '<div class="qz-l">Decoding, batch 1 (tokens per second)</div>' + S.map(s => bar(s.size + ' ' + s.method, s.batch1_tokens_per_s, 100 * s.batch1_tokens_per_s / mx, s.batch1_tokens_per_s.toFixed(1), s.method === 'bf16' ? 'b' : '')).join('')
+      + '<div class="qz-l">Memory of the weights (GB)</div>' + S.map(s => { const g = mem[s.size + ' ' + s.method]; return bar(s.size + ' ' + s.method, g, 100 * g / 3.2, g.toFixed(2), s.method === 'bf16' ? 'b' : ''); }).join('');
+    const f = (sz, m) => S.find(s => s.size === sz && s.method === m);
+    $('#qzStats').innerHTML = ['0.5B', '1.5B'].map(sz => `<div class="stat warn"><div class="k">${sz}: NF4 vs bf16 speed, batch 1 / 16</div><div class="v">${(100 * (f(sz, 'bitsandbytes NF4').batch1_tokens_per_s / f(sz, 'bf16').batch1_tokens_per_s - 1)).toFixed(0)}% / ${(100 * (f(sz, 'bitsandbytes NF4').batch16_tokens_per_s / f(sz, 'bf16').batch16_tokens_per_s - 1)).toFixed(0)}%</div></div>`).join('');
+    $('#qzWhy').innerHTML = '<b>Smaller, not faster.</b> At these sizes each decoding step is dominated by launching kernels, so reading fewer bytes does not help, and dequantising adds work. Fused low-bit kernels and larger models change that.';
+  }
+  function drawCal() {
+    const C = D.calibration;
+    $('#qzOut').innerHTML = C.map(c => bar(`${c.size} ${c.method.replace('int4 group 128, ', '')}, ${c.calibration}`, c.accuracy, 100 * c.accuracy, (100 * c.accuracy).toFixed(1) + '%', c.calibration === 'WikiText' ? '' : 'b')).join('')
+      + '<p class="small muted" style="margin:8px 0 0">Addition accuracy after calibrating on WikiText prose (blue) or chat-formatted Dolly conversations (amber).</p>';
+    $('#qzStats').innerHTML = '';
+    $('#qzWhy').innerHTML = '<b>A hypothesis tested and rejected.</b> Chat-formatted calibration helped two configurations and hurt one; it did not explain why 4-bit arithmetic on 0.5B is so erratic.';
+  }
+  function draw() {
+    const e = v('#qzE');
+    $('#qzVq').classList.toggle('on', e === 'q');
+    ({ q: drawQ, err: drawErr, spd: drawSpd, cal: drawCal })[e]();
+  }
+  ['#qzE', '#qzS', '#qzM'].forEach(id => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
+</body>
+</html>

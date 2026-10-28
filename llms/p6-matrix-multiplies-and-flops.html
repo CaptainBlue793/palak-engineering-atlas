@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Matrix Multiplies &amp; Counting FLOPs · LLMs by Palak Deb Patra</title>
+<meta name="description" content="P6 of LLMs. Dot products as similarity, batched matrix multiplies, counting a model's FLOPs and checking the count, and the roofline that decides whether work is memory-bound or compute-bound, measured on GPT-2 and an RTX 5070 Ti.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .mm-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .mm-v { display:none; } .mm-v.on { display:block; }
+  .mm-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:10px 12px; font-size:13px; overflow-x:auto; }
+  .mm-sl { display:grid; grid-template-columns:110px 1fr 90px; gap:10px; align-items:center; font-size:13px; }
+  .mm-sl input[type=range] { width:100%; accent-color:var(--accent); }
+  .mm-sl code { text-align:right; }
+  .mm-plot { width:100%; height:auto; display:block; }
+  .mm-plot .ax { stroke:var(--border-2); } .mm-plot .grid { stroke:var(--border); stroke-dasharray:2 4; }
+  .mm-plot text { fill:var(--muted); font-size:11px; font-family:var(--mono); }
+  .mm-plot .roof { fill:none; stroke:var(--amber); stroke-width:2; stroke-dasharray:6 4; }
+  .mm-plot .pt { fill:var(--accent); opacity:.55; } .mm-plot .pt2 { fill:var(--green); opacity:.55; }
+  .mm-plot .cur { fill:none; stroke:var(--red); stroke-width:2.5; }
+  .mm-plot .lbl { fill:var(--amber); font-weight:700; }
+  .mm-key { display:flex; flex-wrap:wrap; gap:14px; font-size:12.5px; margin-top:6px; color:var(--text-2); }
+  .mm-key i { display:inline-block; width:10px; height:10px; border-radius:50%; vertical-align:middle; margin-right:6px; background:var(--accent); }
+  .mm-key i.g { background:var(--green); } .mm-key i.r { background:none; border:2px solid var(--red); } .mm-key i.a { border-radius:0; height:2px; width:16px; background:var(--amber); }
+  .mm-stack { display:flex; height:28px; border-radius:6px; overflow:hidden; margin:6px 0 4px; }
+  .mm-stack span { display:flex; align-items:center; justify-content:center; font-size:11.5px; font-weight:700; color:#fff; white-space:nowrap; overflow:hidden; }
+  .mm-grid { display:grid; gap:2px; font-family:var(--mono); font-size:11.5px; }
+  .mm-grid span { padding:5px 4px; text-align:center; border-radius:3px; }
+  .mm-grid .hd { color:var(--muted); background:none; text-align:right; padding-right:8px; }
+  .mm-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
+</head>
+<body data-chapter="0.6">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Prerequisite 6</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 35 min</span></div>
+    <h1>Matrix Multiplies &amp; <span class="grad">Counting FLOPs</span></h1>
+    <p class="lead">Almost all the arithmetic in a language model is matrix multiplication, and almost every cost question about it, from "how long will this training run take?" to "why does generating text feel slow on a fast GPU?", comes down to two numbers: how many floating-point operations (FLOPs) the work needs, and how many bytes it has to move to do them.</p>
+    <p class="lead">This chapter counts both for real work and checks the count. A formula for GPT-2's forward pass matched PyTorch's own FLOP counter to the last digit, while the popular rule of thumb came out 12.6% low. And one weight matrix, multiplied by a single row, ran at 0.43 TFLOPS; multiplied by 16,384 rows, it ran at 96.6 TFLOPS on the same GPU.</p>
+    <ul class="objectives">
+      <li><span>Use dot products and cosine similarity to compare vectors</span></li>
+      <li><span>Write batched matrix multiplies and predict their output shapes</span></li>
+      <li><span>Count the FLOPs of a matrix multiply and of a whole transformer forward pass</span></li>
+      <li><span>Turn FLOPs and time into TFLOPS and utilisation</span></li>
+      <li><span>Decide whether work is memory-bound or compute-bound from its arithmetic intensity</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Tensors, dtypes and GPU timing:</b> <a href="p1-pytorch-tensors.html">P1</a>, especially the timing helper and the bf16 matmul speeds.</li>
+        <li><b>Linear layers:</b> <a href="p3-neural-network-building-blocks.html">P3</a>.</li>
+        <li><b>Matrices:</b> ML Fundamentals <a href="../ml-fundamentals/p4-linear-algebra.html">P4: Linear Algebra for ML</a> (optional).</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Dot products as similarity</h2>
+  <p>A dot product multiplies two vectors element by element and adds the results. It is large when the vectors point the same way, near zero when they are unrelated, and negative when they point apart. Divide it by both vectors' lengths and you get <b>cosine similarity</b>, which ignores length and keeps only direction: 1 for the same direction, 0 for perpendicular. Attention (Chapter 4) is built from dot products between token vectors, and embedding search (RAG) is built from cosine similarities.</p>
+<pre class="code">E = gpt2.transformer.wte.weight.<span class="f">float</span>()                       <span class="c"># (V, C) = (50257, 768): one vector per token</span>
+a, b = E[tok.<span class="f">encode</span>(<span class="s">" server"</span>)[<span class="m">0</span>]], E[tok.<span class="f">encode</span>(<span class="s">" client"</span>)[<span class="m">0</span>]]   <span class="c"># (768,) each</span>
+a @ b                                                         <span class="c"># dot product: 5.88</span>
+F.<span class="f">cosine_similarity</span>(a, b, dim=<span class="m">0</span>)                              <span class="c"># 0.528: the dot product divided by both lengths</span></pre>
+  <p>GPT-2's input embeddings already show structure learnt from text. The cosine similarity of " server" with " servers" was <b>0.80</b>, with " client" <b>0.53</b>, with " database" 0.49, and with " banana" only <b>0.27</b>. Its nearest neighbours over the whole vocabulary were mostly spellings of itself: " servers", " Server", "server" without a space, "Server". The vectors had lengths between 3.2 and 3.7, so here dot products and cosines rank pairs almost the same way; when lengths vary a lot, they do not, which is why retrieval systems usually normalise.</p>
+
+  <h2>Batched matrix multiplies</h2>
+  <p>The <code>@</code> operator multiplies the last two dimensions and treats every dimension in front of them as a batch, broadcasting where needed (P1). A linear layer applied to <code>(B, T, C)</code> activations is one big multiply with B × T rows. Attention needs one multiply per sequence per head, and <code>@</code> does all of them in one call:</p>
+<pre class="code">q = torch.<span class="f">randn</span>(<span class="m">8</span>, <span class="m">12</span>, <span class="m">1024</span>, <span class="m">64</span>, device=<span class="s">"cuda"</span>, dtype=torch.bfloat16)   <span class="c"># (B, heads, T, head_dim)</span>
+k = torch.<span class="f">randn_like</span>(q)
+scores = q @ k.<span class="f">transpose</span>(-<span class="m">2</span>, -<span class="m">1</span>)                                     <span class="c"># (8, 12, 1024, 1024): 96 multiplies at once</span></pre>
+  <p>That call took <b>0.46 ms</b> and produced 192 MiB of scores, every token's similarity with every other token in every head. It ran at 27.8 TFLOPS, well below the GPU's peak, because each of the 96 multiplies has an inner dimension of only 64: lots of output to write for little arithmetic per byte. That gap is exactly what FlashAttention closes (Chapter 17).</p>
+
+  <h2>Counting FLOPs</h2>
+  <p>Multiplying an (m × k) matrix by a (k × n) matrix produces m × n outputs, each a dot product of length k: k multiplies and k additions. So it costs <b>2mkn FLOPs</b>. A transformer is a list of such multiplies, so its cost can be counted exactly. For GPT-2 (12 layers, width C = 768, vocabulary V = 50,257) on a sequence of T = 1,024 tokens:</p>
+  <table class="t cmp">
+    <thead><tr><th>Part</th><th>Multiplies per layer</th><th>FLOPs</th><th>Share</th></tr></thead>
+    <tbody>
+      <tr><td><b>Block matmuls</b> (12 layers)</td><td>Q, K, V and output projections (4C²), MLP up and down (8C²)</td><td>2 · T · 12 · 12C² = 173.9 G</td><td>60%</td></tr>
+      <tr><td><b>Attention</b> (12 layers)</td><td>Q·Kᵀ and scores·V, each T² × C</td><td>4 · 12 · T² · C = 38.7 G</td><td>13%</td></tr>
+      <tr><td><b>Language-model head</b></td><td>T × C by C × V</td><td>2 · T · C · V = 79.0 G</td><td>27%</td></tr>
+      <tr><td><b>Total</b></td><td></td><td><b>291.6 G</b></td><td></td></tr>
+      <tr><td>PyTorch's <code>FlopCounterMode</code></td><td>counted while the model ran</td><td><b>291.6 G</b>, identical</td><td></td></tr>
+      <tr><td>Rule of thumb, 2 · N · T</td><td>N = 124.4 M parameters</td><td>254.9 G</td><td>12.6% low</td></tr>
+    </tbody>
+  </table>
+<pre class="code"><span class="k">from</span> torch.utils.flop_counter <span class="k">import</span> FlopCounterMode
+
+ids = torch.<span class="f">randint</span>(<span class="m">0</span>, <span class="m">50257</span>, (<span class="m">1</span>, <span class="m">1024</span>), device=<span class="s">"cuda"</span>)   <span class="c"># (1, T)</span>
+<span class="k">with</span> torch.<span class="f">no_grad</span>(), <span class="f">FlopCounterMode</span>(display=<span class="k">False</span>) <span class="k">as</span> fc:
+    <span class="f">gpt2</span>(ids)
+fc.<span class="f">get_total_flops</span>()                                       <span class="c"># 291,648,307,200: equal to the formula above</span></pre>
+  <p>The rule of thumb, forward FLOPs ≈ 2 × parameters × tokens, comes from the fact that each parameter is used in one multiply-add per token. It misses attention, whose cost grows with the <i>square</i> of the sequence length: at 1,024 tokens that is 13% of the work, and it grows with length. Training costs about three times the forward pass, because the backward pass needs about twice the forward's arithmetic (P2), which gives the widely used estimate <b>training FLOPs ≈ 6 × parameters × tokens</b> (Chapter 38).</p>
+
+  <h2>From FLOPs to time</h2>
+  <p>Dividing the FLOPs by the measured time gives the speed actually achieved. GPT-2's forward pass over 1,024 tokens in bf16 took <b>6.94 ms</b>: 291.6 GFLOPs in 6.94 ms is <b>42 TFLOPS</b>. The best this GPU reached on any matrix multiply was 96.6 TFLOPS, so GPT-2 used 43% of it. The rest went on the parts that are not large matrix multiplies (normalisation, activations, softmax, small attention multiplies) and on launching hundreds of kernels for a small model. That ratio, achieved FLOPs over peak, is called <b>model FLOPs utilisation</b> (MFU), and it is the number to watch when training gets slow (Chapter 13).</p>
+
+  <h2>Memory-bound and compute-bound</h2>
+  <p>A GPU can only compute on data it has read. This one read memory at about <b>830 GB/s</b> (summing a 1 GiB tensor; a copy, which also writes everything back, managed 759) and peaked at <b>96.6 TFLOPS</b> in bf16. The ratio, about <b>116 FLOPs per byte</b>, is its ridge point. Work whose <b>arithmetic intensity</b> (FLOPs done per byte moved) is below 116 cannot keep the arithmetic units busy: it is <b>memory-bound</b>, and its speed is set by bandwidth. Work above it is <b>compute-bound</b>. Plotting achieved speed against intensity gives the <b>roofline</b>: a sloped line for bandwidth that meets a flat line for peak compute.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>FLOPs</b> 2 · m · k · n</li>
+      <li data-k="step"><b>Bytes</b> read inputs and weights, write outputs</li>
+      <li data-k="step"><b>Intensity</b> FLOPs ÷ bytes</li>
+      <li data-k="step"><b>Compare</b> with the ridge, about 116 here</li>
+      <li data-k="end"><b>Bound</b> below: bandwidth; above: compute</li>
+    </ol>
+    <figcaption><b>Is this operation memory-bound?</b> Four lines of arithmetic, done before any profiling, predict where the time goes.</figcaption>
+  </figure>
+  <p>One 4096 × 4096 bf16 weight matrix (32 MiB) multiplied by m rows shows the whole roofline. With <b>1 row</b>, the multiply does 2 FLOPs per weight read, an intensity of 1: it took 0.078 ms, nearly all of it spent reading the weights, and reached <b>0.43 TFLOPS</b>. With 128 rows, intensity 120, at the ridge: 66.5 TFLOPS. With 1,024 rows and more, 88 to <b>96.6 TFLOPS</b>. The weights cost the same to read either way; more rows reuse them for more arithmetic. Generating text one token at a time is the 1-row case for every layer of the model, which is why decoding is memory-bound on any GPU (Chapter 16) and why serving many users at once, which adds rows, is so much more efficient (Chapter 26).</p>
+  <p>One caution about these small cases: this GPU has a 48 MiB L2 cache, large enough to keep the whole 32 MiB weight between repetitions, which is why a couple of the few-row points sit slightly above the bandwidth line. A real model's weights do not fit, so I also timed one row through a 128 MiB weight (8192 × 8192): <b>0.17 ms</b> with the weight stored the way <code>nn.Linear</code> stores it, a read rate of 777 GB/s and 0.78 TFLOPS. That is the honest number for decoding: close to the memory's speed and less than 1% of the arithmetic.</p>
+  <p>Small layers have a third limit. A GPT-2-sized layer (768 × 3,072, 4.7 MB) never got below about <b>0.017 ms</b> however few rows it had, and never reached the bandwidth line at small sizes: at that scale the fixed cost of launching a kernel dominates. That is part of why GPT-2 reached only 43% utilisation.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Roofline lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="mm-l">Experiment</div>
+      <div class="seg" id="mmE"><button class="active" data-v="roof">rows through one layer</button><button data-v="flops">count GPT-2's FLOPs</button><button data-v="sim">embedding similarity</button></div>
+      <div class="mm-v on" id="mmVr">
+        <div class="mm-l">Layer</div>
+        <div class="seg" id="mmW"><button class="active" data-v="sweep4096">4096 × 4096 (32 MiB)</button><button data-v="sweep768">768 × 3,072 (GPT-2 MLP, 4.5 MiB)</button></div>
+        <div class="mm-sl"><span>rows (m)</span><input type="range" id="mmM" min="0" max="14" step="1" value="0" aria-label="number of rows"><code id="mmMv">1</code></div>
+      </div>
+      <div class="mm-v" id="mmVf">
+        <div class="mm-sl"><span>tokens (T)</span><input type="range" id="mmT" min="1" max="8192" step="1" value="1024" aria-label="sequence length"><code id="mmTv">1,024</code></div>
+      </div>
+      <div class="mm-v" id="mmVs"><div class="mm-l">Cosine similarity of GPT-2's input embeddings</div></div>
+      <div class="mm-box" id="mmOut"></div>
+      <div class="stats" id="mmStats"></div>
+      <div class="mm-why" id="mmWhy"></div>
+    </div>
+    <div class="panel-foot">RTX 5070 Ti, PyTorch 2.11, bf16; each multiply timed with CUDA events, median of 50 after 1 s of warm-up. The roof's sloped part is read bandwidth from summing a 1 GiB tensor (830 GB/s; a copy measured 759); its flat part is the best multiply measured (96.6 TFLOPS). The 32 MiB weight fits in the 48 MiB L2 cache between repetitions, so a few small-row points sit slightly above the slope. GPT-2 FLOPs are the formula in the table, which equalled PyTorch's FlopCounterMode at T = 1,024 (291,648,307,200); other lengths use the same formula. GPT-2 revision 607a30d.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: PaLM and model FLOPs utilisation</div><p>Google's 2022 PaLM paper introduced "model FLOPs utilisation" as the honest way to report training efficiency: count the FLOPs the model mathematically needs (essentially the 6 × parameters × tokens rule plus attention), divide by the time taken and by the hardware's peak, and do not give credit for recomputed work. PaLM reported 46.2% for its 540-billion-parameter run on TPU v4 chips. GPT-2's forward pass on this page, counted the same way, reached 43% of this GPU's best measured multiply, which shows how hard high utilisation is: even a short forward pass loses more than half the hardware to small operations and kernel launches.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Counting a multiply-add as one FLOP</b> instead of two, which halves every estimate.</li>
+      <li><b>Using 2 · N · T for long sequences,</b> where attention's T² term is a growing share of the work.</li>
+      <li><b>Expecting peak TFLOPS from every operation;</b> one row through a layer reached 0.43 of a possible 96.6.</li>
+      <li><b>Comparing vectors by dot product when their lengths differ a lot,</b> instead of normalising to cosine.</li>
+      <li><b>Optimising arithmetic in memory-bound code;</b> below the ridge, only moving fewer bytes makes it faster.</li>
+      <li><b>Judging a GPU by its peak number</b> rather than by measured TFLOPS on your shapes.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Roughly how many FLOPs does it take to train a 7-billion-parameter model on 1 trillion tokens, and how long would that take on one GPU like this one?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Training costs about 6 FLOPs per parameter per token: 2 for the forward pass and about 4 for the backward. So 6 × 7 × 10⁹ × 10¹² ≈ 4.2 × 10²² FLOPs, ignoring attention, which adds a little more for long sequences. A consumer GPU that peaks around 97 TFLOPS in bf16 and achieves perhaps 40% of that in a real training loop delivers about 4 × 10¹³ FLOPs per second, so the run would take around 10⁹ seconds, over 30 years. That is why such runs use thousands of data-centre GPUs for weeks, and why the utilisation percentage matters so much: at that scale every point of MFU is a lot of money.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> A GPU can do about 97 TFLOPS, but generating text one token at a time with a mid-sized model uses only a small fraction of that. Why, and what helps?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Each generated token needs every weight of the model, but only does about 2 FLOPs with each weight it reads, because there is one row going through each layer. That is an arithmetic intensity of about 1 FLOP per byte in bf16, while this GPU needs about 116 FLOPs per byte (peak compute divided by memory bandwidth) to be compute-bound. So decoding is memory-bound: its speed is set by how fast the weights can be read. Measured, a 4096 × 4096 layer did 0.43 TFLOPS with one row and over 88 TFLOPS with a thousand. What helps is anything that does more work per byte read or reads fewer bytes: batching many users' requests so each weight read serves many rows, quantising weights to fewer bits, the KV cache to avoid recomputation, and speculative decoding, which checks several tokens per weight read.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Dot products measure alignment and cosine similarity ignores length; GPT-2's " server" was 0.80 from " servers" and 0.27 from " banana".</li>
+      <li><code>@</code> batches over leading dimensions: one call computed 96 attention score matrices.</li>
+      <li>A matmul costs 2mkn FLOPs; GPT-2 over 1,024 tokens costs 291.6 GFLOPs, exactly what PyTorch counted.</li>
+      <li>2 × parameters × tokens ignores attention (12.6% low here); training is about 6 × parameters × tokens.</li>
+      <li>MFU is achieved over peak: GPT-2's forward pass reached 42 TFLOPS, 43% of this GPU's best.</li>
+      <li>Below about 116 FLOPs per byte this GPU is memory-bound: one row through a layer ran at 0.43 TFLOPS, 16,384 rows at 96.6.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How many FLOPs does multiplying an (m × k) matrix by a (k × n) matrix take?</p>
+      <div class="opts">
+        <button class="opt">m · k · n</button>
+        <button class="opt">2 · m · k · n</button>
+        <button class="opt">m · n</button>
+        <button class="opt">2 · (m · k + k · n)</button>
+      </div>
+      <div class="explain">Each of the m · n outputs is a length-k dot product: k multiplies and k additions.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">For GPT-2 on 1,024 tokens, the rule 2 · N · T gave 254.9 GFLOPs but PyTorch counted 291.6. What did the rule leave out?</p>
+      <div class="opts">
+        <button class="opt">The language-model head</button>
+        <button class="opt">The MLP layers</button>
+        <button class="opt">Attention's score and value multiplies, which grow with T²</button>
+        <button class="opt">The backward pass</button>
+      </div>
+      <div class="explain">Attention cost 38.7 GFLOPs at this length, and its share keeps growing with sequence length.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">This GPU reads memory at about 830 GB/s and does 96.6 TFLOPS of bf16 compute. What does its ridge point of about 116 FLOPs per byte mean?</p>
+      <div class="opts">
+        <button class="opt">Work doing fewer FLOPs per byte moved is limited by memory bandwidth, not arithmetic</button>
+        <button class="opt">It can do at most 116 FLOPs per second</button>
+        <button class="opt">Matrices larger than 116 rows are slow</button>
+        <button class="opt">bf16 values take 116 bytes</button>
+      </div>
+      <div class="explain">Below the ridge, the arithmetic units wait for data; only reading fewer bytes, or reusing each byte for more work, helps.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">One row multiplied by a 4096 × 4096 bf16 weight ran at 0.43 TFLOPS. Why so slow?</p>
+      <div class="opts">
+        <button class="opt">The GPU was not warmed up</button>
+        <button class="opt">bf16 is slow for single rows</button>
+        <button class="opt">The multiply was done on the CPU</button>
+        <button class="opt">It reads all 32 MiB of weights to do only 2 FLOPs per weight: memory-bound</button>
+      </div>
+      <div class="explain">Its 0.078 ms was spent almost entirely reading the weights. With 16,384 rows the same weights did 96.6 TFLOPS.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does cosine similarity remove compared with a raw dot product?</p>
+      <div class="opts">
+        <button class="opt">The sign</button>
+        <button class="opt">The effect of the vectors' lengths, keeping only their directions</button>
+        <button class="opt">The need for a matrix multiply</button>
+        <button class="opt">Small values</button>
+      </div>
+      <div class="explain">It is the dot product divided by both lengths, so it ranges from −1 to 1 whatever the vectors' sizes.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"bandwidth_gbs":758.8,"sweep4096":[{"m":1,"ms":0.0783,"tflops":0.43,"intensity":1.0,"gbs":428.8},{"m":2,"ms":0.0393,"tflops":1.71,"intensity":2.0,"gbs":854.4},{"m":4,"ms":0.0599,"tflops":2.24,"intensity":4.0,"gbs":561.2},{"m":8,"ms":0.0601,"tflops":4.47,"intensity":8.0,"gbs":560.8},{"m":16,"ms":0.0601,"tflops":8.93,"intensity":15.9,"gbs":562.3},{"m":32,"ms":0.0413,"tflops":25.99,"intensity":31.5,"gbs":824.9},{"m":64,"ms":0.0667,"tflops":32.22,"intensity":62.1,"gbs":519.1},{"m":128,"ms":0.0645,"tflops":66.54,"intensity":120.5,"gbs":552.4},{"m":256,"ms":0.1072,"tflops":80.13,"intensity":227.6,"gbs":352.1},{"m":512,"ms":0.2167,"tflops":79.27,"intensity":409.6,"gbs":193.5},{"m":1024,"ms":0.3912,"tflops":87.84,"intensity":682.7,"gbs":128.7},{"m":2048,"ms":0.7766,"tflops":88.49,"intensity":1024.0,"gbs":86.4},{"m":4096,"ms":1.5311,"tflops":89.76,"intensity":1365.3,"gbs":65.7},{"m":8192,"ms":2.8695,"tflops":95.79,"intensity":1638.4,"gbs":58.5},{"m":16384,"ms":5.6928,"tflops":96.57,"intensity":1820.4,"gbs":53.0}],"sweep768":[{"m":1,"ms":0.0168,"tflops":0.28,"intensity":1.0,"gbs":280.5},{"m":2,"ms":0.0165,"tflops":0.57,"intensity":2.0,"gbs":286.7},{"m":4,"ms":0.0167,"tflops":1.13,"intensity":4.0,"gbs":284.3},{"m":8,"ms":0.0169,"tflops":2.23,"intensity":7.9,"gbs":282.1},{"m":16,"ms":0.0169,"tflops":4.48,"intensity":15.6,"gbs":287.1},{"m":32,"ms":0.0179,"tflops":8.45,"intensity":30.4,"gbs":277.8},{"m":64,"ms":0.0207,"tflops":14.61,"intensity":58.0,"gbs":252.0},{"m":128,"ms":0.0315,"tflops":19.17,"intensity":105.9,"gbs":181.0},{"m":256,"ms":0.0313,"tflops":38.56,"intensity":180.7,"gbs":213.4},{"m":512,"ms":0.0418,"tflops":57.74,"intensity":279.3,"gbs":206.8},{"m":1024,"ms":0.072,"tflops":67.09,"intensity":384.0,"gbs":174.7},{"m":2048,"ms":0.1259,"tflops":76.77,"intensity":472.6,"gbs":162.4},{"m":4096,"ms":0.2409,"tflops":80.23,"intensity":534.3,"gbs":150.2},{"m":8192,"ms":0.4365,"tflops":88.55,"intensity":571.5,"gbs":154.9},{"m":16384,"ms":0.8653,"tflops":89.34,"intensity":592.2,"gbs":150.9}],"peak_tflops":96.57,"bmm":{"q":[8,12,1024,64],"scores":[8,12,1024,1024],"ms":0.4641,"tflops":27.77,"scores_mib":192},"gpt2":{"params":124439808,"embed_params":39383808,"non_embed":85056000,"layers":12,"width":768,"vocab":50257,"T":1024,"rule_2NT":254852726784,"rule_2NT_nonembed_plus_head":253242114048,"formula":{"block_matmuls":173946175488,"attention":38654705664,"lm_head":79047426048,"total":291648307200},"counted":291648307200,"counted_by_op":{"aten.addmm":173946175488,"aten._scaled_dot_product_efficient_attention":38654705664,"aten.mm":79047426048},"ms":6.938,"achieved_tflops":42.03},"sim":{"words":[" server"," servers"," client"," database"," cache"," router"," banana"," guitar"],"cos":[[1.0,0.804,0.528,0.489,0.397,0.471,0.271,0.289],[0.804,1.0,0.405,0.452,0.36,0.422,0.237,0.272],[0.528,0.405,1.0,0.365,0.284,0.352,0.246,0.247],[0.489,0.452,0.365,1.0,0.443,0.381,0.244,0.27],[0.397,0.36,0.284,0.443,1.0,0.335,0.218,0.23],[0.471,0.422,0.352,0.381,0.335,1.0,0.305,0.388],[0.271,0.237,0.246,0.244,0.218,0.305,1.0,0.346],[0.289,0.272,0.247,0.27,0.23,0.388,0.346,1.0]],"dot":[[10.31,9.2,5.88,5.2,4.72,5.61,3.18,3.23],[9.2,12.7,5.02,5.33,4.75,5.57,3.09,3.37],[5.88,5.02,12.05,4.2,3.66,4.53,3.12,2.98],[5.2,5.33,4.2,10.96,5.43,4.68,2.95,3.11],[4.72,4.75,3.66,5.43,13.72,4.61,2.95,2.96],[5.61,5.57,4.53,4.68,4.61,13.76,4.14,5.0],[3.18,3.09,3.12,2.95,2.95,4.14,13.38,4.41],[3.23,3.37,2.98,3.11,2.96,5.0,4.41,12.1]],"norms":[3.211,3.564,3.471,3.31,3.704,3.709,3.658,3.478]},"nearest":[[" server",1.0],[" servers",0.804],[" Server",0.789],["server",0.698],["Server",0.694],[" client",0.528],["erver",0.508],["client",0.508],["Client",0.503]],"one_row":{"8192_linear":{"weight_mib":128,"ms":0.1727,"gbs":777.2,"tflops":0.777},"8192_x@W":{"ms":0.2099,"gbs":639.4},"4096_linear":{"ms":0.0538},"4096_x@W":{"ms":0.0783}},"l2_mib":48.0,"read_gbs":829.4,"copy_gbs":758.8};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const BW = D.read_gbs, PEAK = D.peak_tflops, RIDGE = PEAK * 1e12 / (BW * 1e9);
+
+  function drawRoof() {
+    const name = v('#mmW'), rows = D[name], i = +$('#mmM').value, r = rows[i];
+    $('#mmMv').textContent = r.m.toLocaleString('en-GB');
+    const W = 640, H = 270, L = 52, R = 14, T = 14, B = 36;
+    const lx = (x) => L + (W - L - R) * (Math.log10(x) - (-0.2)) / (3.6 + 0.2), ly = (y) => T + (H - T - B) * (1 - (Math.log10(y) - (-1)) / (2.2 + 1));
+    let s = `<line class="ax" x1="${L}" y1="${H - B}" x2="${W - R}" y2="${H - B}"/><line class="ax" x1="${L}" y1="${T}" x2="${L}" y2="${H - B}"/>`;
+    [0.1, 1, 10, 100].forEach(y => { s += `<line class="grid" x1="${L}" y1="${ly(y)}" x2="${W - R}" y2="${ly(y)}"/><text x="${L - 6}" y="${ly(y) + 4}" text-anchor="end">${y}</text>`; });
+    [1, 10, 100, 1000].forEach(x => { s += `<text x="${lx(x)}" y="${H - B + 15}" text-anchor="middle">${x}</text>`; });
+    s += `<text x="${(L + W - R) / 2}" y="${H - 3}" text-anchor="middle">FLOPs per byte (log)</text><text x="14" y="${T + 6}" transform="rotate(-90 14 ${T + 60})" text-anchor="end">TFLOPS</text>`;
+    // The roof: bandwidth × intensity up to the ridge, then flat at peak.
+    s += `<path class="roof" d="M${lx(0.7)},${ly(BW * 0.7 / 1000)} L${lx(RIDGE)},${ly(PEAK)} L${lx(3800)},${ly(PEAK)}"/><text class="lbl" x="${lx(RIDGE) + 6}" y="${ly(PEAK) + 16}">ridge ≈ ${Math.round(RIDGE)}</text>`;
+    D.sweep4096.forEach(p => { s += `<circle class="pt" cx="${lx(p.intensity)}" cy="${ly(Math.max(p.tflops, 0.11))}" r="4.5"/>`; });
+    D.sweep768.forEach(p => { s += `<circle class="pt2" cx="${lx(p.intensity)}" cy="${ly(Math.max(p.tflops, 0.11))}" r="4.5"/>`; });
+    s += `<circle class="cur" cx="${lx(r.intensity)}" cy="${ly(Math.max(r.tflops, 0.11))}" r="9"/>`;
+    $('#mmOut').innerHTML = `<svg class="mm-plot" viewBox="0 0 ${W} ${H}" role="img" aria-label="roofline">${s}</svg><div class="mm-key"><span><i></i>4096 × 4096</span><span><i class="g"></i>768 × 3,072</span><span><i class="r"></i>selected</span><span><i class="a"></i>roof: ${BW} GB/s, then ${PEAK} TFLOPS</span></div>`;
+    const bound = r.intensity < RIDGE ? 'memory' : 'compute';
+    $('#mmStats').innerHTML = `<div class="stat"><div class="k">Time</div><div class="v">${r.ms} ms</div></div><div class="stat ${r.tflops > 60 ? 'good' : r.tflops > 10 ? 'warn' : 'bad'}"><div class="k">Speed</div><div class="v">${r.tflops} TFLOPS</div></div>` +
+      `<div class="stat"><div class="k">Intensity</div><div class="v">${r.intensity} FLOPs/B</div></div><div class="stat"><div class="k">Below the ridge?</div><div class="v">${bound === 'memory' ? 'yes: memory' : 'no: compute'}</div></div>`;
+    const small = name === 'sweep768';
+    $('#mmWhy').innerHTML = small && r.m <= 32 ? `<b>Launch-bound.</b> This layer is only 4.5 MiB, so even reading it takes a few microseconds; the ${r.ms} ms floor is the fixed cost of starting a kernel. GPT-2's small layers spend much of their time here.`
+      : r.m === 1 ? '<b>One row: decoding.</b> Every weight is read to do 2 FLOPs with it, an intensity of 1. Nearly all of the time is spent reading 32 MiB of weights, and the speed is 0.43 TFLOPS of a possible 96.6. (One row was slower than two: the library used a different kernel for it, and the 48 MiB L2 cache helped the few-row cases.)'
+      : Math.abs(r.intensity / RIDGE - 1) < 0.5 ? `<b>Near the ridge.</b> At ${r.intensity} FLOPs per byte, against a ridge of about ${Math.round(RIDGE)}, memory and arithmetic both limit it, so it reaches ${r.tflops} TFLOPS rather than the peak; real kernels bend gently around the corner of the roofline.`
+      : bound === 'memory' ? `<b>Memory-bound.</b> At ${r.intensity} FLOPs per byte the arithmetic units wait for data; doubling the rows nearly doubles the speed for little extra time.`
+      : `<b>Compute-bound.</b> Above the ridge the weights are reused enough that arithmetic, not memory, is the limit: ${r.tflops} TFLOPS against a best of ${PEAK}.`;
+  }
+  function flops(T) {
+    const g = D.gpt2, L = g.layers, C = g.width, V = g.vocab;
+    return { block: 2 * T * L * 12 * C * C, attn: 4 * L * T * T * C, head: 2 * T * C * V };
+  }
+  function drawFlops() {
+    const T = +$('#mmT').value; $('#mmTv').textContent = T.toLocaleString('en-GB');
+    const f = flops(T), tot = f.block + f.attn + f.head, rule = 2 * D.gpt2.params * T;
+    const part = (x, c, label) => `<span style="flex:${x};background:${c}" title="${label}">${x / tot > 0.08 ? label : ''}</span>`;
+    $('#mmOut').innerHTML = `<div class="mm-stack">${part(f.block, 'var(--accent)', 'block matmuls')}${part(f.head, 'var(--accent-2)', 'LM head')}${part(f.attn, 'var(--red)', 'attention')}</div>` +
+      `<div class="small muted">Block matmuls ${(100 * f.block / tot).toFixed(0)}% · LM head ${(100 * f.head / tot).toFixed(0)}% · attention ${(100 * f.attn / tot).toFixed(0)}%</div>`;
+    const G = (x) => x >= 1e12 ? (x / 1e12).toFixed(2) + ' T' : (x / 1e9).toFixed(1) + ' G';
+    $('#mmStats').innerHTML = `<div class="stat"><div class="k">Forward FLOPs</div><div class="v">${G(tot)}</div></div><div class="stat"><div class="k">2 · N · T rule</div><div class="v">${G(rule)}</div></div>` +
+      `<div class="stat ${Math.abs(rule / tot - 1) > 0.1 ? 'warn' : 'good'}"><div class="k">Rule is off by</div><div class="v">${(100 * (rule / tot - 1)).toFixed(1)}%</div></div><div class="stat"><div class="k">Per token</div><div class="v">${G(tot / T)}</div></div>`;
+    $('#mmWhy').innerHTML = T === 1024 ? `<b>Checked.</b> At 1,024 tokens this formula gave 291,648,307,200 FLOPs, exactly what PyTorch's FlopCounterMode counted, and the forward pass took ${D.gpt2.ms} ms: ${D.gpt2.achieved_tflops} TFLOPS.`
+      : T > 1024 ? `<b>Attention grows with T².</b> At ${T.toLocaleString('en-GB')} tokens it is ${(100 * f.attn / tot).toFixed(0)}% of the work, and the 2 · N · T rule misses all of it. (GPT-2 itself only accepts 1,024 tokens; the formula shows what a longer context would cost.)`
+      : `<b>Short sequences are almost all matmuls.</b> With ${T} tokens attention is ${(100 * f.attn / tot).toFixed(1)}% of the work, so 2 · N · T is ${Math.abs(100 * (rule / tot - 1)) < 5 ? 'close' : 'still off, mostly because it counts the position embeddings as if they were multiplied'}.`;
+  }
+  function drawSim() {
+    const S = D.sim, n = S.words.length, col = (x) => `color-mix(in srgb, var(--accent) ${Math.round(Math.max(0, x) * 100)}%, var(--surface))`;
+    $('#mmOut').innerHTML = `<div class="mm-grid" style="grid-template-columns:90px repeat(${n}, 1fr)"><span></span>${S.words.map(w => `<span class="hd" style="text-align:center;padding-right:4px">${w.trim()}</span>`).join('')}` +
+      S.cos.map((row, i) => `<span class="hd">${S.words[i].trim()}</span>` + row.map(x => `<span style="background:${col(x)};color:${x > 0.6 ? '#fff' : 'var(--text)'}">${x.toFixed(2)}</span>`).join('')).join('') + '</div>';
+    $('#mmStats').innerHTML = `<div class="stat good"><div class="k">server · servers</div><div class="v">${S.cos[0][1]}</div></div><div class="stat"><div class="k">server · client</div><div class="v">${S.cos[0][2]}</div></div><div class="stat"><div class="k">server · banana</div><div class="v">${S.cos[0][6]}</div></div>`;
+    $('#mmWhy').innerHTML = `<b>Related words point in similar directions.</b> The nearest tokens to " server" across all 50,257 were ${D.nearest.slice(1, 6).map(x => `"${x[0]}"`).join(', ')}: mostly the same word with different spacing and case. Vector lengths ranged from ${Math.min(...S.norms)} to ${Math.max(...S.norms)}, so dot products rank these pairs much like cosines do.`;
+  }
+  function draw() {
+    const e = v('#mmE');
+    ['r', 'f', 's'].forEach((x, i) => $('#mmV' + x).classList.toggle('on', ['roof', 'flops', 'sim'][i] === e));
+    ({ roof: drawRoof, flops: drawFlops, sim: drawSim })[e]();
+  }
+  ['#mmE', '#mmW'].forEach(id => $(id).addEventListener('segchange', draw));
+  ['#mmM', '#mmT'].forEach(id => $(id).addEventListener('input', draw));
+  draw();
+})();
+</script>
+</body>
+</html>

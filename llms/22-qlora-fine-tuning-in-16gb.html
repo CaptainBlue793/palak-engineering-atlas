@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QLoRA: Fine-Tuning in 16 GB · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 22 of LLMs. QLoRA on one 16 GB GPU: 4-bit NF4 written from scratch and matched to bitsandbytes, every gigabyte of a 7B fine-tune accounted for, and LoRA against QLoRA on Qwen2.5-1.5B and 7B, measured for memory, speed and quality.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ql-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ql-v { display:none; } .ql-v.on { display:block; }
+  .ql-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .ql-bar { display:grid; grid-template-columns:260px 1fr 130px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .ql-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .ql-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .ql-bar .track i.b { background:var(--amber); }
+  .ql-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .ql-sl { display:grid; grid-template-columns:110px 1fr 70px; gap:10px; align-items:center; font-size:13px; padding:3px 0; }
+  .ql-sl input[type=range] { width:100%; accent-color:var(--accent); }
+  .ql-svg { width:100%; height:auto; display:block; }
+  .ql-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .ql-bar { grid-template-columns:130px 1fr 100px; } }
+</style>
+</head>
+<body data-chapter="22">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 22</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
+    <h1>QLoRA: <span class="grad">Fine-Tuning in 16 GB</span></h1>
+    <p class="lead">Chapter 21's LoRA froze the model but still kept every frozen weight in 16 bits. For Qwen2.5-7B that is 14.2 GB, which loaded into this 16 GB GPU and then ran out of memory on a single 512-token training sequence. QLoRA (2023) stores the frozen weights in 4 bits, in a format called NF4, and trains 16-bit LoRA adapters on top.</p>
+    <p class="lead">This chapter writes NF4 from scratch (it matches the bitsandbytes library up to bf16 rounding), accounts for the memory, and fine-tunes three ways on Chapter 19's data. The 7B model's weights shrank from 14.2 to 5.2 GB and it trained at a peak of 11.8 GB. After a quarter of an epoch its held-out reply loss, 1.733, beat a 16-bit LoRA of the 1.5B model after half an epoch, 1.908. The price showed on 1.5B, where both could run: QLoRA was 30% slower and ended 0.03 worse.</p>
+    <ul class="objectives">
+      <li><span>Explain NF4: blocks, scales and 16 levels placed at normal quantiles</span></li>
+      <li><span>Implement NF4 and check it against bitsandbytes</span></li>
+      <li><span>Account for every gigabyte of a QLoRA run</span></li>
+      <li><span>Compare QLoRA with 16-bit LoRA on quality, speed and memory</span></li>
+      <li><span>Decide when 4-bit training is worth it</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>LoRA:</b> <a href="21-lora-and-peft.html">Chapter 21</a>, whose adapters are trained here on a 4-bit base.</li>
+        <li><b>Number formats:</b> <a href="p1-pytorch-tensors.html">PyTorch Tensors on a GPU</a> for bf16 and fp16.</li>
+        <li><b>Where training memory goes:</b> <a href="p7-gpu-memory-budgets.html">GPU Memory Budgets</a> and <a href="13-training-efficiently-on-one-gpu.html">Chapter 13</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>4-bit NF4 weights</h2>
+  <p>A 4-bit code has 16 values. The obvious choice spaces them evenly, but trained weights are not spread evenly: they are roughly normal, most of them close to zero (this chapter's test matrix has a standard deviation of 0.027). Evenly spaced levels waste codes on the rare large values. <b>NF4</b>, "normal float 4", puts its 16 levels at quantiles of a normal distribution, scaled to [−1, 1] and with an exact zero, so each level is used about equally often. Each block of 64 weights gets its own scale, its largest absolute value, so one outlier only affects its own block.</p>
+<pre class="code">LEVELS = torch.<span class="f">tensor</span>([<span class="m">-1.0</span>, <span class="m">-0.6962</span>, <span class="m">-0.5251</span>, <span class="m">-0.3949</span>, <span class="m">-0.2844</span>, <span class="m">-0.1848</span>, <span class="m">-0.0911</span>, <span class="m">0.0</span>,
+                       <span class="m">0.0796</span>, <span class="m">0.1609</span>, <span class="m">0.2461</span>, <span class="m">0.3379</span>, <span class="m">0.4407</span>, <span class="m">0.5626</span>, <span class="m">0.7230</span>, <span class="m">1.0</span>])  <span class="c"># normal quantiles</span>
+<span class="k">def</span> <span class="f">nf4_roundtrip</span>(w, block=<span class="m">64</span>):
+    <span class="s">"""Scale each block of 64 weights by its largest |value|, snap every weight to the nearest of 16 levels."""</span>
+    x = w.<span class="f">float</span>().<span class="f">reshape</span>(<span class="m">-1</span>, block)
+    scale = x.<span class="f">abs</span>().<span class="f">amax</span>(<span class="m">1</span>, keepdim=<span class="k">True</span>)                        <span class="c"># one scale per block</span>
+    idx = ((x / scale)[..., <span class="k">None</span>] - LEVELS).<span class="f">abs</span>().<span class="f">argmin</span>(<span class="m">-1</span>)      <span class="c"># the 4-bit code of each weight</span>
+    <span class="k">return</span> (LEVELS[idx] * scale).<span class="f">reshape</span>(w.shape)</pre>
+  <p>The levels are shown to 4 places; the script uses bitsandbytes' exact values. Run on a real matrix, layer 10's MLP down projection in Qwen2.5-1.5B (1,536 × 8,960), the from-scratch version matched <code>bitsandbytes.functional.quantize_4bit</code> to within 0.00096, which is the bf16 rounding of the library's output. Relative error, ‖W − Q(W)‖ / ‖W‖, on the same matrix:</p>
+  <table class="t cmp">
+    <thead><tr><th>Format</th><th>Bits per weight</th><th>Relative error</th></tr></thead>
+    <tbody>
+      <tr><td>FP8 (e4m3), no scaling</td><td>8</td><td>3.0%</td></tr>
+      <tr><td><b>NF4</b>, blocks of 64</td><td>4 + scale</td><td><b>9.4%</b></td></tr>
+      <tr><td>int4, evenly spaced, same blocks and scales</td><td>4 + scale</td><td>11.6%</td></tr>
+    </tbody>
+  </table>
+  <p>NF4 cut the error of evenly spaced 4-bit levels by a fifth at the same size. The scales cost space too: one 32-bit scale per 64 weights adds 0.5 bit a weight. <b>Double quantisation</b>, QLoRA's second idea, stores those scales in 8 bits with one 32-bit scale per 256 blocks, which costs 8/64 + 32/(64 × 256) = 0.127 bits, so a weight takes about 4.13 bits in all. An error of 9.4% per weight sounds large, but the errors are small, random and largely cancel inside each matrix product. The test that matters is the model's loss: before any training, Qwen2.5-1.5B's held-out reply loss went from 2.195 in bf16 to 2.226 in NF4, 0.031 worse.</p>
+
+  <h2>Memory, step by step</h2>
+  <p>Loading with bitsandbytes takes one config. The frozen linear layers become 4-bit; at each forward and backward pass they are turned back into bf16 a layer at a time for the matrix multiply:</p>
+<pre class="code">NF4 = <span class="t">BitsAndBytesConfig</span>(load_in_4bit=<span class="k">True</span>, bnb_4bit_quant_type=<span class="s">"nf4"</span>,
+                         bnb_4bit_use_double_quant=<span class="k">True</span>, bnb_4bit_compute_dtype=torch.bfloat16)
+m = <span class="t">AutoModelForCausalLM</span>.<span class="f">from_pretrained</span>(<span class="s">"Qwen/Qwen2.5-7B"</span>, quantization_config=NF4, device_map={<span class="s">""</span>: <span class="m">0</span>})
+m = <span class="f">prepare_model_for_kbit_training</span>(m, use_gradient_checkpointing=<span class="k">True</span>)   <span class="c"># also casts the non-4-bit weights to fp32</span>
+m = <span class="f">get_peft_model</span>(m, <span class="t">LoraConfig</span>(r=<span class="m">16</span>, lora_alpha=<span class="m">32</span>, target_modules=[<span class="s">"q_proj"</span>, <span class="s">"k_proj"</span>, <span class="s">"v_proj"</span>, <span class="s">"o_proj"</span>,
+                                                          <span class="s">"gate_proj"</span>, <span class="s">"up_proj"</span>, <span class="s">"down_proj"</span>]))</pre>
+  <table class="t cmp">
+    <thead><tr><th>Weights on the GPU, measured</th><th>bf16</th><th>NF4</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen2.5-1.5B</td><td>2.88 GB</td><td>1.08 GB</td></tr>
+      <tr><td>Qwen2.5-7B</td><td>14.19 GB</td><td><b>5.18 GB</b></td></tr>
+    </tbody>
+  </table>
+  <p>Four bits is not a quarter. bitsandbytes leaves the embedding table and the output layer in 16 bits, and in Qwen2.5-7B they are separate matrices of 545 million parameters each: 2.03 GB. The other 6.53 billion weights at 4.13 bits come to 3.14 GB, and the two add up to 5.17 GB, against 5.18 measured. In 16 bits the 7B model's weights alone took 14.19 GB of the 15 GB that PyTorch was allowed here, and a LoRA step on one 512-token sequence failed with "CUDA out of memory. Tried to allocate 20.00 MiB" at a peak of 14.92 GB. In 4 bits the same training ran at a peak of 11.83 GB. Where it went:</p>
+  <table class="t cmp">
+    <thead><tr><th>Qwen2.5-7B QLoRA</th><th>Size</th><th>How it is known</th></tr></thead>
+    <tbody>
+      <tr><td>Frozen weights as loaded (NF4 linear layers, 16-bit embedding and output layer)</td><td>5.18 GB</td><td>measured</td></tr>
+      <tr><td>Embedding and output layer cast from bf16 to fp32 by <code>prepare_model_for_kbit_training</code></td><td>+2.03 GB</td><td>computed</td></tr>
+      <tr><td>LoRA adapters: 40.4 M parameters × 16 bytes (fp32 weights, gradients, two AdamW moments)</td><td>0.60 GB</td><td>computed</td></tr>
+      <tr><td>Activations with gradient checkpointing, the loss and working buffers</td><td>≈ 4.0 GB</td><td>the remainder</td></tr>
+      <tr><td><b>Peak</b></td><td><b>11.83 GB</b></td><td>measured</td></tr>
+    </tbody>
+  </table>
+  <p>The fp32 cast is easy to miss. peft's <code>prepare_model_for_kbit_training</code> converts every parameter that is not 4-bit to fp32 for numerical stability; for 7B that is 2.03 GB, almost two thirds of what the 4-bit transformer layers themselves take. On the 1.5B model the effect is plain: its weights shrank by 1.80 GB, but its 233-million-parameter embedding, shared with the output layer, grew by 0.43 GB in the cast, and activations do not shrink at all. The training peak fell only from 4.93 to 4.14 GB, 0.79 GB. At that size the weights are a small part of training memory, and quantising them buys little.</p>
+
+  <h2>Paged optimisers</h2>
+  <p>QLoRA's third idea is <b>paged optimisers</b>: optimiser states kept in memory that the GPU driver can move to the CPU's RAM when the GPU runs short, so that a sudden spike, usually from an unusually long batch, slows a step instead of crashing the run. They were not used here; every run used plain AdamW. With LoRA the optimiser states are small: two fp32 moments for 40.4 million adapter parameters are 0.30 GB, 2.5% of the 7B peak, so there is little to page. The spikes come from activations, and capping sequences at 512 tokens kept those bounded. On this Windows machine the driver already does something similar to everything: past 16 GB it spills into system memory instead of failing, which <a href="13-training-efficiently-on-one-gpu.html">Chapter 13</a> measured at 28 to 47 times slower. That is why every run here capped PyTorch at 15 GB, so a run that does not fit fails quickly instead.</p>
+
+  <h2>Quality vs a 16-bit LoRA</h2>
+  <p>All runs used Chapter 19's Dolly data and Chapter 21's best LoRA setting: rank 16 and alpha 32 on all seven linear layers, learning rate 2 × 10⁻⁴, cosine schedule, 16 conversations a step, scored by reply loss on the same 300 held-out conversations. The 7B run took 215 steps, a quarter of an epoch, to keep it under a quarter of an hour; the others took 430.</p>
+  <table class="t cmp">
+    <thead><tr><th>Run</th><th>Steps</th><th>Peak memory</th><th>Speed</th><th>Time</th><th>Reply loss before → after</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen2.5-1.5B, LoRA on bf16 weights</td><td>430</td><td>4.93 GB</td><td>2,529 tok/s</td><td>408 s</td><td>2.195 → <b>1.908</b></td></tr>
+      <tr><td>Qwen2.5-1.5B, QLoRA</td><td>430</td><td>4.14 GB</td><td>1,782 tok/s</td><td>578 s</td><td>2.226 → 1.940</td></tr>
+      <tr><td>Qwen2.5-7B, QLoRA</td><td>215</td><td>11.83 GB</td><td>631 tok/s</td><td>814 s</td><td>2.011 → <b>1.733</b></td></tr>
+      <tr><td>Qwen2.5-7B, LoRA on bf16 weights</td><td colspan="5">out of memory on one 512-token sequence</td></tr>
+    </tbody>
+  </table>
+  <p>On the same 1.5B model, quantisation cost 0.031 before training and 0.032 after it: half an epoch of adapter training did not close the gap. The QLoRA paper found 4-bit adapters matching 16-bit ones on its benchmarks; here a small, steady gap remained, about a third of the gap between LoRA and a full fine-tune in Chapter 21. QLoRA was also 30% slower, because every forward and backward pass turns each layer's weights back into bf16 before using them. Chapter 21 found that LoRA saves memory, not time; QLoRA spends time to save more memory.</p>
+  <p>The 7B result is the reason to use it. With half as many training steps, the 4-bit 7B model ended 0.18 below the 16-bit 1.5B model, and far below Chapter 21's 0.5B LoRA at 2.148 on the same held-out replies. Its starting point alone, 2.011, was better than the 0.5B model after training. A larger model in 4 bits beat a smaller one in 16 bits by much more than quantisation cost, and by more than any setting in Chapter 21 changed things.</p>
+
+  <h2>When it is worth it</h2>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Pick the model</b> the task needs, not the one that fits</li>
+      <li data-k="step"><b>Fits in 16 bits for training?</b> Use LoRA: faster, slightly better</li>
+      <li data-k="step"><b>Does not fit?</b> QLoRA: 4-bit frozen weights, 16-bit adapters</li>
+      <li data-k="step"><b>Budget the rest:</b> fp32 casts, adapters, activations</li>
+      <li data-k="end"><b>Check after merging</b> or serve on the 4-bit base</li>
+    </ol>
+    <figcaption><b>QLoRA is for the model you could not otherwise train.</b> When 16-bit LoRA fits, it was 30% faster and 0.03 better here.</figcaption>
+  </figure>
+  <p>One more decision comes after training. The adapter learned to correct the 4-bit weights, not the original 16-bit ones, so it can be served on the same 4-bit base, which is small but runs slower, or merged into the 16-bit model for speed. Merging puts it on slightly different weights from the ones it was trained with, so measure the merged model on held-out data before shipping it. <a href="25-quantisation.html">Chapter 25</a> covers quantisation for serving, where the same formats are used without any training.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">QLoRA lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ql-l">Experiment</div>
+      <div class="seg" id="qlE"><button class="active" data-v="runs">training runs</button><button data-v="mem">memory</button><button data-v="nf4">NF4 levels</button><button data-v="fits">what fits</button></div>
+      <div class="ql-v" id="qlVn"><button class="btn" id="qlNew">New random block</button></div>
+      <div class="ql-v" id="qlVf">
+        <div class="ql-sl"><span>model size</span><input type="range" id="qlN" min="0" max="6" value="3" aria-label="model size in billions of parameters"><code id="qlNv"></code></div>
+      </div>
+      <div class="ql-box" id="qlOut"></div>
+      <div class="stats" id="qlStats"></div>
+      <div class="ql-why" id="qlWhy"></div>
+    </div>
+    <div class="panel-foot">Qwen2.5-1.5B (revision 8faed76) and Qwen2.5-7B (d149729), bitsandbytes 0.50.2 NF4 with double quantisation and bf16 compute, peft LoRA rank 16, alpha 32 on all seven linear layers, AdamW at 2 × 10⁻⁴ with a cosine schedule and 5% warm-up, 16 conversations a step in micro-batches of 4, gradient checkpointing, PyTorch capped at 15 GB, seed 0, RTX 5070 Ti. Dolly-15k as in Chapter 19; reply loss on 300 held-out conversations. The NF4 tab's random block and the "what fits" tab are computed in your browser; everything else is measured.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧰</div>
+    <div class="body"><div class="title">Use case: a 7B assistant on one consumer GPU</div><p>QLoRA is a large part of why open-model fine-tuning moved from research clusters to single GPUs. A team that wants a model tuned on its own support tickets or code can take an open 7- or 8-billion-parameter base model and train an adapter overnight on one 16 or 24 GB card, and popular fine-tuning tools such as Hugging Face's TRL, Axolotl and Unsloth ship QLoRA as a standard recipe. The measurements here show the trade those teams make: a slower step and a small loss in quality against a 16-bit LoRA of the same model, in exchange for training a model several times larger than the GPU could otherwise handle, and the larger model wins by far more than the quantisation costs.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Expecting 4 bits to mean a quarter of the memory;</b> 7B's weights went from 14.19 to 5.18 GB, and training peaked at 11.83 GB.</li>
+      <li><b>Forgetting the fp32 cast</b> in <code>prepare_model_for_kbit_training</code>: 2.03 GB for 7B's embedding and output layers.</li>
+      <li><b>Using QLoRA when 16-bit LoRA fits;</b> on 1.5B it was 30% slower and 0.03 worse to save 0.79 GB.</li>
+      <li><b>Judging a format by its per-weight error</b> (9.4% for NF4) instead of by the model's loss (+0.031).</li>
+      <li><b>Merging the adapter into the 16-bit weights</b> without measuring the merged model again.</li>
+      <li><b>Letting the driver spill into system memory</b> on Windows instead of failing fast; cap PyTorch's memory.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is QLoRA, and why does it work?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>QLoRA is LoRA on a base model whose frozen weights are stored in 4 bits. The format, NF4, splits each matrix into blocks of 64 with one scale each and snaps every weight to one of 16 levels placed at normal quantiles, because trained weights are roughly normal. Double quantisation also compresses the scales, so a weight costs about 4.13 bits. During training each layer is turned back into bf16 for its matrix multiply, and only the 16-bit adapters get gradients. It works because the base is frozen, so quantisation error is a fixed small perturbation the adapters can partly absorb. On Qwen2.5-7B the weights went from 14.19 to 5.18 GB, and training fit in 11.83 GB where 16-bit LoRA ran out of memory.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You have one 16 GB GPU and want the best fine-tuned assistant you can get. A 1.5B model with 16-bit LoRA, or a 7B model with QLoRA?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>The 7B with QLoRA, if its speed is acceptable. On the same 1.5B model QLoRA was 30% slower and 0.03 worse than 16-bit LoRA, so quantisation does cost something, but model size matters far more: the 7B QLoRA reached a held-out reply loss of 1.733 after a quarter of an epoch, against 1.908 for the 1.5B LoRA after half an epoch. I would budget memory explicitly, 5.2 GB of 4-bit weights, 2 GB of fp32 casts, 0.6 GB of adapter state and around 4 GB of activations at 512 tokens, keep sequences bounded, and measure the final model in the form I will serve, either on the 4-bit base or merged into 16 bits. If serving latency matters more than quality, the smaller model is the honest alternative.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>QLoRA trains 16-bit LoRA adapters on frozen weights stored as 4-bit NF4.</li>
+      <li>NF4 places 16 levels at normal quantiles, with a scale per block of 64: 9.4% error against 11.6% for evenly spaced levels.</li>
+      <li>4 bits is not a quarter: 7B's weights went from 14.19 to 5.18 GB because the embedding and output layers stay in 16 bits.</li>
+      <li>7B could not take one LoRA step in 16 bits under 15 GB; in 4 bits it trained at 11.83 GB.</li>
+      <li>On the same 1.5B model QLoRA was 30% slower and 0.03 worse than 16-bit LoRA.</li>
+      <li>The larger 4-bit model won anyway: 1.733 against 1.908, with half the training steps.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why does NF4 place its 16 levels at quantiles of a normal distribution?</p>
+      <div class="opts">
+        <button class="opt">To make dequantisation faster</button>
+        <button class="opt">Trained weights are roughly normal, so the levels go where most weights are, near zero</button>
+        <button class="opt">GPUs can only multiply normal numbers</button>
+        <button class="opt">So that the scale fits in the same 4 bits</button>
+      </div>
+      <div class="explain">On a real Qwen matrix NF4's error was 9.4%, against 11.6% for evenly spaced 4-bit levels.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Qwen2.5-7B took 5.18 GB in NF4, not a quarter of its 14.19 GB in bf16. Why?</p>
+      <div class="opts">
+        <button class="opt">NF4 really uses 8 bits a weight</button>
+        <button class="opt">bitsandbytes pads every tensor to a power of two</button>
+        <button class="opt">The block scales take most of the space</button>
+        <button class="opt">The embedding and output layers stay in 16 bits: 2.03 GB of it</button>
+      </div>
+      <div class="explain">6.53 billion weights at about 4.13 bits come to 3.14 GB; the two 545-million-parameter vocabulary matrices add 2.03 GB.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">On the same 1.5B model, how did QLoRA compare with 16-bit LoRA?</p>
+      <div class="opts">
+        <button class="opt">30% slower and 0.03 worse in reply loss, for 0.79 GB less peak memory</button>
+        <button class="opt">Faster and better</button>
+        <button class="opt">Identical in every way</button>
+        <button class="opt">It failed to train</button>
+      </div>
+      <div class="explain">1,782 against 2,529 tokens a second; 1.940 against 1.908; 4.14 against 4.93 GB.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What happened when Qwen2.5-7B was trained with LoRA on bf16 weights under the 15 GB cap?</p>
+      <div class="opts">
+        <button class="opt">It trained, only more slowly</button>
+        <button class="opt">It matched QLoRA's loss</button>
+        <button class="opt">It ran out of memory on a single 512-token sequence</button>
+        <button class="opt">It needed no gradient checkpointing</button>
+      </div>
+      <div class="explain">The weights alone took 14.19 GB; memory reached 14.92 GB before the failure.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">When is QLoRA the right choice?</p>
+      <div class="opts">
+        <button class="opt">Always: it costs nothing</button>
+        <button class="opt">When the model you want cannot be trained in 16 bits on your GPU</button>
+        <button class="opt">Only for models under a billion parameters</button>
+        <button class="opt">When you need the fastest training steps</button>
+      </div>
+      <div class="explain">The 4-bit 7B reached 1.733 after a quarter of an epoch; the 16-bit 1.5B reached 1.908 after half.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"runs":[{"label":"Qwen2.5-1.5B, LoRA on bf16 weights","model":"Qwen2.5-1.5B","four_bit":false,"steps":430,"seconds":407.6,"tokens_per_s":2529,"peak_GB":4.93,"trainable_params":18464768,"response_loss_before":2.1949,"response_loss_after":1.9082},{"label":"Qwen2.5-1.5B, QLoRA (NF4 weights)","model":"Qwen2.5-1.5B","four_bit":true,"steps":430,"seconds":578.4,"tokens_per_s":1782,"peak_GB":4.14,"trainable_params":18464768,"response_loss_before":2.2257,"response_loss_after":1.9404},{"label":"Qwen2.5-7B, QLoRA (NF4 weights)","model":"Qwen2.5-7B","four_bit":true,"steps":215,"seconds":814.3,"tokens_per_s":631,"peak_GB":11.83,"trainable_params":40370176,"response_loss_before":2.0113,"response_loss_after":1.7326}],"memory":{"Qwen2.5-1.5B bf16":{"weights_GB":2.88,"fits":true},"Qwen2.5-1.5B 4-bit NF4":{"weights_GB":1.08,"fits":true},"Qwen2.5-7B bf16":{"weights_GB":14.19,"fits":true},"Qwen2.5-7B 4-bit NF4":{"weights_GB":5.18,"fits":true}},"nf4":{"matrix":"layer 10 MLP down projection","shape":[1536,8960],"ours_vs_bitsandbytes_max_diff":0.0009606778621673584,"rel_error_nf4":0.09419328719377518,"rel_error_int4_absmax":0.11605357378721237,"rel_error_bf16_to_fp8_e4m3":0.029739171266555786,"weight_std":0.027015911415219307},"bf16_7b_lora":{"weights_GB":14.19,"seq":512,"ok":false,"error":"CUDA out of memory. Tried to allocate 20.00 MiB","peak_GB":14.92}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const RUNS = D.runs, OOM = D.bf16_7b_lora, Q = D.nf4;
+  const LV = [-1, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0, 0.0796, 0.1609, 0.2461, 0.3379, 0.4407, 0.5626, 0.723, 1];
+  const pct = (x) => (100 * x).toFixed(1) + '%';
+
+  function drawRuns() {
+    const mn = 1.6, mx = 2.3, w = (x) => (100 * (x - mn) / (mx - mn)).toFixed(1);
+    $('#qlOut').innerHTML = RUNS.map(r => `<div class="ql-bar"><span>${r.label}</span><span class="track"><i class="${r.four_bit ? 'b' : ''}" style="width:${w(r.response_loss_after)}%"></i></span><span class="n">${r.response_loss_before} → ${r.response_loss_after}</span></div>`).join('')
+      + `<div class="ql-bar"><span>Qwen2.5-7B, LoRA on bf16 weights</span><span class="track"></span><span class="n">out of memory</span></div><p class="small muted" style="margin:8px 0 0">Bars: held-out reply loss after training (lower is better; bars start at 1.6). Amber: 4-bit base weights. Right: before → after.</p>`;
+    $('#qlStats').innerHTML = RUNS.map(r => `<div class="stat${r.model.endsWith('7B') ? ' good' : ''}"><div class="k">${r.model}, ${r.four_bit ? 'QLoRA' : 'LoRA'}</div><div class="v">${r.peak_GB} GB · ${r.tokens_per_s.toLocaleString('en-GB')} tok/s</div></div>`).join('');
+    $('#qlWhy').innerHTML = '<b>A bigger model in 4 bits beat a smaller one in 16.</b> On the same 1.5B model QLoRA was 30% slower and ended 0.03 worse; on 7B it was the only way to train at all, and the best result here.';
+  }
+  function drawMem() {
+    const M = Object.entries(D.memory);
+    $('#qlOut').innerHTML = M.map(([k, m]) => `<div class="ql-bar"><span>${k}</span><span class="track"><i class="${k.includes('NF4') ? 'b' : ''}" style="width:${(100 * m.weights_GB / 16).toFixed(1)}%"></i></span><span class="n">${m.weights_GB} GB</span></div>`).join('')
+      + '<p class="small muted" style="margin:8px 0 0">Bars: weights on the GPU after loading, out of 16 GB. PyTorch was capped at 15 GB.</p>';
+    const q7 = RUNS.find(r => r.model === 'Qwen2.5-7B');
+    $('#qlStats').innerHTML = `<div class="stat bad"><div class="k">7B, LoRA on bf16 weights</div><div class="v">out of memory at ${OOM.peak_GB} GB</div></div><div class="stat"><div class="k">7B NF4 weights</div><div class="v">${D.memory['Qwen2.5-7B 4-bit NF4'].weights_GB} GB</div></div><div class="stat good"><div class="k">7B QLoRA training peak</div><div class="v">${q7.peak_GB} GB</div></div>`;
+    $('#qlWhy').innerHTML = '<b>Four bits is not a quarter.</b> The embedding and output layers stay in 16 bits, and peft casts them to fp32 for training. Even so, 7B went from not fitting a single step to training with 3 GB to spare.';
+  }
+  let seed = 1;
+  function rng() { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }
+  function drawNf4() {
+    const blk = Array.from({ length: 64 }, () => Math.sqrt(-2 * Math.log(1 - rng())) * Math.cos(2 * Math.PI * rng()) * Q.weight_std);
+    const amax = Math.max(...blk.map(Math.abs)), snap = (L) => blk.map(w => amax * L.reduce((a, b) => Math.abs(w / amax - b) < Math.abs(w / amax - a) ? b : a));
+    const I4 = Array.from({ length: 15 }, (_, k) => (k - 7) / 7);
+    const err = (q) => Math.sqrt(q.reduce((s, x, i) => s + (x - blk[i]) ** 2, 0) / blk.reduce((s, x) => s + x * x, 0));
+    const W = 640, x = (t) => 30 + (W - 60) * (t + 1) / 2;
+    let g = `<svg class="ql-svg" viewBox="0 0 ${W} 190" role="img" aria-label="NF4 and int4 levels with a random block of weights">`;
+    g += `<text x="30" y="16" font-size="11" fill="${css('--muted')}">NF4: 16 levels, dense near zero</text>`;
+    LV.forEach(t => g += `<line x1="${x(t)}" x2="${x(t)}" y1="24" y2="54" stroke="${css('--accent')}" stroke-width="2"/>`);
+    g += `<line x1="30" x2="${W - 30}" y1="88" y2="88" stroke="${css('--border')}"/>`;
+    blk.forEach(w => g += `<circle cx="${x(w / amax).toFixed(1)}" cy="${(88 + 10 * (rng() - 0.5)).toFixed(1)}" r="3" fill="${css('--text-2')}" opacity="0.7"/>`);
+    g += `<text x="30" y="112" font-size="11" fill="${css('--muted')}">64 weights, divided by the block's largest |value|</text>`;
+    I4.forEach(t => g += `<line x1="${x(t)}" x2="${x(t)}" y1="124" y2="154" stroke="${css('--amber')}" stroke-width="2"/>`);
+    g += `<text x="30" y="172" font-size="11" fill="${css('--muted')}">int4 with the same scale: 15 evenly spaced levels</text>`;
+    [-1, -0.5, 0, 0.5, 1].forEach(t => g += `<text x="${x(t)}" y="186" text-anchor="middle" font-size="10" fill="${css('--muted')}">${t}</text>`);
+    $('#qlOut').innerHTML = g + '</svg>';
+    const en = err(snap(LV)), ei = err(snap(I4));
+    $('#qlStats').innerHTML = `<div class="stat ${en < ei ? 'good' : ''}"><div class="k">This block, NF4 error</div><div class="v">${pct(en)}</div></div><div class="stat"><div class="k">This block, int4 error</div><div class="v">${pct(ei)}</div></div><div class="stat"><div class="k">Real matrix: NF4 / int4 / FP8</div><div class="v">${pct(Q.rel_error_nf4)} / ${pct(Q.rel_error_int4_absmax)} / ${pct(Q.rel_error_bf16_to_fp8_e4m3)}</div></div>`;
+    $('#qlWhy').innerHTML = '<b>Levels where the weights are.</b> Most weights sit near zero, where NF4 has its levels closest together; evenly spaced int4 spends codes on the rare large values. The block is random normal weights, computed in your browser.';
+  }
+  function drawFits() {
+    const N = [0.5, 1.5, 3, 7, 14, 32, 70][+$('#qlN').value], GB = 2 ** 30;
+    $('#qlNv').textContent = N + 'B';
+    const bf = N * 1e9 * 2 / GB, nf = N * 1e9 * 4.127 / 8 / GB, w = (g) => Math.min(100, 100 * g / 48).toFixed(1);
+    $('#qlOut').innerHTML = [['bf16 weights', bf, ''], ['NF4 weights', nf, 'b']].map(([k, g, c]) => `<div class="ql-bar"><span>${k}</span><span class="track"><i class="${c}" style="width:${w(g)}%"></i></span><span class="n">${g.toFixed(1)} GB</span></div>`).join('')
+      + '<p class="small muted" style="margin:8px 0 0">Weights only, from the formula: 2 bytes a weight in bf16, about 4.13 bits in NF4, with the embeddings counted in 4 bits too, so real models are somewhat bigger. Bars run to 48 GB.</p>';
+    const room = 16 - nf, need = 6.65 * N / 7;
+    $('#qlStats').innerHTML = `<div class="stat ${bf < 16 ? 'good' : 'bad'}"><div class="k">bf16 weights in 16 GB</div><div class="v">${bf < 16 ? 'fit' : 'do not fit'}</div></div><div class="stat"><div class="k">Room left beside NF4 weights</div><div class="v">${room > 0 ? room.toFixed(1) + ' GB' : 'none'}</div></div><div class="stat ${room > need ? 'good' : room > 0 ? 'warn' : 'bad'}"><div class="k">Training overhead, scaled from 7B</div><div class="v">≈ ${need.toFixed(1)} GB</div></div>`;
+    $('#qlWhy').innerHTML = '<b>Weights are only the start.</b> Training 7B in 4 bits needed 6.6 GB more than its weights here (fp32 casts, adapter state, activations at 512 tokens). Scaling that in proportion to model size is a rough guide: by 14B, 16 GB is no longer enough even in 4 bits.';
+  }
+  function draw() {
+    const e = v('#qlE');
+    $('#qlVn').classList.toggle('on', e === 'nf4');
+    $('#qlVf').classList.toggle('on', e === 'fits');
+    ({ runs: drawRuns, mem: drawMem, nf4: drawNf4, fits: drawFits })[e]();
+  }
+  $('#qlE').addEventListener('segchange', draw);
+  $('#qlNew').addEventListener('click', drawNf4);
+  $('#qlN').addEventListener('input', draw);
+  draw();
+})();
+</script>
+</body>
+</html>

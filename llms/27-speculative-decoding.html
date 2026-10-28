@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Speculative Decoding · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 27 of LLMs. Speculative decoding written from scratch, with Qwen2.5-0.5B-Instruct drafting for Qwen2.5-1.5B-Instruct: acceptance by task and draft length, the sampling rule checked to preserve the target's distribution, prompt-lookup drafting, Hugging Face's assisted generation, and the measured reason it was slower here, with a calculator for when it pays.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sp-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .sp-v { display:none; } .sp-v.on { display:block; }
+  .sp-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .sp-bar { display:grid; grid-template-columns:210px 1fr 120px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .sp-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .sp-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .sp-bar .track i.b { background:var(--amber); }
+  .sp-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .sp-sl { display:grid; grid-template-columns:150px 1fr 70px; gap:10px; align-items:center; font-size:13px; padding:3px 0; }
+  .sp-sl input[type=range] { width:100%; accent-color:var(--accent); }
+  .sp-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .sp-bar { grid-template-columns:120px 1fr 96px; } .sp-sl { grid-template-columns:110px 1fr 60px; } }
+</style>
+</head>
+<body data-chapter="27">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 27</span><span class="pill">Advanced</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Speculative <span class="grad">Decoding</span></h1>
+    <p class="lead">A large model generates one token per forward pass, but a pass over five tokens costs barely more than a pass over one. Speculative decoding exploits that: a small, cheap model drafts several tokens, the large model checks them all in one pass, and every draft token it agrees with is a token gained. Done right, the output is exactly what the large model would have produced on its own.</p>
+    <p class="lead">This chapter implements it with Qwen2.5-0.5B-Instruct drafting for Qwen2.5-1.5B-Instruct. The drafts were good: on code the large model accepted 88% of them, 4.5 tokens per pass. And it was <b>slower</b>, 46 tokens a second against 67 alone, as was Hugging Face's own implementation. The measurements show exactly why, and when speculation does pay. Prompt lookup, which drafts by copying from the prompt at no cost, was the only version that sped things up here, by 9% on copying tasks.</p>
+    <ul class="objectives">
+      <li><span>Explain why one decoding step costs nearly the same for 1 token or 5</span></li>
+      <li><span>Implement draft-and-verify with cache rollback</span></li>
+      <li><span>Apply the acceptance rule that keeps the target model's distribution exactly</span></li>
+      <li><span>Predict the speed-up from acceptance rate, draft length and the draft's relative cost</span></li>
+      <li><span>Know the alternatives: prompt lookup, self-speculation, Medusa and EAGLE heads</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The KV cache and decode cost:</b> <a href="16-the-kv-cache.html">Chapter 16</a>.</li>
+        <li><b>Sampling:</b> <a href="09-decoding.html">Chapter 9</a>.</li>
+        <li><b>Why batched bf16 outputs can differ:</b> <a href="26-inference-engines-and-batching.html">Chapter 26</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Why decoding is slow</h2>
+  <p>Generating a token means one forward pass through the whole model, and the next token cannot start until this one is chosen. Measured after a real prompt, one step of the 1.5B target took 14.8 ms. A pass over 5 tokens took 16.7 ms, only 13% longer for five times the work: each step's cost is mostly fixed (reading the weights, and on this setup launching kernels), not per token. If the next 5 tokens were known in advance, the model could check them all for nearly the price of one. Speculative decoding (Leviathan et al. and Chen et al., both 2023) guesses them.</p>
+
+  <h2>Draft and verify</h2>
+  <p>Each round: the draft model proposes k tokens one at a time; the target runs once over all k, giving its own prediction at every position; the longest prefix where they agree is kept, plus one token from the target at the first disagreement (or after the last draft token, if all were accepted). Both models' caches are then cut back to the accepted length:</p>
+<pre class="code">draft_toks = [d.<span class="f">next</span>() <span class="k">for</span> _ <span class="k">in</span> <span class="f">range</span>(k)]                 <span class="c"># k cheap steps</span>
+logits = torch.<span class="f">cat</span>([t_last[<span class="k">None</span>], t.<span class="f">feed</span>(draft_toks)])       <span class="c"># one target pass over all k</span>
+n_ok = <span class="m">0</span>
+<span class="k">while</span> n_ok &lt; k <span class="k">and</span> logits[n_ok].<span class="f">argmax</span>() == draft_toks[n_ok]:
+    n_ok += <span class="m">1</span>
+fix = <span class="f">int</span>(logits[n_ok].<span class="f">argmax</span>())                             <span class="c"># the target's own token where they first disagree</span>
+out += draft_toks[:n_ok] + [fix]
+t.<span class="f">crop</span>(base + n_ok); d.<span class="f">crop</span>(base + n_ok)                     <span class="c"># roll both caches back to what was kept</span></pre>
+  <p>With greedy decoding the rule is simply "keep the tokens the target would have chosen", so the output should equal the target's alone. In bf16 it did for 7 of the 8 extraction and code prompts at k = 2 but only 4 of the 8 factual and creative ones; in fp32 all 8 checked factual and creative prompts matched exactly. As in Chapter 26, checking k tokens in one pass adds numbers in a different order than k separate passes, and bf16 rounding can flip near-ties.</p>
+
+  <h2>The acceptance rule</h2>
+  <p>With sampling, "agree" cannot mean "same token". The rule that keeps the target's distribution exactly: accept a draft token x with probability min(1, p(x) / q(x)), where p is the target's probability and q the draft's. If it is rejected, sample the replacement from the leftover mass, max(0, p − q), normalised. Tokens the draft over-proposes get thinned out; tokens it under-proposes are topped up by the replacement step. The result is distributed exactly as if the target had sampled alone.</p>
+  <p>That was checked directly. For the prompt "Name a colour.", 2,000 single tokens were generated by speculative sampling with a 4-token draft, and their frequencies compared with the target's own probabilities: "Blue" 90.0% against 90.4%, "Red" 3.1% against 3.1%, "Purple" 1.6% against 1.5%. The total variation distance was 0.0099, about what 2,000 samples' noise alone gives, even though the draft's own first-token distribution was 0.92 away from the target's: a poor draft costs speed, never correctness.</p>
+
+  <h2>Measured speed-up</h2>
+  <p>Four prompts for each of four kinds of task, 160 tokens each, greedy:</p>
+  <table class="t cmp">
+    <thead><tr><th>Task</th><th>Target alone</th><th>k = 2</th><th>k = 4</th><th>k = 8</th><th>Accepted, k = 4</th><th>Tokens per target pass, k = 4</th></tr></thead>
+    <tbody>
+      <tr><td>Extraction (copy a list, a sentence, JSON)</td><td>67.8 tok/s</td><td>38.8</td><td>44.9</td><td>44.9</td><td>91.9%</td><td>4.44</td></tr>
+      <tr><td>Code</td><td>67.0</td><td>39.8</td><td>46.2</td><td>46.1</td><td>88.2%</td><td>4.46</td></tr>
+      <tr><td>Factual explanation</td><td>68.4</td><td>33.8</td><td>33.7</td><td>26.8</td><td>57.1%</td><td>3.25</td></tr>
+      <tr><td>Creative writing</td><td>68.4</td><td>30.6</td><td>26.3</td><td>19.2</td><td>40.1%</td><td>2.54</td></tr>
+    </tbody>
+  </table>
+  <p>Acceptance behaved as expected: high where the next tokens are predictable (copying, code), low where many continuations are good (stories), and falling as k grows, since one wrong token discards everything drafted after it. Sampling at temperature 0.7 gave the same pattern, 86.7% on code and 39.4% on creative writing. Hugging Face's assisted generation, with the same pair, was also slower: 49.3 against 66.2 tokens a second on code (both runs through its generate, which applied Qwen's default repetition penalty of 1.1; the from-scratch loop used none).</p>
+  <p>The step times explain why. A draft step took 12.8 ms, 87% of a target step. Drafting 4 tokens cost 51 ms to save target passes that cost 15 ms each. The implementation here also feeds the correction token through both models as an extra step after each round, where optimised versions fold it into the next pass; together that predicts 46.8 tokens a second for code at k = 4, against 46.2 measured. Even without that overhead, the ideal speed-up is tokens per round divided by the round's cost in target steps, 4.46 / (4 × 0.87 + 1.13) = 0.97: no gain. On this GPU both models are so small that a step's cost is fixed overhead, the same for 0.5B as for 1.5B parameters.</p>
+  <p>Speculation pays when the draft is <b>much</b> cheaper than the target, as when a 1B draft serves a 70B target whose every step reads 140 GB of weights. With the cost ratio at 0.05 instead of 0.87 and the same 88% acceptance, the same formula gives 4.46 / (0.2 + 1.13) = 3.4 times faster. Papers and engines report 2 to 3 times on such pairs. The calculator in the lab shows the trade.</p>
+
+  <h2>Self-speculation and Medusa heads</h2>
+  <p>A separate draft model has to be loaded, kept in memory, share the tokenizer, and still costs something per token. Alternatives remove it. <b>Prompt lookup</b> drafts by finding the last few generated tokens earlier in the context and proposing what followed them there, which costs nothing. Measured here with up to 8 drafted tokens, it was the only version that sped things up: 73.6 against 67.8 tokens a second on extraction (+9%), where the output copies the prompt, and 70.7 against 68.4 on factual answers (+3%), where it rarely finds a match. It suits summarising, editing and code changes, where much of the output repeats the input.</p>
+  <p>Not measured here: <b>Medusa</b> adds a few extra output heads to the target model that predict tokens 2, 3, 4 ahead from the same hidden state, trained briefly on the model's own outputs; <b>EAGLE</b> trains a single small layer that drafts from the target's hidden states, which makes drafts far more accurate than a separate small model; and <b>self-speculation</b> drafts with the target itself, skipping some of its layers. All of them make the draft nearly free, which is exactly what was missing here.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>Draft</b> k tokens with something cheap</li>
+      <li data-k="step"><b>Verify</b> all k with one target pass</li>
+      <li data-k="step"><b>Accept</b> greedy match, or min(1, p/q) when sampling</li>
+      <li data-k="step"><b>Replace</b> the first rejected token from the target</li>
+      <li data-k="end"><b>Roll back</b> both caches and repeat</li>
+    </ol>
+    <figcaption><b>Speculative decoding.</b> The output distribution is the target's; only the speed depends on the draft, and only a draft much cheaper than the target makes it faster.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Speculative decoding lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="sp-l">Experiment</div>
+      <div class="seg" id="spE"><button class="active" data-v="g">speed by task</button><button data-v="dist">distribution check</button><button data-v="calc">when it pays</button></div>
+      <div class="sp-v" id="spVg">
+        <div class="sp-l">Task</div>
+        <div class="seg" id="spT"><button class="active" data-v="code">code</button><button data-v="extraction">extraction</button><button data-v="factual">factual</button><button data-v="creative">creative</button></div>
+      </div>
+      <div class="sp-v" id="spVc">
+        <div class="sp-sl"><span>acceptance α</span><input type="range" id="spA" min="30" max="95" value="88" aria-label="acceptance rate"><code id="spAv"></code></div>
+        <div class="sp-sl"><span>draft length k</span><input type="range" id="spK" min="1" max="8" value="4" aria-label="draft length"><code id="spKv"></code></div>
+        <div class="sp-sl"><span>draft cost / target</span><input type="range" id="spC" min="0" max="6" value="6" aria-label="draft cost ratio"><code id="spCv"></code></div>
+      </div>
+      <div class="sp-box" id="spOut"></div>
+      <div class="stats" id="spStats"></div>
+      <div class="sp-why" id="spWhy"></div>
+    </div>
+    <div class="panel-foot">Target Qwen2.5-1.5B-Instruct (revision 989aa79), draft Qwen2.5-0.5B-Instruct (7ae5576), bf16, a from-scratch loop over Hugging Face's model forward with DynamicCache rollback; 4 prompts per task, 160 new tokens, batch 1, RTX 5070 Ti. Step times: median of 50 after a prompt. "When it pays" is computed in your browser from the formula below it, with the verify pass fixed at this GPU's measured 1.13 target steps.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">⚡</div>
+    <div class="body"><div class="title">Use case: faster replies from a large model</div><p>Interactive products care about time per output token, and for a large model at small batch sizes each token is limited by reading the weights. Speculative decoding is how many serving systems cut that: engines such as vLLM, SGLang and TensorRT-LLM support draft models, n-gram (prompt lookup) drafting and EAGLE- or Medusa-style heads, and code assistants lean on lookup drafting because edits repeat so much of the file. The measurements here are the warning: it only helps when the draft is far cheaper than the target and accepted often, so it is tuned per model pair and per workload, and usually switched off at large batch sizes, where the GPU is already busy and verifying rejected drafts wastes work.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Assuming speculation is always faster;</b> with a draft costing 87% of a target step it was 31% slower here.</li>
+      <li><b>Judging a draft by acceptance alone;</b> 88% accepted still lost time.</li>
+      <li><b>Using a long draft on open-ended text;</b> creative writing fell to 24% acceptance at k = 8.</li>
+      <li><b>Accepting sampled drafts by "same token";</b> use min(1, p/q) and resample from max(0, p − q).</li>
+      <li><b>Expecting bit-identical greedy output in bf16;</b> fp32 matched 8 of 8, bf16 about half.</li>
+      <li><b>Forgetting to roll back the draft model's cache</b> along with the target's after a rejection.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How does speculative decoding speed up generation without changing the output?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Decoding is sequential and each step's cost is mostly fixed, so checking several tokens in one pass costs little more than generating one; on my setup, 16.7 ms for 5 tokens against 14.8 for 1. A cheap draft model proposes k tokens; the target scores all of them in one pass; the prefix it agrees with is kept, plus one token of its own. With sampling, a draft token is accepted with probability min(1, p/q) and a rejected one is replaced by sampling from max(0, p − q), which makes the output exactly the target's distribution: in a test with 2,000 samples the total variation distance was 0.0099 even though the draft's distribution was 0.92 away. The speed-up is the accepted tokens per round divided by the round's cost, so it needs high acceptance and a draft much cheaper than the target.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You add a draft model and generation gets slower. What do you check?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First the cost ratio. In my measurements a 0.5B draft cost 87% of a 1.5B target per step, because both were overhead-bound at batch 1, so even 88% acceptance gave 4.46 tokens per round for 4.6 target steps of cost: a predicted 0.97 times, and in practice slower. Then acceptance by workload: 92% on extraction, 40% on creative writing at k = 4, so k should be tuned per workload, often smaller for open-ended text. Then the implementation: extra passes per round, like feeding the correction token separately, which cost me a target and a draft step each round. Fixes: a much cheaper drafter (prompt lookup, which gave me +9% on copying tasks, or EAGLE or Medusa heads), a larger target where the step is bandwidth-bound, and turning speculation off at high batch sizes.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>One target pass over 5 tokens cost 16.7 ms against 14.8 for 1: verifying is nearly free.</li>
+      <li>The acceptance rule min(1, p/q) keeps the target's distribution exactly (total variation 0.0099 on 2,000 samples).</li>
+      <li>Acceptance depends on the task: 92% copying, 88% code, 57% explanations, 40% stories at k = 4.</li>
+      <li>Here it was slower (46 against 67 tok/s) because the draft cost 87% of a target step.</li>
+      <li>Speed-up ≈ tokens per round / (k × draft cost + verify cost): it needs a draft far cheaper than the target.</li>
+      <li>Prompt lookup, a free drafter, was the only version faster here (+9% on copying).</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why can the target check k draft tokens for little more than the cost of one?</p>
+      <div class="opts">
+        <button class="opt">It skips some layers</button>
+        <button class="opt">It uses the draft's KV cache</button>
+        <button class="opt">A step's cost is mostly fixed, not per token: 5 tokens took 16.7 ms against 14.8 for 1</button>
+        <button class="opt">It only checks the last token</button>
+      </div>
+      <div class="explain">Reading weights and launching kernels dominate a decode step at batch 1.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">With sampling, how is a draft token accepted so that the output keeps the target's distribution?</p>
+      <div class="opts">
+        <button class="opt">With probability min(1, p/q); if rejected, resample from max(0, p − q)</button>
+        <button class="opt">Only if it is the target's most likely token</button>
+        <button class="opt">Always, if the draft is confident</button>
+        <button class="opt">With probability q</button>
+      </div>
+      <div class="explain">Checked: 2,000 samples matched the target to a total variation of 0.0099.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Code drafts were 88% accepted, yet speculation was slower. Why?</p>
+      <div class="opts">
+        <button class="opt">The acceptance rule was wrong</button>
+        <button class="opt">The prompts were too short</button>
+        <button class="opt">bf16 rounding</button>
+        <button class="opt">A draft step cost 87% of a target step, so drafting cost more than the passes it saved</button>
+      </div>
+      <div class="explain">4.46 tokens per round for about 4.6 target steps of cost: at best 0.97 times.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">On which task was acceptance lowest, and why?</p>
+      <div class="opts">
+        <button class="opt">Code, because syntax is strict</button>
+        <button class="opt">Creative writing, because many continuations are good and the two models pick differently</button>
+        <button class="opt">Extraction, because the text is long</button>
+        <button class="opt">All tasks were the same</button>
+      </div>
+      <div class="explain">40% at k = 4, 24% at k = 8, against 92% when copying.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why did prompt lookup speed things up when the draft model did not?</p>
+      <div class="opts">
+        <button class="opt">It is more accurate than any model</button>
+        <button class="opt">It uses a larger batch</button>
+        <button class="opt">Its drafts cost nothing, so every accepted token is pure gain</button>
+        <button class="opt">It changes the output</button>
+      </div>
+      <div class="explain">+9% on extraction, +3% on factual answers; it works where the output repeats the input.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"greedy":[{"task":"code","k":0,"tokens_per_s":67.0,"identical":4,"of":4,"acceptance":null,"tokens_per_target_pass":1.0},{"task":"code","k":2,"tokens_per_s":39.8,"identical":3,"of":4,"acceptance":0.916,"tokens_per_target_pass":2.81},{"task":"code","k":4,"tokens_per_s":46.2,"identical":2,"of":4,"acceptance":0.882,"tokens_per_target_pass":4.46},{"task":"code","k":8,"tokens_per_s":46.1,"identical":2,"of":4,"acceptance":0.764,"tokens_per_target_pass":6.89},{"task":"factual","k":0,"tokens_per_s":68.4,"identical":4,"of":4,"acceptance":null,"tokens_per_target_pass":1.0},{"task":"factual","k":2,"tokens_per_s":33.8,"identical":2,"of":4,"acceptance":0.704,"tokens_per_target_pass":2.39},{"task":"factual","k":4,"tokens_per_s":33.7,"identical":2,"of":4,"acceptance":0.571,"tokens_per_target_pass":3.25},{"task":"factual","k":8,"tokens_per_s":26.8,"identical":1,"of":4,"acceptance":0.379,"tokens_per_target_pass":3.99},{"task":"creative","k":0,"tokens_per_s":68.4,"identical":4,"of":4,"acceptance":null,"tokens_per_target_pass":1.0},{"task":"creative","k":2,"tokens_per_s":30.6,"identical":2,"of":4,"acceptance":0.585,"tokens_per_target_pass":2.16},{"task":"creative","k":4,"tokens_per_s":26.3,"identical":2,"of":4,"acceptance":0.401,"tokens_per_target_pass":2.54},{"task":"creative","k":8,"tokens_per_s":19.2,"identical":2,"of":4,"acceptance":0.242,"tokens_per_target_pass":2.85},{"task":"extraction","k":0,"tokens_per_s":67.8,"identical":4,"of":4,"acceptance":null,"tokens_per_target_pass":1.0},{"task":"extraction","k":2,"tokens_per_s":38.8,"identical":4,"of":4,"acceptance":0.962,"tokens_per_target_pass":2.85},{"task":"extraction","k":4,"tokens_per_s":44.9,"identical":4,"of":4,"acceptance":0.919,"tokens_per_target_pass":4.44},{"task":"extraction","k":8,"tokens_per_s":44.9,"identical":4,"of":4,"acceptance":0.807,"tokens_per_target_pass":6.86}],"lookup":[{"task":"extraction","tokens_per_s":73.6,"identical":4,"acceptance":0.417,"tokens_per_target_pass":1.23},{"task":"factual","tokens_per_s":70.7,"identical":1,"acceptance":0.295,"tokens_per_target_pass":1.1}],"distribution":{"samples":2000,"total_variation":0.0099,"top":[["Blue",0.9037,0.9],["Red",0.0309,0.031],["Purple",0.0146,0.0155],["Green",0.0146,0.016],["Sure",0.0114,0.0095],["I",0.0061,0.0085],["The",0.0061,0.006],["blue",0.0047,0.0065]],"draft_total_variation":0.9203},"sampling":[{"temperature":0.7,"task":"code","acceptance":0.867,"tokens_per_s":44.5,"target_alone_tokens_per_s":66.0},{"temperature":0.7,"task":"creative","acceptance":0.394,"tokens_per_s":26.1,"target_alone_tokens_per_s":67.5},{"temperature":1.0,"task":"code","acceptance":0.812,"tokens_per_s":42.7,"target_alone_tokens_per_s":67.0},{"temperature":1.0,"task":"creative","acceptance":0.454,"tokens_per_s":28.2,"target_alone_tokens_per_s":67.9}],"hf":[{"task":"code","assisted":false,"tokens_per_s":66.2},{"task":"code","assisted":true,"tokens_per_s":49.3},{"task":"creative","assisted":false,"tokens_per_s":66.6},{"task":"creative","assisted":true,"tokens_per_s":40.7}],"step_ms":{"draft_1_token":12.77,"target_1_token":14.75,"target_5_tokens":16.68},"fp32_identical":{"factual":4,"creative":4}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const bar = (k, w, txt, c) => `<div class="sp-bar"><span>${k}</span><span class="track"><i class="${c || ''}" style="width:${Math.max(0.5, Math.min(100, w)).toFixed(1)}%"></i></span><span class="n">${txt}</span></div>`;
+  const C_GPU = D.step_ms.draft_1_token / D.step_ms.target_1_token, V = D.step_ms.target_5_tokens / D.step_ms.target_1_token;
+
+  function drawG() {
+    const t = v('#spT'), rows = D.greedy.filter(r => r.task === t), base = rows.find(r => r.k === 0), mx = 80;
+    const lk = (D.lookup || []).find(r => r.task === t);
+    $('#spOut').innerHTML = rows.map(r => bar(r.k ? `draft model, k = ${r.k}` : 'target alone', 100 * r.tokens_per_s / mx, `${r.tokens_per_s} tok/s`, r.k ? 'b' : '')).join('')
+      + (lk ? bar('prompt lookup, up to 8', 100 * lk.tokens_per_s / mx, `${lk.tokens_per_s} tok/s`) : '')
+      + `<p class="small muted" style="margin:8px 0 0">Greedy, 160 tokens, 4 prompts. Amber: drafting with Qwen2.5-0.5B.</p>`;
+    const k4 = rows.find(r => r.k === 4);
+    $('#spStats').innerHTML = `<div class="stat"><div class="k">Accepted, k = 4</div><div class="v">${(100 * k4.acceptance).toFixed(1)}%</div></div><div class="stat"><div class="k">Tokens per target pass</div><div class="v">${k4.tokens_per_target_pass}</div></div><div class="stat ${k4.tokens_per_s > base.tokens_per_s ? 'good' : 'bad'}"><div class="k">Speed vs target alone</div><div class="v">${(k4.tokens_per_s / base.tokens_per_s).toFixed(2)}×</div></div>`;
+    $('#spWhy').innerHTML = '<b>Good drafts, no gain.</b> The draft costs ' + Math.round(100 * C_GPU) + '% of a target step on this GPU, so every drafted token costs nearly what it saves.' + (lk ? ' Prompt lookup drafts for free, so it is the one that helps.' : '');
+  }
+  function drawDist() {
+    const T = D.distribution.top;
+    $('#spOut').innerHTML = T.map(([t, p, e]) => bar(`"${t.replace(/</g, '&lt;')}": target / speculative`, 100 * p, `${(100 * p).toFixed(1)} / ${(100 * e).toFixed(1)}%`)).join('') + '<p class="small muted" style="margin:8px 0 0">First token for "Name a colour.": the target\'s probabilities against frequencies in 2,000 speculative samples (temperature 1, k = 4).</p>';
+    $('#spStats').innerHTML = `<div class="stat good"><div class="k">Speculative vs target (total variation)</div><div class="v">${D.distribution.total_variation}</div></div><div class="stat bad"><div class="k">Draft alone vs target</div><div class="v">${D.distribution.draft_total_variation}</div></div><div class="stat"><div class="k">Samples</div><div class="v">${D.distribution.samples.toLocaleString('en-GB')}</div></div>`;
+    $('#spWhy').innerHTML = '<b>The rule corrects the draft completely.</b> The draft\'s own distribution was far off, yet accept-with-min(1, p/q) and resample-the-remainder reproduced the target\'s within sampling noise.';
+  }
+  function drawCalc() {
+    const a = +$('#spA').value / 100, k = +$('#spK').value, c = [0.02, 0.05, 0.1, 0.2, 0.4, 0.6, C_GPU][+$('#spC').value];
+    $('#spAv').textContent = Math.round(100 * a) + '%'; $('#spKv').textContent = k; $('#spCv').textContent = c.toFixed(2);
+    const E = (1 - a ** (k + 1)) / (1 - a), cost = k * c + V, sp = E / cost;
+    const ks = [1, 2, 3, 4, 5, 6, 7, 8], best = Math.max(...ks.map(j => (1 - a ** (j + 1)) / (1 - a) / (j * c + V)));
+    $('#spOut').innerHTML = ks.map(j => { const s = (1 - a ** (j + 1)) / (1 - a) / (j * c + V); return bar(`k = ${j}`, 100 * s / Math.max(best, 1.2), s.toFixed(2) + '×', s < 1 ? 'b' : ''); }).join('') + `<p class="small muted" style="margin:8px 0 0">Speed-up = expected tokens per round (1 − α<sup>k+1</sup>) / (1 − α), divided by the round's cost in target steps, k × ${c.toFixed(2)} + ${V.toFixed(2)}. Amber: slower than the target alone. Assumes independent acceptances.</p>`;
+    $('#spStats').innerHTML = `<div class="stat"><div class="k">Tokens per round</div><div class="v">${E.toFixed(2)}</div></div><div class="stat"><div class="k">Cost per round (target steps)</div><div class="v">${cost.toFixed(2)}</div></div><div class="stat ${sp >= 1 ? 'good' : 'bad'}"><div class="k">Speed-up at k = ${k}</div><div class="v">${sp.toFixed(2)}×</div></div>`;
+    $('#spWhy').innerHTML = c > 0.8 ? '<b>This GPU\'s ratio.</b> At ' + c.toFixed(2) + ' no draft length wins. Slide the cost down to see a large target with a small draft.' : '<b>A cheap draft changes everything.</b> With the draft at ' + c.toFixed(2) + ' of a target step, high acceptance turns into a real speed-up, and longer drafts pay until acceptance runs out.';
+  }
+  function draw() {
+    const e = v('#spE');
+    $('#spVg').classList.toggle('on', e === 'g'); $('#spVc').classList.toggle('on', e === 'calc');
+    ({ g: drawG, dist: drawDist, calc: drawCalc })[e]();
+  }
+  ['#spE', '#spT'].forEach(id => $(id).addEventListener('segchange', draw));
+  ['#spA', '#spK', '#spC'].forEach(id => $(id).addEventListener('input', draw));
+  draw();
+})();
+</script>
+</body>
+</html>

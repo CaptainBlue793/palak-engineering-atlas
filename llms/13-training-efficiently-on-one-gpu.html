@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Training Efficiently on One GPU · LLMs by Palak Deb Patra</title>
+<meta name="description" content="Chapter 13 of LLMs. GPT-2 small trained on one 16 GB GPU under each efficiency technique: TF32, bf16 mixed precision, fused AdamW, torch.compile, gradient accumulation, activation checkpointing and a chunked loss, measured in tokens per second, gigabytes and model FLOPs utilisation.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ef-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ef-v { display:none; } .ef-v.on { display:block; }
+  .ef-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .ef-bar { display:grid; grid-template-columns:270px 1fr 110px; gap:10px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .ef-bar .track { display:block; height:13px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .ef-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .ef-bar .track i.b { background:var(--amber); }
+  .ef-bar .track i.r { background:var(--red); }
+  .ef-bar .n { text-align:right; font-family:var(--mono); font-size:12px; }
+  .ef-stack { display:flex; height:28px; border-radius:6px; overflow:hidden; background:var(--surface); margin:6px 0; }
+  .ef-stack i { display:block; height:100%; }
+  .ef-key { display:flex; flex-wrap:wrap; gap:4px 16px; font-size:12.5px; color:var(--muted); }
+  .ef-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .ef-bar { grid-template-columns:140px 1fr 90px; } }
+</style>
+</head>
+<body data-chapter="13">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 13</span><span class="pill">Intermediate</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Training Efficiently on <span class="grad">One GPU</span></h1>
+    <p class="lead">A training run's cost is its tokens divided by its tokens per second. Chapter 11 fixed the tokens; this chapter is about the other half. A handful of standard techniques change how fast the same model trains, and how big a batch fits, without changing what it learns.</p>
+    <p class="lead">Each was measured on GPT-2 small, 124 million parameters with a 1,024-token context, on this 16 GB GPU. Together, bf16 mixed precision, a fused optimiser and <code>torch.compile</code> took training from 25,000 to 70,000 tokens per second, from 21% to 58% of the GPU's measured peak. Gradient accumulation gave the same gradients as a four-times-larger batch to within 3 × 10⁻⁸ while using a quarter of the memory. And on Windows, running out of GPU memory did not fail at all: it made training 28 to 47 times slower.</p>
+    <ul class="objectives">
+      <li><span>Use bf16 mixed precision and know what it saves</span></li>
+      <li><span>Speed up a training step with fused optimisers and torch.compile</span></li>
+      <li><span>Reach a large effective batch with gradient accumulation</span></li>
+      <li><span>Trade compute for memory with activation checkpointing</span></li>
+      <li><span>Measure tokens per second and model FLOPs utilisation (MFU)</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>What uses GPU memory in training:</b> <a href="p7-gpu-memory-budgets.html">P7: GPU Memory Budgets</a>.</li>
+        <li><b>FLOPs and the GPU's peak:</b> <a href="p6-matrix-multiplies-and-flops.html">P6: Matrix Multiplies &amp; Counting FLOPs</a>.</li>
+        <li><b>The model and its training loop:</b> <a href="07-build-a-tiny-gpt.html">Chapter 7</a> and <a href="08-training-a-tiny-gpt.html">Chapter 8</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Measuring the right thing</h2>
+  <p>Every result below is GPT-2 small trained on real web text for 12 timed steps after a warm-up, with batches of 1,024-token sequences. Two numbers summarise a setup. <b>Tokens per second</b> is what sets the cost of a run. <b>Model FLOPs utilisation</b> (MFU) is the share of the GPU's peak arithmetic doing useful work: tokens per second times the FLOPs the model needs per token, about 6 × parameters plus attention, here 798 million per token (Chapter 11), divided by the peak. The peak used is the best bf16 matrix multiply measured on this GPU in P6, 96.6 trillion operations per second, so MFU here is relative to what this card has been seen to do, not to a datasheet.</p>
+
+  <h2>bf16 mixed precision</h2>
+  <p>The baseline does everything in fp32: 25,018 tokens per second, 21% MFU (measured, like every MFU here, against the bf16 peak, which fp32 arithmetic cannot reach), 12.1 GB at a batch of 8 sequences. Two one-line changes speed it up without touching the model.</p>
+<pre class="code">torch.backends.cuda.matmul.allow_tf32 = <span class="k">True</span>                 <span class="c"># TF32: fp32 matmuls on tensor cores, 10-bit mantissa</span>
+
+<span class="k">with</span> torch.<span class="f">autocast</span>(<span class="s">"cuda"</span>, dtype=torch.bfloat16):             <span class="c"># bf16 mixed precision</span>
+    _, loss = <span class="f">model</span>(x, y)                                   <span class="c"># matmuls in bf16, sensitive ops (softmax, norms, loss) in fp32</span>
+loss.<span class="f">backward</span>()                                            <span class="c"># weights, gradients and optimiser stay fp32</span></pre>
+  <p><b>TF32</b> lets fp32 matrix multiplies use the tensor cores with a shorter mantissa: 34,076 tokens per second, 36% faster, same memory. <b>bf16 autocast</b> runs the matrix multiplies in bfloat16, which has fp32's range but only 8 bits of mantissa (P1), while keeping the master weights, gradients and optimiser state in fp32: <b>50,189</b> tokens per second, twice the baseline, and 9.6 GB because activations stored for the backward pass are half the size. The loss after 15 steps was identical to three decimals, 8.097 in all three. bf16 needs no loss scaling, unlike fp16, because its range matches fp32's; that is why it became the default for training.</p>
+
+  <h2>Fused optimisers and torch.compile</h2>
+  <p>Not all of a step is matrix multiplies. AdamW updates 124 million parameters with a dozen element-wise operations each, and a plain implementation launches a separate small GPU kernel for each operation on each tensor. <code>fused=True</code> does the whole update in one kernel: 53,274 tokens per second, another 6%. <code>torch.compile</code> goes further for the model itself: it traces the forward and backward pass and generates fused kernels, so chains like add-bias, GELU and dropout read and write memory once instead of three times.</p>
+<pre class="code">opt = torch.optim.<span class="f">AdamW</span>(model.<span class="f">parameters</span>(), lr=<span class="m">3e-4</span>, fused=<span class="k">True</span>)   <span class="c"># one kernel for the whole update</span>
+model = torch.<span class="f">compile</span>(model)                                       <span class="c"># first steps are slow while it compiles</span></pre>
+  <p>Compiled, the step ran at <b>70,136 tokens per second, 58% MFU</b>, and used less memory, 7.3 GB, because fused kernels keep fewer intermediate tensors. (On Windows this needs the community <code>triton-windows</code> package; on Linux it works out of the box.) The full ladder at a batch of 8:</p>
+  <table class="t cmp">
+    <thead><tr><th>Setup (batch 8 × 1,024)</th><th>Tokens per second</th><th>MFU</th><th>Peak memory</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td>25,018</td><td>21%</td><td>12.1 GB</td></tr>
+      <tr><td>TF32 matmuls</td><td>34,076</td><td>28%</td><td>12.1 GB</td></tr>
+      <tr><td>bf16 autocast</td><td>50,189</td><td>42%</td><td>9.6 GB</td></tr>
+      <tr><td>+ fused AdamW</td><td>53,274</td><td>44%</td><td>9.6 GB</td></tr>
+      <tr><td>+ torch.compile</td><td><b>70,136</b></td><td><b>58%</b></td><td>7.3 GB</td></tr>
+    </tbody>
+  </table>
+  <p>2.8 times faster in total, with the same model, data and learning. Training this model on Chinchilla's 2.5 billion tokens would take 28 hours in fp32 and 10 hours with all three. Large training runs across thousands of GPUs report MFU of roughly 40–50%; the remaining gap to 100% is memory traffic, kernel launches and the non-matmul work that no technique fully removes.</p>
+
+  <h2>Where the memory goes</h2>
+  <p>Measured at a batch of 8 in bf16, P7's accounting holds: 0.48 GB of fp32 weights, 0.48 GB of gradients and 0.97 GB of AdamW's two moment estimates, together the fixed 16 bytes per parameter of mixed-precision training. The rest of the 8.7 GB peak is <b>activations</b>, 5.1 GB of tensors saved in the forward pass for the backward pass, and they grow with the batch. At this vocabulary size a large part of that is the output: the logits are batch × 1,024 × 50,257 numbers, about 0.8 GB in bf16 at a batch of 8, plus a 1.5 GB fp32 copy for the loss.</p>
+  <p>Two techniques shrink the activations. <b>Activation checkpointing</b> keeps only each block's input in the forward pass and recomputes the block's internals during the backward pass, trading about a third more compute in the blocks for most of their activation memory. A <b>chunked loss</b> attacks the logits: compute the output layer and the loss 2,048 positions at a time, recomputing each chunk in the backward pass, so the full batch × 1,024 × 50,257 table never exists at once.</p>
+<pre class="code"><span class="k">for</span> b <span class="k">in</span> model.h:
+    h = <span class="f">checkpoint</span>(b, h, use_reentrant=<span class="k">False</span>)                 <span class="c"># keep the input, recompute the inside in backward</span>
+h = model.<span class="f">ln_f</span>(h).<span class="f">reshape</span>(-<span class="m">1</span>, <span class="m">768</span>); y = y.<span class="f">reshape</span>(-<span class="m">1</span>)
+piece = <span class="k">lambda</span> a, t: F.<span class="f">cross_entropy</span>((a @ model.wte.weight.T).<span class="f">float</span>(), t, reduction=<span class="s">"sum"</span>)
+loss = <span class="f">sum</span>(<span class="f">checkpoint</span>(piece, h[i:i + <span class="m">2048</span>], y[i:i + <span class="m">2048</span>], use_reentrant=<span class="k">False</span>)
+           <span class="k">for</span> i <span class="k">in</span> <span class="f">range</span>(<span class="m">0</span>, h.shape[<span class="m">0</span>], <span class="m">2048</span>)) / h.shape[<span class="m">0</span>]   <span class="c"># logits for 2,048 positions at a time</span></pre>
+  <p>With PyTorch capped at 15 GiB, so that a run that does not fit fails (see below), in bf16 with fused AdamW:</p>
+  <table class="t cmp">
+    <thead><tr><th>Setup</th><th>Batch 8</th><th>Batch 16</th><th>Batch 32</th><th>Batch 64</th></tr></thead>
+    <tbody>
+      <tr><td>Plain</td><td>8.8 GB · 53.0k tok/s</td><td>out of memory</td><td>—</td><td>—</td></tr>
+      <tr><td>Checkpointed blocks</td><td>—</td><td>11.3 GB · 48.0k</td><td>—</td><td>—</td></tr>
+      <tr><td>Chunked loss</td><td>—</td><td><b>8.2 GB</b> · 45.3k</td><td>13.4 GB · 46.6k</td><td>—</td></tr>
+      <tr><td>Both</td><td>—</td><td>—</td><td>4.2 GB · 41.9k</td><td><b>6.0 GB</b> · 41.7k</td></tr>
+    </tbody>
+  </table>
+  <p>The surprise is which one mattered more. Checkpointing every block let a batch of 16 fit, in 11.3 GB at 9% lower speed. The chunked loss alone did better, 8.2 GB at the same batch, because with a 50,257-token vocabulary the logits and their fp32 copy were the largest activations in the model, about 4.6 GB at a batch of 16. Together they fit a batch of 64, eight times the plain limit, in 6 GB, for about 21% fewer tokens per second. Libraries such as Liger Kernel fuse the output layer and the loss into one kernel for exactly this reason; for models with vocabularies of 128,000 to 256,000 tokens the logits matter even more.</p>
+
+  <h2>Gradient accumulation</h2>
+  <p>When the batch you want does not fit, split it. Run several micro-batches forward and backward, letting the gradients add up, and step the optimiser once. With each micro-batch's loss divided by the number of micro-batches, the result is mathematically the same gradient as the big batch.</p>
+<pre class="code">opt.<span class="f">zero_grad</span>()
+<span class="k">for</span> micro <span class="k">in</span> <span class="f">range</span>(<span class="m">4</span>):                         <span class="c"># 4 micro-batches of 8 = an effective batch of 32</span>
+    x, y = <span class="f">batch</span>(<span class="m">8</span>)
+    <span class="k">with</span> torch.<span class="f">autocast</span>(<span class="s">"cuda"</span>, dtype=torch.bfloat16):
+        _, loss = <span class="f">model</span>(x, y)
+    (loss / <span class="m">4</span>).<span class="f">backward</span>()                      <span class="c"># gradients accumulate in .grad</span>
+opt.<span class="f">step</span>()</pre>
+  <p>Checked on a small model in fp32, the accumulated gradient matched the single big batch to within <b>3 × 10⁻⁸</b>. On GPT-2 small, 8 × 4 accumulated ran at 67,711 tokens per second in 7.8 GB, where a real batch of 32 needed far more memory than the card has. Accumulation costs a little speed, since each small batch uses the GPU less fully, and it is not quite free with batch normalisation, but transformers use layer norm, so for them it is exact.</p>
+
+  <h2>Running out of memory on Windows</h2>
+  <p>The first time these measurements were run, two setups needed more than the card's 16 GB: fp32 at a batch of 16 and compiled bf16 at a batch of 32. Neither failed. Both "succeeded" with peaks of 22.8 and 24.3 GB, at <b>590</b> and <b>2,451</b> tokens per second, 47 and 28 times slower than they should have been. On Windows, NVIDIA's driver by default lets the GPU borrow system RAM when its own memory is full ("sysmem fallback"), over a PCIe link many times slower than the card's own memory. The fix used for the memory measurements here is one line, which makes PyTorch raise an out-of-memory error instead:</p>
+<pre class="code">torch.cuda.<span class="f">set_per_process_memory_fraction</span>(<span class="m">15</span> * <span class="m">2</span>**<span class="m">30</span> / torch.cuda.<span class="f">get_device_properties</span>(<span class="m">0</span>).total_memory)</pre>
+  <p>If a training run on a Windows machine is mysteriously slow, check its peak memory against the card's size first.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Efficiency lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ef-l">Experiment</div>
+      <div class="seg" id="efE"><button class="active" data-v="ladder">speed ladder</button><button data-v="mem">memory breakdown</button><button data-v="fit">what fits</button><button data-v="cost">cost of a run</button></div>
+      <div class="ef-v" id="efVc">
+        <div class="ef-l">Training tokens</div>
+        <div class="seg" id="efT"><button data-v="0.1">100 M</button><button class="active" data-v="2.5">2.5 B (Chinchilla)</button><button data-v="10">10 B</button></div>
+      </div>
+      <div class="ef-box" id="efOut"></div>
+      <div class="stats" id="efStats"></div>
+      <div class="ef-why" id="efWhy"></div>
+    </div>
+    <div class="panel-foot">GPT-2 small (124,439,808 parameters) from <code>tinygpt.py</code>, context 1,024, trained on C4 text tokenised with GPT-2's tokeniser, AdamW, 12 timed steps after a warm-up, RTX 5070 Ti 16 GB, PyTorch 2.11, Windows. MFU uses 798 M FLOPs per token against P6's measured bf16 peak of 96.6 TFLOPS. Memory measurements use a 15 GiB cap so that oversized runs fail instead of spilling into system RAM.</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🏎️</div>
+    <div class="body"><div class="title">Use case: reproducing GPT-2 on a budget</div><p>In 2024, Andrej Karpathy's llm.c project reproduced GPT-2 small, trained from scratch on 10 billion tokens of FineWeb, in about 90 minutes on one node of eight H100 GPUs for around $20, a model that had cost OpenAI far more in 2019. Almost none of the saving came from new ideas about language models: it came from the techniques on this page, bf16, fused kernels, FlashAttention (Chapter 17), large batches and careful measurement of MFU, plus faster hardware. The same arithmetic applies here. At 70,000 tokens per second, those 10 billion tokens would take this single 16 GB card about 40 hours; at the fp32 baseline, 111.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Training in fp32 by default;</b> bf16 autocast alone doubled throughput here.</li>
+      <li><b>Using fp16 without a loss scaler;</b> bf16 has fp32's range and needs none.</li>
+      <li><b>Timing the first steps of a compiled model;</b> they include compilation.</li>
+      <li><b>Forgetting to divide the loss</b> by the number of accumulation steps, which multiplies the effective learning rate.</li>
+      <li><b>Raising the batch until it "still runs" on Windows;</b> past the card's memory it ran 28 to 47 times slower instead of failing.</li>
+      <li><b>Reporting speed without MFU;</b> 70,000 tokens per second means little without the model's size.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How would you make a single-GPU training run faster?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Measure tokens per second and MFU first. Then: bf16 autocast for the matrix multiplies, with fp32 master weights; a fused optimiser so the update is one kernel; torch.compile to fuse element-wise operations; FlashAttention through scaled_dot_product_attention; and a batch large enough to keep the GPU busy. On GPT-2 small on a 16 GB card that went from 25,000 tokens per second in fp32, 21% MFU, to 70,000, 58% MFU, with identical losses. If the batch I want does not fit, use gradient accumulation, which gives the same gradients, and activation checkpointing if activations are the limit, accepting extra recomputation.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> What uses the memory when training a transformer, and how do you reduce each part?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>With AdamW in mixed precision, about 16 bytes per parameter are fixed: fp32 weights, fp32 gradients and two fp32 moment estimates; for GPT-2 small that measured 0.48, 0.48 and 0.97 GB. Those shrink with 8-bit optimisers, sharding across GPUs (ZeRO, FSDP) or parameter-efficient fine-tuning. The rest is activations, which grow with batch size, sequence length and depth; 5.1 GB at a batch of 8 here. They shrink with activation checkpointing, which recomputes them during the backward pass, with smaller micro-batches plus gradient accumulation, and with FlashAttention, which never stores the attention matrix. With a large vocabulary, the logits are a big share: batch × sequence × 50,257, plus an fp32 copy for the loss, which a chunked or fused cross-entropy avoids.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>bf16 autocast doubled throughput and cut memory, with the same loss; it needs no loss scaling.</li>
+      <li>Fused AdamW and torch.compile took GPT-2 small from 50,000 to 70,000 tokens per second, 58% MFU.</li>
+      <li>Weights, gradients and AdamW states cost 16 bytes per parameter; activations grow with the batch.</li>
+      <li>Gradient accumulation gave the same gradients as a 4× batch to 3 × 10⁻⁸, at a quarter of the memory.</li>
+      <li>Checkpointing blocks and chunking the loss let batch 64 fit in 6 GB; here the logits were the biggest activation.</li>
+      <li>On Windows, exceeding GPU memory spilled into system RAM and ran 28–47× slower instead of failing.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why can bf16 mixed precision train without a loss scaler, unlike fp16?</p>
+      <div class="opts">
+        <button class="opt">It has more mantissa bits</button>
+        <button class="opt">It has the same exponent range as fp32, so small gradients do not underflow</button>
+        <button class="opt">It runs on the CPU</button>
+        <button class="opt">It stores gradients as integers</button>
+      </div>
+      <div class="explain">bf16 trades mantissa for range; the losses here matched fp32 to three decimals.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does model FLOPs utilisation (MFU) measure?</p>
+      <div class="opts">
+        <button class="opt">The share of GPU memory in use</button>
+        <button class="opt">How many layers are compiled</button>
+        <button class="opt">The loss per FLOP</button>
+        <button class="opt">Tokens per second × FLOPs per token, as a share of the GPU's peak arithmetic</button>
+      </div>
+      <div class="explain">58% here with bf16, fused AdamW and torch.compile; 21% in fp32.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">You accumulate gradients over 4 micro-batches. What must you do to the loss?</p>
+      <div class="opts">
+        <button class="opt">Divide each micro-batch's loss by 4 before backward, so the sum equals the big batch's mean</button>
+        <button class="opt">Multiply it by 4</button>
+        <button class="opt">Nothing</button>
+        <button class="opt">Step the optimiser after each micro-batch</button>
+      </div>
+      <div class="explain">Done that way, the gradient matched the full batch to 3 × 10⁻⁸.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A batch of 16 ran out of memory. Which change alone used the least memory at that batch?</p>
+      <div class="opts">
+        <button class="opt">Switching from bf16 back to fp32</button>
+        <button class="opt">Checkpointing every transformer block (11.3 GB)</button>
+        <button class="opt">Computing the output layer and loss in chunks, so the full logits never exist (8.2 GB)</button>
+        <button class="opt">Turning off the fused optimiser</button>
+      </div>
+      <div class="explain">With a 50,257-token vocabulary, the logits and their fp32 copy were the largest activations.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">On Windows, a training run that needs more than the GPU's memory…</p>
+      <div class="opts">
+        <button class="opt">always fails with an out-of-memory error</button>
+        <button class="opt">may silently spill into system RAM and run many times slower; capping PyTorch's memory makes it fail cleanly</button>
+        <button class="opt">runs at the same speed</button>
+        <button class="opt">automatically uses gradient accumulation</button>
+      </div>
+      <div class="explain">Here 28 to 47 times slower, with no error.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"peak_tflops_P6":96.57,"flops_per_token":797815296,"params":124439808,"runs":[{"name":"fp32","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":25018,"step_ms":327.4,"peak_GB":12.1,"mfu":0.207,"loss":8.097,"oom":false},{"name":"fp32","batch":16,"accum":1,"tokens_per_step":16384,"tokens_per_s":590,"step_ms":27784.8,"peak_GB":22.8,"mfu":0.005,"loss":8.04,"oom":false},{"name":"TF32 matmuls","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":34076,"step_ms":240.4,"peak_GB":12.1,"mfu":0.282,"loss":8.097,"oom":false},{"name":"bf16 autocast","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":50189,"step_ms":163.2,"peak_GB":9.6,"mfu":0.415,"loss":8.097,"oom":false},{"name":"bf16 + fused AdamW","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":53274,"step_ms":153.8,"peak_GB":9.6,"mfu":0.44,"loss":8.097,"oom":false},{"name":"bf16 + fused + torch.compile","batch":8,"accum":1,"tokens_per_step":8192,"tokens_per_s":70136,"step_ms":116.8,"peak_GB":7.32,"mfu":0.579,"loss":8.13,"oom":false},{"name":"bf16 + fused + compile, batch 16","batch":16,"accum":1,"tokens_per_step":16384,"tokens_per_s":69005,"step_ms":237.4,"peak_GB":12.96,"mfu":0.57,"loss":7.718,"oom":false},{"name":"bf16 + fused + compile, batch 32","batch":32,"accum":1,"tokens_per_step":32768,"tokens_per_s":2451,"step_ms":13370.4,"peak_GB":24.28,"mfu":0.02,"loss":7.732,"oom":false},{"name":"bf16 + fused, batch 32","batch":32,"accum":1,"oom":true,"peak_GB":26.35},{"name":"bf16 + fused + checkpointing, batch 32","batch":32,"accum":1,"oom":true,"peak_GB":23.29},{"name":"bf16 + fused + checkpointing, batch 64","batch":64,"accum":1,"oom":true,"peak_GB":21.66},{"name":"bf16 + fused + compile, batch 8 × 4 accumulated","batch":8,"accum":4,"tokens_per_step":32768,"tokens_per_s":67711,"step_ms":483.9,"peak_GB":7.79,"mfu":0.559,"loss":7.703,"oom":false}],"memory_bf16_b8":{"weights_GB":0.483,"grads_GB":0.483,"adam_states_GB":0.967,"activations_GB":5.118,"peak_GB":8.669},"accum_check":{"max_abs_diff":2.9802322387695312e-08,"grad_norm":0.7110529541969299},"memory_runs":[{"name":"plain","batch":8,"fits":true,"tokens_per_s":52977,"peak_GB":8.84,"loss":8.207},{"name":"plain","batch":16,"fits":false,"peak_GB":12.05},{"name":"plain","batch":24,"fits":false,"peak_GB":10.82},{"name":"checkpointed blocks","batch":16,"fits":true,"tokens_per_s":48032,"peak_GB":11.32,"loss":8.215},{"name":"checkpointed blocks","batch":24,"fits":false,"peak_GB":10.95},{"name":"chunked loss","batch":16,"fits":true,"tokens_per_s":45316,"peak_GB":8.16,"loss":8.215},{"name":"chunked loss","batch":32,"fits":true,"tokens_per_s":46564,"peak_GB":13.39,"loss":8.233},{"name":"checkpointed blocks + chunked loss","batch":32,"fits":true,"tokens_per_s":41929,"peak_GB":4.19,"loss":8.233},{"name":"checkpointed blocks + chunked loss","batch":48,"fits":true,"tokens_per_s":41725,"peak_GB":4.89,"loss":8.122},{"name":"checkpointed blocks + chunked loss","batch":64,"fits":true,"tokens_per_s":41748,"peak_GB":5.99,"loss":8.131}],"cap_GB":15.0,"logits_GB":{"8":2.3,"16":4.6,"32":9.2}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const RUN = Object.fromEntries(D.runs.map(r => [r.name + '|' + r.batch + '|' + r.accum, r]));
+  const LADDER = [['fp32', 8], ['TF32 matmuls', 8], ['bf16 autocast', 8], ['bf16 + fused AdamW', 8], ['bf16 + fused + torch.compile', 8], ['bf16 + fused + compile, batch 16', 16], ['bf16 + fused + compile, batch 8 × 4 accumulated', 8, 4]];
+  const SPILL = [['fp32', 16], ['bf16 + fused + compile, batch 32', 32]];
+  const get = ([n, b, a]) => RUN[n + '|' + b + '|' + (a || 1)];
+
+  function drawLadder() {
+    const mx = 72000;
+    $('#efOut').innerHTML = LADDER.map(k => { const r = get(k); return `<div class="ef-bar"><span>${r.name}${r.batch !== 8 || r.accum > 1 ? '' : ''}</span><span class="track"><i style="width:${(100 * r.tokens_per_s / mx).toFixed(1)}%"></i></span><span class="n">${r.tokens_per_s.toLocaleString('en-GB')} tok/s</span></div>`; }).join('')
+      + '<div class="ef-l" style="margin-top:12px">Past the card\'s memory (no cap, Windows)</div>' + SPILL.map(k => { const r = get(k); return `<div class="ef-bar"><span>${r.name}${r.name === 'fp32' ? ', batch 16' : ''} · ${r.peak_GB} GB</span><span class="track"><i class="r" style="width:${(100 * r.tokens_per_s / mx).toFixed(1)}%"></i></span><span class="n">${r.tokens_per_s.toLocaleString('en-GB')} tok/s</span></div>`; }).join('');
+    const a = get(LADDER[0]), b = get(LADDER[4]);
+    $('#efStats').innerHTML = `<div class="stat"><div class="k">fp32 MFU</div><div class="v">${Math.round(100 * a.mfu)}%</div></div><div class="stat good"><div class="k">Best MFU</div><div class="v">${Math.round(100 * b.mfu)}%</div></div><div class="stat good"><div class="k">Speed-up</div><div class="v">${(b.tokens_per_s / a.tokens_per_s).toFixed(1)}×</div></div><div class="stat"><div class="k">Memory, fp32 → compiled</div><div class="v">${a.peak_GB} → ${b.peak_GB} GB</div></div>`;
+    $('#efWhy').innerHTML = '<b>Each step removes waste, not work.</b> The model does the same arithmetic throughout; bf16 does it on faster units, fusion removes memory round trips and kernel launches. The red bars are the same kind of run with too large a batch: no error, just a collapse in speed.';
+  }
+  function drawMem() {
+    const M = D.memory_bf16_b8, parts = [['weights (fp32)', M.weights_GB, '--accent'], ['gradients (fp32)', M.grads_GB, '--accent-2'], ['AdamW states (fp32)', M.adam_states_GB, '--green'], ['activations', M.activations_GB, '--amber']];
+    const tot = parts.reduce((s, p) => s + p[1], 0), other = Math.max(0, M.peak_GB - tot);
+    $('#efOut').innerHTML = `<div class="ef-stack">${parts.map(([n, g, c]) => `<i style="width:${(100 * g / M.peak_GB).toFixed(1)}%;background:var(${c})" title="${n}: ${g} GB"></i>`).join('')}<i style="width:${(100 * other / M.peak_GB).toFixed(1)}%;background:var(--muted)" title="temporary buffers"></i></div><div class="ef-key">${parts.map(([n, g, c]) => `<span><span style="color:var(${c})">■</span> ${n} <b>${g.toFixed(2)} GB</b></span>`).join('')}<span><span style="color:var(--muted)">■</span> temporary <b>${other.toFixed(2)} GB</b></span></div>`;
+    $('#efStats').innerHTML = `<div class="stat"><div class="k">Peak, bf16, batch 8</div><div class="v">${M.peak_GB} GB</div></div><div class="stat"><div class="k">Fixed: 16 bytes/param</div><div class="v">${(M.weights_GB + M.grads_GB + M.adam_states_GB).toFixed(2)} GB</div></div><div class="stat warn"><div class="k">Logits + fp32 copy, batch 16</div><div class="v">${D.logits_GB ? D.logits_GB['16'] : '—'} GB</div></div>`;
+    $('#efWhy').innerHTML = '<b>Activations dominate, and grow with the batch.</b> The fixed 16 bytes per parameter is under 2 GB for this model; everything else is what the forward pass keeps for the backward pass, and with a 50,257-token vocabulary the logits are a large part of it.';
+  }
+  function drawFit() {
+    const R = D.memory_runs || [], cap = D.cap_GB || 15;
+    $('#efOut').innerHTML = R.map(r => `<div class="ef-bar"><span>${r.name}, batch ${r.batch}</span><span class="track"><i class="${r.fits ? '' : 'r'}" style="width:${(100 * Math.min(r.peak_GB, cap) / cap).toFixed(1)}%"></i></span><span class="n">${r.fits ? r.peak_GB + ' GB · ' + (r.tokens_per_s / 1000).toFixed(0) + 'k/s' : 'out of memory'}</span></div>`).join('') + `<p class="small muted" style="margin:8px 0 0">bf16 + fused AdamW, no compile, PyTorch capped at ${cap} GiB.</p>`;
+    $('#efStats').innerHTML = '';
+    $('#efWhy').innerHTML = '<b>Memory follows the biggest tensor.</b> Checkpointing the blocks helped, but the output logits, batch × 1,024 × 50,257 plus an fp32 copy, were the largest activation. Chunking the loss removed them; with both, a batch of 64 fit in 6 GB at about a fifth less speed.';
+  }
+  function drawCost() {
+    const tok = +v('#efT') * 1e9, rows = LADDER.slice(0, 5).map(k => get(k));
+    const mx = tok / rows[0].tokens_per_s / 3600;
+    $('#efOut').innerHTML = rows.map(r => { const h = tok / r.tokens_per_s / 3600; return `<div class="ef-bar"><span>${r.name}</span><span class="track"><i class="b" style="width:${(100 * h / mx).toFixed(1)}%"></i></span><span class="n">${h < 1 ? (h * 60).toFixed(0) + ' min' : h.toFixed(1) + ' h'}</span></div>`; }).join('');
+    const best = rows[4];
+    $('#efStats').innerHTML = `<div class="stat good"><div class="k">Hours saved</div><div class="v">${(tok / rows[0].tokens_per_s / 3600 - tok / best.tokens_per_s / 3600).toFixed(1)} h</div></div>`;
+    $('#efWhy').innerHTML = '<b>Speed is cost.</b> The same run, the same model, the same final loss: only the time on the GPU changes. Times assume the measured throughput holds for the whole run.';
+  }
+  function draw() {
+    const e = v('#efE');
+    $('#efVc').classList.toggle('on', e === 'cost');
+    ({ ladder: drawLadder, mem: drawMem, fit: drawFit, cost: drawCost })[e]();
+  }
+  ['#efE', '#efT'].forEach(id => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
+</body>
+</html>

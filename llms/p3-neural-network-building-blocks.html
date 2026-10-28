@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Linear Layers, Softmax &amp; Cross-Entropy · LLMs by Palak Deb Patra</title>
+<meta name="description" content="P3 of LLMs. Linear layers as matrix multiplies, ReLU, GELU and SiLU, softmax and why the naive version returns NaN on GPT-2's real logits, cross-entropy, and LayerNorm vs RMSNorm on GPT-2's residual stream.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('llm-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sx-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .sx-v { display:none; } .sx-v.on { display:block; }
+  .sx-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; font-size:13px; overflow-x:auto; }
+  .sx-sl { display:grid; grid-template-columns:80px 1fr 64px; gap:10px; align-items:center; font-size:13px; padding:3px 0; }
+  .sx-sl input[type=range] { width:100%; accent-color:var(--accent); }
+  .sx-sl code { text-align:right; font-size:12px; }
+  .sx-bar { display:grid; grid-template-columns:80px 1fr 150px; gap:8px; align-items:center; padding:4px 0; font-size:12.5px; }
+  .sx-bar .track { height:16px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .sx-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .sx-bar.tgt span:first-child { font-weight:700; color:var(--accent); }
+  .sx-bar .n { font-family:var(--mono); font-size:12px; text-align:right; }
+  .sx-row { display:grid; grid-template-columns:110px repeat(3, 1fr); gap:10px; padding:6px 0; border-bottom:1px dashed var(--border); font-size:13px; }
+  .sx-row:last-child { border-bottom:0; }
+  .sx-row.h { color:var(--muted); font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+  .sx-ok { color:var(--green); font-weight:700; } .sx-bad { color:var(--red); font-weight:700; } .sx-mid { color:var(--amber); font-weight:700; }
+  .sx-tgt { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  .sx-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  .sx-ce td:nth-child(2), .sx-ce td:nth-child(3) { font-family:var(--mono); text-align:right; }
+  @media (max-width:640px) { .sx-row { grid-template-columns:80px repeat(3, 1fr); gap:6px; font-size:12px; } .sx-bar { grid-template-columns:64px 1fr 110px; } }
+</style>
+</head>
+<body data-chapter="0.3">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Prerequisite 3</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 40 min</span></div>
+    <h1>Linear Layers, Softmax &amp; <span class="grad">Cross-Entropy</span></h1>
+    <p class="lead">A transformer is assembled from a handful of parts that this course will use in every chapter: linear layers that mix numbers, activations that bend them, normalisation that keeps them in range, and at the very end a softmax that turns scores into probabilities and a cross-entropy loss that says how wrong those probabilities were.</p>
+    <p class="lead">Each part is a few lines of code, and each has a numerical trap. This chapter opens up GPT-2 to look at real values instead of toy ones: logits so negative that the textbook softmax returns <code>NaN</code> in every precision, a loss that moves by 0.42 when it is computed in bf16, and a residual stream whose largest value grows from 1.2 to 92.7 on its way through the model.</p>
+    <ul class="objectives">
+      <li><span>Read a linear layer as a matrix multiply, and count its parameters and FLOPs</span></li>
+      <li><span>Tell ReLU, GELU and SiLU apart, and know where each is used</span></li>
+      <li><span>Write a softmax that cannot overflow or underflow, and explain why the naive one does</span></li>
+      <li><span>Compute and interpret cross-entropy, including what its value at step zero should be</span></li>
+      <li><span>Explain what LayerNorm and RMSNorm do to a vector, and why models need them</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Tensors and dtypes:</b> <a href="p1-pytorch-tensors.html">P1</a>, especially fp32, bf16 and fp16 ranges.</li>
+        <li><b>The training loop:</b> <a href="p2-autograd-and-training-loops.html">P2</a>.</li>
+        <li><b>Logs and softmax as maths:</b> ML &amp; AI Systems <a href="../ml-ai-systems/p6-logs-softmax.html">P6: Logs, Exponentials &amp; Softmax</a> (optional; this chapter is about the numerics in code).</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Linear layers as matrix multiplies</h2>
+  <p>A linear layer computes <code>y = x Wᵀ + b</code>. Each output number is a weighted sum of every input number, plus a bias. <code>nn.Linear(768, 3072)</code>, the first layer of GPT-2's MLP block, stores a weight of shape <code>(3072, 768)</code> and a bias of 3,072: 2,362,368 parameters. Applied to activations of shape <code>(B, T, 768)</code>, it acts on the last dimension only, so every token is transformed independently by the same weights.</p>
+<pre class="code">lin = nn.<span class="f">Linear</span>(<span class="m">768</span>, <span class="m">3072</span>).<span class="f">to</span>(<span class="s">"cuda"</span>)
+x = torch.<span class="f">randn</span>(<span class="m">4</span>, <span class="m">128</span>, <span class="m">768</span>, device=<span class="s">"cuda"</span>)       <span class="c"># (B, T, C)</span>
+y = <span class="f">lin</span>(x)                                          <span class="c"># (B, T, 3072)</span>
+(y - (x @ lin.weight.T + lin.bias)).<span class="f">abs</span>().<span class="f">max</span>()       <span class="c"># 0.0: it is exactly a matmul plus a bias</span></pre>
+  <p>The cost is one multiply and one add per weight per token: 2 × 768 × 3,072 ≈ 4.7 million FLOPs per token for this layer. Almost all of a language model's parameters and compute live in layers like this one, which is why the matrix-multiply speeds in P1 decide how fast a model trains.</p>
+
+  <h2>Activations: ReLU, GELU and SiLU</h2>
+  <p>Stacking linear layers alone gives another linear layer, however many you stack. An <b>activation</b> function between them bends the output, which is what lets a network represent anything interesting. Transformers use smooth relatives of ReLU:</p>
+  <table class="t cmp">
+    <thead><tr><th>x</th><th>−3</th><th>−1</th><th>−0.5</th><th>0</th><th>0.5</th><th>1</th><th>3</th><th>Used in</th></tr></thead>
+    <tbody>
+      <tr><td><b>ReLU</b> max(0, x)</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0.5</td><td>1</td><td>3</td><td>Older networks; still common outside transformers</td></tr>
+      <tr><td><b>GELU</b> x · Φ(x)</td><td>−0.0041</td><td>−0.1587</td><td>−0.1543</td><td>0</td><td>0.3457</td><td>0.8413</td><td>2.9959</td><td>GPT-2, BERT (GPT-2 uses the tanh approximation)</td></tr>
+      <tr><td><b>SiLU</b> x · sigmoid(x)</td><td>−0.1423</td><td>−0.2689</td><td>−0.1888</td><td>0</td><td>0.3112</td><td>0.7311</td><td>2.8577</td><td>Llama, Qwen, Mistral, inside SwiGLU (Chapter 15)</td></tr>
+    </tbody>
+  </table>
+  <p>GELU multiplies x by the probability Φ(x) that a standard normal value is below x. Computing Φ exactly needs the error function, so GPT-2 used a tanh formula instead; across −6 to 6 the two differ by at most <b>0.00047</b>. That gap matters only when you load weights trained with one into code that uses the other, which is a real way to get slightly wrong outputs from a correctly loaded model. Hugging Face calls GPT-2's version <code>gelu_new</code> for exactly this reason.</p>
+
+  <h2>Softmax and the NaN it hides</h2>
+  <p>The last layer of a language model outputs one score, a <b>logit</b>, per vocabulary entry. <b>Softmax</b> turns logits into probabilities: exponentiate each one, then divide by the sum, so the results are positive and add up to 1. Written directly from that definition, it looks harmless:</p>
+<pre class="code"><span class="k">def</span> <span class="f">naive_softmax</span>(z):                 <span class="c"># z: (V,) logits</span>
+    e = torch.<span class="f">exp</span>(z)
+    <span class="k">return</span> e / e.<span class="f">sum</span>()
+
+<span class="k">def</span> <span class="f">stable_softmax</span>(z):
+    e = torch.<span class="f">exp</span>(z - z.<span class="f">max</span>())           <span class="c"># largest exponent is now exp(0) = 1</span>
+    <span class="k">return</span> e / e.<span class="f">sum</span>()</pre>
+  <p>Now feed them GPT-2's real logits for the next token after "The server returned HTTP status code". All 50,257 of them are large and negative: from <b>−124.0</b> (for " 200") down to −156.3. <code>exp(−124)</code> is about 10⁻⁵⁴, far below the smallest number fp32 can hold (about 1.4 × 10⁻⁴⁵), so every exponential becomes exactly zero, the sum is zero, and 0 / 0 is <code>NaN</code>. The naive softmax returned NaN in fp32, bf16 and fp16 alike. The overflow version of the same failure happens at the other end: <code>exp(x)</code> becomes infinite once x passes <b>88.7</b> in fp32 and bf16, and just <b>11.1</b> in fp16.</p>
+  <p>Subtracting the largest logit first changes nothing mathematically, because softmax only depends on differences between logits, but it puts the biggest exponent at exactly 1, so the sum can never be zero or infinite. The stable version gave " 200" a probability of 0.15925 in fp32, matching PyTorch's own <code>torch.softmax</code>, which does the same subtraction internally. Shifting every logit up by 100 gave a bit-for-bit identical stable result. In bf16 the top probability came out at 0.157 (an error of up to 0.005 on individual probabilities), and in fp16 even the stable version rounded 33,895 of the 50,257 probabilities to exactly zero.</p>
+  <figure class="flow">
+    <ol>
+      <li data-k="start"><b>logits</b> one score per token, any size</li>
+      <li data-k="step"><b>− max</b> largest becomes 0</li>
+      <li data-k="step"><b>exp</b> every value now in (0, 1]</li>
+      <li data-k="step"><b>÷ sum</b> probabilities that add to 1</li>
+      <li data-k="end"><b>− log p(target)</b> the cross-entropy loss</li>
+    </ol>
+    <figcaption><b>From logits to loss, safely.</b> In practice the last three boxes are fused: <code>F.cross_entropy</code> takes logits directly and computes log-probabilities with the max subtracted, never forming the probabilities at all.</figcaption>
+  </figure>
+
+  <h2>Cross-entropy</h2>
+  <p>Training needs one number that says how wrong the probabilities were. <b>Cross-entropy</b> takes the probability the model gave the token that actually came next and returns its negative logarithm: −log p(correct token). A confident right answer (p near 1) costs almost nothing; a token given probability 0.0001 costs 9.2. Averaged over every position of every sequence, it is the loss every language model in this course is trained on.</p>
+<pre class="code">ids = <span class="f">tok</span>(sentence, return_tensors=<span class="s">"pt"</span>).input_ids.<span class="f">to</span>(<span class="s">"cuda"</span>)   <span class="c"># (1, T)</span>
+logits = <span class="f">gpt2</span>(ids).logits[<span class="m">0</span>]                                    <span class="c"># (T, V): a prediction at every position</span>
+loss = F.<span class="f">cross_entropy</span>(logits[:-<span class="m">1</span>], ids[<span class="m">0</span>, <span class="m">1</span>:], reduction=<span class="s">"none"</span>) <span class="c"># (T-1,): position t predicts token t+1</span></pre>
+  <p>For the sentence "The server returned HTTP status code 200 and the request completed in 35 ms.", GPT-2's per-token losses were:</p>
+  <table class="t sx-ce">
+    <thead><tr><th>Next token</th><th>Probability</th><th>Loss (nats)</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>" server"</td><td>0.0001</td><td>9.18</td><td>After just "The", almost anything could follow</td></tr>
+      <tr><td>" code"</td><td>0.3085</td><td>1.18</td><td>"HTTP status" makes "code" likely</td></tr>
+      <tr><td>" 200"</td><td>0.1592</td><td>1.84</td><td>The most likely status, but not certain</td></tr>
+      <tr><td>" 35"</td><td>0.0016</td><td>6.45</td><td>Any number of milliseconds was plausible</td></tr>
+      <tr><td>"."</td><td>0.6802</td><td>0.39</td><td>"in 35 ms" usually ends a sentence</td></tr>
+      <tr><td><b>Mean of 14 tokens</b></td><td></td><td><b>3.88</b></td><td>The number training would minimise</td></tr>
+    </tbody>
+  </table>
+  <p>Two reference points make a loss value readable. A model that spreads probability evenly over all 50,257 tokens scores ln(50,257) = <b>10.82</b> on every token, and a freshly initialised language-model head scored <b>11.02</b>, so a new model's loss should start just above ln(vocabulary size); one that starts far higher has a bug in its initialisation. And GPT-2's 3.88 means that, on average, the right token got a probability of about e⁻³·⁸⁸ ≈ 0.02 (P4 turns this into perplexity).</p>
+  <p><code>F.cross_entropy</code> takes logits, not probabilities, and matched the manual −log(softmax) exactly here. It also needs them in fp32. GPT-2's logits are around −124 to −156, where bf16 can only represent values in steps of 0.5 (below 128) or 1 (above), so the differences between logits that decide the probabilities are rounded away. Computed from bf16 logits, the mean loss moved from 3.879 to 3.853 and one token's loss moved by <b>0.42</b>. That is why training code casts logits to fp32 before the loss even when everything else runs in bf16.</p>
+
+  <h2>LayerNorm and RMSNorm</h2>
+  <p>Each transformer block adds its output to a running vector, the <b>residual stream</b> (Chapter 6), so values can grow from block to block. In GPT-2, for the last token of the same prompt, the largest absolute value grew from <b>1.2</b> in the embeddings to <b>41.7</b> after six blocks and <b>92.7</b> after eleven, with a single dimension (447) responsible for that 41.7. A layer fed vectors whose size changes that much from layer to layer is hard to train. <b>Normalisation</b> rescales each token's vector before a block reads it.</p>
+<pre class="code"><span class="k">def</span> <span class="f">layer_norm</span>(x, eps=<span class="m">1e-5</span>):                              <span class="c"># x: (..., C)</span>
+    mu = x.<span class="f">mean</span>(-<span class="m">1</span>, keepdim=<span class="k">True</span>)
+    var = x.<span class="f">var</span>(-<span class="m">1</span>, keepdim=<span class="k">True</span>, unbiased=<span class="k">False</span>)
+    <span class="k">return</span> (x - mu) / torch.<span class="f">sqrt</span>(var + eps)                   <span class="c"># then × gain + bias (learned)</span>
+
+<span class="k">def</span> <span class="f">rms_norm</span>(x, eps=<span class="m">1e-6</span>):
+    <span class="k">return</span> x / torch.<span class="f">sqrt</span>(x.<span class="f">pow</span>(<span class="m">2</span>).<span class="f">mean</span>(-<span class="m">1</span>, keepdim=<span class="k">True</span>) + eps)   <span class="c"># then × gain (learned)</span></pre>
+  <table class="t cmp">
+    <thead><tr><th></th><th>LayerNorm</th><th>RMSNorm</th></tr></thead>
+    <tbody>
+      <tr><td><b>What it does</b></td><td>Subtracts the mean, divides by the standard deviation</td><td>Divides by the root mean square; no mean subtracted</td></tr>
+      <tr><td><b>Learned parameters</b></td><td>A gain and a bias per channel</td><td>A gain per channel</td></tr>
+      <tr><td><b>GPT-2 vector after six blocks</b></td><td>mean 0.0, SD 1.0, largest value 13.5</td><td>RMS 1.0, mean 0.010, largest value 13.5</td></tr>
+      <tr><td><b>My code vs PyTorch's module</b></td><td>differs by 4.8 × 10⁻⁷</td><td>differs by 4.8 × 10⁻⁷</td></tr>
+      <tr><td><b>Time, (32, 1024, 768) bf16</b></td><td>0.144 ms</td><td>0.140 ms</td></tr>
+      <tr><td><b>Used in</b></td><td>GPT-2, BERT, the original transformer</td><td>Llama, Mistral, Qwen and most current open models</td></tr>
+    </tbody>
+  </table>
+  <p>Both bring a vector of RMS 3.09 back to RMS 1.0. RMSNorm skips the mean, which is close to zero anyway for these vectors, and the bias, and in practice trains as well. On this GPU at this size the two took almost the same time, so the reason models switched is simplicity rather than a large speed-up here. Normalisation does not remove the outlier: dimension 447 is still the largest value afterwards, just scaled down with everything else.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Softmax &amp; cross-entropy lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="sx-l">Experiment</div>
+      <div class="seg" id="sxE"><button class="active" data-v="toy">your logits</button><button data-v="gpt2">GPT-2's real logits</button><button data-v="resid">the residual stream</button></div>
+      <div class="sx-v on" id="sxVt">
+        <div class="sx-l">Five-token vocabulary: drag the logits, then shift them all</div>
+        <div id="sxSliders"></div>
+        <div class="sx-sl"><span><b>shift all</b></span><input type="range" id="sxShift" min="-200" max="200" step="1" value="0" aria-label="add to every logit"><code id="sxShiftV">+0</code></div>
+        <div class="sx-l">Which token actually came next?</div>
+        <div class="seg" id="sxT"></div>
+      </div>
+      <div class="sx-v" id="sxVg">
+        <div class="sx-l">Precision</div>
+        <div class="seg" id="sxP"><button class="active" data-v="float32">fp32</button><button data-v="bfloat16">bf16</button><button data-v="float16">fp16</button></div>
+      </div>
+      <div class="sx-v" id="sxVr">
+        <div class="sx-l">Show</div>
+        <div class="seg" id="sxR"><button class="active" data-v="max">largest |value| by depth</button><button data-v="rms">RMS by depth</button></div>
+      </div>
+      <div class="sx-box" id="sxOut"></div>
+      <div class="stats" id="sxStats"></div>
+      <div class="sx-why" id="sxWhy"></div>
+    </div>
+    <div class="panel-foot">GPT-2 (124M, Hugging Face revision 607a30d) in fp32 on an RTX 5070 Ti with PyTorch 2.11. Prompt "The server returned HTTP status code"; the residual stream is the last token's vector after 0 to 11 blocks (0 = the embeddings). In "your logits", softmax is computed in your browser in double precision with the max subtracted; whether the naive version would fail is decided from the real fp32 and fp16 limits: overflow above e^88.72 and e^11.09, every term rounding to zero below e^−103.97 and e^−17.33 (half the smallest number each can hold).</div>
+  </div>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: Llama's switch to RMSNorm</div><p>The 2019 RMSNorm paper by Zhang and Sennrich argued that LayerNorm's re-centring (subtracting the mean) contributes little and that rescaling alone is enough. Meta's Llama models adopted RMSNorm, applied before each block rather than after, and most open models since (Mistral, Qwen, Gemma) followed. The measurement on this page is a fair summary of the trade: on a GPT-2-sized tensor the two cost almost the same, and RMSNorm produced the same scale with one fewer statistic and no bias. Chapter 15 opens a current open model and finds it in every block.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Writing softmax as <code>exp(z) / exp(z).sum()</code>,</b> which returned NaN on GPT-2's real logits in every precision.</li>
+      <li><b>Passing probabilities to <code>F.cross_entropy</code>,</b> which expects raw logits and applies log-softmax itself.</li>
+      <li><b>Computing the loss from bf16 logits;</b> cast logits to fp32 first, or individual losses move by tenths of a nat.</li>
+      <li><b>Ignoring a first-step loss far above ln(vocabulary size),</b> which usually means a bad initialisation scale.</li>
+      <li><b>Loading weights trained with one GELU variant into code using the other,</b> and getting slightly different outputs.</li>
+      <li><b>Forgetting that normalisation has learned weights;</b> a norm "without parameters" in your code will not match a trained model's.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Why do softmax implementations subtract the maximum logit, and what goes wrong if they don't?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Softmax depends only on the differences between logits, so subtracting any constant leaves the result unchanged. Subtracting the maximum makes the largest exponent exactly exp(0) = 1 and every other one smaller, so nothing can overflow and the sum is at least 1, so it can never be zero. Without it, large positive logits overflow: exp becomes infinite above about 88.7 in fp32 and only 11.1 in fp16, and inf divided by inf is NaN. Large negative logits fail too, which surprises people: GPT-2's real next-token logits are all around −124 to −156, every exp underflows to zero in fp32, and the naive softmax returns 0 / 0 = NaN. In practice you rarely write it yourself: <code>torch.softmax</code> and <code>F.cross_entropy</code> both do the subtraction, and the loss works from log-probabilities directly.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> You start training a language model with a 50,257-token vocabulary and the loss at step 0 is 11.0. Is that a good sign? What would worry you?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is what you want. A model that knows nothing should spread probability almost evenly over the vocabulary, and a uniform distribution gives a cross-entropy of ln(50,257) ≈ 10.82 on every token; a freshly initialised head measured 11.02. A loss well above that, say 30 or 50, means the initial logits are far too large, so the model is confidently wrong from the start: typically an initialisation scale or a missing normalisation, and it often leads to instability. A loss well below ln(V) at step zero is also suspicious: the targets may be leaking into the inputs, for example through a missing shift between inputs and labels or a missing causal mask. Later in training, the number is read through perplexity, the exponential of the loss.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A linear layer is <code>x Wᵀ + b</code> on the last dimension; nn.Linear(768, 3072) has 2.36 million parameters and costs about 4.7 MFLOPs per token.</li>
+      <li>Transformers use smooth activations: GELU in GPT-2, SiLU inside SwiGLU in Llama-style models.</li>
+      <li>Always subtract the max inside softmax; on GPT-2's real logits (−124 to −156) the naive version underflowed to 0/0 = NaN in every precision.</li>
+      <li>Cross-entropy is −log p(correct token); a new model should start near ln(vocab), 10.82 for GPT-2's vocabulary.</li>
+      <li>Compute logits and the loss in fp32: from bf16 logits one token's loss moved by 0.42.</li>
+      <li>LayerNorm and RMSNorm rescale each token's vector to unit size; RMSNorm drops the mean and the bias and is what current open models use.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">The naive softmax <code>exp(z) / exp(z).sum()</code> returned NaN on GPT-2's next-token logits even in fp32. Why?</p>
+      <div class="opts">
+        <button class="opt">The largest logit overflowed to infinity</button>
+        <button class="opt">Every logit was around −124 or lower, so every exp() underflowed to 0 and the result was 0 / 0</button>
+        <button class="opt">The vocabulary is too large for fp32</button>
+        <button class="opt">GPT-2's logits contain NaN</button>
+      </div>
+      <div class="explain">exp(−124) ≈ 10⁻⁵⁴ is far below fp32's smallest value. Subtracting the max (−124.0) puts the largest term at exp(0) = 1.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Above roughly what value does exp(x) overflow to infinity in fp16?</p>
+      <div class="opts">
+        <button class="opt">2</button>
+        <button class="opt">88.7</button>
+        <button class="opt">11.1</button>
+        <button class="opt">65,504</button>
+      </div>
+      <div class="explain">fp16's largest value is 65,504, and ln(65,504) ≈ 11.09. In fp32 and bf16 the limit is about 88.7.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">GPT-2 gave the correct next token a probability of 0.1592. What is that token's cross-entropy loss?</p>
+      <div class="opts">
+        <button class="opt">About 1.84</button>
+        <button class="opt">About 0.16</button>
+        <button class="opt">About 0.84</button>
+        <button class="opt">About 6.28</button>
+      </div>
+      <div class="explain">−ln(0.1592) ≈ 1.84 nats, the value measured for " 200".</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A new language model with a 50,257-token vocabulary should have a loss close to what at step zero?</p>
+      <div class="opts">
+        <button class="opt">0</button>
+        <button class="opt">1</button>
+        <button class="opt">3.9</button>
+        <button class="opt">10.8, which is ln(50,257)</button>
+      </div>
+      <div class="explain">Near-uniform predictions score ln(V) on every token; a freshly initialised head measured 11.02.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How does RMSNorm differ from LayerNorm?</p>
+      <div class="opts">
+        <button class="opt">It normalises across the batch instead of across channels</button>
+        <button class="opt">It divides by the root mean square without subtracting the mean, and has no bias</button>
+        <button class="opt">It has no learned parameters at all</button>
+        <button class="opt">It is applied only to the output layer</button>
+      </div>
+      <div class="explain">Both act on each token's vector. RMSNorm keeps only the rescaling and a learned gain; on GPT-2's vector the mean was already near zero (0.03).</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = LLM;
+  const D = {"linear":{"weight_shape":[3072,768],"params":2362368,"max_diff":0.0,"flops_per_token":4718592},"acts":{"x":[-3.0,-1.0,-0.5,0.0,0.5,1.0,3.0],"relu":[0.0,0.0,0.0,0.0,0.5,1.0,3.0],"gelu":[-0.0041,-0.1587,-0.1543,0.0,0.3457,0.8413,2.9959],"gelu_tanh":[-0.0036,-0.1588,-0.1543,0.0,0.3457,0.8412,2.9964],"silu":[-0.1423,-0.2689,-0.1888,0.0,0.3112,0.7311,2.8577]},"gelu_tanh_max_err":0.000473235519323335,"logits":{"vocab":50257,"max":-124.016,"min":-156.299,"mean":-140.727,"top":[[" 200",-124.016],[" 1",-125.502],[" 0",-125.526],[" 204",-125.578],[" 304",-125.69]]},"softmax":{"float32 naive":{"nan":true,"zeros":0,"top_p":null,"max_err":null,"sum":null},"float32 stable":{"nan":false,"zeros":0,"top_p":0.15925,"max_err":3.22e-09,"sum":1.0},"float32 torch":{"nan":false,"zeros":0,"top_p":0.15925,"max_err":1.59e-08,"sum":1.0},"bfloat16 naive":{"nan":true,"zeros":0,"top_p":null,"max_err":null,"sum":null},"bfloat16 stable":{"nan":false,"zeros":0,"top_p":0.15723,"max_err":0.00532,"sum":0.99996},"bfloat16 torch":{"nan":false,"zeros":0,"top_p":0.15723,"max_err":0.00532,"sum":0.99994},"float16 naive":{"nan":true,"zeros":0,"top_p":null,"max_err":null,"sum":null},"float16 stable":{"nan":false,"zeros":33895,"top_p":0.16162,"max_err":0.00237,"sum":0.99997},"float16 torch":{"nan":false,"zeros":33103,"top_p":0.16162,"max_err":0.00237,"sum":0.99995}},"exp_limits":{"float32":88.72283905206835,"float16":11.089866488461016,"bfloat16":88.71892521235186},"shift":{"float32":false,"float16":true},"shift_stable_same":0.0,"ce":{"sentence":"The server returned HTTP status code 200 and the request completed in 35 ms.","tokens":["The"," server"," returned"," HTTP"," status"," code"," 200"," and"," the"," request"," completed"," in"," 35"," ms","."],"per_token":[[" server",9.183,0.0001],[" returned",6.461,0.0016],[" HTTP",6.449,0.0016],[" status",2.306,0.0997],[" code",1.176,0.3085],[" 200",1.837,0.1592],[" and",1.846,0.1578],[" the",1.674,0.1875],[" request",3.746,0.0236],[" completed",4.977,0.0069],[" in",4.428,0.0119],[" 35",6.449,0.0016],[" ms",3.384,0.0339],[".",0.385,0.6802]],"mean":3.8787,"manual_max_diff":0.0,"uniform":10.8249},"ce_bf16":{"mean":3.8532,"max_abs_diff":0.4177},"init_loss":11.0174,"norm":{"layer":6,"top_dims":[447,64,373],"top_vals":[41.74,-25.92,-18.66],"before":{"mean":0.0316,"std":3.085,"rms":3.0852,"max_abs":41.744},"layernorm":{"mean":0.0,"std":1.0,"rms":1.0,"max_abs":13.521},"rmsnorm":{"mean":0.0102,"std":0.9999,"rms":1.0,"max_abs":13.53},"manual_ln_diff":4.76837158203125e-07,"manual_rms_diff":4.76837158203125e-07,"sample_before":[-0.119,-1.119,-5.544,-0.841,-1.839,-0.618,2.502,-3.498,0.708,-2.516,1.993,-0.868],"sample_ln":[-0.049,-0.373,-1.807,-0.283,-0.606,-0.21,0.801,-1.144,0.219,-0.826,0.636,-0.291],"by_layer_max_abs":[1.2,23.0,24.6,25.5,28.6,33.9,41.7,49.1,53.2,59.7,64.6,92.7,234.7],"by_layer_rms":[0.19,2.04,2.05,2.3,2.59,2.78,3.09,3.43,3.83,4.44,5.58,7.82,10.61]},"norm_speed_ms":{"layernorm":0.1444,"rmsnorm":0.1403}};
+  const v = (id) => $(id).dataset.value || $(id + ' .active').dataset.v;
+  const TOK = [' 200', ' 1', ' 0', ' 204', ' 304'];
+  const base = [4.0, 2.5, 2.5, 2.4, 2.3];
+  let target = 0;
+  // Limits for the naive softmax: overflow above ln(max), every term rounding to zero below ln(smallest subnormal).
+  const LIM = { fp32: { over: 88.7228, under: -103.9721 }, fp16: { over: 11.0901, under: -17.3287 } };   // under: ln of half the smallest subnormal
+
+  $('#sxSliders').innerHTML = TOK.map((t, i) => `<div class="sx-sl"><span>"${t.trim()}"</span><input type="range" min="-20" max="20" step="0.1" value="${base[i]}" data-i="${i}" aria-label="logit for ${t}"><code id="sxLv${i}">${base[i].toFixed(1)}</code></div>`).join('');
+  $('#sxT').innerHTML = TOK.map((t, i) => `<button${i === 0 ? ' class="active"' : ''} data-v="${i}">"${t.trim()}"</button>`).join('');
+  // Delegated click handler: this seg is built at run time, after the runtime wired up the static ones.
+  $('#sxT').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; [...$('#sxT').children].forEach(x => x.classList.toggle('active', x === b)); target = +b.dataset.v; draw(); });
+
+  function naive(z, lim) {
+    const mx = Math.max(...z);
+    if (mx > lim.over) return 'overflow: exp() → inf, inf / inf = NaN';
+    if (mx < lim.under) return 'underflow: every exp() → 0, 0 / 0 = NaN';
+    return null;
+  }
+  function drawToy() {
+    const shift = +$('#sxShift').value; $('#sxShiftV').textContent = (shift >= 0 ? '+' : '') + shift;
+    const raw = [...document.querySelectorAll('#sxSliders input')].map(x => +x.value);
+    raw.forEach((x, i) => { $('#sxLv' + i).textContent = x.toFixed(1); });
+    const z = raw.map(x => x + shift), mx = Math.max(...z), e = z.map(x => Math.exp(x - mx)), s = e.reduce((a, b) => a + b, 0), p = e.map(x => x / s);
+    $('#sxOut').innerHTML = p.map((q, i) => `<div class="sx-bar${i === target ? ' tgt' : ''}"><span>"${TOK[i].trim()}"</span><span class="track"><i style="width:${(100 * q).toFixed(2)}%"></i></span><span class="n">p ${q.toFixed(4)} · z ${z[i].toFixed(1)}</span></div>`).join('');
+    const ce = -Math.log(p[target]), n32 = naive(z, LIM.fp32), n16 = naive(z, LIM.fp16);
+    $('#sxStats').innerHTML = `<div class="stat"><div class="k">Loss for "${TOK[target].trim()}"</div><div class="v">${ce.toFixed(3)}</div></div>` +
+      `<div class="stat ${n32 ? 'bad' : 'good'}"><div class="k">Naive softmax, fp32</div><div class="v">${n32 ? 'NaN' : 'ok'}</div></div><div class="stat ${n16 ? 'bad' : 'good'}"><div class="k">Naive softmax, fp16</div><div class="v">${n16 ? 'NaN' : 'ok'}</div></div>`;
+    const fails = [n32 && `fp32 ${n32}`, n16 && `fp16 ${n16}`].filter(Boolean);
+    $('#sxWhy').innerHTML = (shift !== 0 ? `<b>Shifting every logit by ${shift > 0 ? '+' : ''}${shift} changed no probability.</b> Softmax only sees differences between logits. ` : '<b>Probabilities depend only on the gaps between logits.</b> Try the shift slider. ') +
+      (fails.length ? `But the naive formula fails here: ${fails.join('; ')}. The stable version above is unaffected.` : `The naive formula is still safe in both precisions at these values. GPT-2's real logits sit around −124 to −156: try a shift of −130.`) +
+      ` The loss is −ln p("${TOK[target].trim()}") = ${ce.toFixed(3)}; a token given probability 1 would cost 0.`;
+  }
+  function drawGpt2() {
+    const d = v('#sxP'), rows = ['naive', 'stable', 'torch'].map(k => [k, D.softmax[`${d} ${k}`]]);
+    const label = { naive: 'exp(z) / sum', stable: 'subtract max first', torch: 'torch.softmax' };
+    $('#sxOut').innerHTML = `<div class="sx-row h"><span>Method</span><span>Result</span><span>p(" 200")</span><span>Largest error</span></div>` +
+      rows.map(([k, r]) => `<div class="sx-row"><b>${label[k]}</b><span class="${r.nan ? 'sx-bad' : 'sx-ok'}">${r.nan ? 'NaN' : 'ok' + (r.zeros ? `, ${r.zeros.toLocaleString('en-GB')} exact zeros` : '')}</span><code>${r.top_p ?? '—'}</code><code>${r.max_err ?? '—'}</code></div>`).join('');
+    const L = D.logits;
+    $('#sxStats').innerHTML = `<div class="stat"><div class="k">Largest logit</div><div class="v">${L.max}</div></div><div class="stat"><div class="k">Smallest</div><div class="v">${L.min}</div></div><div class="stat"><div class="k">Vocabulary</div><div class="v">${L.vocab.toLocaleString('en-GB')}</div></div>`;
+    $('#sxWhy').innerHTML = { float32: '<b>All 50,257 logits are below −124,</b> so every exp() underflows to zero in fp32 and the naive formula divides 0 by 0. Subtracting the max fixes it; PyTorch\'s softmax does the same internally. Error is measured against a float64 softmax.',
+      bfloat16: '<b>Same NaN, and a less accurate fix.</b> In bf16 the stable softmax works but individual probabilities are off by up to 0.005, and " 200" gets 0.157 instead of 0.159.',
+      float16: '<b>Same NaN, plus mass underflow.</b> Even the stable fp16 softmax rounds 33,895 of the 50,257 probabilities to exactly zero, because fp16 cannot hold anything below about 6 × 10⁻⁸.' }[d];
+  }
+  function drawResid() {
+    const k = v('#sxR'), N = D.norm, vals = (k === 'max' ? N.by_layer_max_abs : N.by_layer_rms).slice(0, 12), mx = Math.max(...vals);
+    $('#sxOut').innerHTML = vals.map((x, i) => `<div class="sx-bar"><span>${i === 0 ? 'embeddings' : 'after ' + i + (i === 1 ? ' block' : ' blocks')}</span><span class="track"><i style="width:${(100 * x / mx).toFixed(1)}%"></i></span><span class="n">${x}</span></div>`).join('');
+    $('#sxStats').innerHTML = `<div class="stat warn"><div class="k">After 6 blocks, before norm</div><div class="v">RMS ${N.before.rms}</div></div><div class="stat good"><div class="k">After LayerNorm</div><div class="v">RMS ${N.layernorm.rms}</div></div><div class="stat"><div class="k">Largest dim</div><div class="v">#${N.top_dims[0]}: ${N.top_vals[0]}</div></div>`;
+    $('#sxWhy').innerHTML = k === 'max' ? `<b>The stream keeps growing.</b> Each block adds its output, so the largest value rises from ${vals[0]} at the embeddings to ${vals[11]} entering the last block, and a few dimensions (447 here) carry most of it. LayerNorm in front of every block rescales the vector to unit size so each block sees inputs of the same scale; it brought the largest value after six blocks from ${N.before.max_abs} to ${N.layernorm.max_abs}.`
+      : `<b>The typical size grows too.</b> The root mean square of the vector rises from ${vals[0]} to ${vals[11]}. Without normalisation, the first block and the eleventh would see inputs of very different sizes.`;
+  }
+  function draw() {
+    const e = v('#sxE');
+    ['t', 'g', 'r'].forEach((x, i) => $('#sxV' + x).classList.toggle('on', ['toy', 'gpt2', 'resid'][i] === e));
+    ({ toy: drawToy, gpt2: drawGpt2, resid: drawResid })[e]();
+  }
+  document.querySelectorAll('#sxSliders input, #sxShift').forEach(x => x.addEventListener('input', draw));
+  ['#sxE', '#sxP', '#sxR'].forEach(id => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
+</body>
+</html>
