@@ -49,3 +49,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - 03:36 ch24 killed by owner (npz re-read bug, fixed) -> rerun queued inside ch26 wrapper; ch25 OWL post_process API fix -> rerun inside ch27 wrapper. Restore ch26_main/ch27_main names after.
 - Ch24 shipped (after npz re-read fix + owner kill): zero-shot L/14 Imagenette 99.9 / Pets 93.6 / EuroSAT 62.9 (probe 95.7); prompts up to 18 pts; written label flips B/32 on 21.6%, ResNet-50 0%.
 - Ch26 shipped: AE PSNR 16.6/19.5/23.5/26.7 dB for z 8-512, AE-512 random codes -> noise; VAE beta 0.1/1/4: 22.7/18.6/16.4 dB, active dims 128/49/11.
+- Ch27 shipped: 8-Gaussian toy minimax 8/8, non-saturating 8->6/8 (partial collapse), +minibatch std 8/8; DCGAN 72 s, D dominant (0.92/0.08); cGAN 78 s.
