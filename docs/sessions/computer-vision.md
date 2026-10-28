@@ -42,3 +42,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch18 shipped (after pycocotools loadRes-mutation fix): Mask R-CNN v2 box 51.9 / mask 46.3 / box-as-mask 15.1 AP on 500 COCO imgs; bicycle 38.5->18.8, pizza 65.9->66.9; Keypoint R-CNN 65.0 AP.
 - Ch19 shipped: 30-line ViT-B/16 matches torchvision to 1.9e-6; Imagenette 92.3% (384 interp 89.4%); naive attention OOM at 768 px bs16, fused 2.2 GB; last-block CLS attention goes to low-info patches (registers artefact).
 - Ch20 follow-up: replaced 'early blocks attend locally' with Ch19's measured per-block attention distances.
+- Ch21 shipped: window attn 115x faster than global at 12,544 tokens; 224->896 px ViT-B 67x slower, Swin-T 4.9x, R50 5.8x; DETR 45.4 AP (44.4 with NMS), APs 24.0 vs 29-34 for FPN detectors.
