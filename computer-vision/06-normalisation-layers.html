@@ -3,37 +3,280 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Batch Norm &amp; Normalisation Layers</title>
+<title>Batch Norm &amp; Normalisation Layers · Computer Vision by Palak Deb Patra</title>
+<meta name="description" content="Chapter 6 of Computer Vision. What BatchNorm computes, running statistics and the train/eval switch, small batches, GroupNorm and LayerNorm, re-estimating statistics for shifted data, and folding BN into a convolution, all measured on a ResNet-20.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('cv-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .bn-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .bn-v { display:none; } .bn-v.on { display:block; }
+  .bn-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; }
+  .bn-bar { display:grid; grid-template-columns:230px 1fr 64px; gap:8px; align-items:center; padding:3px 0; font-size:12.5px; }
+  .bn-bar .track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .bn-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .bn-bar.bad .track i { background:var(--red); }
+  .bn-bar .n { font-family:var(--mono); text-align:right; }
+  .bn-sl { display:grid; grid-template-columns:110px minmax(0,1fr) 50px; gap:8px; align-items:center; font-size:13px; }
+  .bn-sl input { width:100%; min-width:0; } .bn-sl b { font-family:var(--mono); text-align:right; }
+  .bn-cells { display:flex; gap:3px; flex-wrap:wrap; margin-top:8px; font-family:var(--mono); font-size:11.5px; }
+  .bn-cells span { padding:4px 6px; border-radius:5px; border:1px solid var(--border); background:var(--surface); min-width:44px; text-align:center; }
+  .bn-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .bn-bar { grid-template-columns:140px 1fr 56px; } }
+</style>
 </head>
 <body data-chapter="6">
-<!-- cv:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 6</span><span class="pill">Beginner</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Batch Norm &amp; Normalisation <span class="grad">Layers</span></h1>
-    <p class="lead">BatchNorm, GroupNorm and LayerNorm, the train/eval switch that silently breaks models, and small-batch failures.</p>
+    <h1>Batch Norm &amp; <span class="grad">Normalisation Layers</span></h1>
+    <p class="lead">Batch normalisation is in almost every CNN, usually after every convolution. It makes networks train faster, at higher learning rates, and is part of why the deep networks of Chapter 7 train at all. It is also the one layer whose output for an image depends on the <i>other</i> images in the batch, and that single fact is behind a family of bugs that raise no errors.</p>
+    <p class="lead">This chapter trains a ResNet-20 with BatchNorm, GroupNorm and no normalisation, then takes the trained BatchNorm model and breaks it on purpose: evaluating in the wrong mode, with small batches, with batches of one class, and on darkened images. One mistake took it from 89% to 10%; another silently and permanently cost it 11 points.</p>
+    <ul class="objectives">
+      <li><span>Write out what BatchNorm computes in training and in evaluation</span></li>
+      <li><span>Explain running statistics, and why <code>model.eval()</code> matters</span></li>
+      <li><span>Predict how BatchNorm behaves with small or unusual batches, and when to use GroupNorm or LayerNorm</span></li>
+      <li><span>Re-estimate BatchNorm statistics for shifted data</span></li>
+      <li><span>Fold a BatchNorm layer into the convolution before it for deployment</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Training a CNN:</b> <a href="04-training-a-cnn.html">Chapter 4: Training a CNN on CIFAR-10</a>.</li>
+        <li><b>Normalising inputs:</b> <a href="p1-images-as-tensors.html">P1: Images as Tensors</a> (mean and std per channel). LLMs <a href="../llms/p3-neural-network-building-blocks.html">P3</a> covers LayerNorm and RMSNorm for transformers.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>What BatchNorm computes</li>
-    <li>Running statistics and eval mode</li>
-    <li>Small batches</li>
-    <li>GroupNorm and LayerNorm</li>
-    <li>Folding BN into a conv</li>
-  </ol>
+  <h2>What BatchNorm computes</h2>
+  <p>For each channel, BatchNorm takes the activations of that channel across the whole batch and every spatial position, computes their mean μ and variance σ², and normalises: x̂ = (x − μ) / √(σ² + ε). Then it rescales with two learned numbers per channel, y = γ x̂ + β, so the layer can undo the normalisation if that helps. The effect is that every channel entering the next layer has a stable scale whatever the weights before it are doing, which smooths optimisation and lets learning rates be higher.</p>
+<pre class="code"><span class="k">def</span> <span class="f">batchnorm_train</span>(x, gamma, beta, running, momentum=<span class="m">0.1</span>, eps=<span class="m">1e-5</span>):
+    <span class="c"># x: (N, C, H, W). Statistics per channel, over the batch AND all positions.</span>
+    mu = x.<span class="f">mean</span>((<span class="m">0</span>, <span class="m">2</span>, <span class="m">3</span>))                                   <span class="c"># (C,)</span>
+    var = x.<span class="f">var</span>((<span class="m">0</span>, <span class="m">2</span>, <span class="m">3</span>), unbiased=<span class="k">False</span>)                  <span class="c"># (C,)</span>
+    running[<span class="s">"mean"</span>] = (<span class="m">1</span> - momentum) * running[<span class="s">"mean"</span>] + momentum * mu   <span class="c"># remembered for evaluation</span>
+    running[<span class="s">"var"</span>] = (<span class="m">1</span> - momentum) * running[<span class="s">"var"</span>] + momentum * var
+    xh = (x - mu[:, <span class="k">None</span>, <span class="k">None</span>]) / (var[:, <span class="k">None</span>, <span class="k">None</span>] + eps).<span class="f">sqrt</span>()
+    <span class="k">return</span> gamma[:, <span class="k">None</span>, <span class="k">None</span>] * xh + beta[:, <span class="k">None</span>, <span class="k">None</span>]
+
+<span class="k">def</span> <span class="f">batchnorm_eval</span>(x, gamma, beta, running, eps=<span class="m">1e-5</span>):
+    <span class="c"># no batch statistics: use the averages collected during training</span>
+    xh = (x - running[<span class="s">"mean"</span>][:, <span class="k">None</span>, <span class="k">None</span>]) / (running[<span class="s">"var"</span>][:, <span class="k">None</span>, <span class="k">None</span>] + eps).<span class="f">sqrt</span>()
+    <span class="k">return</span> gamma[:, <span class="k">None</span>, <span class="k">None</span>] * xh + beta[:, <span class="k">None</span>, <span class="k">None</span>]</pre>
+  <p>There are two modes. In <b>training</b> mode it uses the current batch’s statistics, and also updates an exponential moving average of them, the <b>running</b> mean and variance. In <b>evaluation</b> mode it uses only the running averages, so each image’s output depends on that image alone. <code>model.train()</code> and <code>model.eval()</code> switch every BatchNorm layer (and dropout) between the two. Forgetting the switch is not an error; the model just behaves differently.</p>
+
+  <h2>With, without, and GroupNorm</h2>
+  <p>A ResNet-20 (Chapter 7’s CIFAR network), 20 epochs, batch 128, everything else as in Chapter 4:</p>
+  <table class="t cmp">
+    <thead><tr><th>Normalisation</th><th>Peak LR</th><th>Test accuracy</th><th>Train accuracy</th><th>Time</th></tr></thead>
+    <tbody>
+      <tr><td><b>BatchNorm</b></td><td>0.1</td><td><b>89.44%</b></td><td>94.03%</td><td>26.1 s</td></tr>
+      <tr><td>GroupNorm (groups of 4 channels)</td><td>0.05</td><td>84.84%</td><td>88.31%</td><td>42.3 s</td></tr>
+      <tr><td>None</td><td>0.02</td><td>73.72%</td><td>75.13%</td><td>17.8 s</td></tr>
+      <tr><td>None</td><td>0.1</td><td>83.84%</td><td>87.00%</td><td>17.6 s</td></tr>
+    </tbody>
+  </table>
+  <p>BatchNorm was best by 4.6 points over GroupNorm and 5.6 over the best unnormalised run, and the unnormalised network was sensitive to the learning rate in a way the others were not. <b>GroupNorm</b> normalises each image on its own, over groups of channels and all positions, so it does not depend on the batch at all; it was 62% slower here because its kernels are less optimised than cuDNN’s fused BatchNorm. <b>LayerNorm</b> is the same idea over all channels at once; it is the standard in transformers (Chapters 19–21), where batch statistics over tokens of different images make little sense.</p>
+
+  <h2>The train/eval switch, broken on purpose</h2>
+  <p>The same trained model, each test on a fresh copy, 10,000 test images:</p>
+  <table class="t cmp">
+    <thead><tr><th>How it was evaluated</th><th>Test accuracy</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>model.eval()</code>, batch 1,000</td><td><b>89.01%</b></td><td>running statistics: the correct way</td></tr>
+      <tr><td><code>model.eval()</code>, batch 1</td><td>89.15%</td><td>identical per image (on 2,000 images); batch size no longer matters</td></tr>
+      <tr><td>left in train mode, batch 1,000</td><td>88.36%</td><td>batch statistics of 1,000 test images are close to the running ones</td></tr>
+      <tr><td>train mode, batch 32</td><td>86.15%</td><td>noisier statistics</td></tr>
+      <tr><td>train mode, batch 4</td><td>71.32%</td><td>four images give a poor estimate of a channel’s mean and variance</td></tr>
+      <tr><td>train mode, batch 1</td><td><b>9.95%</b></td><td>each image normalised by itself: the features that distinguish it are removed</td></tr>
+      <tr><td>train mode, batches of one class</td><td><b>15.23%</b></td><td>normalising within one class removes what the class has in common</td></tr>
+    </tbody>
+  </table>
+  <p>The last two rows are why a model that works in a notebook fails in a service: the notebook evaluated large shuffled batches, the service sends one image at a time, and nobody called <code>eval()</code>. Worse, train mode also <i>updates the running statistics</i>. After one pass over the class-sorted test batches in train mode, the same model evaluated correctly in eval mode scored <b>77.73%</b>, 11.3 points lower than before, permanently, until retrained or reset. (The first run of this chapter’s own experiment fell into exactly this trap: its later measurements were made on a model whose statistics an earlier test had overwritten, and had to be redone on fresh copies.) A shuffled train-mode pass did much less damage (88.87%) because shuffled batches look like the training batches.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">BatchNorm lab</span><span class="p-tag">Live + measured</span></div>
+    <div class="panel-body">
+      <div class="bn-l">Experiment</div>
+      <div class="seg" id="bnE"><button class="active" data-v="sim">what a batch’s statistics look like</button><button data-v="eval">evaluation modes</button><button data-v="bs">training batch size</button><button data-v="shift">shifted data</button></div>
+      <div class="bn-v on" id="bnVs">
+        <div class="bn-sl">batch size<input type="range" id="bnB" min="0" max="6" step="1" value="2" aria-label="batch size"><b id="bnBv"></b></div>
+        <div class="bn-l">One channel: true mean 0.40, true std 1.00. Estimates from 8 random batches:</div>
+        <div class="bn-cells" id="bnCells"></div>
+        <div class="bn-box" id="bnSim"></div>
+        <div style="margin-top:8px"><button class="btn" id="bnRe">🎲 draw new batches</button></div>
+      </div>
+      <div class="bn-v" id="bnVe"><div class="bn-box" id="bnEval"></div></div>
+      <div class="bn-v" id="bnVb"><div class="bn-box" id="bnBs"></div></div>
+      <div class="bn-v" id="bnVh"><div class="bn-box" id="bnShift"></div></div>
+      <div class="stats" id="bnStats"></div>
+      <div class="bn-why" id="bnWhy"></div>
+    </div>
+    <div class="panel-foot">The first view simulates one channel’s activations in your browser (a normal distribution with mean 0.4 and std 1, with each image’s 64 positions sharing a per-image offset of std 0.5, as real activations do) and shows the mean and std BatchNorm would compute from batches of that size. All other numbers: ResNet-20 on CIFAR-10, 20 epochs at batch 128 (89.0–89.4% test across two training runs with the same seed), or 5 epochs at each batch size with the learning rate scaled by batch / 128; RTX 5070 Ti, bf16.</div>
+  </div>
+
+  <h2>Small batches when training</h2>
+  <p>Training with tiny batches has the same problem from the other side: the statistics BatchNorm normalises with are noisy, and the running averages it stores are averages of noisy estimates. Five epochs at each batch size, learning rate scaled with batch:</p>
+  <table class="t cmp">
+    <thead><tr><th>Training batch</th><th>4</th><th>16</th><th>64</th><th>256</th></tr></thead>
+    <tbody>
+      <tr><td>BatchNorm</td><td>81.94%</td><td>82.34%</td><td>82.73%</td><td>81.79%</td></tr>
+      <tr><td>GroupNorm</td><td>74.51%</td><td>76.29%</td><td>74.94%</td><td>66.64%</td></tr>
+    </tbody>
+  </table>
+  <p>BatchNorm barely degraded down to batch 4 on this small network: 81.9% against 82.7% at batch 64. That is better than its reputation, partly because CIFAR images are small and fairly uniform, and partly because at training time the noise in batch statistics acts as a mild regulariser. (A batch-2 run was started and stopped unfinished to free the GPU, so it is not reported.) GroupNorm was the weaker layer throughout on this small network, and at batch 256 its scaled learning rate was too high for it in five epochs. GroupNorm’s case is not that it beats BatchNorm when both work, but that it keeps working where BatchNorm cannot: in detection and segmentation (Chapters 14–18), where high-resolution inputs leave room for only one or two images per GPU, and in any model that must give identical results however it is batched.</p>
+
+  <h2>Shifted data: re-estimating the statistics</h2>
+  <p>Running statistics encode what the training data looked like. If deployed images differ, say darker, from a different camera, they no longer match. Testing on CIFAR-10 test images darkened to 50% brightness: with the stored statistics the model scored <b>85.34%</b> (on the second half of the test set, 89.12% when not darkened). Resetting every BatchNorm layer’s running statistics and re-estimating them from 5,000 darkened images in train mode, with no labels and no weight updates, recovered <b>88.18%</b>. This is a cheap form of test-time adaptation (sometimes called AdaBN): useful when a whole deployment shifts at once, dangerous if done on small or unrepresentative batches, as the class-sorted result above shows.</p>
+  <figure class="flow">
+    <ol>
+      <li><b>Collect unlabelled images</b><small>from the new camera or site</small></li>
+      <li><b>Reset BN statistics</b><small>reset_running_stats(), momentum = None</small></li>
+      <li><b>Forward in train mode</b><small>shuffled batches of 100+, no gradients</small></li>
+      <li><b>Back to eval()</b><small>weights unchanged</small></li>
+      <li><b>Validate</b><small>on labelled samples from the new data</small></li>
+    </ol>
+    <figcaption><b>Re-estimating BatchNorm statistics for a new domain.</b> 85.3% → 88.2% on darkened images here, using 5,000 unlabelled images.</figcaption>
+  </figure>
+
+  <h2>Folding BatchNorm for deployment</h2>
+  <p>In eval mode BatchNorm is a fixed per-channel scale and shift, and a convolution followed by a scale and shift is just another convolution. So for deployment it can be <b>folded</b> into the convolution before it: W′ = W · γ/√(σ² + ε) per output channel, b′ = β − γ μ/√(σ² + ε). On the trained ResNet-20 the folded stem matched the original to 0.0023 (bf16 inputs) and the fully folded network had the same accuracy within 0.05 points, while running 7% faster at batch 256 (1.25 ms against 1.34 ms) because it skips a pass over every feature map. Deployment toolchains (ONNX Runtime, TensorRT, mobile runtimes) do this automatically; Chapter 38 measures the rest of the deployment stack.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: synchronised BatchNorm in detection training</div><p>Object detectors train on large images, often at 800 to 1,333 pixels, so each GPU holds only two to eight of them, and BatchNorm statistics computed per GPU are noisy, the situation measured above. Detection libraries handle this in three ways: freeze the backbone’s BatchNorm layers at their ImageNet statistics (torchvision’s detection models use a frozen BatchNorm in the backbone for this reason), use <b>synchronised BatchNorm</b>, which averages statistics across all GPUs in each step at the cost of extra communication, or replace BatchNorm with GroupNorm. All three exist because a layer that depends on the batch behaves badly when the batch is small.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Forgetting <code>model.eval()</code> before inference:</b> at batch 1 the model scored 10%.</li>
+      <li><b>Running test or production data through a model in train mode,</b> which silently overwrites its running statistics (−11.3 points here, permanently).</li>
+      <li><b>Training BatchNorm models with batches of 2–4 per GPU</b> without freezing, synchronising or replacing the layers.</li>
+      <li><b>Feeding batches that are all one class</b> (or one camera, one patient) through BatchNorm in train mode.</li>
+      <li><b>Putting a bias in a convolution followed by BatchNorm</b>: the mean subtraction removes it, so it is wasted parameters.</li>
+      <li><b>Fine-tuning with tiny batches and BN still updating,</b> drifting the pretrained statistics.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> A classifier scores 89% in offline evaluation and about 10% in production, where it serves one image at a time. What would you check first?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Whether the serving code calls <code>model.eval()</code>. In train mode BatchNorm normalises with the statistics of the current batch; with one image per batch each channel is normalised by that image’s own mean and variance, which removes exactly the information the next layers need. Measured on a ResNet-20, that was 89.0% in eval mode and 9.95% in train mode at batch 1. I would also check that the production model’s running statistics were not overwritten by an earlier pass in train mode (a sorted or one-class pass cost 11 points permanently here), and then the usual preprocessing suspects. The fix is <code>model.eval()</code> plus <code>torch.inference_mode()</code>, and a test that runs the same images at batch 1 and batch 64 and checks the outputs match.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> When would you choose GroupNorm or LayerNorm over BatchNorm?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>When batch statistics are unreliable or unwanted. BatchNorm needs reasonably large, representative batches: detection and segmentation on high-resolution images often fit only one or two images per GPU, video and 3D models likewise, and some settings need outputs independent of batch composition (per-request inference that must be deterministic, contrastive learning where batch statistics can leak information between samples). GroupNorm normalises each sample over groups of channels and has no train/eval difference; LayerNorm normalises over all features of each token and is the default in transformers. When batches are large and i.i.d., BatchNorm is usually the best and fastest choice for CNNs: here it beat GroupNorm by 4.6 points at batch 128 and trained 1.6 times faster.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>BatchNorm normalises each channel with batch statistics in training and with running averages in evaluation.</li>
+      <li>It was the best layer here: 89.4% vs 84.8% for GroupNorm and 83.8% with none.</li>
+      <li>Train mode at inference depends on the batch: 88.4% at 1,000, 71.3% at 4, 10.0% at batch 1, 15.2% for one-class batches.</li>
+      <li>Train mode also overwrites the running statistics: one bad pass cost 11.3 points for good. Deep-copy before experiments.</li>
+      <li>Re-estimating statistics on unlabelled shifted data recovered darkened-image accuracy from 85.3% to 88.2%.</li>
+      <li>In eval mode BN is an affine map and folds into the preceding convolution: same accuracy, 7% faster.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Over which dimensions does BatchNorm compute its mean for a (N, C, H, W) tensor?</p>
+      <div class="opts">
+        <button class="opt">C, H and W, per image</button>
+        <button class="opt">H and W only</button>
+        <button class="opt">N, H and W, per channel</button>
+        <button class="opt">All four</button>
+      </div>
+      <div class="explain">One mean and variance per channel, over the batch and all spatial positions. GroupNorm and LayerNorm instead normalise each image on its own.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A BatchNorm model is evaluated in train mode with batch size 1. What happened to accuracy?</p>
+      <div class="opts">
+        <button class="opt">It fell from 89% to about 10%</button>
+        <button class="opt">It stayed at 89%</button>
+        <button class="opt">It rose slightly</button>
+        <button class="opt">It raised an error</button>
+      </div>
+      <div class="explain">Each image is normalised by its own statistics, removing what distinguishes it. PyTorch only raises an error when a BN layer sees a single value per channel, such as after global pooling.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why did a single train-mode pass over class-sorted test batches lower later <i>eval-mode</i> accuracy?</p>
+      <div class="opts">
+        <button class="opt">It changed the weights</button>
+        <button class="opt">It changed γ and β</button>
+        <button class="opt">It deleted the running statistics</button>
+        <button class="opt">Train mode updates the running mean and variance, which absorbed the unrepresentative batches</button>
+      </div>
+      <div class="explain">No gradients flowed, but the running averages moved. Eval accuracy dropped from 89.0% to 77.7% and stayed there.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does folding BatchNorm into the preceding convolution change?</p>
+      <div class="opts">
+        <button class="opt">The model’s accuracy</button>
+        <button class="opt">Nothing about the outputs; it removes a layer, so inference is faster</button>
+        <button class="opt">It makes the model train faster</button>
+        <button class="opt">It converts the model to int8</button>
+      </div>
+      <div class="explain">In eval mode BN is a fixed affine map per channel, so W and b absorb it. Same accuracy within 0.05 points, 7% faster here.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Images in deployment are darker than in training. Which cheap step recovered most of the lost accuracy?</p>
+      <div class="opts">
+        <button class="opt">Retraining with labels</button>
+        <button class="opt">Switching to train mode at inference</button>
+        <button class="opt">Re-estimating the BN running statistics on unlabelled darkened images</button>
+        <button class="opt">Increasing the batch size</button>
+      </div>
+      <div class="explain">85.3% → 88.2%, with no labels and no weight updates. Done on large, shuffled batches, then back to eval mode.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = CV;
+  const D = {"switch":{"eval, batch 1000":89.01,"eval, batch 1":89.15,"train mode, batch 1000":88.36,"train mode, batch 32":86.15,"train mode, batch 4":71.32,"train mode, batch 1":9.95,"train mode, batches of one class":15.23},"after_sorted":77.73,"after_shuffled":88.87,"shift":{"clean":89.01,"dark_stored_stats":85.34,"dark_reestimated":88.18,"clean_second_half":89.12},"bs":{"bn_4":81.94,"gn_4":74.51,"bn_16":82.34,"gn_16":76.29,"bn_64":82.73,"gn_64":74.94,"bn_256":81.79,"gn_256":66.64}};
+  const BS = [1, 2, 4, 8, 32, 128, 1000];
+  function gauss() { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  function sim() {
+    const n = BS[+$('#bnB').value]; $('#bnBv').textContent = n;
+    const est = Array.from({ length: 8 }, () => { let s = 0, s2 = 0, k = 0; for (let i = 0; i < n; i++) { const off = 0.5 * gauss(); for (let p = 0; p < 64; p++) { const v = 0.4 + off + Math.sqrt(0.75) * gauss(); s += v; s2 += v * v; k++; } } const m = s / k; return [m, Math.sqrt(Math.max(1e-9, s2 / k - m * m))]; });
+    $('#bnCells').innerHTML = est.map(([m, sd]) => `<span>μ ${m.toFixed(2)}<br>σ ${sd.toFixed(2)}</span>`).join('');
+    const ms = est.map(e => e[0]), spread = Math.sqrt(ms.reduce((a, b) => a + (b - 0.4) ** 2, 0) / ms.length);
+    $('#bnSim').innerHTML = `<b>${n} image${n > 1 ? 's' : ''} × 64 positions per batch.</b> The batch means scatter by about ±${spread.toFixed(2)} around the true 0.40. ${n === 1 ? 'With one image, “the batch mean” is that image’s own mean: normalising by it erases the image’s overall brightness of this feature, which is often exactly what the classifier needs.' : n <= 4 ? 'Every image in the batch is normalised by noisy, shared numbers: its output depends on which other images it happened to be batched with.' : 'Large batches give stable statistics, close to the running averages stored for evaluation.'}`;
+    $('#bnStats').innerHTML = `<div class="stat ${spread > 0.2 ? 'bad' : spread > 0.08 ? 'warn' : 'good'}"><div class="k">Spread of batch means</div><div class="v">±${spread.toFixed(2)}</div></div>`;
+    $('#bnWhy').innerHTML = '<b>Why batch size matters to BatchNorm.</b> Positions within one image are correlated, so a batch of a few images carries little more information about the channel’s mean than one image does. That is why batch 4 still worked in training here but batch 1 at inference did not.';
+  }
+  const bars = (rows, max, badBelow) => rows.map(([k, v]) => `<div class="bn-bar${v < badBelow ? ' bad' : ''}"><span>${k}</span><span class="track"><i style="width:${Math.max(0.6, v / max * 100)}%"></i></span><span class="n">${v.toFixed(2)}%</span></div>`).join('');
+  function ev() {
+    $('#bnEval').innerHTML = bars(Object.entries(D.switch).concat([['eval mode after one train-mode pass over sorted batches', D.after_sorted], ['eval mode after one shuffled train-mode pass', D.after_shuffled]]), 100, 80);
+    $('#bnStats').innerHTML = `<div class="stat good"><div class="k">eval()</div><div class="v">${D.switch['eval, batch 1000']}%</div></div><div class="stat bad"><div class="k">train mode, batch 1</div><div class="v">${D.switch['train mode, batch 1']}%</div></div><div class="stat bad"><div class="k">after a sorted pass</div><div class="v">${D.after_sorted}%</div></div>`;
+    $('#bnWhy').innerHTML = '<b>Same weights, different answers.</b> In train mode each image’s output depends on its batch mates. Below about 32 images per batch the statistics are too noisy; one-class batches remove the class signal itself. And every train-mode pass rewrites the stored statistics.';
+  }
+  function bs() {
+    const rows = []; for (const b of [4, 16, 64, 256]) { if (D.bs['bn_' + b] != null) rows.push(['BatchNorm, batch ' + b, D.bs['bn_' + b]]); if (D.bs['gn_' + b] != null) rows.push(['GroupNorm, batch ' + b, D.bs['gn_' + b]]); }
+    $('#bnBs').innerHTML = bars(rows, 100, 70);
+    $('#bnStats').innerHTML = `<div class="stat"><div class="k">BN, batch 4</div><div class="v">${D.bs.bn_4}%</div></div><div class="stat"><div class="k">BN, batch 64</div><div class="v">${D.bs.bn_64}%</div></div><div class="stat"><div class="k">GN, batch 4</div><div class="v">${D.bs.gn_4}%</div></div>`;
+    $('#bnWhy').innerHTML = '<b>Five epochs each, learning rate scaled with batch.</b> BatchNorm held up surprisingly well down to batch 4 on this small model. GroupNorm is independent of the batch by construction, but was weaker throughout here.';
+  }
+  function sh() {
+    const s = D.shift; $('#bnShift').innerHTML = bars([['clean (second half of test set)', s.clean_second_half], ['darkened 50%, stored statistics', s.dark_stored_stats], ['darkened 50%, statistics re-estimated', s.dark_reestimated]], 100, 0);
+    $('#bnStats').innerHTML = `<div class="stat warn"><div class="k">Stored stats</div><div class="v">${s.dark_stored_stats}%</div></div><div class="stat good"><div class="k">Re-estimated</div><div class="v">${s.dark_reestimated}%</div></div>`;
+    $('#bnWhy').innerHTML = '<b>No labels, no weight updates.</b> Resetting the running statistics and recomputing them on 5,000 darkened images recovered most of the gap. The network’s weights did not change; only what it considers “normal” for each channel did.';
+  }
+  function draw() { const e = $('#bnE .active').dataset.v; ['s', 'e', 'b', 'h'].forEach((k, i) => $('#bnV' + k).classList.toggle('on', ['sim', 'eval', 'bs', 'shift'][i] === e)); ({ sim, eval: ev, bs, shift: sh })[e](); }
+  $('#bnE').addEventListener('segchange', draw); $('#bnB').addEventListener('input', sim); $('#bnRe').onclick = sim;
+  draw();
+})();
+</script>
 </body>
 </html>
