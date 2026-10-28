@@ -55,3 +55,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch29 shipped: SD1.5 VAE 48x at 31.2 dB; 1.31 s/img at 30 steps, U-Net 95%; CLIP score 28.2 (s=1) -> 31.5 (s=2) -> 33.2 (s=20, oversaturated); pixel diversity proxy failed (rose with s).
 - Ch31 shipped: 10-class UCF101 subset (75 test videos) saturates: ResNet-50 1 frame 89.3 / 8 frames 93.3, Kinetics 3D nets 100; shuffling changed nothing; R(2+1)D same FLOPs as R3D but 2.3x slower.
 - Ch30 shipped (after SciPy sqrtm fix): FID DDPM 17.8, DCGAN 43.4 (recall 51.6 vs 23.8); DDIM 10 steps 45.8 with precision up to 75.8; real-vs-real 72.4 at n=500 -> 4.9 at 10k; noise sigma 10 -> 51.2.
+- Ch32 shipped: EPE RAFT large 0.049 / small 0.071 / Farneback 1.81 px (true mean 7.8); SORT IDF1 83.6 vs Hungarian 71.9 vs greedy 69.0, misses 294 -> 135, IDs 15.8 -> 12 for 8 objects.
