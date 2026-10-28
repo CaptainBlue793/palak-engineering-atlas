@@ -44,3 +44,5 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch20 follow-up: replaced 'early blocks attend locally' with Ch19's measured per-block attention distances.
 - Ch21 shipped: window attn 115x faster than global at 12,544 tokens; 224->896 px ViT-B 67x slower, Swin-T 4.9x, R50 5.8x; DETR 45.4 AP (44.4 with NMS), APs 24.0 vs 29-34 for FPN detectors.
 - Ch22 shipped: SimCLR 40 ep linear 78.2 / kNN 74.5 (random 43.5/40.3); 1% labels +23.4 vs supervised, 10% -4.9; no colour jitter -17.7 pts with highest pair acc (92%); bs128 beat 512 at equal epochs (4x steps).
+- 02:55 ch23 imported knn from the ch22 wrapper, which re-ran the ch22 experiment inside ch23 (~19 min lost). Restored ch21_exp.py/ch22_exp.py; shipped Ch22 numbers preserved in r_ch22_shipped.json.
+- Ch23 shipped: MAE hidden-patch loss 0.11/0.16/0.24/0.44 at 25/50/75/90%; frozen DINO >= supervised (EuroSAT kNN 94.8 vs 89.4); frozen MAE kNN on Pets 29-38%; DINO last-block attention roughly on objects.
