@@ -41,3 +41,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch20 shipped: ResNet-18 lead over small ViT 23.4 pts at 5k -> 12.0 at 50k; Mixup/CutMix/LS 82.0 -> 85.7 (60 ep) -> 90.9 (200 ep); patch 4 best (82.4) vs 8 (77.3) and 2 (80.0, 5.7x time).
 - Ch18 shipped (after pycocotools loadRes-mutation fix): Mask R-CNN v2 box 51.9 / mask 46.3 / box-as-mask 15.1 AP on 500 COCO imgs; bicycle 38.5->18.8, pizza 65.9->66.9; Keypoint R-CNN 65.0 AP.
 - Ch19 shipped: 30-line ViT-B/16 matches torchvision to 1.9e-6; Imagenette 92.3% (384 interp 89.4%); naive attention OOM at 768 px bs16, fused 2.2 GB; last-block CLS attention goes to low-info patches (registers artefact).
+- Ch20 follow-up: replaced 'early blocks attend locally' with Ch19's measured per-block attention distances.
