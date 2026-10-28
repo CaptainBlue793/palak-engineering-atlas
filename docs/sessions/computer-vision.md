@@ -52,3 +52,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch27 shipped: 8-Gaussian toy minimax 8/8, non-saturating 8->6/8 (partial collapse), +minibatch std 8/8; DCGAN 72 s, D dominant (0.92/0.08); cGAN 78 s.
 - Ch25 shipped (after OWL API + tensor-round fixes): SAM 1-click own pick 48.1 / best-of-3 73.9 / box 77.1 mIoU; enc 78.5 ms vs dec 3.8 ms; OWL-ViT COCO 32.6 AP zero-shot; novel classes found 52-100%.
 - Ch28 shipped: 7.3M U-Net, 40k steps in 45 min; noise-pred loss 0.597 at t=0 -> 0 at t=999; DDPM 1000 steps 204 ms/img vs DDIM 100/50/20/10 at 20.5/10.2/4.1/2.0 ms.
+- Ch29 shipped: SD1.5 VAE 48x at 31.2 dB; 1.31 s/img at 30 steps, U-Net 95%; CLIP score 28.2 (s=1) -> 31.5 (s=2) -> 33.2 (s=20, oversaturated); pixel diversity proxy failed (rose with s).
