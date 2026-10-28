@@ -56,3 +56,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch31 shipped: 10-class UCF101 subset (75 test videos) saturates: ResNet-50 1 frame 89.3 / 8 frames 93.3, Kinetics 3D nets 100; shuffling changed nothing; R(2+1)D same FLOPs as R3D but 2.3x slower.
 - Ch30 shipped (after SciPy sqrtm fix): FID DDPM 17.8, DCGAN 43.4 (recall 51.6 vs 23.8); DDIM 10 steps 45.8 with precision up to 75.8; real-vs-real 72.4 at n=500 -> 4.9 at 10k; noise sigma 10 -> 51.2.
 - Ch32 shipped: EPE RAFT large 0.049 / small 0.071 / Farneback 1.81 px (true mean 7.8); SORT IDF1 83.6 vs Hungarian 71.9 vs greedy 69.0, misses 294 -> 135, IDs 15.8 -> 12 for 8 objects.
+- Ch33 shipped: projection matches OpenCV to 6e-14 px; calibration RMS 0.41 px at 3-20 views but fx 814 vs 800 at 3 views, k2 poorly determined; BM 1.21 px on 76% / SGBM 1.45 on 85% / mono 1.55 on 100% (17% >2px).
