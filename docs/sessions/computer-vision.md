@@ -67,3 +67,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 ## 2026-10-29 — release prep
 - Done: owner said "release CV". Merged origin/main (already up to date); registry live (chapters 56, hours 42 from chapter minutes); `cv-` sync keys in assets/account.js, api/src/index.js, ACCOUNTS.md and the API test (25/25 pass on a local Worker); README table and tree; study data and dist rebuilt (60 pages, 6.67 MB). Checks: content audit 0 errors, bundle, crosslinks, palette, hub (default, dark, 390 px) all pass.
 - Next: owner merges to main and pushes, runs the Worker deploy and `gh release create computer-vision-v1.0.0`.
+- RELEASED 2026-10-29: merged to main (25fb5e8), Pages live (registry 56 chapters, 42 h), owner ran the Worker deploy (version 606c73a9, cv- keys) and published GitHub release computer-vision-v1.0.0 with the dist attached. Case studies 41–48 remain for the all-courses case-study pass. Next course: Deep Learning, then NLP.
