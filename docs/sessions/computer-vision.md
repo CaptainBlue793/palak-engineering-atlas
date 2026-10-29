@@ -62,3 +62,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch36 shipped (after GPU-memory fix): Pets R@1 DINO 91.6 / R50 91.2 / CLIP 79.3; heads on 25 breeds all worse on 12 unseen than frozen features (98.2 -> 96.8/96.2/91.5); IVF nprobe16 scans 6.6% for 97.7% recall@10.
 - Ch38 shipped: R50 bs64 fp32 34.2 -> bf16 16.3 -> compile 11.4 ms, but bf16 bs1 slower than fp32; CPU int8 R50 3.1x, 0 loss; MobileNetV3 int8 -5.4 pts; ONNX RT 2.3-4.6x; pruning 0-90% no speed change; model 76% of a request.
 - Ch35 shipped (after sentencepiece install + case-insensitive TrOCR follow-up): CRNN CER 0.02 / 6.19 / 97.5% (seen / unseen / degraded); TrOCR (writes capitals) ignoring case 3.66 / 2.66 / 12.77%.
+- Ch39 shipped: baseline 88.7; no norm 33.2, low-res 72.0, BGR 76.0, wrong stats 88.0, aug on 87.9, train mode bs16 86.8; 20% noise 85.7; leaked 94.1 vs clean 89.7; 10% cats -> cat recall 26%; top-500 loss 100% mislabelled.

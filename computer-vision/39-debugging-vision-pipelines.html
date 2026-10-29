@@ -3,37 +3,247 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Debugging Vision Pipelines &amp; Datasets</title>
+<title>Debugging Vision Pipelines &amp; Datasets · Computer Vision by Palak Deb Patra</title>
+<meta name="description" content="Chapter 39 of Computer Vision. Bugs planted on purpose in a CIFAR-10 pipeline and measured: BGR at test time, the wrong normalisation statistics, augmentation left on, train mode at inference, label noise, test images leaked into training, a channel-order mismatch, and class imbalance; finding mislabelled images by their loss; and a debugging checklist.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('cv-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .db-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .db-v { display:none; } .db-v.on { display:block; }
+  .db-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; }
+  .db-bar { display:grid; grid-template-columns:minmax(0, 290px) 1fr 70px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .db-bar .track { height:13px; border-radius:4px; background:var(--surface); overflow:hidden; } .db-bar .track i { display:block; height:100%; }
+  .db-bar .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .db-check { list-style:none; padding:0; margin:0; } .db-check li { padding:6px 0; border-bottom:1px solid var(--border); font-size:14px; } .db-check label { display:flex; gap:10px; align-items:flex-start; cursor:pointer; }
+  .db-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .db-bar { grid-template-columns:minmax(0, 140px) 1fr 60px; font-size:12px; } }
+</style>
 </head>
 <body data-chapter="39">
-<!-- cv:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 39</span><span class="pill">Expert</span><span class="pill">⏱ 50 min</span></div>
-    <h1>Debugging Vision Pipelines &amp; <span class="grad">Datasets</span></h1>
-    <p class="lead">BGR vs RGB, wrong normalisation, label noise, leaked duplicates and biased data: bugs planted on purpose and found.</p>
+    <h1>Debugging Vision Pipelines <span class="grad">&amp; Datasets</span></h1>
+    <p class="lead">Most failures of deployed vision systems are not exotic. A colour channel swapped by a decoding library, normalisation statistics copied from the wrong model, augmentation that was meant for training only, a model left in training mode, labels that are wrong, test images that leaked into training. None of them crash. They quietly cost accuracy, or worse, they inflate it in testing and fail in production.</p>
+    <p class="lead">This chapter plants each of those bugs on purpose in a small, known-good CIFAR-10 pipeline and measures what each one does, so that you can recognise the symptom when you meet it. It also shows the cheapest way to find mislabelled images: ask the model which ones it finds hardest. The damage varied enormously. No normalisation cut accuracy from 88.7% to 33%; swapped colour channels and a lower resolution each cost 13–17 points; using ImageNet’s normalisation statistics instead of CIFAR’s cost only 0.7. Leaked test images inflated their own accuracy by 4 points. And ranking training images by loss found the planted wrong labels with 100% precision in the top 500.</p>
+    <ul class="objectives">
+      <li><span>Recognise the symptoms of preprocessing mismatches</span></li>
+      <li><span>Measure the effect of label noise, and find noisy labels</span></li>
+      <li><span>Detect train–test leakage and near-duplicates</span></li>
+      <li><span>Spot class imbalance hiding behind overall accuracy</span></li>
+      <li><span>Work through a debugging checklist systematically</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Colour order and normalisation:</b> <a href="p3-colour-gamma-and-formats.html">P3</a> and <a href="p6-loading-image-data.html">P6</a>; train and eval modes in <a href="06-normalisation-layers.html">Chapter 6</a>.</li>
+        <li><b>Per-class metrics:</b> <a href="09-evaluating-classifiers.html">Chapter 9</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Preprocessing mismatches</li>
-    <li>Label noise</li>
-    <li>Duplicate and leaked images</li>
-    <li>Dataset bias</li>
-    <li>A debugging checklist</li>
-  </ol>
+  <h2>The known-good pipeline</h2>
+  <p>The reference is deliberately simple: a small CNN (Chapter 3’s, 64 base channels) trained for 15 epochs on CIFAR-10 with random crops and flips, normalised with CIFAR’s own per-channel mean and standard deviation. It reached <b>88.67%</b> on the 10,000 test images. Every bug below changes one thing.</p>
+
+  <h2>Bugs at test time</h2>
+  <p>The first group leaves training untouched and changes only how the trained model is used, the situation of a model handed from a research notebook to a serving team.</p>
+  <table class="t cmp">
+    <thead><tr><th>Bug at test time (same trained model)</th><th>Test accuracy</th><th>Change</th></tr></thead>
+    <tbody>
+      <tr><td>Correct pipeline</td><td><b>88.67%</b></td><td>—</td></tr>
+      <tr><td>No normalisation (pixels in [0, 1])</td><td>33.20%</td><td><b>−55.5</b></td></tr>
+      <tr><td>Resized 32 → 24 → 32 (a lower-resolution source)</td><td>72.01%</td><td>−16.7</td></tr>
+      <tr><td>BGR instead of RGB</td><td>75.99%</td><td>−12.7</td></tr>
+      <tr><td>Model left in train mode, batch 16</td><td>86.84%</td><td>−1.8</td></tr>
+      <tr><td>Random crop and flip left on</td><td>87.86%</td><td>−0.8</td></tr>
+      <tr><td>ImageNet mean and std instead of CIFAR’s</td><td>87.98%</td><td>−0.7</td></tr>
+      <tr><td>Model left in train mode, batch 1,000</td><td>88.55%</td><td>−0.1</td></tr>
+    </tbody>
+  </table>
+  <p>Two bugs were catastrophic, two serious and the rest mild, and the mild ones are the dangerous kind. Skipping normalisation shifted every input by about two standard deviations and cut accuracy to a third; nobody ships that for long. Swapping red and blue cost 13 points on CIFAR-10, a large loss that still leaves a plausible-looking 76%. A lower-resolution source cost 17 points. The surprises are at the bottom of the table. ImageNet’s statistics are close enough to CIFAR’s that using the wrong ones cost 0.7 points; augmentation left on cost 0.8; and train mode cost only 0.1 at batch 1,000, because a large batch’s own statistics are close to the running averages, but 1.8 at batch 16, and it would be far worse at batch 1. Losses of half a point to two points are exactly the size that looks like noise and goes unnoticed, which is why the checklist starts with plotting the tensors rather than waiting for accuracy to complain.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Bug lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="db-l">View</div>
+      <div class="seg" id="dbE"><button class="active" data-v="test">test-time bugs</button><button data-v="train">training and data bugs</button><button data-v="noise">finding noisy labels</button><button data-v="check">checklist</button></div>
+      <div class="db-v on" id="dbVtest"><div class="db-box" id="dbT"></div></div>
+      <div class="db-v" id="dbVtrain"><div class="db-box" id="dbR"></div></div>
+      <div class="db-v" id="dbVnoise"><div class="db-box" id="dbN"></div></div>
+      <div class="db-v" id="dbVcheck"><div class="db-box"><ul class="db-check" id="dbC"></ul></div></div>
+      <div class="stats" id="dbStats"></div>
+      <div class="db-why" id="dbWhy"></div>
+    </div>
+    <div class="panel-foot">All models: Chapter 3’s CNN (64 base channels), 15 epochs, SGD with a one-cycle schedule, crops and flips, bf16 on an RTX 5070 Ti, seed 0; accuracy on the 10,000 CIFAR-10 test images unless stated. Test-time bugs reuse the baseline model. Label noise: a share of training labels replaced by uniformly random classes (so about a tenth of the replaced labels are accidentally right). Leakage: 2,000 test images added to the 50,000 training images. Imbalance: only 500 of the 5,000 training cats kept. One run per setting. The checklist ticks are stored in this browser only.</div>
+  </div>
+
+  <h2>Bugs in training and data</h2>
+  <table class="t cmp">
+    <thead><tr><th>Bug in training or data</th><th>Measured on</th><th>Accuracy</th><th>vs baseline 88.67%</th></tr></thead>
+    <tbody>
+      <tr><td>10% of training labels randomised</td><td>full test set</td><td>86.75%</td><td>−1.9</td></tr>
+      <tr><td>20% randomised</td><td>full test set</td><td>85.65%</td><td>−3.0</td></tr>
+      <tr><td>40% randomised</td><td>full test set</td><td>80.01%</td><td>−8.7</td></tr>
+      <tr><td>Trained on BGR, tested on RGB</td><td>full test set</td><td>77.17%</td><td>−11.5</td></tr>
+      <tr><td>Trained on BGR, tested on BGR</td><td>full test set</td><td>89.26%</td><td>+0.6</td></tr>
+      <tr><td rowspan="3">2,000 test images leaked into training</td><td>reported: full test set</td><td>90.58%</td><td>+1.9</td></tr>
+      <tr><td>the 2,000 leaked images</td><td><b>94.10%</b></td><td></td></tr>
+      <tr><td>the 8,000 clean images</td><td>89.70%</td><td></td></tr>
+      <tr><td rowspan="2">Only 500 of 5,000 training cats</td><td>overall</td><td>84.74%</td><td>−3.9</td></tr>
+      <tr><td>cat recall</td><td><b>26.2%</b></td><td></td></tr>
+    </tbody>
+  </table>
+  <p>Label noise hurt less than you might expect: with 20% of labels randomised, accuracy fell only 3 points, because in 15 epochs the network learns the consistent majority before it has time to memorise the noise (longer training makes noisy-label damage grow). Channel order is not wrong in itself: a model trained and tested on BGR was as good as the RGB baseline; what costs 11.5 points is the <i>mismatch</i>. Leakage inflated the reported score by 0.9 points over the honest clean-set figure, and the leaked images themselves scored 94.1%, 4.4 points above clean ones, because the model had trained on them; with longer training or a bigger model, memorisation, and the inflation, grow. Imbalance hid well: removing nine tenths of the cats cost 3.9 points overall, but the model recognised only 26% of test cats and predicted “cat” 287 times for 1,000 real cats. Overall accuracy would never have revealed that.</p>
+
+  <h2>Finding mislabelled images</h2>
+  <p>Networks learn clean, consistent labels before they memorise noisy ones, so after training, examples with a high loss on their own training label are disproportionately mislabelled. Ranking the training set by per-example loss and reviewing the top of the list is the cheapest data-cleaning tool there is; confident learning (cleanlab) refines it with out-of-fold predictions and per-class thresholds.</p>
+  <table class="t cmp">
+    <thead><tr><th>Training images reviewed (by highest loss on their own label)</th><th>Share actually mislabelled</th></tr></thead>
+    <tbody>
+      <tr><td>A random sample (the base rate)</td><td>17.9%</td></tr>
+      <tr><td>Top 500</td><td><b>100.0%</b></td></tr>
+      <tr><td>Top 2,000</td><td>99.8%</td></tr>
+      <tr><td>Top 5,000 (10% of the set)</td><td>98.4%</td></tr>
+    </tbody>
+  </table>
+  <p>With 20% of labels randomised (17.9% actually wrong, since a random label is sometimes the right one), every one of the 500 highest-loss training images was mislabelled, and 98.4% of the top 5,000. Reviewing that top 10% of the dataset would have found 54.9% of all the wrong labels; the remainder are mislabelled images that the network has partly memorised, so their loss is no longer high, which is why cross-validated scoring (each image scored by a model that did not train on it) finds more. As a data-cleaning tool for the cost of one training run, it is hard to beat.</p>
+
+  <h2>A debugging checklist</h2>
+  <p>When accuracy is lower than expected, or higher than seems possible, work through the pipeline in order: the data, the inputs as the model actually sees them, the model’s mode and outputs, and the evaluation. The panel’s last view is a checklist you can tick as you go; the items are the bugs measured above plus the ones that appear across this course.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: the model that was 99% accurate</div><p>A team reports 99% accuracy detecting a disease from photos, far above clinicians. Debugging it follows this chapter. Are patients split between training and test, or do photos of the same patient appear in both (leakage, measured below inflating accuracy on the leaked images)? Do positive images come from one hospital’s camera and negatives from another (a shortcut the model can learn from colour statistics)? Are images resized, colour-ordered and normalised the same way in the app as in training (the test-time bugs)? Is the rare class’s recall reported, not just accuracy (imbalance)? Each of these has been found behind published medical-imaging results that did not replicate.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Never looking at the tensors the model receives:</b> plot a batch after preprocessing, at both training and serving time.</li>
+      <li><b>Trusting a result that is too good:</b> leaked test images scored 94.1% against 89.7% for clean ones; the full test score overstated real performance.</li>
+      <li><b>Splitting by image when the unit is a person, a video or a scene</b>: near-duplicates cross the split.</li>
+      <li><b>Reporting overall accuracy on imbalanced data:</b> with 10% of the cats, overall accuracy fell only 3.9 points while cat recall fell to 26%.</li>
+      <li><b>Fixing a symptom in the model</b> (more epochs, bigger network) when the bug is in the data.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Your model’s accuracy dropped sharply after deployment. Where do you look first?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>At the inputs, before the model. I would log a sample of production tensors exactly as they enter the model and compare them with training tensors: colour order (OpenCV decodes BGR), value range and normalisation statistics, resize method and resolution, crop, and whether training-only augmentation is still on. Then check the model is in eval mode with the right weights loaded, and that the label mapping is the same. Only after those would I look at genuine distribution shift in the images. In a planted-bug experiment on CIFAR-10, swapping RGB to BGR at test time cost 13 points and dropping normalisation cost 55, while using the wrong normalisation statistics cost under 1: the small ones are the ones that slip through, so I compare tensors directly rather than wait for accuracy to drop.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How would you find and handle label noise in a large dataset?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Train a model, ideally with cross-validation so every example is scored by a model that did not train on it, and rank examples by their loss or by the gap between the given label’s probability and the top prediction; review the top of the list, which is rich in errors, and fix or remove those labels; repeat. Confident learning formalises the thresholds per class. During training, label smoothing, early stopping and robust losses reduce the damage of the noise that remains. Also check that the test set is clean, because label noise there caps measured accuracy. In my experiment, ranking a 20%-noisy training set by loss after one training run, the top 500 were 100% mislabelled and the top 10% contained 55% of all errors.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Most pipeline bugs do not crash; they cost or inflate accuracy silently.</li>
+      <li>Measured on CIFAR-10: no normalisation −55 points, lower resolution −17, BGR −13; wrong normalisation statistics −0.7, augmentation left on −0.8.</li>
+      <li>Leaked test images scored 94.1% vs 89.7% clean; removing 90% of the cats cost 3.9 points overall but cat recall fell to 26%.</li>
+      <li>Sorting training images by loss: the top 500 were 100% mislabelled.</li>
+      <li>Debug in order: data, inputs as the model sees them, model mode, evaluation.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">You decode images with OpenCV and feed them to a model trained on RGB. What happens?</p>
+      <div class="opts">
+        <button class="opt">Nothing, the model is invariant to colour order</button>
+        <button class="opt">The red and blue channels are swapped, which lowers accuracy without any error message</button>
+        <button class="opt">The code crashes</button>
+        <button class="opt">The images are flipped horizontally</button>
+      </div>
+      <div class="explain">OpenCV returns BGR; nothing checks it, so the cost only shows in accuracy.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why does leaving a BatchNorm model in train mode at inference matter more with small batches?</p>
+      <div class="opts">
+        <button class="opt">It does not matter</button>
+        <button class="opt">Train mode disables the classifier</button>
+        <button class="opt">Each batch is normalised with its own statistics, which are noisy for small batches and differ from the running averages learned in training</button>
+        <button class="opt">Train mode uses fp32</button>
+      </div>
+      <div class="explain">At batch 1 the statistics are a single image’s; predictions then depend on what else is in the batch.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does sorting training examples by their loss help you find?</p>
+      <div class="opts">
+        <button class="opt">Mislabelled examples, which are over-represented among the highest-loss ones</button>
+        <button class="opt">The best learning rate</button>
+        <button class="opt">Duplicates</button>
+        <button class="opt">The easiest classes</button>
+      </div>
+      <div class="explain">Networks fit clean labels first; wrong labels stay hard.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Test images leaked into training. What is the effect on reported accuracy?</p>
+      <div class="opts">
+        <button class="opt">It goes down</button>
+        <button class="opt">No effect</button>
+        <button class="opt">It becomes random</button>
+        <button class="opt">It is inflated on the leaked images, so the full test score overstates real performance</button>
+      </div>
+      <div class="explain">Measured here by scoring leaked and clean test images separately.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A model trained with only 10% of the usual cats loses only 4 points of overall accuracy. What should you check?</p>
+      <div class="opts">
+        <button class="opt">The learning rate</button>
+        <button class="opt">Per-class recall: the cat class can collapse while overall accuracy hardly moves</button>
+        <button class="opt">The number of epochs</button>
+        <button class="opt">Nothing, it is fine</button>
+      </div>
+      <div class="explain">Measured here: overall accuracy 84.7%, but cat recall 26%. One class of ten moves overall accuracy by at most a tenth of its own drop.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = CV;
+  const D = {"baseline":88.67,"test_bugs":{"correct":88.67,"BGR at test time":75.99,"ImageNet mean/std instead of CIFAR's":87.98,"no normalisation":33.2,"random crop + flip left on at test time":87.86,"resized 32 -> 24 -> 32 (lower resolution)":72.01,"model left in train mode (batch 1000)":88.55,"model left in train mode (batch 16)":86.84},"train_bugs":{"10% random labels":86.75,"20% random labels":85.65,"40% random labels":80.01,"trained on BGR, tested on RGB":77.17,"trained on BGR, tested on BGR":89.26},"find_noise":{"actually_wrong_pct":17.9,"precision_top500":100.0,"precision_top2000":99.8,"precision_top5000":98.4,"recall_top_10pct":54.9},"leak":{"reported_on_full_test":90.58,"on_leaked_2000":94.1,"on_clean_8000":89.7},"imbalance":{"overall":84.74,"cat_recall":26.2,"dog_recall":88.4,"cats_predicted":287}};
+  const bar = (lab, v, mx, col, unit = '%') => `<div class="db-bar"><span>${lab}</span><span class="track"><i style="width:${Math.min(100, 100 * v / mx)}%;background:${col}"></i></span><span class="n">${v}${unit}</span></div>`;
+  function test() {
+    const T = D.test_bugs, ks = Object.keys(T), b = T.correct;
+    $('#dbT').innerHTML = ks.map(k => bar(k, T[k], 100, k === 'correct' ? '#22c55e' : T[k] < b - 5 ? '#e11d48' : '#f59e0b')).join('');
+    const worst = ks.reduce((a, k) => T[k] < T[a] ? k : a, ks[0]);
+    $('#dbStats').innerHTML = `<div class="stat good"><div class="k">Correct pipeline</div><div class="v">${b}%</div></div><div class="stat"><div class="k">Worst bug</div><div class="v">${worst}: ${T[worst]}%</div></div>`;
+    $('#dbWhy').innerHTML = '<b>Big bugs are loud; small ones hide.</b> No normalisation, BGR and low resolution cost 13–55 points and get noticed. Wrong statistics, augmentation left on and train mode cost 0.1–1.8 points, the size of run-to-run noise, and survive for months.';
+  }
+  function train() {
+    const T = D.train_bugs, L = D.leak, I = D.imbalance, b = D.baseline;
+    $('#dbR').innerHTML = '<div style="margin:4px 0"><b>Label noise and channel order</b></div>' + bar('baseline', b, 100, '#22c55e') + Object.keys(T).map(k => bar(k, T[k], 100, '#f97316')).join('') + '<div style="margin:10px 0 4px"><b>2,000 test images leaked into training</b></div>' + bar('reported on the full test set', L.reported_on_full_test, 100, '#f59e0b') + bar('on the 2,000 leaked images', L.on_leaked_2000, 100, '#e11d48') + bar('on the 8,000 clean images', L.on_clean_8000, 100, '#22c55e') + '<div style="margin:10px 0 4px"><b>Only 10% of the training cats</b></div>' + bar('overall accuracy', I.overall, 100, '#22c55e') + bar('cat recall', I.cat_recall, 100, '#e11d48') + bar('dog recall', I.dog_recall, 100, '#3b82f6');
+    $('#dbStats').innerHTML = `<div class="stat"><div class="k">Leak inflation (leaked − clean)</div><div class="v">${(L.on_leaked_2000 - L.on_clean_8000).toFixed(1)} pts</div></div><div class="stat"><div class="k">Images predicted as cat</div><div class="v">${I.cats_predicted} (1,000 are cats)</div></div>`;
+    $('#dbWhy').innerHTML = '<b>Read each block against the right baseline.</b> Label noise costs a few points in short training. Leakage looks like a gain unless leaked and clean test images are scored separately. Imbalance hardly moves overall accuracy while one class collapses.';
+  }
+  function noise() {
+    const N = D.find_noise;
+    $('#dbN').innerHTML = `<div style="margin:4px 0"><b>20% of labels replaced at random: ${N.actually_wrong_pct}% actually wrong</b></div>` + bar('share wrong in the whole training set', N.actually_wrong_pct, 100, '#94a3b8') + bar('share wrong among the 500 highest-loss', N.precision_top500, 100, '#e11d48') + bar('… among the top 2,000', N.precision_top2000, 100, '#f97316') + bar('… among the top 5,000', N.precision_top5000, 100, '#f59e0b') + bar('share of all wrong labels found in the top 10%', N.recall_top_10pct, 100, '#22c55e');
+    $('#dbStats').innerHTML = `<div class="stat good"><div class="k">Top 500: wrong labels</div><div class="v">${N.precision_top500}%</div></div><div class="stat"><div class="k">vs random sample</div><div class="v">${N.actually_wrong_pct}%</div></div>`;
+    $('#dbWhy').innerHTML = '<b>The network points at its own bad labels.</b> Clean labels are learned first, wrong ones stay hard, so the highest-loss examples are almost all mislabelled. Reviewing the top 10% here found over half of all errors.';
+  }
+  const ITEMS = ['Plot a batch exactly as the model receives it, in training and in serving', 'Colour order: RGB vs BGR (OpenCV, some cameras)', 'Value range and normalisation statistics match the weights', 'Resize method, resolution and crop match training', 'Training-only augmentation is off at inference', 'model.eval() at inference; correct weights loaded', 'Label mapping (class index → name) is identical', 'Splits by the right unit (patient, video, scene); no duplicates across splits', 'Per-class recall and a confusion matrix, not only accuracy', 'Review the highest-loss training examples for label errors', 'Compare with a trivial baseline and with the previous model', 'If it is too good to be true, look for leakage or shortcuts'];
+  function check() {
+    let st = []; try { st = JSON.parse(localStorage.getItem('cv-ch39-check') || '[]'); } catch (e) {}
+    $('#dbC').innerHTML = ITEMS.map((t, i) => `<li><label><input type="checkbox" data-i="${i}"${st.includes(i) ? ' checked' : ''}> <span>${t}</span></label></li>`).join('');
+    $('#dbC').querySelectorAll('input').forEach(c => c.addEventListener('change', () => { const s = [...$('#dbC').querySelectorAll('input')].filter(x => x.checked).map(x => +x.dataset.i); try { localStorage.setItem('cv-ch39-check', JSON.stringify(s)); } catch (e) {} $('#dbStats').innerHTML = `<div class="stat"><div class="k">Checked</div><div class="v">${s.length} / ${ITEMS.length}</div></div>`; }));
+    $('#dbStats').innerHTML = `<div class="stat"><div class="k">Checked</div><div class="v">${st.length} / ${ITEMS.length}</div></div>`;
+    $('#dbWhy').innerHTML = 'Work top to bottom: the first five items need no model at all, and they cover the test-time bugs measured above.';
+  }
+  function draw() { const e = $('#dbE .active').dataset.v; ['test', 'train', 'noise', 'check'].forEach(k => $('#dbV' + k).classList.toggle('on', k === e)); ({ test, train, noise, check })[e](); }
+  $('#dbE').addEventListener('segchange', draw); draw();
+})();
+</script>
 </body>
 </html>
