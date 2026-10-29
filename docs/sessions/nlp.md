@@ -7,3 +7,4 @@
 - Shell done: home page (4×6 map, code strip with a measured truncation demo), glossary (101 terms), mock interview (24 problems), README. Lab `atlas-courses
 lp-lab` with drive/shot/eval/errs/links/inject and ship_nlp.sh.
 - P1 shipped: café composed vs decomposed -> different cased-BERT tokens; uncased BERT strips Hindi vowel signs; XLM-R NFKC; C4 lines 28% non-ASCII, NFKC changes 1.6%; tweet_eval hub copy 0% non-ASCII (pre-folded).
+- P2 shipped: masked pooling 86.94 vs 84.78; one review 70%→51% positive as padding grows; dynamic padding saved nothing on IMDB (0.853^64), bucketing cut padding 46.3%→1.8%, 1.56x faster.
