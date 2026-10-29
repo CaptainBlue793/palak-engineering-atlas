@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Deploying Vision Models · Computer Vision by Palak Deb Patra</title>
+<meta name="description" content="Chapter 38 of Computer Vision. ResNet-50 and MobileNetV3 measured for latency and accuracy across fp32, bf16 and fp16 on a GPU, torch.compile, CPU fp32 against int8 post-training quantisation, ONNX Runtime, unstructured pruning that saves no time, and where the milliseconds of one request actually go.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('cv-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .dp-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .dp-v { display:none; } .dp-v.on { display:block; }
+  .dp-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .dp-tbl { border-collapse:collapse; font-size:13px; width:100%; font-variant-numeric:tabular-nums; } .dp-tbl td, .dp-tbl th { padding:5px 8px; border-bottom:1px solid var(--border); text-align:right; } .dp-tbl td:first-child, .dp-tbl th:first-child { text-align:left; }
+  .dp-bar { display:grid; grid-template-columns:minmax(0, 220px) 1fr 80px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .dp-bar .track { height:13px; border-radius:4px; background:var(--surface); overflow:hidden; } .dp-bar .track i { display:block; height:100%; }
+  .dp-bar .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .dp-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .dp-bar { grid-template-columns:minmax(0, 120px) 1fr 66px; font-size:12px; } }
+</style>
+</head>
+<body data-chapter="38">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 38</span><span class="pill">Expert</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Deploying <span class="grad">Vision Models</span></h1>
+    <p class="lead">A model that scores well in a notebook still has to answer within a latency budget, fit the memory of the device it runs on, and cost little enough per request to be worth running. The tools are well known: lower precision, quantisation, compilation, exporting to an optimised runtime, pruning, batching. What is less well known is how much each one actually buys on real hardware, and how often the model is not where the time goes.</p>
+    <p class="lead">This chapter measures them on two ImageNet classifiers, ResNet-50 and MobileNetV3-Large, with accuracy checked on Imagenette after every change, on the RTX 5070 Ti and on the CPU of the same machine. Some results were expected: bf16 halved ResNet-50’s batch time on the GPU, int8 quantisation made it 3.1 times faster on the CPU at no cost in accuracy, and pruning 50% of its weights saved no time at all. Some were not: at batch 1, bf16 was <i>slower</i> than fp32, int8 cost MobileNetV3 5.4 points of accuracy, and ONNX Runtime ran MobileNetV3 4.6 times faster than PyTorch on the same CPU.</p>
+    <ul class="objectives">
+      <li><span>Set a latency budget and measure latency properly</span></li>
+      <li><span>Use reduced precision and post-training int8 quantisation</span></li>
+      <li><span>Know when pruning saves time and when it does not</span></li>
+      <li><span>Export to ONNX and verify the exported model</span></li>
+      <li><span>Find where end-to-end latency goes, including preprocessing</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>GPU memory, throughput and timing:</b> <a href="p8-gpu-memory-and-throughput.html">P8</a>; efficient architectures in <a href="12-efficient-convolutions.html">Chapter 12</a>.</li>
+        <li><b>Image loading and preprocessing:</b> <a href="p6-loading-image-data.html">P6</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Latency budgets</h2>
+  <p>Start from the requirement, not the model. A camera at 30 frames per second leaves 33 ms per frame for everything; an interactive web request might allow 100–200 ms end to end; a nightly batch job cares about images per second per pound, not latency. Measure the right thing: <b>batch-1 latency</b> for interactive use, <b>throughput</b> at the best batch size for offline work, and always the <b>tail</b> (95th or 99th percentile), because users notice the slow requests. On a GPU, time with CUDA events or synchronise before reading the clock (P8); warm up first, because the first calls pay for kernel selection and memory allocation.</p>
+
+  <h2>Precision: fp32, bf16, fp16, int8</h2>
+  <p>Inference rarely needs 32-bit floats. <b>bf16</b> and <b>fp16</b> halve memory traffic and run on tensor cores; bf16 has fp32’s range and is the safe default on recent GPUs, fp16 more precision but less range. <b>int8 quantisation</b> goes further: weights and activations are stored as 8-bit integers with a scale per tensor or per channel, cutting size four times and using integer arithmetic. <b>Post-training static quantisation</b> needs a small <b>calibration</b> set to record activation ranges; quantisation-aware training simulates rounding during training when PTQ loses too much.</p>
+<pre class="code"><span class="k">from</span> torch.ao.quantization <span class="k">import</span> get_default_qconfig_mapping
+<span class="k">from</span> torch.ao.quantization.quantize_fx <span class="k">import</span> prepare_fx, convert_fx
+qm = <span class="f">prepare_fx</span>(model.<span class="f">eval</span>(), <span class="f">get_default_qconfig_mapping</span>(<span class="s">"x86"</span>), example_inputs)   <span class="c"># insert observers</span>
+<span class="k">for</span> x <span class="k">in</span> calibration_images: <span class="f">qm</span>(x)                                            <span class="c"># 100 images: record activation ranges</span>
+q = <span class="f">convert_fx</span>(qm)                                                              <span class="c"># int8 weights and activations</span></pre>
+  <table class="t cmp">
+    <thead><tr><th>ResNet-50 (25.6 M params)</th><th>batch 1</th><th>batch 64</th><th>Imagenette top-1</th><th>Size</th></tr></thead>
+    <tbody>
+      <tr><td>GPU fp32</td><td>2.49 ms</td><td>34.2 ms</td><td>86.97%</td><td>97.8 MB</td></tr>
+      <tr><td>GPU bf16 autocast</td><td>6.97 ms</td><td>16.3 ms</td><td>86.97%</td><td></td></tr>
+      <tr><td>GPU fp16 weights</td><td>6.91 ms</td><td>16.0 ms</td><td>86.97%</td><td></td></tr>
+      <tr><td><b>GPU bf16 + torch.compile</b> (38 s to compile)</td><td><b>1.68 ms</b></td><td><b>11.4 ms</b></td><td>86.76%</td><td></td></tr>
+      <tr><td>CPU fp32, 8 threads</td><td>15.7 ms</td><td>—</td><td>86.97%</td><td>97.8 MB</td></tr>
+      <tr><td><b>CPU int8 (static PTQ)</b></td><td><b>5.13 ms</b></td><td>—</td><td><b>87.07%</b></td><td><b>24.9 MB</b></td></tr>
+      <tr><td>ONNX Runtime CPU fp32</td><td>6.76 ms</td><td>—</td><td>86.97%</td><td></td></tr>
+    </tbody>
+  </table>
+  <table class="t cmp">
+    <thead><tr><th>MobileNetV3-Large (5.5 M params)</th><th>batch 1</th><th>batch 64</th><th>Imagenette top-1</th><th>Size</th></tr></thead>
+    <tbody>
+      <tr><td>GPU fp32</td><td>2.59 ms</td><td>8.22 ms</td><td>80.45%</td><td>21.1 MB</td></tr>
+      <tr><td>GPU bf16 autocast</td><td>3.21 ms</td><td>4.39 ms</td><td>80.75%</td><td></td></tr>
+      <tr><td>GPU bf16 + torch.compile (60 s to compile)</td><td><b>2.00 ms</b></td><td><b>3.38 ms</b></td><td>80.96%</td><td></td></tr>
+      <tr><td>CPU fp32, 8 threads</td><td>5.64 ms</td><td>—</td><td>80.55%</td><td>21.1 MB</td></tr>
+      <tr><td>CPU int8 (static PTQ)</td><td>4.24 ms</td><td>—</td><td><b>75.15%</b></td><td>5.7 MB</td></tr>
+      <tr><td><b>ONNX Runtime CPU fp32</b></td><td><b>1.22 ms</b></td><td>—</td><td>80.55%</td><td></td></tr>
+    </tbody>
+  </table>
+  <p>At batch 64, where the GPU is busy, bf16 halved ResNet-50’s time (34.2 to 16.3 ms) and compiling took it to 11.4 ms, three times fp32, with no change in accuracy beyond a few images. At batch 1 the picture inverted: bf16 took 6.97 ms against fp32’s 2.49, because a single small image does not keep the GPU busy, and the extra work of casting tensors at every layer, issued from Python, costs more than the faster arithmetic saves. (A separate end-to-end measurement below timed the same bf16 model at 3.5 ms; batch-1 times of a few milliseconds are sensitive to launch overhead and clocks, which is one more reason to measure on the real path.) <code>torch.compile</code> fixes both cases by fusing operations and cutting the Python overhead, at the price of 38–60 seconds of compilation. On the CPU, int8 made ResNet-50 3.1 times faster and four times smaller with no loss, but cost MobileNetV3 5.4 points while saving only a quarter of its time: depthwise convolutions and hard-swish activations quantise poorly per tensor, the classic weakness the interview drill below discusses. Exporting to ONNX Runtime gave both models a large CPU speed-up with outputs matching PyTorch to 4–9 × 10<sup>−6</sup>.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Deployment lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="dp-l">View</div>
+      <div class="seg" id="dpE"><button class="active" data-v="opt">optimisations</button><button data-v="prune">pruning</button><button data-v="e2e">one request, end to end</button></div>
+      <div class="dp-v on" id="dpVopt">
+        <div class="dp-l">Model</div>
+        <div class="seg" id="dpM"><button class="active" data-v="ResNet-50">ResNet-50</button><button data-v="MobileNetV3-L">MobileNetV3-Large</button></div>
+        <div class="dp-box" id="dpO"></div>
+      </div>
+      <div class="dp-v" id="dpVprune"><div class="dp-box" id="dpP"></div></div>
+      <div class="dp-v" id="dpVe2e"><div class="dp-box" id="dpT"></div></div>
+      <div class="stats" id="dpStats"></div>
+      <div class="dp-why" id="dpWhy"></div>
+    </div>
+    <div class="panel-foot">torchvision ResNet-50 (IMAGENET1K_V2) and MobileNetV3-Large (IMAGENET1K_V2). Accuracy: every fourth Imagenette validation image (982 photos), 1,000-way top-1 with each model’s own preprocessing. GPU: RTX 5070 Ti, channels-last, median of 30 runs with CUDA events after 10 warm-up runs. CPU: the same machine’s CPU, 8 threads, mean of 10 runs at batch 1. int8: FX graph-mode static PTQ, x86 backend, 100 calibration images from Imagenette train. ONNX: opset 17, ONNX Runtime CPU provider. Pruning: global L1 magnitude pruning of all convolution weights, no fine-tuning. End to end: one JPEG through torchvision decode and the model’s preprocessing on the CPU, then the GPU, median of 50.</div>
+  </div>
+
+  <h2>Pruning</h2>
+  <p><b>Pruning</b> removes weights that matter little, typically the smallest in magnitude. <b>Unstructured</b> pruning zeroes individual weights anywhere; <b>structured</b> pruning removes whole channels or filters, which actually shrinks the matrices. The distinction decides whether anything gets faster.</p>
+  <table class="t cmp">
+    <thead><tr><th>ResNet-50, share of conv weights set to zero</th><th>0%</th><th>30%</th><th>50%</th><th>70%</th><th>90%</th></tr></thead>
+    <tbody>
+      <tr><td>Imagenette top-1 (no fine-tuning)</td><td>86.97%</td><td>87.17%</td><td>83.71%</td><td>66.80%</td><td>0.00%</td></tr>
+      <tr><td>GPU time, batch 64, bf16</td><td>16.36 ms</td><td>16.33 ms</td><td>16.35 ms</td><td>16.33 ms</td><td>16.36 ms</td></tr>
+    </tbody>
+  </table>
+  <p>A third of the weights could be zeroed with no loss at all, a measure of how over-parameterised ResNet-50 is; at half, accuracy fell 3 points, at 70% by 20, and at 90% the network was destroyed. Fine-tuning after pruning recovers much of the loss at moderate levels. And the time did not change by a hundredth of a millisecond at any level: the zeros are scattered through dense weight tensors, and dense GPU kernels multiply them anyway. Unstructured sparsity saves time only with sparse kernels and hardware support (such as NVIDIA’s 2:4 structured sparsity); structured pruning, which removes whole channels, makes the network genuinely smaller and faster.</p>
+
+  <h2>ONNX and inference runtimes</h2>
+  <p>Exporting to <b>ONNX</b> freezes the model into a framework-neutral graph that optimised runtimes can run: ONNX Runtime on servers and phones, TensorRT on NVIDIA GPUs (with layer fusion and int8 calibration of its own), OpenVINO on Intel, Core ML on Apple, TFLite and ExecuTorch on mobile. Always <b>verify the export</b>: run the same input through both and compare outputs, because unsupported operators, dynamic shapes and preprocessing differences are common sources of silent errors. Here the exported models matched PyTorch’s outputs to within 4 × 10<sup>−6</sup> (ResNet-50) and 9 × 10<sup>−6</sup> (MobileNetV3), with identical Imagenette accuracy, and ran 2.3 and 4.6 times faster on the CPU at batch 1, from graph optimisation and fused kernels alone.</p>
+
+  <h2>Where the time goes</h2>
+  <table class="t cmp">
+    <thead><tr><th>One request, ResNet-50 bf16 on the GPU</th><th>Time</th><th>Share</th></tr></thead>
+    <tbody>
+      <tr><td>Read the file</td><td>0.14 ms</td><td>3%</td></tr>
+      <tr><td>Decode the JPEG (CPU)</td><td>0.34 ms</td><td>7%</td></tr>
+      <tr><td>Resize, crop, normalise (CPU)</td><td>0.41 ms</td><td>9%</td></tr>
+      <tr><td>Copy to the GPU</td><td>0.11 ms</td><td>2%</td></tr>
+      <tr><td><b>Model</b></td><td><b>3.48 ms</b></td><td><b>76%</b></td></tr>
+      <tr><td>Softmax, top-5, copy back</td><td>0.11 ms</td><td>2%</td></tr>
+      <tr><td>Total</td><td>4.59 ms</td><td></td></tr>
+    </tbody>
+  </table>
+  <p>On this machine the model was three quarters of the time and the CPU-side preparation a fifth. That share is not fixed: these Imagenette JPEGs are only 320 pixels on the short side. A 12-megapixel phone photo takes tens of milliseconds to decode and resize on a CPU, and on an embedded board with a weak CPU and a fast accelerator the preprocessing routinely becomes the larger part. Moving decode and resize to the GPU (nvJPEG, DALI, torchvision’s GPU decoder) or decoding at reduced resolution are then the biggest wins available.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: a model on a factory camera</div><p>An inspection camera on a production line takes a photo every 40 ms and must pass or reject each part before the next arrives, on an embedded board with no data-centre GPU. A typical path is a small architecture (Chapter 12), trained normally, quantised to int8 with a few hundred real line images for calibration, exported to the board’s runtime, and benchmarked end to end on the board itself, including image capture and preprocessing, which on small CPUs can take longer than the network. The acceptance test is the defect recall measured after quantisation, on held-out line images, not the original model’s accuracy.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Timing GPU code without synchronising</b> or without warm-up (P8).</li>
+      <li><b>Expecting unstructured pruning to speed things up:</b> zeroing 30–90% of ResNet-50’s weights changed its GPU time by less than 0.03 ms.</li>
+      <li><b>Not re-checking accuracy after every optimisation</b>, especially quantisation and export.</li>
+      <li><b>Optimising the model when preprocessing dominates:</b> measure first; here the model was 76% of a request, but with large photos or a weak CPU, decoding and resizing can dominate.</li>
+      <li><b>Calibrating int8 on unrepresentative images</b> (wrong lighting, wrong camera): activation ranges will be wrong in production.</li>
+      <li><b>Different preprocessing in training and serving</b> (resize method, colour order): the most common silent accuracy loss (Chapter 39).</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How would you make an image classifier fast enough for a 30 fps camera?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First measure end to end on the target hardware at batch 1, including capture, decoding and preprocessing, with warm-up and proper synchronisation, and look at the tail. If the model dominates: run in bf16 or fp16 on a GPU, or int8 with post-training quantisation calibrated on real frames on a CPU or edge accelerator; compile or export to an optimised runtime and verify outputs match; and if that is not enough, switch to a smaller architecture rather than pruning unstructured weights, which rarely speeds up dense hardware. If preprocessing dominates, move resize and normalisation to the GPU or into the runtime, decode at lower resolution, and avoid copies. Re-check accuracy after every step. On an RTX 5070 Ti, compiling ResNet-50 in bf16 took batch-64 time from 34 to 11 ms, but plain bf16 autocast was slower than fp32 at batch 1; on the CPU, int8 was 3.1× faster with no accuracy loss for ResNet-50, and ONNX Runtime 4.6× faster for MobileNetV3.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> When does int8 quantisation hurt accuracy, and what do you do about it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It hurts when activation or weight distributions have outliers, so a single scale wastes most of the 256 levels on rare values; depthwise convolutions and small mobile models with per-tensor quantisation are classic victims, as are layers like the first convolution and the classifier. Fixes, in order: per-channel weight quantisation, better calibration data and methods (percentile or entropy rather than min/max), leaving sensitive layers in higher precision, and quantisation-aware training, which fine-tunes with simulated rounding. Always measure on representative data, per class if the task is imbalanced. I saw exactly this: post-training int8 kept ResNet-50’s Imagenette accuracy (87.0 to 87.1%) but cost MobileNetV3-Large 5.4 points (80.6 to 75.2%), which is where I would switch to per-channel weights, better calibration, or quantisation-aware training.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Start from a latency budget; measure batch-1 latency, throughput and tails, synchronised and warmed up.</li>
+      <li>On the GPU: bf16 halved ResNet-50’s batch-64 time and torch.compile tripled throughput, but bf16 without compile was slower at batch 1.</li>
+      <li>On the CPU: int8 PTQ made ResNet-50 3.1× faster and 4× smaller at no cost, but cost MobileNetV3 5.4 points; ONNX Runtime gave 2.3–4.6×.</li>
+      <li>Unstructured pruning: up to 30% free in accuracy, zero speed-up at any level.</li>
+      <li>Verify every export and re-measure accuracy after every optimisation.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does post-training static int8 quantisation need besides the trained model?</p>
+      <div class="opts">
+        <button class="opt">The full training set and a new training run</button>
+        <button class="opt">Nothing else</button>
+        <button class="opt">A small calibration set to record activation ranges</button>
+        <button class="opt">A larger model</button>
+      </div>
+      <div class="explain">Weights can be quantised directly; activations need observed ranges to choose their scales.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why does unstructured pruning usually not speed up inference on GPUs and CPUs?</p>
+      <div class="opts">
+        <button class="opt">The zeros are scattered, so dense kernels still do all the multiplications</button>
+        <button class="opt">It increases the number of parameters</button>
+        <button class="opt">It always lowers accuracy too much</button>
+        <button class="opt">Pruned models cannot be exported</button>
+      </div>
+      <div class="explain">Speed needs structured sparsity (whole channels) or hardware and kernels that exploit sparse patterns.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">For an interactive service, which latency number matters most?</p>
+      <div class="opts">
+        <button class="opt">The mean at the best batch size</button>
+        <button class="opt">The fastest single run</button>
+        <button class="opt">The compile time</button>
+        <button class="opt">Batch-1 latency, including its tail (95th–99th percentile)</button>
+      </div>
+      <div class="explain">Users experience individual requests, and remember the slow ones.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What should you always do after exporting a model to ONNX?</p>
+      <div class="opts">
+        <button class="opt">Retrain it</button>
+        <button class="opt">Run the same inputs through both versions and compare outputs and accuracy</button>
+        <button class="opt">Quantise it</button>
+        <button class="opt">Delete the PyTorch version</button>
+      </div>
+      <div class="explain">Unsupported operators and shape handling can change results silently.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Which is the safer reduced-precision default on recent GPUs?</p>
+      <div class="opts">
+        <button class="opt">int4</button>
+        <button class="opt">fp16, because it has more precision</button>
+        <button class="opt">bf16, because it keeps fp32’s exponent range</button>
+        <button class="opt">fp64</button>
+      </div>
+      <div class="explain">bf16 rarely overflows; fp16 can, without loss scaling or care.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = CV;
+  const D = {"n":982,"models":{"ResNet-50":{"rows":{"GPU fp32":{"bs1_ms":2.489,"bs64_ms":34.187,"acc":86.97},"GPU bf16 autocast":{"bs1_ms":6.965,"bs64_ms":16.314,"acc":86.97},"GPU fp16 weights":{"bs1_ms":6.907,"bs64_ms":16.008,"acc":86.97},"GPU bf16 + torch.compile":{"bs1_ms":1.679,"bs64_ms":11.38,"acc":86.76,"compile_s":37.7},"CPU fp32 (8 threads)":{"bs1_ms":15.7,"acc":86.97,"size_mb":97.8},"CPU int8 (static PTQ)":{"bs1_ms":5.13,"acc":87.07,"size_mb":24.9},"ONNX Runtime CPU fp32":{"bs1_ms":6.76,"acc":86.97,"max_diff_vs_torch":3.933906555175781e-06}},"params_m":25.6},"MobileNetV3-L":{"rows":{"GPU fp32":{"bs1_ms":2.594,"bs64_ms":8.22,"acc":80.45},"GPU bf16 autocast":{"bs1_ms":3.209,"bs64_ms":4.394,"acc":80.75},"GPU fp16 weights":{"bs1_ms":3.031,"bs64_ms":4.261,"acc":80.55},"GPU bf16 + torch.compile":{"bs1_ms":2.004,"bs64_ms":3.376,"acc":80.96,"compile_s":60.4},"CPU fp32 (8 threads)":{"bs1_ms":5.64,"acc":80.55,"size_mb":21.1},"CPU int8 (static PTQ)":{"bs1_ms":4.24,"acc":75.15,"size_mb":5.7},"ONNX Runtime CPU fp32":{"bs1_ms":1.22,"acc":80.55,"max_diff_vs_torch":9.059906005859375e-06}},"params_m":5.5}},"prune":{"0.0":{"acc":86.97,"bs64_ms":16.355},"0.3":{"acc":87.17,"bs64_ms":16.329},"0.5":{"acc":83.71,"bs64_ms":16.347},"0.7":{"acc":66.8,"bs64_ms":16.334},"0.9":{"acc":0.0,"bs64_ms":16.362}},"e2e_ms":{"read file":0.135,"decode JPEG":0.339,"resize + crop + normalise":0.414,"copy to GPU":0.113,"model (bf16)":3.479,"softmax + top-5 to CPU":0.111}};
+  const bar = (lab, v, mx, col, unit) => `<div class="dp-bar"><span>${lab}</span><span class="track"><i style="width:${Math.min(100, 100 * v / mx)}%;background:${col}"></i></span><span class="n">${v}${unit}</span></div>`;
+  function opt() {
+    const M = D.models[$('#dpM .active').dataset.v], rows = M.rows, ks = Object.keys(rows).filter(k => !rows[k].error);
+    $('#dpO').innerHTML = '<table class="dp-tbl"><thead><tr><th>Setting</th><th>batch 1 (ms)</th><th>batch 64 (ms)</th><th>images / s at 64</th><th>Imagenette top-1</th><th>size</th></tr></thead><tbody>' + ks.map(k => { const r = rows[k]; return `<tr><td>${k}</td><td>${r.bs1_ms}</td><td>${r.bs64_ms ?? '—'}</td><td>${r.bs64_ms ? Math.round(64000 / r.bs64_ms).toLocaleString() : '—'}</td><td>${r.acc}%</td><td>${r.size_mb ? r.size_mb + ' MB' : ''}</td></tr>`; }).join('') + '</tbody></table>' + Object.keys(rows).filter(k => rows[k].error).map(k => `<div class="small muted" style="margin-top:6px">${k}: not run (${rows[k].error.slice(0, 90)}…)</div>`).join('');
+    const f = rows['GPU fp32'], b = rows['GPU bf16 autocast'];
+    $('#dpStats').innerHTML = `<div class="stat"><div class="k">bf16 vs fp32, batch 64</div><div class="v">${(f.bs64_ms / b.bs64_ms).toFixed(2)}× faster</div></div><div class="stat"><div class="k">Parameters</div><div class="v">${M.params_m} M</div></div>` + (rows['CPU int8 (static PTQ)'] && !rows['CPU int8 (static PTQ)'].error ? `<div class="stat"><div class="k">CPU int8 vs fp32</div><div class="v">${(rows['CPU fp32 (8 threads)'].bs1_ms / rows['CPU int8 (static PTQ)'].bs1_ms).toFixed(2)}× faster, ${(rows['CPU int8 (static PTQ)'].acc - rows['CPU fp32 (8 threads)'].acc).toFixed(1)} pts</div></div>` : '');
+    $('#dpWhy').innerHTML = (($('#dpM .active').dataset.v === 'ResNet-50') ? '<b>Batch size changes the answer.</b> At batch 64, bf16 and compilation give large speed-ups. At batch 1 the GPU is idle most of the time and overheads dominate: plain bf16 is slower than fp32 and only compilation helps. On the CPU, int8 is a clear win for ResNet-50.' : '<b>Small models behave differently.</b> MobileNetV3 gains little from the GPU, loses 5.4 points to int8 for a small speed-up, and gains most from ONNX Runtime’s fused CPU kernels.');
+  }
+  function prune() {
+    const P = D.prune, ks = Object.keys(P).sort((a, b) => a - b), ma = Math.max(...ks.map(k => P[k].bs64_ms));
+    $('#dpP').innerHTML = '<div style="margin-bottom:4px"><b>Imagenette top-1 after pruning (no fine-tuning)</b></div>' + ks.map(k => bar(`${Math.round(k * 100)}% of conv weights zeroed`, P[k].acc, 100, '#22c55e', '%')).join('') + '<div style="margin:10px 0 4px"><b>GPU time, batch 64, bf16</b></div>' + ks.map(k => bar(`${Math.round(k * 100)}% zeroed`, P[k].bs64_ms, ma, '#f97316', ' ms')).join('');
+    $('#dpStats').innerHTML = ''; $('#dpWhy').innerHTML = '<b>Accuracy falls, time does not.</b> The first 30% of weights are free to remove; beyond 50% accuracy drops quickly without fine-tuning. The GPU time is identical at every level because dense kernels multiply the zeros anyway.';
+  }
+  function e2e() {
+    const T = D.e2e_ms, ks = Object.keys(T), tot = ks.reduce((a, k) => a + T[k], 0);
+    $('#dpT').innerHTML = '<div style="margin-bottom:4px"><b>One request: ResNet-50, one Imagenette JPEG</b></div>' + ks.map(k => bar(k, T[k], tot, k.startsWith('model') ? '#3b82f6' : '#f97316', ' ms')).join('');
+    $('#dpStats').innerHTML = `<div class="stat"><div class="k">Total</div><div class="v">${tot.toFixed(2)} ms</div></div><div class="stat"><div class="k">Model share</div><div class="v">${(100 * T['model (bf16)'] / tot).toFixed(0)}%</div></div>`;
+    $('#dpWhy').innerHTML = '<b>Measure the whole path.</b> Here the model dominated, but a fifth of the time was spent before it ran. With large photos or a slow CPU that fifth becomes the majority.';
+  }
+  function draw() { const e = $('#dpE .active').dataset.v; ['opt', 'prune', 'e2e'].forEach(k => $('#dpV' + k).classList.toggle('on', k === e)); ({ opt, prune, e2e })[e](); }
+  ['#dpE', '#dpM'].forEach(id => $(id).addEventListener('segchange', draw)); draw();
+})();
+</script>
+</body>
+</html>

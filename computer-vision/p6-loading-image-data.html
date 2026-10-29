@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Loading Image Data Fast · Computer Vision by Palak Deb Patra</title>
+<meta name="description" content="P6 of Computer Vision. Dataset and DataLoader, JPEG decode cost by library and image size, worker processes, pinned memory, and whether the GPU waits for data, all measured on Imagenette.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('cv-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ld-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ld-pipe { display:grid; grid-template-columns:1fr auto 1fr; gap:10px; align-items:center; margin-top:12px; }
+  .ld-stage { border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; }
+  .ld-stage b { display:block; font-size:13px; }
+  .ld-stage .big { font-family:var(--mono); font-size:22px; font-weight:800; margin-top:4px; }
+  .ld-stage small { color:var(--muted); font-size:12px; }
+  .ld-arrow { font-size:22px; color:var(--muted); }
+  .ld-util { margin-top:12px; }
+  .ld-util .track { height:22px; border-radius:6px; background:var(--surface-2); border:1px solid var(--border); overflow:hidden; display:flex; }
+  .ld-util .busy { background:linear-gradient(90deg,var(--accent),var(--accent-2)); height:100%; }
+  .ld-util .idle { background:repeating-linear-gradient(45deg, transparent 0 6px, color-mix(in srgb, var(--red) 25%, transparent) 6px 12px); height:100%; }
+  .ld-util .lab { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-top:4px; }
+  .ld-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  .ld-wk { display:flex; gap:4px; flex-wrap:wrap; margin-top:8px; }
+  .ld-wk i { width:16px; height:16px; border-radius:4px; background:var(--accent); opacity:.85; display:inline-block; }
+  .ld-wk i.off { background:var(--surface-2); border:1px solid var(--border); opacity:1; }
+  @media (max-width:640px) { .ld-pipe { grid-template-columns:1fr; } .ld-arrow { transform:rotate(90deg); justify-self:center; } }
+</style>
+</head>
+<body data-chapter="0.6">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Prerequisite 6</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 35 min</span></div>
+    <h1>Loading Image Data <span class="grad">Fast</span></h1>
+    <p class="lead">A GPU that trains on 2,800 images a second needs 2,800 JPEGs a second read from disk, decoded, cropped, flipped and normalised on the CPU, and copied across. If the CPU side falls behind, the GPU sits idle and the expensive part of the machine does nothing. Image training is often limited by the input pipeline rather than by the model.</p>
+    <p class="lead">This chapter measures that pipeline on Imagenette’s 9,469 training photos: what one decode costs in four libraries and at four sizes, how throughput scales with DataLoader worker processes, and how many workers ResNet-18 and ResNet-50 need before the GPU stops waiting.</p>
+    <ul class="objectives">
+      <li><span>Write a <code>Dataset</code> and a <code>DataLoader</code> and know what each worker does</span></li>
+      <li><span>Estimate decode and augmentation cost per image, and how it grows with image size</span></li>
+      <li><span>Choose a number of workers from measurements, not folklore</span></li>
+      <li><span>Use pinned memory, uint8 transfers and GPU decoding where they help</span></li>
+      <li><span>Tell whether a training run is data-bound or compute-bound</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The training loop:</b> <a href="p2-pytorch-training-loop.html">P2: PyTorch &amp; the Training Loop</a>.</li>
+        <li><b>Image formats:</b> <a href="p3-colour-gamma-and-formats.html">P3: Colour Spaces, Gamma &amp; Image Formats</a> (what a JPEG decode does).</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Dataset and DataLoader</h2>
+  <p>A PyTorch <code>Dataset</code> answers two questions: how many items there are (<code>__len__</code>) and what item <i>i</i> is (<code>__getitem__</code>): here, read a JPEG, decode it and apply the training transforms. A <code>DataLoader</code> wraps it: it shuffles indices, calls <code>__getitem__</code> for a batch of them, and stacks the results into one tensor. With <code>num_workers &gt; 0</code> it starts that many separate processes, each building whole batches in parallel while the main process trains on the previous one.</p>
+<pre class="code"><span class="k">from</span> torch.utils.data <span class="k">import</span> Dataset, DataLoader
+<span class="k">import</span> torchvision.transforms.v2 <span class="k">as</span> T
+
+TRAIN_TF = T.<span class="f">Compose</span>([T.<span class="f">RandomResizedCrop</span>(<span class="m">224</span>, antialias=<span class="k">True</span>), T.<span class="f">RandomHorizontalFlip</span>(),
+                      T.<span class="f">ToDtype</span>(torch.float32, scale=<span class="k">True</span>), T.<span class="f">Normalize</span>(MEAN, STD)])
+
+<span class="k">class</span> <span class="t">Imagenette</span>(Dataset):
+    <span class="k">def</span> <span class="f">__init__</span>(self, files, tf): self.files, self.tf = files, tf     <span class="c"># list of (path, label)</span>
+    <span class="k">def</span> <span class="f">__len__</span>(self): <span class="k">return</span> <span class="f">len</span>(self.files)
+    <span class="k">def</span> <span class="f">__getitem__</span>(self, i):
+        path, y = self.files[i]
+        img = T.functional.<span class="f">pil_to_tensor</span>(Image.<span class="f">open</span>(path).<span class="f">convert</span>(<span class="s">"RGB"</span>))  <span class="c"># (3, H, W) uint8</span>
+        <span class="k">return</span> self.<span class="f">tf</span>(img), y                                    <span class="c"># (3, 224, 224) float32, int</span>
+
+<span class="k">if</span> __name__ == <span class="s">"__main__"</span>:                                         <span class="c"># required on Windows and macOS: workers re-import this file</span>
+    dl = <span class="f">DataLoader</span>(<span class="f">Imagenette</span>(files, TRAIN_TF), batch_size=<span class="m">128</span>, shuffle=<span class="k">True</span>,
+                    num_workers=<span class="m">8</span>, pin_memory=<span class="k">True</span>, persistent_workers=<span class="k">True</span>, drop_last=<span class="k">True</span>)
+    <span class="k">for</span> x, y <span class="k">in</span> dl:                                                  <span class="c"># x: (128, 3, 224, 224) float32 in pinned memory</span>
+        x, y = x.<span class="f">to</span>(<span class="s">"cuda"</span>, non_blocking=<span class="k">True</span>), y.<span class="f">to</span>(<span class="s">"cuda"</span>, non_blocking=<span class="k">True</span>)</pre>
+  <p>The <code>if __name__ == "__main__"</code> guard is not optional on Windows and macOS. Workers there start by <i>spawning</i> a fresh Python process that imports your script; without the guard, each worker would start its own DataLoader, and so on. <code>persistent_workers=True</code> keeps the workers alive between epochs instead of paying their start-up every epoch.</p>
+  <figure class="seq" data-actors="Main process|Worker 1|Worker 2|GPU">
+    <ol>
+      <li data-m="0>1">indices for batch 1</li>
+      <li data-m="0>2">indices for batch 2</li>
+      <li data-m="1>1" data-k="async">decode + crop + flip 128 images</li>
+      <li data-m="1>0" data-k="reply">batch 1 (pinned memory)</li>
+      <li data-m="0>3">copy, train step 1</li>
+      <li data-m="2>0" data-k="reply">batch 2, ready while step 1 runs</li>
+      <li data-m="0>1">indices for batch 3</li>
+      <li data-m="0>3">train step 2, no waiting</li>
+    </ol>
+    <figcaption><b>Workers prefetch.</b> Each worker builds whole batches ahead of time (two each, by default), so the GPU never waits as long as the workers together produce batches at least as fast as the GPU consumes them.</figcaption>
+  </figure>
+
+  <h2>What one image costs</h2>
+  <p>Imagenette’s training photos average 416 × 356 pixels and 27.3 KB. Timed on 400 of them, one at a time on one CPU core:</p>
+  <table class="t cmp">
+    <thead><tr><th>Step</th><th>Time per image</th><th>Images per second, one core</th></tr></thead>
+    <tbody>
+      <tr><td>PIL <code>open</code> + <code>convert("RGB")</code></td><td>0.501 ms</td><td>~2,000</td></tr>
+      <tr><td><code>cv2.imread</code></td><td>0.357 ms</td><td>~2,800</td></tr>
+      <tr><td>torchvision <code>decode_jpeg</code> (CPU)</td><td>0.353 ms</td><td>~2,830</td></tr>
+      <tr><td>PIL with <code>draft</code> at ½ scale</td><td>0.347 ms</td><td>~2,880</td></tr>
+      <tr><td>PIL decode + the training transforms above</td><td>1.048 ms</td><td>~950</td></tr>
+      <tr><td>torchvision <code>decode_jpeg</code> on the GPU, batch of 128</td><td>0.083 ms</td><td>~12,000</td></tr>
+    </tbody>
+  </table>
+  <p>Decoding is only half the cost; the random resized crop, flip, float conversion and normalisation doubled it. And decode cost grows with the number of pixels. The same photos re-encoded at different sizes (quality 90):</p>
+  <table class="t cmp">
+    <thead><tr><th>Shorter side</th><th>File size</th><th>Decode (PIL)</th><th>vs 320 px</th></tr></thead>
+    <tbody>
+      <tr><td>160 px</td><td>12.5 KB</td><td>0.145 ms</td><td>2.9× faster</td></tr>
+      <tr><td>320 px</td><td>36.0 KB</td><td>0.423 ms</td><td>—</td></tr>
+      <tr><td>640 px</td><td>94.8 KB</td><td>1.783 ms</td><td>4.2× slower</td></tr>
+      <tr><td>1280 px</td><td>263.1 KB</td><td>6.257 ms</td><td>14.8× slower</td></tr>
+    </tbody>
+  </table>
+  <p>A model that trains at 224 × 224 gains nothing from 1280-pixel originals except a 15× slower decode. Storing a training copy of the dataset pre-resized (a shorter side of around 256 to 320 is common for 224 training) is the single cheapest speed-up there is. PIL’s <code>draft</code> mode does something similar on the fly: JPEG can decode at ½, ¼ or ⅛ scale by skipping high frequencies, which is why it beat the full decode.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Input pipeline planner</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ld-l">Model being trained (224 × 224, batch 128, bf16, channels-last)</div>
+      <div class="seg" id="ldM"><button class="active" data-v="resnet18">ResNet-18</button><button data-v="resnet50">ResNet-50</button></div>
+      <div class="ld-l">DataLoader workers</div>
+      <div class="seg" id="ldW"><button data-v="0">0</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="4">4</button><button class="active" data-v="8">8</button><button data-v="12">12</button></div>
+      <div class="ld-l">What the workers return</div>
+      <div class="seg" id="ldO"><button class="active" data-v="float">float32, normalised</button><button data-v="uint8">uint8, normalise on GPU</button></div>
+      <div class="ld-wk" id="ldWk"></div>
+      <div class="ld-pipe">
+        <div class="ld-stage"><b>Loader produces</b><div class="big" id="ldL"></div><small id="ldLs"></small></div>
+        <div class="ld-arrow">→</div>
+        <div class="ld-stage"><b>GPU can train on</b><div class="big" id="ldG"></div><small>measured on synthetic data already on the GPU</small></div>
+      </div>
+      <div class="ld-util"><div class="track" id="ldU"></div><div class="lab"><span>GPU busy</span><span id="ldUt"></span></div></div>
+      <div class="stats" id="ldStats"></div>
+      <div class="ld-why" id="ldWhy"></div>
+    </div>
+    <div class="panel-foot">Loader rates are images per second over 40 batches of 128 from Imagenette-320 train (9,469 JPEGs, on an NVMe SSD and warm in the OS file cache), with the transforms in the listing, after the first batch; 16 logical CPU cores, Windows 11, PyTorch 2.11. GPU rates are ResNet training steps on an RTX 5070 Ti. With 8 workers feeding the real model, ResNet-18 trained at 2,813 images/s, waiting for data 3.9% of the time, and ResNet-50 at 1,024 (the difference from 969 is run-to-run noise). The planner assumes throughput is the slower of the two stages.</div>
+  </div>
+
+  <h2>How many workers?</h2>
+  <p>With <code>num_workers=0</code> everything happens in the training process: 260 images a second, well below the 950 the per-image timing predicts, because Python overhead, collation and the training step all share one core. Each extra worker adds a core’s worth of decoding: 435 with one, 1,074 with two, 2,387 with four, 3,939 with eight and 5,077 with twelve on this 16-thread CPU. The question is not “how many is best” but “how many does this model need”. ResNet-50 consumes 969 images a second, so two workers nearly suffice; ResNet-18 consumes 2,857, so it needs eight. Beyond the GPU’s rate, more workers only use more memory and CPU.</p>
+  <table class="t cmp">
+    <thead><tr><th>Technique</th><th>Measured here</th><th>When it helps</th></tr></thead>
+    <tbody>
+      <tr><td>More workers</td><td>260 → 5,077 images/s from 0 to 12</td><td>always, until the loader outruns the GPU</td></tr>
+      <tr><td>Return uint8, normalise on the GPU</td><td>3,939 → 6,357 images/s at 8 workers</td><td>CPU-bound loaders; 4× fewer bytes per batch to copy</td></tr>
+      <tr><td><code>decode_jpeg</code> instead of PIL</td><td>3,939 → 5,542 at 8 workers</td><td>decode-heavy pipelines</td></tr>
+      <tr><td>Pinned memory</td><td>2,975 → 3,027 copied to GPU</td><td>large batches and fast GPUs; overlaps the copy</td></tr>
+      <tr><td>Pre-resized dataset</td><td>decode 6.26 ms → 0.42 ms (1280 → 320 px)</td><td>high-resolution originals</td></tr>
+      <tr><td>GPU decode</td><td>0.083 ms per image in a batch of 128</td><td>when CPU cores are the bottleneck</td></tr>
+    </tbody>
+  </table>
+  <p>Pinned memory made little difference in this measurement because the loader, not the copy, was the bottleneck: a 128 × 3 × 224 × 224 float batch is 77 MB, which takes a few milliseconds at PCIe speeds against 30 ms to build it. Returning uint8 is the bigger win on both ends: workers skip the float conversion and normalisation, and the batch shrinks to 19 MB.</p>
+
+  <h2>Is my run data-bound?</h2>
+  <p>A quick test: time the training step on a batch that is already on the GPU (synthetic data, or one real batch reused), then time the real loop. If the real loop is much slower, the loader is the bottleneck. Here, at 8 workers, ResNet-18 ran at 2,813 images a second against 2,857 synthetic, and spent 3.9% of its time waiting in <code>next(it)</code>: compute-bound, as it should be. Watching <code>nvidia-smi</code> is a rougher version of the same test: GPU utilisation that drops in a sawtooth between steps means the GPU is starving. Fixing it is the planner’s list: more workers, cheaper transforms, uint8 batches, smaller stored images, or moving the augmentation onto the GPU (the CIFAR chapters of this course keep the whole dataset on the GPU, which removes the loader entirely).</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: fast ImageNet training was a data-loading problem</div><p>Public speed records for training ResNet-50 on ImageNet, from hours down to minutes on large clusters, spent much of their engineering on input, not on the model: storing the dataset pre-resized to small sizes, decoding at reduced resolution, moving decode and augmentation onto the GPU with libraries such as NVIDIA DALI, and using progressive resizing, training first on small images (cheap to decode and to compute) and only at full size at the end. At 1.28 million images per epoch, the difference between 1,000 and 5,000 images a second is the difference between 21 minutes and 4 minutes per epoch on one machine.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Leaving <code>num_workers=0</code>,</b> so decoding and training share one core (260 images/s here).</li>
+      <li><b>Forgetting the <code>if __name__ == "__main__"</code> guard</b> on Windows or macOS.</li>
+      <li><b>Training at 224 px from 1,280 px originals,</b> paying 15× the decode cost for pixels the model never sees.</li>
+      <li><b>Normalising to float32 in the workers,</b> then copying four times the bytes.</li>
+      <li><b>Using the same random seed in every worker</b> for custom NumPy augmentations, so workers produce identical crops (set seeds per worker with <code>worker_init_fn</code>).</li>
+      <li><b>Tuning the model while the GPU is idle half the time</b> because the loader is the bottleneck.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Your GPU shows 40% utilisation while training an image classifier. How do you find and fix the cause?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First prove where the time goes: time the training step on data already on the GPU, and time how long the loop waits in <code>next()</code> on the loader. If synthetic steps are fast and the loop waits, it is the input pipeline. Then fix the most expensive stage: add workers (here throughput scaled from 260 images/s with none to over 5,000 with twelve); store the dataset pre-resized close to the training resolution, because decode cost grows with pixels (a 1,280 px JPEG took 15 times longer than a 320 px one); return uint8 from the workers and normalise on the GPU (3,939 to 6,357 images/s); decode with a faster library or on the GPU; and pin memory with non-blocking copies. Stop when the loader is faster than the GPU’s measured step rate. If the loader is not the problem, look at small batches, synchronisation in the loop such as <code>loss.item()</code> every step, or CPU-side work between steps.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why does the same data pipeline starve ResNet-18 but not ResNet-50?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Because the loader’s rate depends on the data and the CPU, while the GPU’s rate depends on the model. ResNet-18 needs about 1.8 billion multiply-adds per 224 × 224 image and ResNet-50 about 4.1 billion, plus more memory traffic, so on this GPU ResNet-18 trained at 2,857 images a second and ResNet-50 at 969. Two workers produced about 1,074 images a second: enough for ResNet-50, about 38% of what ResNet-18 can use. Smaller and faster models, lower resolutions and faster GPUs all move the bottleneck onto the input pipeline, which is why efficient architectures (Chapter 12) are often benchmarked with data already in memory, and why their real-world training speed depends on the loader.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A <code>Dataset</code> returns one item; a <code>DataLoader</code> batches, shuffles and runs worker processes that prefetch.</li>
+      <li>Decode plus augmentation cost about 1 ms per Imagenette photo on one core; decode alone grows with pixel count (6.3 ms at 1,280 px).</li>
+      <li>Workers scale throughput almost linearly: 260 images/s with none, 3,939 with eight, 5,077 with twelve.</li>
+      <li>Return uint8 and normalise on the GPU: 3,939 → 6,357 images/s, and 4× smaller batches to copy.</li>
+      <li>Stop adding workers once the loader beats the GPU: ResNet-50 needs about 970 images/s here, ResNet-18 about 2,860.</li>
+      <li>Check for starvation by comparing the real loop with synthetic data on the GPU, and by timing waits on the loader.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why must DataLoader code with workers sit under <code>if __name__ == "__main__":</code> on Windows?</p>
+      <div class="opts">
+        <button class="opt">It makes the loader faster</button>
+        <button class="opt">It enables pinned memory</button>
+        <button class="opt">Workers are spawned as new processes that import the script, which would otherwise start loaders recursively</button>
+        <button class="opt">PyTorch requires it for CUDA</button>
+      </div>
+      <div class="explain">On Windows and macOS workers start by spawning, which re-imports the main module. The guard stops that import from re-running the training code.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Decoding the same photo at 1,280 px instead of 320 px took how much longer?</p>
+      <div class="opts">
+        <button class="opt">About the same</button>
+        <button class="opt">About 15 times</button>
+        <button class="opt">About 2 times</button>
+        <button class="opt">About 100 times</button>
+      </div>
+      <div class="explain">6.257 ms against 0.423 ms: decode cost grows roughly with the number of pixels (16 times as many here).</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A loader produces 1,074 images/s and the GPU can train ResNet-18 on 2,857 images/s. Roughly how busy is the GPU?</p>
+      <div class="opts">
+        <button class="opt">100%</button>
+        <button class="opt">About 85%</button>
+        <button class="opt">About 60%</button>
+        <button class="opt">About 38%</button>
+      </div>
+      <div class="explain">The pipeline runs at the slower stage: 1,074 / 2,857 ≈ 0.38. The GPU waits the rest of the time.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Which change raised 8-worker throughput from 3,939 to 6,357 images/s?</p>
+      <div class="opts">
+        <button class="opt">Returning uint8 batches and normalising on the GPU</button>
+        <button class="opt">Pinning memory</button>
+        <button class="opt">Using batch size 256</button>
+        <button class="opt">Using PIL instead of torchvision</button>
+      </div>
+      <div class="explain">The workers skip the float conversion and normalisation, and each batch is a quarter of the bytes. Pinning made little difference here.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How do you test whether training is limited by data loading?</p>
+      <div class="opts">
+        <button class="opt">Double the learning rate</button>
+        <button class="opt">Check the loss curve</button>
+        <button class="opt">Compare the step rate on data already on the GPU with the real loop, and time waits on the loader</button>
+        <button class="opt">Count the model’s parameters</button>
+      </div>
+      <div class="explain">ResNet-18 ran 2,857 images/s on synthetic data and 2,813 with the real loader, waiting 3.9% of the time: compute-bound.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = CV;
+  const D = {"workers":{"0":259.8,"1":435.1,"2":1073.7,"4":2387.3,"8":3939.0,"12":5076.9},"uint8_8w":6357.4,"gpu":{"resnet18":2856.6,"resnet18_real":2812.8,"resnet18_wait_frac":0.039,"resnet50":969.4,"resnet50_real":1023.5,"resnet50_wait_frac":0.06}};
+  const fmt = (x) => Math.round(x).toLocaleString('en-GB');
+  function draw() {
+    const m = $('#ldM .active').dataset.v, w = $('#ldW .active').dataset.v, o = $('#ldO .active').dataset.v;
+    let L = D.workers[w];
+    if (o === 'uint8') L = L * D.uint8_8w / D.workers['8'];     // the measured uint8 speed-up at 8 workers, applied to the chosen count
+    const G = D.gpu[m], thr = Math.min(L, G), util = thr / G;
+    $('#ldWk').innerHTML = Array.from({ length: 16 }, (_, i) => `<i class="${i < Math.max(1, +w) ? '' : 'off'}" title="${i < +w ? 'worker ' + (i + 1) : i === 0 && +w === 0 ? 'main process' : 'idle core'}"></i>`).join('') + `<span class="small muted" style="margin-left:6px">${+w === 0 ? 'main process only' : w + ' of 16 logical cores decoding'}</span>`;
+    $('#ldL').textContent = fmt(L) + ' img/s'; $('#ldLs').textContent = o === 'uint8' ? (w === '8' ? 'measured, uint8 batches' : 'estimated from the uint8 speed-up measured at 8 workers') : 'measured, float32 batches';
+    $('#ldG').textContent = fmt(G) + ' img/s';
+    $('#ldU').innerHTML = `<div class="busy" style="width:${util * 100}%"></div><div class="idle" style="width:${(1 - util) * 100}%"></div>`;
+    $('#ldUt').textContent = Math.round(util * 100) + '% busy' + (util < 1 ? ', waiting ' + Math.round((1 - util) * 100) + '%' : '');
+    const epoch = (n) => { const s = n / thr; return s > 120 ? (s / 60).toFixed(1) + ' min' : s.toFixed(1) + ' s'; };
+    $('#ldStats').innerHTML = `<div class="stat ${util > 0.95 ? 'good' : util > 0.6 ? 'warn' : 'bad'}"><div class="k">Training speed</div><div class="v">${fmt(thr)} img/s</div></div><div class="stat"><div class="k">Imagenette epoch</div><div class="v">${epoch(9469)}</div></div><div class="stat"><div class="k">ImageNet-1k epoch</div><div class="v">${epoch(1281167)}</div></div>`;
+    const name = m === 'resnet18' ? 'ResNet-18' : 'ResNet-50';
+    $('#ldWhy').innerHTML = util < 0.95
+      ? `<b>Data-bound.</b> The loader delivers ${fmt(L)} images a second and ${name} could use ${fmt(G)}, so the GPU waits ${Math.round((1 - util) * 100)}% of the time. ${+w < 12 ? 'Add workers' : 'Return uint8 batches'}${o === 'float' ? ', or return uint8 and normalise on the GPU' : ''}.`
+      : `<b>Compute-bound.</b> ${fmt(L)} images a second is more than ${name} can train on (${fmt(G)}), so the GPU never waits for data. ${+w > 4 && m === 'resnet50' ? 'Fewer workers would do; the extra ones only use CPU and memory.' : 'Speeding up the loader further would change nothing; speeding up the model would.'}`;
+  }
+  ['#ldM', '#ldW', '#ldO'].forEach(id => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
+</body>
+</html>

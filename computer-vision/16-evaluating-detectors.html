@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Evaluating Detectors: mAP from Scratch · Computer Vision by Palak Deb Patra</title>
+<meta name="description" content="Chapter 16 of Computer Vision. Matching detections to ground truth, precision-recall curves, average precision and COCO's AP@[.5:.95] implemented from scratch and matched to pycocotools exactly, plus what score thresholds, detection limits and per-class results reveal.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('cv-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ma-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ma-v { display:none; } .ma-v.on { display:block; }
+  .ma-svg { width:100%; height:auto; display:block; } .ma-svg .ax { stroke:var(--border); } .ma-svg .tk { fill:var(--muted); font-size:11px; font-family:var(--mono); }
+  .ma-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; }
+  .ma-bar { display:grid; grid-template-columns:120px 1fr 60px; gap:8px; align-items:center; padding:2px 0; font-size:12px; }
+  .ma-bar .track { height:11px; border-radius:4px; background:var(--surface); overflow:hidden; } .ma-bar .track i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); }
+  .ma-bar .n { font-family:var(--mono); text-align:right; }
+  .ma-cols { display:grid; grid-template-columns:1fr 1fr; gap:16px; } @media (max-width:700px) { .ma-cols { grid-template-columns:1fr; } }
+  .ma-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
+</head>
+<body data-chapter="16">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 16</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Evaluating Detectors: mAP from <span class="grad">Scratch</span></h1>
+    <p class="lead">“51.3 mAP” is the number every detection paper leads with, and few people could compute it by hand. It averages precision over 101 recall levels, 10 IoU thresholds and 80 classes, with special rules for crowds, small objects and the 100 most confident detections per image. Each rule changes the number, and each one hides something a product might care about.</p>
+    <p class="lead">This chapter implements COCO’s mean average precision from scratch in about 60 lines, runs it on Faster R-CNN’s detections for 500 COCO images, and matches pycocotools, the reference implementation, to every printed digit at all ten IoU thresholds. Then it takes the number apart: per class, from 100 down to 0; by IoU threshold, from 70.8 at 0.5 to 7.0 at 0.95; and by score threshold, where the same model drops 10 points.</p>
+    <ul class="objectives">
+      <li><span>Match detections to ground truth greedily by score at an IoU threshold</span></li>
+      <li><span>Build a precision–recall curve and compute interpolated average precision</span></li>
+      <li><span>Compute COCO AP@[.5:.95], AP50, AP75 and AP by object size</span></li>
+      <li><span>Handle crowd annotations and the per-image detection limit correctly</span></li>
+      <li><span>Explain what mAP hides, and what to report alongside it</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>IoU and NMS:</b> <a href="13-detection-basics.html">Chapter 13: Detection Basics</a>.</li>
+        <li><b>Precision, recall and thresholds:</b> <a href="p7-losses-and-metrics.html">P7: Losses &amp; Metrics</a>; the detector is <a href="14-two-stage-detectors.html">Chapter 14</a>’s Faster R-CNN v2.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Step 1: match detections to ground truth</h2>
+  <p>For one class in one image, sort the detections by score. Go down the list; each detection is a <b>true positive</b> if its IoU with some not-yet-matched ground-truth box is at least the threshold (it takes the one it overlaps most), otherwise a <b>false positive</b>. Each ground-truth box can be matched once, so a duplicate detection of an already-matched object is a false positive. Ground-truth boxes never matched are <b>false negatives</b>. Two COCO rules complicate this. Boxes marked <code>iscrowd</code> (a crowd of people annotated as one region) are “ignore” regions: a detection matching one is neither right nor wrong, and crowd regions can absorb many detections. And when computing AP for one size range (small: area below 32², medium, large: above 96²), objects outside it are ignored rather than counted as misses.</p>
+
+  <h2>Step 2: precision–recall and average precision</h2>
+  <p>Pool all detections of the class across all images, sort them by score, and walk down the list keeping running counts: after each detection, precision = TP / (TP + FP) and recall = TP / (number of ground-truth objects). This traces the <b>precision–recall curve</b>, from high precision and low recall (only the most confident detections) to low precision and high recall. Precision is then made monotonic: at each recall it is replaced by the best precision achieved at that recall or higher. <b>Average precision</b> is the mean of that interpolated precision at 101 recall levels, 0, 0.01, …, 1.0, and is 0 at recall levels never reached.</p>
+<pre class="code"><span class="k">def</span> <span class="f">ap_one_class</span>(scores, is_tp, is_ignored, n_gt):           <span class="c"># per detection, pooled over images</span>
+    order = np.<span class="f">argsort</span>(-scores, kind=<span class="s">"mergesort"</span>)            <span class="c"># stable sort, as pycocotools</span>
+    tp = np.<span class="f">cumsum</span>(is_tp[order] &amp; ~is_ignored[order])
+    fp = np.<span class="f">cumsum</span>(~is_tp[order] &amp; ~is_ignored[order])
+    recall, precision = tp / n_gt, tp / np.<span class="f">maximum</span>(tp + fp, np.<span class="f">spacing</span>(<span class="m">1</span>))
+    precision = np.maximum.<span class="f">accumulate</span>(precision[::-<span class="m">1</span>])[::-<span class="m">1</span>]    <span class="c"># best precision at this recall or beyond</span>
+    idx = np.<span class="f">searchsorted</span>(recall, np.<span class="f">linspace</span>(<span class="m">0</span>, <span class="m">1</span>, <span class="m">101</span>), side=<span class="s">"left"</span>)
+    <span class="k">return</span> np.<span class="f">mean</span>([precision[i] <span class="k">if</span> i &lt; <span class="f">len</span>(precision) <span class="k">else</span> <span class="m">0</span> <span class="k">for</span> i <span class="k">in</span> idx])
+
+<span class="c"># COCO AP = mean over 10 IoU thresholds (0.50:0.05:0.95) and over classes with any ground truth,</span>
+<span class="c"># with at most 100 detections per image (by score), crowd regions ignored, and per-size variants.</span></pre>
+
+  <h2>Matching pycocotools exactly</h2>
+  <p>On Faster R-CNN v2’s 15,950 detections for the first 500 COCO validation images, the from-scratch implementation and pycocotools agreed at every IoU threshold to the two decimals pycocotools prints:</p>
+  <table class="t cmp">
+    <thead><tr><th>IoU threshold</th><th>0.50</th><th>0.55</th><th>0.60</th><th>0.65</th><th>0.70</th><th>0.75</th><th>0.80</th><th>0.85</th><th>0.90</th><th>0.95</th><th>AP</th></tr></thead>
+    <tbody>
+      <tr><td>pycocotools</td><td>70.77</td><td>69.17</td><td>67.19</td><td>64.85</td><td>61.85</td><td>57.20</td><td>49.38</td><td>40.54</td><td>24.94</td><td>6.96</td><td>51.28</td></tr>
+      <tr><td>from scratch</td><td>70.77</td><td>69.17</td><td>67.19</td><td>64.85</td><td>61.85</td><td>57.20</td><td>49.38</td><td>40.54</td><td>24.94</td><td>6.96</td><td>51.28</td></tr>
+    </tbody>
+  </table>
+  <p>Getting there required every detail: the stable sort, matching each detection to the highest-IoU unmatched box, letting crowd regions be matched repeatedly with IoU computed over the detection’s area, sorting ignored ground truths last so real ones are preferred, the 100-detection cap per image and class, and interpolating at 101 points. Small-object AP (32.99) and large-object AP (63.19) matched too. Implementations that skip any of these give numbers that are “mAP” but not comparable with anyone else’s.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Inside one mAP</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ma-l">View</div>
+      <div class="seg" id="maE"><button class="active" data-v="pr">precision–recall curves</button><button data-v="thr">AP by IoU threshold</button><button data-v="cls">AP by class</button><button data-v="score">score threshold &amp; max detections</button></div>
+      <div class="ma-v on" id="maVp">
+        <div class="seg" id="maC"></div>
+        <div class="ma-l">IoU threshold</div>
+        <div class="seg" id="maT"><button class="active" data-v="0.5">0.50</button><button data-v="0.75">0.75</button></div>
+        <svg class="ma-svg" id="maSvg" viewBox="0 0 640 280" role="img" aria-label="precision against recall"></svg>
+      </div>
+      <div class="ma-v" id="maVt"><div class="ma-box" id="maThr"></div></div>
+      <div class="ma-v" id="maVc"><div class="ma-box ma-cols" id="maCls"></div></div>
+      <div class="ma-v" id="maVs"><div class="ma-box" id="maScore"></div></div>
+      <div class="stats" id="maStats"></div>
+      <div class="ma-why" id="maWhy"></div>
+    </div>
+    <div class="panel-foot">Faster R-CNN ResNet-50 FPN v2 (COCO weights, torchvision’s default score threshold 0.05, 31.9 detections per image) on the first 500 COCO val2017 images; AP from the from-scratch implementation, which matched pycocotools at every threshold. Curves are the interpolated precision, sampled about 60 times along each. Per-class AP is the mean over the ten IoU thresholds, for classes with at least one ground-truth object in these images (classes with very few objects, such as toothbrush, are noisy).</div>
+  </div>
+
+  <h2>What mAP hides</h2>
+  <p>Taking the 51.28 apart shows how much one number averages away:</p>
+  <ul>
+    <li><b>Localisation.</b> AP fell from 70.8 at IoU 0.5 to 57.2 at 0.75 and 7.0 at 0.95. COCO’s average rewards precise boxes heavily; a task that only needs “roughly where” (counting, alerting) should look at AP50.</li>
+    <li><b>Classes.</b> Per-class AP ranged from 100 (toothbrush, a single instance) and 91.3 (stop sign) to 19.2 (book) and 0 (scissors). Common, distinctive objects score high; small, cluttered and rare ones low. The mean hides which is which.</li>
+    <li><b>Size.</b> Small objects scored 33.0 against 63.2 for large ones.</li>
+    <li><b>The operating point.</b> AP integrates over every score threshold, but a product runs at one. Keeping only detections above 0.5 cut AP from 51.3 to 49.0 (fewer detections means less recall to integrate over) while leaving 9.5 boxes per image instead of 31.9; precision and recall at that threshold are what users see.</li>
+    <li><b>The detection cap.</b> Allowing only 1 detection per image and class gave 35.5 AP, 10 gave 50.6, 100 gave 51.3: crowded scenes need the high cap, and a system that keeps only the top few detections is not measured by the standard number.</li>
+  </ul>
+  <figure class="flow">
+    <ol>
+      <li><b>Report COCO AP</b><small>for comparison with the literature</small></li>
+      <li><b>Add AP50 and AP75</b><small>localisation quality</small></li>
+      <li><b>Add AP by size</b><small>small objects fail first</small></li>
+      <li><b>Per-class AP for the classes that matter</b><small>not the mean</small></li>
+      <li><b>Precision and recall at the deployed threshold</b><small>what the product actually does</small></li>
+    </ol>
+    <figcaption><b>Reporting a detector honestly.</b> The single mAP is for papers; the rest is for decisions.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: VOC’s 11-point AP and COCO’s 101-point AP</div><p>The PASCAL VOC benchmark originally computed AP at 11 recall levels (0, 0.1, …, 1) and at a single IoU of 0.5; it later switched to using every recall point. COCO introduced averaging over IoU thresholds 0.5 to 0.95 and 101 recall levels, which rewards tight boxes and gives smoother numbers. The same detector can therefore have three or four different “mAP” values depending on the definition, and papers have been caught comparing a VOC-style number with a COCO-style one. Whenever you see an mAP, find out which IoU thresholds, which interpolation and which dataset split it used.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Writing your own mAP without matching pycocotools</b> on a known case; small rule differences change the number.</li>
+      <li><b>Counting detections that match crowd regions as false positives</b> (or ignoring crowd annotations entirely).</li>
+      <li><b>Applying a high score threshold before computing AP</b>: it truncates the curve (51.3 → 49.0 at 0.5).</li>
+      <li><b>Comparing AP50 with AP@[.5:.95],</b> or VOC 11-point AP with COCO AP.</li>
+      <li><b>Reporting the mean only,</b> when the classes or sizes that matter score far lower.</li>
+      <li><b>Evaluating on a subset</b> and comparing with full-set numbers (500 images gave 51.3 against a published 46.7).</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How is COCO mAP computed?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>For each class and each IoU threshold from 0.50 to 0.95 in steps of 0.05: in every image, keep the top 100 detections, sort by score, and greedily match each to the highest-IoU unmatched ground truth above the threshold (true positive) or mark it a false positive; crowd regions are ignored. Pool across images, sort by score, and compute running precision and recall. Make precision non-increasing by taking, at each recall, the best precision at that recall or beyond, and average it at 101 recall levels: that is AP for the class and threshold. Average over thresholds and over classes. AP50 and AP75 fix one threshold; APs, APm, APl restrict to object sizes. Implemented from scratch on 500 COCO images, this matched pycocotools to two decimals at every threshold.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your detector’s mAP improved by 2 points but users see no difference. How can both be true?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>mAP averages over things users do not experience. The gain might be at strict IoU thresholds (tighter boxes at 0.85–0.95), which matter for COCO’s average but not for an application that only needs approximate locations; or at low score thresholds that the product never uses; or in classes, sizes or crowded images that are rare in production. Here AP ranged from 70.8 at IoU 0.5 to 7.0 at 0.95, and keeping only detections above 0.5 already changed it. I would compare the two models at the deployed operating point (precision and recall at the chosen threshold, IoU 0.5 or whatever the product needs), per class for the classes that matter, on a sample of real production images, and check whether the differences are larger than run-to-run noise.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Match detections greedily by score to unmatched ground truth above an IoU threshold; duplicates are false positives, crowds are ignored.</li>
+      <li>AP = mean interpolated precision at 101 recall levels; COCO AP also averages IoU 0.50:0.05:0.95 and classes.</li>
+      <li>A from-scratch implementation matched pycocotools exactly (51.28) once every rule was copied.</li>
+      <li>The same model: 70.8 at IoU 0.5, 7.0 at 0.95; small 33.0 vs large 63.2; per-class from 100 to 0.</li>
+      <li>Report AP50/AP75, AP by size, per-class AP and precision/recall at the deployed threshold alongside mAP.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A second detection of an object that has already been matched is counted as…</p>
+      <div class="opts">
+        <button class="opt">a true positive</button>
+        <button class="opt">ignored</button>
+        <button class="opt">a false positive</button>
+        <button class="opt">a false negative</button>
+      </div>
+      <div class="explain">Each ground-truth box can be matched once; duplicates lower precision, which is why NMS matters for AP.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does COCO’s AP@[.5:.95] average over?</p>
+      <div class="opts">
+        <button class="opt">Ten IoU thresholds from 0.50 to 0.95, and over classes</button>
+        <button class="opt">Ten score thresholds</button>
+        <button class="opt">Ten random subsets of images</button>
+        <button class="opt">Precision at ten recall levels only</button>
+      </div>
+      <div class="explain">Each threshold gets its own 101-point AP per class; the reported AP is the mean of all of them.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does interpolating precision in the PR curve do?</p>
+      <div class="opts">
+        <button class="opt">Averages precision over images</button>
+        <button class="opt">Removes false positives</button>
+        <button class="opt">Smooths the curve with a moving average</button>
+        <button class="opt">Replaces precision at each recall by the best precision at that recall or higher</button>
+      </div>
+      <div class="explain">It makes the curve non-increasing, so AP does not depend on small wiggles in the ranking.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Keeping only detections scoring above 0.5 changed Faster R-CNN’s AP how?</p>
+      <div class="opts">
+        <button class="opt">Raised it, by removing false positives</button>
+        <button class="opt">Lowered it from 51.3 to 49.0, by cutting off the high-recall end of the curve</button>
+        <button class="opt">No change</button>
+        <button class="opt">Lowered it to about 20</button>
+      </div>
+      <div class="explain">AP integrates over all thresholds; truncating the list removes recall it could have earned.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">How are detections that overlap a crowd (iscrowd) region treated by COCO evaluation?</p>
+      <div class="opts">
+        <button class="opt">As false positives</button>
+        <button class="opt">As true positives</button>
+        <button class="opt">Ignored: neither rewarded nor penalised</button>
+        <button class="opt">Counted twice</button>
+      </div>
+      <div class="explain">A crowd region marks many unannotated people; detections inside it are ignored, and one crowd region can absorb several.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $, $$ } = CV;
+  const D = {"curves":{"person":{"0.5":[[0.001,1.0],[0.051,1.0],[0.099,0.996],[0.149,0.996],[0.198,0.996],[0.248,0.996],[0.295,0.991],[0.342,0.99],[0.39,0.989],[0.437,0.986],[0.479,0.979],[0.523,0.977],[0.56,0.966],[0.598,0.96],[0.634,0.95],[0.668,0.94],[0.698,0.928],[0.721,0.91],[0.746,0.896],[0.767,0.881],[0.786,0.864],[0.8,0.853],[0.809,0.839],[0.824,0.829],[0.831,0.815],[0.836,0.796],[0.849,0.782],[0.855,0.765],[0.861,0.748],[0.869,0.735],[0.876,0.721],[0.877,0.703],[0.879,0.685],[0.881,0.668],[0.889,0.655],[0.894,0.639],[0.896,0.624],[0.9,0.61],[0.903,0.598],[0.906,0.585],[0.914,0.575],[0.916,0.56],[0.917,0.547],[0.918,0.535],[0.92,0.523],[0.92,0.512],[0.921,0.501],[0.922,0.49],[0.923,0.479],[0.926,0.47],[0.927,0.46],[0.927,0.45],[0.928,0.441],[0.93,0.433],[0.932,0.425],[0.933,0.417],[0.933,0.409],[0.933,0.4],[0.933,0.393],[0.933,0.385],[0.934,0.379],[0.934,0.373]],"0.75":[[0.001,1.0],[0.051,1.0],[0.097,0.975],[0.145,0.975],[0.193,0.967],[0.24,0.967],[0.285,0.959],[0.324,0.938],[0.364,0.926],[0.403,0.912],[0.437,0.895],[0.476,0.893],[0.509,0.88],[0.533,0.86],[0.562,0.844],[0.587,0.828],[0.61,0.814],[0.629,0.796],[0.642,0.775],[0.653,0.756],[0.666,0.742],[0.677,0.731],[0.684,0.717],[0.693,0.704],[0.699,0.692],[0.7,0.673],[0.708,0.659],[0.711,0.644],[0.715,0.628],[0.718,0.614],[0.72,0.6],[0.72,0.585],[0.722,0.569],[0.723,0.555],[0.727,0.543],[0.729,0.528],[0.73,0.514],[0.73,0.501],[0.731,0.489],[0.732,0.478],[0.736,0.467],[0.737,0.455],[0.737,0.443],[0.737,0.433],[0.739,0.424],[0.741,0.416],[0.741,0.406],[0.742,0.397],[0.743,0.388],[0.744,0.381],[0.744,0.373],[0.745,0.365],[0.746,0.357],[0.746,0.35],[0.746,0.343],[0.746,0.336],[0.746,0.329],[0.746,0.323],[0.746,0.317],[0.746,0.311],[0.748,0.305],[0.748,0.3]]},"car":{"0.5":[[0.006,1.0],[0.078,1.0],[0.144,1.0],[0.216,1.0],[0.269,0.943],[0.329,0.935],[0.401,0.935],[0.449,0.912],[0.503,0.889],[0.545,0.868],[0.569,0.842],[0.587,0.803],[0.623,0.791],[0.653,0.782],[0.689,0.777],[0.713,0.769],[0.719,0.745],[0.719,0.727],[0.725,0.703],[0.743,0.689],[0.749,0.661],[0.76,0.648],[0.772,0.647],[0.784,0.632],[0.796,0.616],[0.796,0.594],[0.796,0.578],[0.802,0.57],[0.808,0.556],[0.814,0.535],[0.82,0.513],[0.826,0.495],[0.838,0.483],[0.856,0.474],[0.856,0.458],[0.856,0.441],[0.862,0.429],[0.862,0.414],[0.862,0.402],[0.88,0.395],[0.88,0.383],[0.88,0.371],[0.88,0.36],[0.88,0.35],[0.892,0.345],[0.892,0.336],[0.898,0.329],[0.898,0.321],[0.898,0.312],[0.898,0.305],[0.898,0.298],[0.898,0.291],[0.904,0.286],[0.904,0.28],[0.904,0.274],[0.904,0.268],[0.904,0.262],[0.904,0.257],[0.904,0.252],[0.904,0.247],[0.904,0.242]],"0.75":[[0.006,1.0],[0.078,1.0],[0.144,1.0],[0.21,0.972],[0.246,0.872],[0.293,0.846],[0.353,0.842],[0.401,0.83],[0.449,0.802],[0.485,0.779],[0.491,0.735],[0.503,0.698],[0.533,0.684],[0.551,0.662],[0.563,0.639],[0.569,0.621],[0.569,0.597],[0.569,0.583],[0.575,0.565],[0.581,0.545],[0.587,0.524],[0.599,0.513],[0.599,0.508],[0.605,0.495],[0.611,0.479],[0.611,0.462],[0.611,0.449],[0.611,0.438],[0.611,0.427],[0.617,0.411],[0.629,0.398],[0.635,0.384],[0.647,0.376],[0.653,0.365],[0.653,0.353],[0.653,0.34],[0.653,0.327],[0.653,0.316],[0.653,0.307],[0.671,0.304],[0.671,0.294],[0.671,0.285],[0.671,0.277],[0.671,0.269],[0.671,0.261],[0.671,0.254],[0.671,0.247],[0.671,0.241],[0.671,0.235],[0.671,0.229],[0.671,0.224],[0.671,0.218],[0.671,0.213],[0.671,0.209],[0.671,0.204],[0.671,0.2],[0.671,0.195],[0.671,0.191],[0.671,0.188],[0.671,0.184],[0.671,0.18]]},"chair":{"0.5":[[0.005,1.0],[0.102,1.0],[0.193,0.974],[0.254,0.905],[0.34,0.905],[0.406,0.87],[0.447,0.793],[0.472,0.715],[0.503,0.671],[0.523,0.619],[0.528,0.571],[0.543,0.532],[0.548,0.502],[0.569,0.481],[0.584,0.458],[0.589,0.435],[0.614,0.422],[0.635,0.41],[0.65,0.396],[0.66,0.383],[0.665,0.368],[0.665,0.35],[0.67,0.338],[0.685,0.333],[0.695,0.323],[0.701,0.313],[0.706,0.303],[0.716,0.297],[0.721,0.289],[0.736,0.284],[0.736,0.274],[0.736,0.265],[0.736,0.257],[0.736,0.249],[0.736,0.242],[0.751,0.239],[0.756,0.233],[0.756,0.227],[0.761,0.222],[0.761,0.216],[0.761,0.21],[0.766,0.207],[0.766,0.202],[0.772,0.198],[0.772,0.194],[0.772,0.19],[0.777,0.187],[0.782,0.184],[0.787,0.181],[0.792,0.178],[0.792,0.175],[0.792,0.171],[0.797,0.169],[0.802,0.167],[0.802,0.165],[0.807,0.162],[0.807,0.159],[0.807,0.156],[0.807,0.153],[0.807,0.151],[0.807,0.148]],"0.75":[[0.005,1.0],[0.102,1.0],[0.183,0.923],[0.228,0.842],[0.294,0.823],[0.355,0.787],[0.371,0.682],[0.391,0.611],[0.421,0.579],[0.442,0.534],[0.442,0.489],[0.457,0.457],[0.462,0.431],[0.482,0.416],[0.497,0.397],[0.497,0.37],[0.513,0.358],[0.523,0.342],[0.528,0.327],[0.528,0.31],[0.533,0.298],[0.533,0.284],[0.533,0.272],[0.543,0.267],[0.553,0.26],[0.553,0.249],[0.558,0.242],[0.563,0.236],[0.563,0.227],[0.569,0.222],[0.569,0.214],[0.569,0.207],[0.569,0.2],[0.569,0.194],[0.569,0.188],[0.574,0.184],[0.574,0.178],[0.574,0.174],[0.579,0.17],[0.579,0.165],[0.579,0.161],[0.584,0.158],[0.584,0.155],[0.589,0.152],[0.589,0.149],[0.589,0.146],[0.589,0.143],[0.589,0.14],[0.594,0.138],[0.594,0.135],[0.594,0.132],[0.594,0.129],[0.594,0.127],[0.599,0.126],[0.599,0.124],[0.604,0.122],[0.604,0.119],[0.604,0.117],[0.604,0.115],[0.604,0.113],[0.604,0.111]]},"cup":{"0.5":[[0.009,1.0],[0.074,1.0],[0.139,1.0],[0.204,1.0],[0.269,1.0],[0.324,0.975],[0.38,0.957],[0.435,0.941],[0.491,0.931],[0.546,0.922],[0.556,0.848],[0.611,0.848],[0.639,0.816],[0.667,0.785],[0.713,0.778],[0.713,0.726],[0.741,0.708],[0.75,0.675],[0.759,0.648],[0.769,0.619],[0.778,0.596],[0.787,0.577],[0.815,0.568],[0.815,0.543],[0.815,0.521],[0.815,0.5],[0.815,0.481],[0.824,0.468],[0.824,0.452],[0.833,0.441],[0.833,0.427],[0.833,0.416],[0.843,0.404],[0.843,0.392],[0.843,0.381],[0.843,0.37],[0.843,0.362],[0.852,0.354],[0.852,0.345],[0.852,0.336],[0.852,0.327],[0.852,0.319],[0.852,0.312],[0.852,0.305],[0.852,0.298],[0.852,0.291],[0.852,0.285],[0.852,0.279],[0.852,0.273],[0.852,0.27],[0.861,0.265],[0.861,0.26],[0.861,0.255],[0.861,0.25],[0.861,0.245],[0.861,0.241],[0.861,0.237],[0.861,0.233],[0.861,0.229],[0.861,0.225],[0.861,0.221],[0.861,0.217]],"0.75":[[0.009,1.0],[0.074,1.0],[0.139,1.0],[0.204,1.0],[0.269,1.0],[0.324,0.974],[0.37,0.935],[0.426,0.922],[0.472,0.897],[0.519,0.875],[0.519,0.789],[0.556,0.772],[0.574,0.729],[0.593,0.699],[0.639,0.697],[0.639,0.651],[0.667,0.637],[0.667,0.6],[0.676,0.575],[0.676,0.545],[0.685,0.525],[0.694,0.51],[0.713,0.497],[0.713,0.475],[0.713,0.456],[0.713,0.438],[0.713,0.421],[0.722,0.411],[0.722,0.396],[0.731,0.387],[0.731,0.374],[0.731,0.365],[0.741,0.356],[0.741,0.345],[0.741,0.335],[0.741,0.325],[0.741,0.319],[0.75,0.312],[0.75,0.303],[0.75,0.296],[0.75,0.288],[0.75,0.281],[0.75,0.275],[0.75,0.268],[0.75,0.262],[0.75,0.256],[0.75,0.251],[0.75,0.245],[0.75,0.24],[0.75,0.238],[0.759,0.234],[0.759,0.229],[0.759,0.225],[0.759,0.22],[0.759,0.216],[0.759,0.212],[0.759,0.209],[0.759,0.205],[0.759,0.201],[0.759,0.198],[0.759,0.195],[0.759,0.192]]},"bottle":{"0.5":[[0.009,1.0],[0.086,1.0],[0.155,0.967],[0.224,0.967],[0.267,0.912],[0.302,0.841],[0.353,0.811],[0.405,0.794],[0.448,0.765],[0.466,0.701],[0.474,0.651],[0.491,0.62],[0.509,0.594],[0.534,0.585],[0.552,0.557],[0.569,0.536],[0.595,0.519],[0.621,0.514],[0.629,0.49],[0.629,0.465],[0.647,0.458],[0.655,0.437],[0.655,0.418],[0.672,0.406],[0.672,0.39],[0.681,0.378],[0.69,0.367],[0.698,0.357],[0.698,0.349],[0.707,0.342],[0.707,0.331],[0.716,0.324],[0.716,0.317],[0.724,0.311],[0.724,0.303],[0.724,0.295],[0.724,0.288],[0.724,0.282],[0.724,0.277],[0.724,0.269],[0.724,0.264],[0.724,0.263],[0.733,0.258],[0.741,0.255],[0.741,0.249],[0.741,0.242],[0.741,0.236],[0.741,0.231],[0.741,0.225],[0.75,0.223],[0.75,0.217],[0.75,0.214],[0.759,0.211],[0.759,0.206],[0.767,0.204],[0.767,0.2],[0.767,0.196],[0.767,0.192],[0.767,0.189],[0.767,0.185],[0.767,0.182],[0.767,0.178],[0.767,0.175],[0.776,0.174],[0.776,0.171]],"0.75":[[0.009,1.0],[0.086,1.0],[0.155,0.967],[0.224,0.967],[0.267,0.912],[0.302,0.841],[0.345,0.8],[0.379,0.754],[0.414,0.716],[0.414,0.632],[0.422,0.583],[0.422,0.544],[0.44,0.525],[0.466,0.519],[0.474,0.487],[0.483,0.465],[0.509,0.451],[0.534,0.45],[0.543,0.429],[0.543,0.406],[0.56,0.402],[0.569,0.384],[0.569,0.368],[0.586,0.358],[0.586,0.343],[0.586,0.329],[0.595,0.319],[0.603,0.311],[0.603,0.304],[0.603,0.294],[0.603,0.285],[0.612,0.28],[0.612,0.273],[0.621,0.269],[0.621,0.262],[0.621,0.254],[0.621,0.248],[0.621,0.243],[0.621,0.239],[0.621,0.232],[0.621,0.228],[0.621,0.227],[0.629,0.223],[0.629,0.218],[0.629,0.212],[0.629,0.207],[0.629,0.202],[0.629,0.197],[0.629,0.192],[0.638,0.19],[0.638,0.186],[0.638,0.183],[0.647,0.18],[0.647,0.176],[0.647,0.173],[0.647,0.169],[0.647,0.166],[0.647,0.163],[0.647,0.16],[0.647,0.157],[0.647,0.154],[0.647,0.151],[0.647,0.148],[0.647,0.146],[0.647,0.143]]},"dog":{"0.5":[[0.111,1.0],[0.222,1.0],[0.333,1.0],[0.444,1.0],[0.556,1.0],[0.667,1.0],[0.778,1.0],[0.889,1.0],[1.0,1.0],[1.0,0.9],[1.0,0.818],[1.0,0.75],[1.0,0.692],[1.0,0.643],[1.0,0.6],[1.0,0.562],[1.0,0.529],[1.0,0.5],[1.0,0.474],[1.0,0.45],[1.0,0.429],[1.0,0.409],[1.0,0.391],[1.0,0.375],[1.0,0.36],[1.0,0.346],[1.0,0.333],[1.0,0.321],[1.0,0.31],[1.0,0.3],[1.0,0.29],[1.0,0.281],[1.0,0.273],[1.0,0.265],[1.0,0.257],[1.0,0.25],[1.0,0.243],[1.0,0.237],[1.0,0.231],[1.0,0.225],[1.0,0.22],[1.0,0.214]],"0.75":[[0.111,1.0],[0.222,1.0],[0.333,1.0],[0.444,1.0],[0.556,1.0],[0.667,1.0],[0.778,1.0],[0.778,0.889],[0.889,0.889],[0.889,0.8],[0.889,0.727],[0.889,0.667],[0.889,0.615],[0.889,0.571],[0.889,0.533],[0.889,0.5],[0.889,0.471],[0.889,0.444],[0.889,0.421],[0.889,0.4],[0.889,0.381],[0.889,0.364],[0.889,0.348],[0.889,0.333],[0.889,0.32],[0.889,0.308],[0.889,0.296],[0.889,0.286],[0.889,0.276],[0.889,0.267],[0.889,0.258],[0.889,0.25],[0.889,0.242],[0.889,0.235],[0.889,0.229],[0.889,0.222],[0.889,0.216],[0.889,0.211],[0.889,0.205],[0.889,0.2],[0.889,0.195],[0.889,0.19]]},"clock":{"0.5":[[0.05,1.0],[0.1,1.0],[0.15,1.0],[0.2,1.0],[0.25,1.0],[0.3,1.0],[0.35,1.0],[0.4,1.0],[0.45,1.0],[0.5,1.0],[0.55,1.0],[0.6,1.0],[0.65,1.0],[0.65,0.933],[0.7,0.933],[0.7,0.895],[0.75,0.895],[0.8,0.895],[0.85,0.895],[0.85,0.85],[0.85,0.81],[0.85,0.773],[0.85,0.739],[0.85,0.708],[0.85,0.68],[0.85,0.654],[0.85,0.63],[0.85,0.607],[0.85,0.586],[0.85,0.567],[0.85,0.548],[0.85,0.531],[0.85,0.515],[0.85,0.514],[0.9,0.514],[0.9,0.5],[0.9,0.486],[0.9,0.474],[0.9,0.462],[0.9,0.45],[0.9,0.439],[0.9,0.429],[0.9,0.419],[0.9,0.409],[0.9,0.4],[0.9,0.391],[0.9,0.383],[0.9,0.375],[0.9,0.367],[0.9,0.36],[0.9,0.353],[0.9,0.346],[0.9,0.34],[0.9,0.333],[0.9,0.328],[0.9,0.328],[0.9,0.328],[0.95,0.328],[0.95,0.322],[0.95,0.317],[0.95,0.311],[0.95,0.306],[0.95,0.302],[0.95,0.297],[0.95,0.292],[0.95,0.288],[0.95,0.284],[0.95,0.279],[0.95,0.275],[0.95,0.271],[0.95,0.268],[0.95,0.264],[0.95,0.26],[0.95,0.257],[0.95,0.253],[0.95,0.25],[0.95,0.247],[0.95,0.244],[0.95,0.241],[0.95,0.237],[0.95,0.235],[0.95,0.232],[0.95,0.229],[0.95,0.226],[0.95,0.224],[0.95,0.221],[0.95,0.218],[0.95,0.216],[0.95,0.213],[0.95,0.211],[0.95,0.209],[0.95,0.207],[0.95,0.204],[0.95,0.202],[0.95,0.2],[0.95,0.198],[0.95,0.196],[0.95,0.194],[0.95,0.192],[0.95,0.19],[0.95,0.188],[0.95,0.186],[0.95,0.184],[0.95,0.183],[0.95,0.181],[0.95,0.179],[0.95,0.178]],"0.75":[[0.05,1.0],[0.1,1.0],[0.15,1.0],[0.2,1.0],[0.2,0.889],[0.25,0.889],[0.3,0.889],[0.35,0.889],[0.4,0.889],[0.4,0.833],[0.45,0.833],[0.5,0.833],[0.5,0.769],[0.5,0.737],[0.55,0.737],[0.55,0.737],[0.6,0.737],[0.65,0.737],[0.7,0.737],[0.7,0.7],[0.7,0.667],[0.7,0.636],[0.7,0.609],[0.7,0.583],[0.7,0.56],[0.7,0.538],[0.7,0.519],[0.7,0.5],[0.7,0.483],[0.7,0.467],[0.7,0.452],[0.7,0.438],[0.7,0.424],[0.7,0.412],[0.7,0.4],[0.7,0.389],[0.7,0.378],[0.7,0.368],[0.7,0.359],[0.7,0.35],[0.7,0.341],[0.7,0.333],[0.7,0.326],[0.7,0.318],[0.7,0.311],[0.7,0.304],[0.7,0.298],[0.7,0.292],[0.7,0.286],[0.7,0.28],[0.7,0.275],[0.7,0.269],[0.7,0.264],[0.7,0.259],[0.7,0.259],[0.7,0.259],[0.7,0.259],[0.75,0.259],[0.75,0.254],[0.75,0.25],[0.75,0.246],[0.75,0.242],[0.75,0.238],[0.75,0.234],[0.75,0.231],[0.75,0.227],[0.75,0.224],[0.75,0.221],[0.75,0.217],[0.75,0.214],[0.75,0.211],[0.75,0.208],[0.75,0.205],[0.75,0.203],[0.75,0.2],[0.75,0.197],[0.75,0.195],[0.75,0.192],[0.75,0.19],[0.75,0.188],[0.75,0.185],[0.75,0.183],[0.75,0.181],[0.75,0.179],[0.75,0.176],[0.75,0.174],[0.75,0.172],[0.75,0.17],[0.75,0.169],[0.75,0.167],[0.75,0.165],[0.75,0.163],[0.75,0.161],[0.75,0.16],[0.75,0.158],[0.75,0.156],[0.75,0.155],[0.75,0.153],[0.75,0.152],[0.75,0.15],[0.75,0.149],[0.75,0.147],[0.75,0.146],[0.75,0.144],[0.75,0.143],[0.75,0.142],[0.75,0.14]]}},"per_class":{"toothbrush":100.0,"stop sign":91.3,"giraffe":89.3,"cat":86.0,"bear":82.2,"zebra":79.0,"frisbee":79.0,"airplane":77.0,"snowboard":76.2,"dog":75.7,"mouse":73.7,"laptop":73.2,"elephant":71.6,"bus":70.6,"sheep":69.5,"pizza":69.5,"tv":69.4,"suitcase":68.3,"horse":68.1,"toilet":67.2,"baseball bat":66.6,"tennis racket":62.6,"donut":62.1,"orange":61.6,"fire hydrant":61.4,"person":60.7,"sports ball":59.9,"clock":59.1,"motorcycle":59.0,"teddy bear":57.0,"keyboard":56.5,"hot dog":55.2,"bed":55.0,"surfboard":54.6,"cup":54.4,"skateboard":53.0,"train":52.6,"refrigerator":51.9,"umbrella":51.3,"sink":51.0,"car":49.9,"cow":49.2,"microwave":47.9,"cell phone":46.4,"bowl":45.9,"kite":45.3,"couch":45.3,"baseball glove":44.6,"cake":44.2,"fork":44.1,"bird":42.6,"vase":41.2,"sandwich":40.7,"wine glass":40.3,"bottle":38.6,"tie":38.3,"chair":37.5,"carrot":36.7,"potted plant":35.1,"truck":34.9,"remote":34.8,"parking meter":33.6,"knife":33.6,"bicycle":33.1,"oven":31.1,"dining table":30.9,"boat":30.1,"traffic light":28.9,"skis":28.8,"bench":28.3,"spoon":26.0,"banana":25.5,"handbag":24.2,"apple":21.1,"broccoli":20.5,"backpack":19.5,"book":19.2,"scissors":0.0},"n_gt":{"person":1069,"car":167,"chair":197,"cup":108,"bottle":116,"dog":9,"clock":20},"mine":{"AP":51.28,"AP50":70.77,"AP75":57.2,"APs":32.99,"APl":63.19},"mine_per_thr":[70.77,69.17,67.19,64.85,61.85,57.2,49.38,40.54,24.94,6.96],"pycoco_per_thr":[70.77,69.17,67.19,64.85,61.85,57.2,49.38,40.54,24.94,6.96],"score_thr":{"0.0":{"AP":51.28,"AP50":70.77,"AP75":57.2,"APs":32.99,"APm":55.74,"APl":63.19,"AR1":40.04,"AR10":61.66,"AR100":63.42,"dets_per_img":31.9},"0.05":{"AP":51.28,"AP50":70.77,"AP75":57.2,"APs":32.99,"APm":55.74,"APl":63.19,"AR1":40.04,"AR10":61.66,"AR100":63.42,"dets_per_img":31.9},"0.3":{"AP":50.37,"AP50":69.06,"AP75":56.34,"APs":31.5,"APm":54.79,"APl":62.58,"AR1":39.08,"AR10":58.54,"AR100":59.72,"dets_per_img":13.5},"0.5":{"AP":48.98,"AP50":66.26,"AP75":55.04,"APs":29.86,"APm":53.44,"APl":61.8,"AR1":37.82,"AR10":55.67,"AR100":56.42,"dets_per_img":9.5},"0.7":{"AP":47.02,"AP50":62.75,"AP75":53.04,"APs":27.36,"APm":51.57,"APl":60.05,"AR1":36.63,"AR10":52.24,"AR100":52.6,"dets_per_img":7.0},"0.9":{"AP":41.25,"AP50":54.18,"AP75":46.96,"APs":21.38,"APm":45.46,"APl":55.46,"AR1":32.17,"AR10":44.44,"AR100":44.53,"dets_per_img":4.5}},"maxdets":{"1":35.45,"10":50.58,"100":51.28}};
+  const CLS = Object.keys(D.curves); let cur = CLS[0];
+  $('#maC').innerHTML = CLS.map((c, i) => `<button class="${i ? '' : 'active'}" data-v="${c}">${c}</button>`).join('');
+  function pr() {
+    cur = $('#maC .active').dataset.v; const t = $('#maT .active').dataset.v, c = D.curves[cur][t] || [];
+    const X0 = 50, X1 = 620, Y0 = 250, Y1 = 14, xp = v => X0 + (X1 - X0) * v, yp = v => Y0 - (Y0 - Y1) * v;
+    let s = `<line class="ax" x1="${X0}" y1="${Y0}" x2="${X1}" y2="${Y0}"/><line class="ax" x1="${X0}" y1="${Y1}" x2="${X0}" y2="${Y0}"/>`;
+    for (const v of [0, 0.25, 0.5, 0.75, 1]) s += `<text class="tk" x="${xp(v)}" y="${Y0 + 15}" text-anchor="middle">${v}</text><text class="tk" x="${X0 - 6}" y="${yp(v) + 4}" text-anchor="end">${v}</text>`;
+    s += `<text class="tk" x="${X1}" y="${Y0 + 28}" text-anchor="end">recall</text><text class="tk" x="${X0 + 4}" y="${Y1 + 10}">precision</text>`;
+    if (c.length) {
+      let d = `M${xp(0)},${yp(c[0][1])}`; c.forEach(([r, p]) => d += `L${xp(r).toFixed(1)},${yp(p).toFixed(1)}`); const last = c.at(-1);
+      s += `<path d="${d}L${xp(last[0])},${yp(0)}L${xp(0)},${yp(0)}Z" fill="color-mix(in srgb, var(--accent) 15%, transparent)"/><path d="${d}" fill="none" stroke="var(--accent)" stroke-width="2.4"/>`;
+      s += `<line x1="${xp(last[0])}" y1="${Y1}" x2="${xp(last[0])}" y2="${Y0}" stroke="var(--red)" stroke-dasharray="3 3"/><text class="tk" x="${xp(last[0]) - 4}" y="${Y1 + 24}" text-anchor="end" style="fill:var(--red)">max recall ${last[0]}</text>`;
+    }
+    $('#maSvg').innerHTML = s;
+    const area = c.length ? c.reduce((a, [r, p], i) => a + (i ? (r - c[i - 1][0]) * p : r * p), 0) : 0;
+    $('#maStats').innerHTML = `<div class="stat"><div class="k">${cur}, ground-truth objects</div><div class="v">${D.n_gt[cur]}</div></div><div class="stat good"><div class="k">AP @ ${t} (area, approx.)</div><div class="v">${(area * 100).toFixed(1)}</div></div><div class="stat"><div class="k">AP over .5:.95</div><div class="v">${D.per_class[cur]}</div></div>`;
+    $('#maWhy').innerHTML = `<b>The shaded area is AP.</b> The curve starts at the most confident detections and moves right as less confident ones are added. Where it ends (the red line) is the best recall the detector reached: objects never detected cap the area. Switch to IoU 0.75 and the whole curve sinks, because boxes that were “right enough” at 0.5 now miss.`;
+  }
+  function thr() {
+    const v = D.mine_per_thr, ts = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95];
+    $('#maThr').innerHTML = ts.map((t, i) => `<div class="ma-bar"><span>IoU ${t.toFixed(2)}</span><span class="track"><i style="width:${v[i]}%"></i></span><span class="n">${v[i]}</span></div>`).join('') + `<div class="ma-bar"><span><b>mean = AP</b></span><span class="track"><i style="width:${D.mine.AP}%"></i></span><span class="n">${D.mine.AP}</span></div>`;
+    $('#maStats').innerHTML = `<div class="stat good"><div class="k">AP50</div><div class="v">${v[0]}</div></div><div class="stat"><div class="k">AP75</div><div class="v">${v[5]}</div></div><div class="stat bad"><div class="k">AP95</div><div class="v">${v[9]}</div></div><div class="stat"><div class="k">matches pycocotools</div><div class="v">${D.mine_per_thr.every((x, i) => x === D.pycoco_per_thr[i]) ? 'all 10' : 'no'}</div></div>`;
+    $('#maWhy').innerHTML = '<b>COCO AP rewards tight boxes.</b> Half of the ten thresholds are above 0.7, where even good boxes start to fail; at 0.95 almost nothing matches. AP50 is the right number when “roughly here” is enough.';
+  }
+  function cls() {
+    const E = Object.entries(D.per_class), top = E.slice(0, 15), bot = E.slice(-15);
+    const col = (rows, t) => `<div><div class="ma-l" style="margin-top:0">${t}</div>` + rows.map(([k, v]) => `<div class="ma-bar"><span>${k}</span><span class="track"><i style="width:${v}%"></i></span><span class="n">${v}</span></div>`).join('') + '</div>';
+    $('#maCls').innerHTML = col(top, 'Highest 15 classes') + col(bot, 'Lowest 15 classes');
+    $('#maStats').innerHTML = `<div class="stat"><div class="k">Classes with objects</div><div class="v">${E.length}</div></div><div class="stat good"><div class="k">Best</div><div class="v">${E[0][0]} ${E[0][1]}</div></div><div class="stat bad"><div class="k">Worst</div><div class="v">${E.at(-1)[0]} ${E.at(-1)[1]}</div></div>`;
+    $('#maWhy').innerHTML = '<b>One mean, eighty stories.</b> Large, distinctive objects (stop signs, giraffes, cats) score near the top; small, cluttered or ambiguous ones (books, backpacks, broccoli) near the bottom. Classes with only a few instances in 500 images swing wildly, so compare per-class AP on larger evaluation sets.';
+  }
+  function score() {
+    const S = Object.entries(D.score_thr), M = Object.entries(D.maxdets);
+    $('#maScore').innerHTML = '<div class="ma-l" style="margin-top:0">AP after keeping only detections above a score</div>' + S.map(([k, v]) => `<div class="ma-bar"><span>score ≥ ${k}</span><span class="track"><i style="width:${v.AP / 55 * 100}%"></i></span><span class="n">${v.AP}</span></div><div class="small muted" style="margin:-2px 0 4px 128px">${v.dets_per_img} detections per image</div>`).join('') + '<div class="ma-l">AP with at most k detections per image and class</div>' + M.map(([k, v]) => `<div class="ma-bar"><span>k = ${k}</span><span class="track"><i style="width:${v / 55 * 100}%"></i></span><span class="n">${v}</span></div>`).join('');
+    $('#maStats').innerHTML = `<div class="stat"><div class="k">Default (score ≥ 0.05)</div><div class="v">${D.score_thr['0.05'].AP}</div></div><div class="stat warn"><div class="k">score ≥ 0.9</div><div class="v">${D.score_thr['0.9'].AP}</div></div><div class="stat warn"><div class="k">1 detection max</div><div class="v">${D.maxdets['1']}</div></div>`;
+    $('#maWhy').innerHTML = '<b>AP integrates over thresholds; a product picks one.</b> Removing low-scoring detections can only remove recall, so AP falls (51.3 → 41.3 at 0.9) even though the remaining output looks cleaner. What matters for deployment is precision and recall at the chosen threshold, not this curve’s area.';
+  }
+  function draw() { const e = $('#maE .active').dataset.v; ['p', 't', 'c', 's'].forEach((k, i) => $('#maV' + k).classList.toggle('on', ['pr', 'thr', 'cls', 'score'][i] === e)); ({ pr, thr, cls, score })[e](); }
+  ['#maE', '#maC', '#maT'].forEach(id => $(id).addEventListener('segchange', draw));
+  draw();
+})();
+</script>
+</body>
+</html>

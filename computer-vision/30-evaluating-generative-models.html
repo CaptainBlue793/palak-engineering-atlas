@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Evaluating Generative Models · Computer Vision by Palak Deb Patra</title>
+<meta name="description" content="Chapter 30 of Computer Vision. FID written from scratch on Inception-v3 features and checked against its own sample-count bias; precision and recall for generators; the DCGAN and DDPM samples from Chapters 27 and 28 scored; real images degraded on purpose to see what FID notices and what it misses; and CLIP score.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('cv-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ev-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ev-v { display:none; } .ev-v.on { display:block; }
+  .ev-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; }
+  .ev-box svg { width:100%; height:auto; display:block; } .ev-box text { font-size:11px; fill:var(--muted); }
+  .ev-bar { display:grid; grid-template-columns:minmax(0, 220px) 1fr 70px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .ev-bar .track { height:13px; border-radius:4px; background:var(--surface); overflow:hidden; } .ev-bar .track i { display:block; height:100%; }
+  .ev-bar .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .ev-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .ev-bar { grid-template-columns:minmax(0, 120px) 1fr 60px; font-size:12px; } }
+</style>
+</head>
+<body data-chapter="30">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 30</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Evaluating <span class="grad">Generative Models</span></h1>
+    <p class="lead">A classifier has a right answer for every test image. A generator does not: there is no correct new picture of a horse. What we can ask is whether its samples, taken together, look like they came from the same distribution as real images: each one realistic (<b>fidelity</b>) and the whole set as varied as the real data (<b>diversity</b>). The standard tools compare the two distributions in the feature space of a pretrained network, and each one has blind spots that change what you should conclude.</p>
+    <p class="lead">This chapter writes FID from scratch, uses it to score the GAN and diffusion samples trained in Chapters 27 and 28, and then attacks it: real images with noise, blur, a single class, or just 100 images copied 100 times. The diffusion model scored an FID of 17.8 against the GAN’s 43.4, and cutting its sampler from 1,000 to 10 steps raised FID to 45.8 while precision went <i>up</i>. Adding noise of 10 grey levels to real photos, barely visible, gave a worse FID (51.2) than the GAN; and two halves of the same real data scored 72.4 at 500 images each.</p>
+    <ul class="objectives">
+      <li><span>Explain why likelihood and per-image metrics are not enough</span></li>
+      <li><span>Compute FID from Inception features and know its biases</span></li>
+      <li><span>Separate fidelity from diversity with precision and recall</span></li>
+      <li><span>Read what FID responds to, using deliberately degraded real images</span></li>
+      <li><span>Use CLIP score and human evaluation for text-to-image models</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The samples being scored:</b> <a href="27-gans.html">Chapter 27</a> (DCGAN) and <a href="28-diffusion-from-scratch.html">Chapter 28</a> (DDPM and DDIM).</li>
+        <li><b>Feature spaces and kNN:</b> <a href="22-contrastive-self-supervised.html">Chapter 22</a>; CLIP score in <a href="29-latent-diffusion-and-guidance.html">Chapter 29</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Why likelihood is not enough</h2>
+  <p>Some generators, VAEs and diffusion models among them, can report a likelihood or a bound on it: how probable the test images are under the model. It is a principled number and a poor guide to what people see. A model can achieve good likelihood while producing poor samples, by spending its probability mass on imperceptible pixel noise, and a model with excellent samples can have poor likelihood. GANs have no likelihood at all. And per-image scores like PSNR need a reference image, which generation does not have. So evaluation moved to comparing <i>sets</i> of images in a feature space where distance means something perceptual.</p>
+
+  <h2>FID: Fréchet Inception Distance</h2>
+  <p><b>FID</b> (2017) passes real and generated images through Inception-v3, trained on ImageNet, and takes the 2,048-dimensional output of its final pooling layer. It fits a Gaussian to each set of features, a mean vector μ and a covariance matrix Σ, and measures the Fréchet (Wasserstein-2) distance between the two Gaussians:</p>
+  <p style="text-align:center">FID = ‖μ<sub>r</sub> − μ<sub>g</sub>‖² + Tr( Σ<sub>r</sub> + Σ<sub>g</sub> − 2 (Σ<sub>r</sub> Σ<sub>g</sub>)<sup>½</sup> )</p>
+  <p>The first term catches a shift in the average image (wrong colours, wrong content), the second a difference in spread and shape (too little variety, or variety of the wrong kind). Lower is better; 0 means identical feature statistics.</p>
+<pre class="code">net = <span class="f">inception_v3</span>(weights=Inception_V3_Weights.IMAGENET1K_V1).<span class="f">eval</span>(); net.fc = nn.<span class="f">Identity</span>()      <span class="c"># 2,048-d pool features</span>
+<span class="k">def</span> <span class="f">feats</span>(u8):                                                        <span class="c"># uint8 images -&gt; (N, 2048)</span>
+    x = F.<span class="f">interpolate</span>(u8.<span class="f">float</span>() / <span class="m">255</span>, size=(<span class="m">299</span>, <span class="m">299</span>), mode=<span class="s">"bilinear"</span>)
+    <span class="k">return</span> <span class="f">net</span>((x - MEAN) / STD).<span class="f">double</span>()
+<span class="k">def</span> <span class="f">fid</span>(f1, f2):
+    m1, m2, s1, s2 = f1.<span class="f">mean</span>(<span class="m">0</span>), f2.<span class="f">mean</span>(<span class="m">0</span>), np.<span class="f">cov</span>(f1, rowvar=<span class="k">False</span>), np.<span class="f">cov</span>(f2, rowvar=<span class="k">False</span>)
+    cs = scipy.linalg.<span class="f">sqrtm</span>(s1 @ s2).real                                       <span class="c"># matrix square root</span>
+    <span class="k">return</span> ((m1 - m2) ** <span class="m">2</span>).<span class="f">sum</span>() + np.<span class="f">trace</span>(s1 + s2 - <span class="m">2</span> * cs)</pre>
+  <p>Two warnings before using it. FID numbers are only comparable when computed the same way: the official implementation uses a specific TensorFlow Inception graph and resizing, and torchvision’s weights give somewhat different absolute values (the ones here are internally consistent, not comparable with papers). And FID is <b>biased by sample count</b>: estimating a 2,048 × 2,048 covariance from a few thousand images is noisy, and the noise always adds distance.</p>
+  <p>The bias is easy to measure: compute FID between two disjoint sets of <i>real</i> CIFAR-10 training images, which come from exactly the same distribution, so the true answer is 0.</p>
+  <table class="t cmp">
+    <thead><tr><th>Images per set</th><th>500</th><th>1,000</th><th>2,000</th><th>5,000</th><th>10,000</th></tr></thead>
+    <tbody><tr><td>FID between two real sets</td><td>72.41</td><td>44.42</td><td>23.99</td><td>9.74</td><td><b>4.93</b></td></tr></tbody>
+  </table>
+  <p>At 500 images per set, identical distributions scored 72, worse than the GAN below at 10,000. The bias shrinks roughly in proportion to 1/n, which is why papers report FID at 10,000 or 50,000 samples, and why two FIDs computed at different counts cannot be compared at all. The 10,000 training images against the 10,000 test images scored 4.98, the floor for this setup.</p>
+
+  <h2>Precision and recall for generators</h2>
+  <p>FID folds fidelity and diversity into one number. <b>Precision and recall</b> (2019) separate them using nearest neighbours in the same feature space. Around every real image draw a ball reaching its 3rd nearest real neighbour; the union of balls approximates the region real images occupy. <b>Precision</b> is the share of generated images that land inside the real region: how many samples look real. <b>Recall</b> is the share of real images that land inside the generated region, built the same way from the samples: how much of the real variety the generator covers. A collapsed generator scores high precision and low recall; a noisy one the reverse.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Generative metrics lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ev-l">View</div>
+      <div class="seg" id="evE"><button class="active" data-v="gen">the generators</button><button data-v="deg">real images, degraded</button><button data-v="bias">sample-count bias</button></div>
+      <div class="ev-v on" id="evVgen"><div class="ev-box" id="evG"></div></div>
+      <div class="ev-v" id="evVdeg"><div class="ev-box" id="evD"></div></div>
+      <div class="ev-v" id="evVbias"><div class="ev-box"><svg id="evB" viewBox="0 0 600 220"></svg></div></div>
+      <div class="stats" id="evStats"></div>
+      <div class="ev-why" id="evWhy"></div>
+    </div>
+    <div class="panel-foot">FID computed here from torchvision’s Inception-v3 (ImageNet weights) pool features, images bilinearly resized from 32 to 299 pixels, against the 10,000 CIFAR-10 test images unless stated; values are consistent with each other but not with published FIDs, which use the TensorFlow Inception graph. Precision and recall: k = 3 nearest-neighbour balls on 5,000 real and 5,000 generated features. Generators: 10,000 samples each from Chapter 27’s DCGAN and Chapter 28’s DDPM (EMA weights) with different samplers. Degraded sets: 10,000 training images with Gaussian noise or 2× bilinear down-and-up blur; one class: 3,000 aeroplanes against 3,000 test images; copies: 100 training images each repeated 100 times.</div>
+  </div>
+
+  <h2>Measured: the generators of Chapters 27 and 28</h2>
+  <table class="t cmp">
+    <thead><tr><th>10,000 images</th><th>FID vs test (10k)</th><th>FID at 2k</th><th>Precision</th><th>Recall</th></tr></thead>
+    <tbody>
+      <tr><td>Real training images (reference)</td><td>4.98</td><td>—</td><td>69.7%</td><td>69.0%</td></tr>
+      <tr><td>DCGAN (Chapter 27)</td><td>43.42</td><td>60.18</td><td>67.6%</td><td>23.8%</td></tr>
+      <tr><td><b>DDPM, 1,000 steps (Chapter 28)</b></td><td><b>17.78</b></td><td>36.05</td><td>67.8%</td><td><b>51.6%</b></td></tr>
+      <tr><td>DDIM, 100 steps</td><td>21.76</td><td>40.05</td><td>67.1%</td><td>48.8%</td></tr>
+      <tr><td>DDIM, 50 steps</td><td>23.88</td><td>42.16</td><td>68.2%</td><td>48.1%</td></tr>
+      <tr><td>DDIM, 20 steps</td><td>30.27</td><td>48.16</td><td>71.0%</td><td>42.1%</td></tr>
+      <tr><td>DDIM, 10 steps</td><td>45.83</td><td>63.11</td><td><b>75.8%</b></td><td>30.0%</td></tr>
+    </tbody>
+  </table>
+  <p>The diffusion model was far closer to the real distribution than the GAN: FID 17.8 against 43.4, after 45 minutes of training against 72 seconds, so this is not a fair race, but it is the same ordering the field found. Precision and recall show where the difference lies. Both generators’ samples looked real about equally often (precision 68%, the same as real images’ 70% under this k = 3 test), but the GAN covered less than half as much of the real variety (recall 23.8% against 51.6%): the diversity failure of Chapter 27, now measured on images. Fewer DDIM steps made FID worse steadily, 17.8 to 45.8, and the split shows why: precision <i>rose</i> to 75.8% while recall fell to 30%. Short samplers produce simpler, more typical images, which are more often inside the real distribution and cover less of it. FID alone would only say “worse”. The 2,000-sample column ranks all models identically but every value is 18–20 points higher, the sample-count bias again.</p>
+
+  <h2>What FID notices, and what it misses</h2>
+  <p>To see how FID behaves, it helps to feed it sets of <i>real</i> images that are wrong in a known way.</p>
+  <table class="t cmp">
+    <thead><tr><th>Real images, changed on purpose</th><th>FID</th><th>Precision</th><th>Recall</th><th>What a person sees</th></tr></thead>
+    <tbody>
+      <tr><td>Unchanged training images</td><td>4.98</td><td>69.7%</td><td>69.0%</td><td>—</td></tr>
+      <tr><td>Gaussian noise, σ = 10 grey levels</td><td>51.23</td><td>42.8%</td><td>31.6%</td><td>faint grain</td></tr>
+      <tr><td>Gaussian noise, σ = 25</td><td>131.61</td><td>34.8%</td><td>8.9%</td><td>obvious grain</td></tr>
+      <tr><td>Blur: halve and restore resolution</td><td>84.22</td><td><b>68.2%</b></td><td>9.5%</td><td>slightly soft</td></tr>
+      <tr><td>Only one class (aeroplanes)</td><td>78.48</td><td>70.5%</td><td>33.7%</td><td>perfect images, no variety</td></tr>
+      <tr><td>100 images, each copied 100 times</td><td>138.87</td><td>62.0%</td><td><b>0.0%</b></td><td>perfect images, total collapse</td></tr>
+    </tbody>
+  </table>
+  <p>FID is very sensitive to texture statistics that people barely notice: faint grain of 10 grey levels gave an FID of 51, worse than the GAN, and a mild blur gave 84. Inception features respond strongly to high-frequency content, so FID punishes noise and blur heavily, more than human judges would. It also catches missing diversity: one class of perfect real images scored 78, and 100 images copied 100 times scored 139, the worst of all, although every image is a real photo. Precision and recall separate the two kinds of failure cleanly. Blur kept precision at 68% (blurred images still sit near real ones in feature space) but collapsed recall to 9.5%; the copies kept precision at 62% and had recall exactly 0. One number cannot tell “unrealistic” from “not varied”; two can.</p>
+
+  <h2>Text-to-image: CLIP score and people</h2>
+  <p>For text-to-image models, matching the training distribution is not the goal; matching the prompt is. <b>CLIP score</b> (used in Chapter 29) is 100 × the cosine similarity between CLIP’s embeddings of the image and of its prompt, averaged over a prompt set. It rewards alignment and is blind to everything CLIP is blind to: counting, spatial relations, and text drawn in the image that matches the prompt. Benchmarks such as GenEval and T2I-CompBench test those specific skills with detectors and VQA models, and in the end leading labs rely on <b>human preference</b> studies, side-by-side comparisons on hundreds of prompts, because no automatic metric tracks what people prefer closely enough. The practical stack is: FID or a variant (often on better features such as DINOv2, called FD<sub>DINOv2</sub>) for distribution match, precision and recall to diagnose it, CLIP score or a compositional benchmark for prompt adherence, and people for the final call.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: deciding whether a cheaper sampler can ship</div><p>A team wants to cut its image generator from 50 to 20 sampling steps to halve serving cost. The decision procedure is this chapter in miniature: generate 10,000 or more images with both settings from the same prompts and seeds, compute FID against a held-out real set with the same feature extractor and sample count each time, check precision and recall to see whether the change costs fidelity or diversity, check prompt adherence with CLIP score or a compositional benchmark, and run a blind side-by-side preference test on a few hundred prompts. A change that moves FID by less than its run-to-run noise, measured by repeating with different seeds, is not a change.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Comparing FIDs computed with different sample counts:</b> two sets of the same real images scored 72.4 at 500 each and 4.9 at 10,000.</li>
+      <li><b>Comparing FIDs from different implementations</b> or resizing methods; the absolute numbers differ.</li>
+      <li><b>Reading FID as fidelity alone:</b> 100 real photos copied 100 times scored 139, worse than any generator here; FID mixes realism and variety.</li>
+      <li><b>Computing FID against the training set</b> for a model that may memorise it; use held-out images and check nearest neighbours for copies.</li>
+      <li><b>Trusting CLIP score for counts, positions or text in images.</b></li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What does FID measure?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It compares two sets of images, real and generated, in the feature space of an ImageNet-trained Inception network. Each set’s 2,048-dimensional features are summarised by a mean and a covariance, and FID is the Fréchet distance between the two Gaussians: the squared distance between the means plus a term for how different the covariances are. Lower means the generated set’s statistics are closer to the real one’s, which reflects both realism and variety. It needs many samples, typically 10,000 or 50,000, because it is biased upwards when the covariance is estimated from few. I measured the bias directly: two disjoint halves of CIFAR-10’s training set gave FID 72 at 500 images each and 4.9 at 10,000. Scoring my own models at 10,000 samples, a DDPM got 17.8 and a DCGAN 43.4.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Two models have the same FID. How would you tell them apart?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>FID mixes fidelity and diversity, so I would compute precision and recall in the same feature space: one model may produce very realistic but less varied images, the other varied but less realistic ones. I would check the run-to-run spread of FID with different seeds to see if they are actually distinguishable, look at nearest training neighbours of samples for memorisation, evaluate per class or per prompt category to find where each fails, try a different feature space such as DINOv2 because Inception features are ImageNet-biased, and for text-to-image add prompt-adherence benchmarks and a human preference study. In my measurements, a 10-step DDIM sampler and a DCGAN had similar FIDs (45.8 and 43.4) for opposite reasons: the sampler had the highest precision of all (75.8%) and low recall, the GAN ordinary precision and the lowest recall (23.8%).</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Generators are evaluated as distributions: compare real and generated feature statistics, not individual images.</li>
+      <li>FID is the Fréchet distance between Gaussians fitted to Inception features; lower is better.</li>
+      <li>FID is biased upwards at small sample counts: identical distributions scored 72 at 500 images and 5 at 10,000.</li>
+      <li>Measured: DDPM 17.8, DCGAN 43.4 (recall 52% vs 24%); fewer DDIM steps raised precision and cut recall; faint noise alone scored 51.</li>
+      <li>For text-to-image, add CLIP score or compositional benchmarks, and human preference.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does FID compare?</p>
+      <div class="opts">
+        <button class="opt">Each generated image with its nearest real image, pixel by pixel</button>
+        <button class="opt">The mean and covariance of Inception features of the real and generated sets</button>
+        <button class="opt">The generator’s likelihood on test images</button>
+        <button class="opt">The classification accuracy on generated images</button>
+      </div>
+      <div class="explain">A Gaussian is fitted to each set’s 2,048-d features and the Fréchet distance between them is computed.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why must FIDs be compared at the same sample count?</p>
+      <div class="opts">
+        <button class="opt">Because larger sets are always better</button>
+        <button class="opt">Because Inception needs batches of a fixed size</button>
+        <button class="opt">Because FID is normalised by the count</button>
+        <button class="opt">Because the covariance estimate is noisy with few samples, and the noise biases FID upwards</button>
+      </div>
+      <div class="explain">Two halves of the same real data give a non-zero FID that shrinks as n grows.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">A generator that has collapsed onto a few kinds of image scores…</p>
+      <div class="opts">
+        <button class="opt">High precision and low recall</button>
+        <button class="opt">Low precision and high recall</button>
+        <button class="opt">High precision and high recall</button>
+        <button class="opt">Zero FID</button>
+      </div>
+      <div class="explain">Its samples look real (inside the real region) but cover little of the real variety.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does CLIP score measure for a text-to-image model?</p>
+      <div class="opts">
+        <button class="opt">Image sharpness</button>
+        <button class="opt">Diversity across seeds</button>
+        <button class="opt">How well each image matches its prompt in CLIP’s embedding space</button>
+        <button class="opt">Distance to the training set</button>
+      </div>
+      <div class="explain">It is alignment only, and it inherits CLIP’s blind spots such as counting.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why are published FID numbers hard to compare with your own?</p>
+      <div class="opts">
+        <button class="opt">They use a different definition of the Fréchet distance</button>
+        <button class="opt">Implementation details (Inception weights and graph, resizing, sample count) change the absolute values</button>
+        <button class="opt">They are computed on training images</button>
+        <button class="opt">They are always reported at 1,000 samples</button>
+      </div>
+      <div class="explain">Compare within one implementation and protocol, never across.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = CV;
+  const D = {"feat_secs_20k":15.6,"train_vs_test":4.98,"bias":{"500":{"train_vs_train":72.41},"1000":{"train_vs_train":44.42},"2000":{"train_vs_train":23.99},"5000":{"train_vs_train":9.74},"10000":{"train_vs_train":4.93}},"gen":{"DCGAN (Ch 27)":{"fid_10k_vs_test":43.42,"fid_2k":60.18,"precision":67.6,"recall":23.8},"DDPM 1000 steps (Ch 28)":{"fid_10k_vs_test":17.78,"fid_2k":36.05,"precision":67.8,"recall":51.6},"DDIM 100 steps":{"fid_10k_vs_test":21.76,"fid_2k":40.05,"precision":67.1,"recall":48.8},"DDIM 50 steps":{"fid_10k_vs_test":23.88,"fid_2k":42.16,"precision":68.2,"recall":48.1},"DDIM 20 steps":{"fid_10k_vs_test":30.27,"fid_2k":48.16,"precision":71.0,"recall":42.1},"DDIM 10 steps":{"fid_10k_vs_test":45.83,"fid_2k":63.11,"precision":75.8,"recall":30.0}},"real_pr":{"precision":69.7,"recall":69.0},"degrade":{"noise σ=10":{"fid":51.23,"precision":42.8,"recall":31.6},"noise σ=25":{"fid":131.61,"precision":34.8,"recall":8.9},"blur 2x down-up":{"fid":84.22,"precision":68.2,"recall":9.5},"one class only (airplanes)":{"fid":78.48,"precision":70.5,"recall":33.7},"copies of 100 images":{"fid":138.87,"precision":62.0,"recall":0.0}}};
+  const bar = (lab, v, mx, col, unit = '') => `<div class="ev-bar"><span>${lab}</span><span class="track"><i style="width:${Math.min(100, 100 * v / mx)}%;background:${col}"></i></span><span class="n">${v}${unit}</span></div>`;
+  function block(rows, title) {
+    const mx = Math.max(...rows.map(r => r.fid));
+    return `<div style="margin:6px 0 2px"><b>${title}: FID</b> <span class="small muted">(lower is better)</span></div>` + rows.map(r => bar(r.name, r.fid, mx, '#f97316')).join('') +
+      '<div style="margin:10px 0 2px"><b>Precision</b> <span class="small muted">(samples that look real)</span></div>' + rows.map(r => bar(r.name, r.precision, 100, '#3b82f6', '%')).join('') +
+      '<div style="margin:10px 0 2px"><b>Recall</b> <span class="small muted">(real variety covered)</span></div>' + rows.map(r => bar(r.name, r.recall, 100, '#22c55e', '%')).join('');
+  }
+  function gen() {
+    const G = D.gen, rows = Object.keys(G).map(k => ({ name: k, fid: G[k].fid_10k_vs_test, precision: G[k].precision, recall: G[k].recall }));
+    rows.unshift({ name: 'real training images', fid: D.train_vs_test, precision: D.real_pr.precision, recall: D.real_pr.recall });
+    $('#evG').innerHTML = block(rows, '10,000 images vs the test set');
+    $('#evStats').innerHTML = `<div class="stat"><div class="k">Real train vs real test</div><div class="v">FID ${D.train_vs_test}</div></div>` + Object.keys(G).slice(0, 3).map(k => `<div class="stat"><div class="k">${k}</div><div class="v">FID ${G[k].fid_10k_vs_test}</div></div>`).join('');
+    $('#evWhy').innerHTML = '<b>Same precision, very different recall.</b> Every generator’s samples look real about as often as real images do under this test; what separates them is how much of the real variety they cover. Fewer DDIM steps trade recall for precision: simpler, more typical images.';
+  }
+  function deg() {
+    const G = D.degrade, rows = Object.keys(G).map(k => ({ name: k, fid: G[k].fid, precision: G[k].precision, recall: G[k].recall }));
+    rows.unshift({ name: 'unchanged real images', fid: D.train_vs_test, precision: D.real_pr.precision, recall: D.real_pr.recall });
+    $('#evD').innerHTML = block(rows, 'Real images, broken on purpose');
+    $('#evStats').innerHTML = Object.keys(G).map(k => `<div class="stat"><div class="k">${k}</div><div class="v">FID ${G[k].fid}</div></div>`).join('');
+    $('#evWhy').innerHTML = '<b>FID mixes two failures; precision and recall separate them.</b> Noise lowers both. Blur keeps precision and destroys recall. Copies of 100 real images keep precision and have zero recall, and the worst FID of all.';
+  }
+  function bias() {
+    const B = D.bias, ns = Object.keys(B).map(Number), W = 600, H = 220, L = 50, R = 20, T = 28, Bm = 34, mx = Math.max(...ns.map(n => B[n].train_vs_train));
+    const x = n => L + (Math.log(n) - Math.log(ns[0])) / (Math.log(ns[ns.length - 1]) - Math.log(ns[0])) * (W - L - R), y = v => T + (1 - v / mx) * (H - T - Bm);
+    let g = `<line x1="${L}" x2="${W - R}" y1="${y(0)}" y2="${y(0)}" stroke="var(--border)"/><text x="${L - 6}" y="${y(mx) + 4}" text-anchor="end">${mx.toFixed(0)}</text><text x="${L - 6}" y="${y(0) + 4}" text-anchor="end">0</text>`;
+    ns.forEach((n, i) => g += `<text x="${x(n)}" y="${H - 12}" text-anchor="${i === 0 ? 'start' : i === ns.length - 1 ? 'end' : 'middle'}">${n.toLocaleString()} per set</text><circle cx="${x(n)}" cy="${y(B[n].train_vs_train)}" r="5" fill="#f97316"/><text x="${x(n)}" y="${y(B[n].train_vs_train) - 10}" text-anchor="middle" style="fill:var(--text)">${B[n].train_vs_train}</text>`);
+    g += `<polyline fill="none" stroke="#f97316" stroke-width="2.5" points="${ns.map(n => x(n) + ',' + y(B[n].train_vs_train)).join(' ')}"/>`;
+    $('#evB').innerHTML = g;
+    $('#evStats').innerHTML = `<div class="stat"><div class="k">Two disjoint sets of real images, 500 each</div><div class="v">FID ${B[500].train_vs_train}</div></div><div class="stat good"><div class="k">… 10,000 each</div><div class="v">FID ${B[10000].train_vs_train}</div></div>`;
+    $('#evWhy').innerHTML = '<b>The same distribution, a large FID.</b> Both sets are real CIFAR-10 images. With few samples the 2,048 × 2,048 covariance is poorly estimated, and the error always adds distance. Compare FIDs only at equal, large sample counts.';
+  }
+  function draw() { const e = $('#evE .active').dataset.v; ['gen', 'deg', 'bias'].forEach(k => $('#evV' + k).classList.toggle('on', k === e)); ({ gen, deg, bias })[e](); }
+  $('#evE').addEventListener('segchange', draw); draw();
+})();
+</script>
+</body>
+</html>

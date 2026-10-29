@@ -53,7 +53,7 @@ r = await call('PUT', '/progress', { progress: {
   'sd-done': { v: '[1,2]', t: 1000 }, 'ml-quiz': { v: '{"3":4}', t: 1000 },
   'evil-key': { v: 'x', t: 1 }, '__acct-token': { v: 'x', t: 1 }, 'dsa-done': { v: 5, t: 1 },
   'os-done': { v: '[1]', t: 1 }, 'net-quiz': { v: '{}', t: 1 }, 'db-cards': { v: '{}', t: 1 },
-  'dist-done': { v: '[2]', t: 1 }, 'ops-mock-hist': { v: '[]', t: 1 }, 'mlf-done': { v: '[3]', t: 1 }, 'api-quiz': { v: '{}', t: 1 }, 'rag-done': { v: '[4]', t: 1 }, 'agent-done': { v: '[5]', t: 1 }, 'mas-done': { v: '[6]', t: 1 }, 'llm-done': { v: '[7]', t: 1 },
+  'dist-done': { v: '[2]', t: 1 }, 'ops-mock-hist': { v: '[]', t: 1 }, 'mlf-done': { v: '[3]', t: 1 }, 'api-quiz': { v: '{}', t: 1 }, 'rag-done': { v: '[4]', t: 1 }, 'agent-done': { v: '[5]', t: 1 }, 'mas-done': { v: '[6]', t: 1 }, 'llm-done': { v: '[7]', t: 1 }, 'cv-done': { v: '[8]', t: 1 },
 } }, token);
 check('progress saved', r.status === 200 && r.body.updated_at > 0, r.body);
 r = await call('PUT', '/progress', { progress: { 'sd-done': { v: '[9]', t: 500 }, 'ml-quiz': { v: '{"3":5}', t: 2000 } } }, token);
@@ -61,9 +61,9 @@ r = await call('GET', '/progress', undefined, token);
 const p = r.body.progress;
 check('older write ignored, newer write wins', p['sd-done'].v === '[1,2]' && p['ml-quiz'].v === '{"3":5}', p);
 check('non-course keys and bad values dropped', !('evil-key' in p) && !('__acct-token' in p) && !('dsa-done' in p), p);
-check('new course keys (os, net, db, dist, ops, mlf, api, rag, agent, mas, llm) are kept',
+check('new course keys (os, net, db, dist, ops, mlf, api, rag, agent, mas, llm, cv) are kept',
   p['os-done']?.v === '[1]' && p['net-quiz']?.v === '{}' && p['db-cards']?.v === '{}' &&
-  p['dist-done']?.v === '[2]' && p['ops-mock-hist']?.v === '[]' && p['mlf-done']?.v === '[3]' && p['api-quiz']?.v === '{}' && p['rag-done']?.v === '[4]' && p['agent-done']?.v === '[5]' && p['mas-done']?.v === '[6]' && p['llm-done']?.v === '[7]', p);
+  p['dist-done']?.v === '[2]' && p['ops-mock-hist']?.v === '[]' && p['mlf-done']?.v === '[3]' && p['api-quiz']?.v === '{}' && p['rag-done']?.v === '[4]' && p['agent-done']?.v === '[5]' && p['mas-done']?.v === '[6]' && p['llm-done']?.v === '[7]' && p['cv-done']?.v === '[8]', p);
 r = await call('GET', '/progress');
 check('progress needs a token', r.status === 401);
 

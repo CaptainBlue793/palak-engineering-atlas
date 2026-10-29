@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Efficient Convolutions · Computer Vision by Palak Deb Patra</title>
+<meta name="description" content="Chapter 12 of Computer Vision. Grouped, depthwise-separable and 1x1 convolutions and inverted residuals: FLOPs against measured time on a GPU and a CPU, MobileNet vs ResNet-18, and a depthwise-separable CNN trained on CIFAR-10.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('cv-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .ef-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .ef-v { display:none; } .ef-v.on { display:block; }
+  .ef-box { margin-top:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .ef-row { display:grid; grid-template-columns:180px 1fr 1fr 1fr; gap:10px; align-items:center; padding:4px 0; font-size:12.5px; }
+  .ef-row.h { color:var(--muted); font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+  .ef-cell { display:grid; grid-template-columns:1fr 70px; gap:6px; align-items:center; }
+  .ef-cell .track { height:12px; border-radius:4px; background:var(--surface); overflow:hidden; }
+  .ef-cell .track i { display:block; height:100%; }
+  .ef-cell .n { font-family:var(--mono); font-size:11.5px; text-align:right; }
+  .ef-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:700px) { .ef-row { grid-template-columns:110px 1fr 1fr 1fr; gap:6px; } .ef-cell { grid-template-columns:1fr; } }
+</style>
+</head>
+<body data-chapter="12">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 12</span><span class="pill">Intermediate</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Efficient <span class="grad">Convolutions</span></h1>
+    <p class="lead">A standard 3 × 3 convolution mixes space and channels in one step, and pays for both at once: K² × C<sub>in</sub> × C<sub>out</sub> multiply-adds per position. Mobile networks split it into cheaper parts, a per-channel spatial filter and a 1 × 1 channel mixer, and cut the arithmetic by eight or nine times.</p>
+    <p class="lead">Fewer operations is not the same as faster, and this chapter measures by how much. On this GPU a depthwise convolution with 64 times fewer FLOPs than a standard one ran only 3 times faster, and MobileNet v2, with a sixth of ResNet-18’s FLOPs, was slower than it at batch 1. On a single CPU core the picture flips. The lesson for every efficiency claim: count, then time it on the hardware you will ship on.</p>
+    <ul class="objectives">
+      <li><span>Write grouped, depthwise and pointwise convolutions and count their cost</span></li>
+      <li><span>Build a depthwise-separable block and MobileNet’s inverted residual</span></li>
+      <li><span>Explain arithmetic intensity, and why depthwise layers are memory-bound on a GPU</span></li>
+      <li><span>Predict when FLOP savings turn into speed, on GPU and on CPU</span></li>
+      <li><span>Judge the accuracy cost of factorised convolutions</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Convolution cost:</b> <a href="02-convolutions-in-depth.html">Chapter 2: Convolutions in Depth</a> (FLOPs, and why a 3-channel layer was memory-bound).</li>
+        <li><b>Separable kernels:</b> <a href="p5-classical-filtering.html">P5</a>; GPU throughput in <a href="p8-gpu-memory-and-throughput.html">P8</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Grouped, depthwise and pointwise</h2>
+  <p>A <b>grouped</b> convolution with g groups splits the channels into g independent sets: each output channel sees only C<sub>in</sub>/g inputs, so cost and parameters fall by g. Taken to the limit, g = C, it is a <b>depthwise</b> convolution: each channel is filtered on its own with its own 3 × 3 kernel, no mixing between channels at all. A <b>pointwise</b> (1 × 1) convolution is the opposite: no spatial extent, only channel mixing. Put a depthwise and a pointwise together and you have a <b>depthwise-separable</b> convolution, the factorisation P5 used for blurs (2k instead of k²), applied to channels.</p>
+<pre class="code">C = <span class="m">64</span>
+standard  = nn.<span class="f">Conv2d</span>(C, C, <span class="m">3</span>, padding=<span class="m">1</span>, bias=<span class="k">False</span>)                 <span class="c"># 36,864 params: 9·C·C</span>
+grouped   = nn.<span class="f">Conv2d</span>(C, C, <span class="m">3</span>, padding=<span class="m">1</span>, groups=<span class="m">8</span>, bias=<span class="k">False</span>)       <span class="c">#  4,608: 9·C·C/8</span>
+depthwise = nn.<span class="f">Conv2d</span>(C, C, <span class="m">3</span>, padding=<span class="m">1</span>, groups=C, bias=<span class="k">False</span>)       <span class="c">#    576: 9·C, one 3x3 per channel</span>
+pointwise = nn.<span class="f">Conv2d</span>(C, C, <span class="m">1</span>, bias=<span class="k">False</span>)                            <span class="c">#  4,096: C·C, mixes channels only</span>
+separable = nn.<span class="f">Sequential</span>(depthwise, pointwise)                          <span class="c">#  4,672: 9·C + C·C, ≈ 7.9x fewer</span></pre>
+  <p>For C channels the saving of the separable version is 9C² / (9C + C²) = 9 / (1 + 9/C): 7.9× at 64 channels, 8.7× at 256. MobileNet v1 (2017) is essentially a stack of these. MobileNet v2 (2018) wraps them in an <b>inverted residual</b>: a 1 × 1 convolution that <i>expands</i> the channels six times, a depthwise 3 × 3 in that wide space, and a 1 × 1 that projects back down, with the residual connection between the narrow ends. It is ResNet’s bottleneck (Chapter 7) turned inside out: narrow–wide–narrow instead of wide–narrow–wide, because depthwise filtering is cheap enough to afford a wide middle.</p>
+
+  <h2>FLOPs against time, one layer at a time</h2>
+  <p>Each layer at batch 32, timed with CUDA events on the RTX 5070 Ti (median of 40, bf16, channels-last) and on one CPU thread at batch 1:</p>
+  <table class="t cmp">
+    <thead><tr><th>Layer, 64 ch at 56 × 56</th><th>Parameters</th><th>GFLOP</th><th>GPU time</th><th>Achieved</th><th>Speed-up vs standard: FLOPs / GPU time</th></tr></thead>
+    <tbody>
+      <tr><td>Standard 3 × 3</td><td>36,864</td><td>7.40</td><td>0.118 ms</td><td>62.5 TFLOPS</td><td>1× / 1×</td></tr>
+      <tr><td>Grouped 3 × 3, g = 8</td><td>4,608</td><td>0.93</td><td>0.099 ms</td><td>9.3 TFLOPS</td><td>8× / 1.2×</td></tr>
+      <tr><td>Depthwise 3 × 3</td><td>576</td><td>0.12</td><td>0.038 ms</td><td>3.1 TFLOPS</td><td><b>64× / 3.1×</b></td></tr>
+      <tr><td>Pointwise 1 × 1</td><td>4,096</td><td>0.82</td><td>0.047 ms</td><td>17.7 TFLOPS</td><td>9× / 2.5×</td></tr>
+      <tr><td>Depthwise-separable</td><td>4,672</td><td>0.94</td><td>0.067 ms</td><td>13.9 TFLOPS</td><td>7.9× / 1.8×</td></tr>
+      <tr><td>Inverted residual (×6 expansion)</td><td>54,272</td><td>10.56</td><td>1.420 ms</td><td>7.4 TFLOPS</td><td>0.7× / 0.08×</td></tr>
+    </tbody>
+  </table>
+  <p>The depthwise layer did 64 times less arithmetic and took a third of the time, because the GPU was not limited by arithmetic. Each depthwise output needs 9 multiply-adds, but every input and output value still has to be read from and written to memory, so the layer’s <b>arithmetic intensity</b>, FLOPs per byte moved, is tiny. Memory bandwidth sets its speed (P6 of the LLMs course calls this memory-bound), and tensor cores sit idle: 3.1 TFLOPS against 62.5 for the dense layer. The inverted residual is the extreme case: expanding 64 channels to 384 at 56 × 56 resolution creates a 384 × 56 × 56 tensor per image that is written and read three times, and the block took 12 times as long as a standard convolution.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">FLOPs vs time</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="ef-l">Compare</div>
+      <div class="seg" id="efE"><button class="active" data-v="l64">layers: 64 ch @ 56²</button><button data-v="l256">layers: 256 ch @ 14²</button><button data-v="nets">whole networks</button><button data-v="cifar">trained on CIFAR-10</button></div>
+      <div class="ef-box" id="efBox"></div>
+      <div class="stats" id="efStats"></div>
+      <div class="ef-why" id="efWhy"></div>
+    </div>
+    <div class="panel-foot">FLOPs counted with <code>torch.utils.flop_counter</code> (2 FLOPs per multiply-add). GPU: RTX 5070 Ti, bf16, channels-last, <code>cudnn.benchmark</code>, median of 40 CUDA-event timings (15 for networks at batch 64). CPU: fp32, batch 1, one thread or eight. Each bar is relative to the largest value in its column, so compare lengths across rows. Networks have random weights (speed does not depend on them). The CIFAR runs use Chapter 4’s recipe for 30 epochs.</div>
+  </div>
+
+  <h2>Whole networks: GPU vs CPU</h2>
+  <table class="t cmp">
+    <thead><tr><th>224 × 224</th><th>Params</th><th>GFLOP</th><th>GPU batch 1</th><th>GPU batch 64</th><th>CPU 8 threads</th><th>CPU 1 thread</th></tr></thead>
+    <tbody>
+      <tr><td>ResNet-18</td><td>11.7 M</td><td>3.63</td><td><b>1.11 ms</b></td><td>8,817 img/s</td><td>7.2 ms</td><td>27.6 ms</td></tr>
+      <tr><td>ResNet-50</td><td>25.6 M</td><td>8.18</td><td>6.33 ms</td><td>3,847 img/s</td><td>14.7 ms</td><td>61.6 ms</td></tr>
+      <tr><td>MobileNet v2</td><td>3.5 M</td><td>0.60</td><td>2.59 ms</td><td>10,319 img/s</td><td>5.3 ms</td><td><b>9.5 ms</b></td></tr>
+      <tr><td>MobileNet v3-Large</td><td>5.5 M</td><td>0.43</td><td>3.26 ms</td><td><b>10,776 img/s</b></td><td>5.3 ms</td><td>7.8 ms</td></tr>
+      <tr><td>EfficientNet-B0</td><td>5.3 M</td><td>0.77</td><td>4.08 ms</td><td>8,245 img/s</td><td>7.1 ms</td><td>13.2 ms</td></tr>
+    </tbody>
+  </table>
+  <p>On the GPU at batch 1, ResNet-18 was the fastest network here, 2.3 times faster than MobileNet v2 despite six times the FLOPs. A batch of one image cannot fill the GPU, so time is set by the number of layers and kernel launches (MobileNet v2 has 52 convolutions to ResNet-18’s 20, each with its own normalisation and activation) rather than by arithmetic. At batch 64 the GPU fills and MobileNet v3 pulled ahead, but only by 22%, nowhere near its 8× FLOP advantage. On one CPU core, where arithmetic is the bottleneck, the FLOP savings appeared: MobileNet v2 was 2.9 times faster than ResNet-18 and MobileNet v3 3.5 times. That is the hardware these networks were designed for. EfficientNet-B0, more accurate than MobileNet (Chapter 11), paid for its squeeze-and-excitation blocks and SiLU activations with more time per FLOP everywhere.</p>
+  <figure class="flow">
+    <ol>
+      <li><b>Count FLOPs and parameters</b><small>a first filter, nothing more</small></li>
+      <li><b>Know the target</b><small>GPU, mobile NPU, CPU; batch size</small></li>
+      <li><b>Time it there</b><small>at the batch size you will serve</small></li>
+      <li><b>Look for memory-bound layers</b><small>depthwise, wide expansions, high resolution</small></li>
+      <li><b>Choose by measured latency and accuracy</b><small>not by FLOPs</small></li>
+    </ol>
+    <figcaption><b>Choosing an efficient architecture.</b> FLOPs predict CPU time reasonably and GPU time poorly; only measurement on the target settles it.</figcaption>
+  </figure>
+
+  <h2>Does factorising cost accuracy?</h2>
+  <p>Chapter 4’s CNN, and the same network with every 3 × 3 convolution replaced by a depthwise-separable pair, trained identically for 30 epochs on CIFAR-10:</p>
+  <table class="t cmp">
+    <thead><tr><th>Model</th><th>Parameters</th><th>MFLOPs</th><th>Test accuracy</th><th>Train time, 30 epochs</th></tr></thead>
+    <tbody>
+      <tr><td>Standard 3 × 3 (Chapter 4)</td><td>1,188,170</td><td>305.6</td><td>91.2%</td><td>43.5 s</td></tr>
+      <tr><td>Depthwise-separable, same widths</td><td>183,434</td><td>49.3</td><td>88.13%</td><td>47.6 s</td></tr>
+      <tr><td>Depthwise-separable, 2× wider</td><td>629,002</td><td>182.4</td><td>89.6%</td><td>90.8 s</td></tr>
+    </tbody>
+  </table>
+  <p>Replacing every 3 × 3 convolution with a depthwise-separable pair (with BatchNorm and ReLU after each half) cut parameters 6.5 times and FLOPs 6.2 times, and cost 3.1 points of accuracy: 88.13% against 91.20%. Doubling the widths won back half the gap (89.60%) with still half the parameters and 60% of the FLOPs of the standard model. Training time went the other way: the separable models took longer to train on this GPU (47.6 s and 90.8 s against 43.5 s), for the memory-bound reasons above. Factorised convolutions are a good trade where arithmetic is the bottleneck and a poor one where it is not. (A first version of this run trained with the model accidentally left in evaluation mode, so BatchNorm never adapted and the separable nets diverged; the numbers here are from the corrected re-run.)</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: designing for the phone, then measuring on it</div><p>MobileNet v3 (2019) was not designed by counting FLOPs alone: its architecture was found by a search that measured latency on real Pixel phones, and the authors then hand-adjusted the parts that the measurements showed were expensive, such as the first and last layers, and replaced the swish activation with a cheaper “hard” version because it ran faster on mobile hardware. EfficientNet’s family was searched for FLOP efficiency and later found to be slower on GPUs than its FLOPs suggested, which motivated GPU-aware designs such as RegNet and EfficientNetV2. The pattern in this chapter’s numbers is the reason: efficiency is a property of a model on a device, not of the model.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Equating FLOPs with latency.</b> 64× fewer FLOPs bought 3× on the GPU here.</li>
+      <li><b>Benchmarking a mobile network on a server GPU</b> and concluding it is slow, or the reverse.</li>
+      <li><b>Timing at batch 64 for a service that runs batch 1.</b> The ranking changed between the two.</li>
+      <li><b>Forgetting the expansion in inverted residuals</b> when estimating memory: the wide middle tensor dominates.</li>
+      <li><b>Leaving out the nonlinearity and normalisation between depthwise and pointwise layers</b> without testing it.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is a depthwise-separable convolution and how much does it save?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It splits a standard K × K convolution into two steps: a depthwise convolution that filters each channel separately with its own K × K kernel (K²·C weights), then a 1 × 1 pointwise convolution that mixes channels (C·C′ weights). The standard layer costs K²·C·C′ per position; the separable one K²·C + C·C′, a saving of roughly K² when the channel count is large: 7.9× for 3 × 3 at 64 channels, 8.7× at 256. The caveat is speed: on a GPU the depthwise step has so little arithmetic per byte that it is memory-bound; a 64-channel depthwise layer here ran at 3 TFLOPS against 62 for the standard convolution, so the separable pair was only 1.8× faster for 7.9× fewer FLOPs.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why can MobileNet v2 be slower than ResNet-18 on a GPU, and when would you still choose it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>At small batch on a GPU, time is dominated by kernel launches and memory traffic, not arithmetic. MobileNet v2 has many more, thinner layers than ResNet-18, and its depthwise and expansion layers are memory-bound, so at batch 1 it took 2.6 ms against 1.1 ms for ResNet-18 despite six times fewer FLOPs; at batch 64 it was only 17% faster. On a CPU or a mobile chip with less parallelism, arithmetic is the limit, and the FLOP savings show: on one CPU core it was 2.9 times faster. So I would choose MobileNet-style models for CPUs, phones and microcontrollers, or where memory and model size matter (3.5 M parameters against 11.7 M), and choose ResNet- or RegNet-style dense convolutions for GPU serving, after timing both on the target at the deployed batch size.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Grouped convs divide cost by g; depthwise (g = C) filters each channel alone; pointwise (1 × 1) mixes channels.</li>
+      <li>Depthwise-separable = depthwise + pointwise: 7.9× fewer FLOPs at 64 channels.</li>
+      <li>On the GPU those savings shrink: 64× fewer FLOPs ran 3× faster, because depthwise layers are memory-bound.</li>
+      <li>MobileNet v2 was slower than ResNet-18 on the GPU at batch 1 and 2.9× faster on one CPU core.</li>
+      <li>Inverted residuals expand channels 6× in the middle; their wide tensors cost time and memory.</li>
+      <li>Count FLOPs to shortlist; time on the target hardware at the real batch size to decide.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">How many weights does a depthwise 3 × 3 convolution on 64 channels have?</p>
+      <div class="opts">
+        <button class="opt">36,864</button>
+        <button class="opt">576</button>
+        <button class="opt">4,096</button>
+        <button class="opt">64</button>
+      </div>
+      <div class="explain">One 3 × 3 kernel per channel: 9 × 64. A standard 3 × 3 from 64 to 64 channels has 9 × 64 × 64 = 36,864.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A depthwise layer did 64× fewer FLOPs than a standard one but ran only 3× faster on the GPU. Why?</p>
+      <div class="opts">
+        <button class="opt">The GPU does not support depthwise convolutions</button>
+        <button class="opt">bf16 was not used</button>
+        <button class="opt">The FLOP count was wrong</button>
+        <button class="opt">It is memory-bound: little arithmetic per byte read and written, so bandwidth sets the time</button>
+      </div>
+      <div class="explain">9 multiply-adds per output cannot keep tensor cores busy; the layer ran at 3.1 TFLOPS against 62.5 for the dense one.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Where did MobileNet’s FLOP savings turn into the biggest speed-up over ResNet-18?</p>
+      <div class="opts">
+        <button class="opt">On one CPU thread at batch 1</button>
+        <button class="opt">On the GPU at batch 1</button>
+        <button class="opt">On the GPU at batch 64</button>
+        <button class="opt">Nowhere</button>
+      </div>
+      <div class="explain">9.5 ms against 27.6 ms on one core (2.9×). On the GPU at batch 1 MobileNet v2 was 2.3× slower.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What is “inverted” about MobileNet v2’s inverted residual?</p>
+      <div class="opts">
+        <button class="opt">It subtracts the input instead of adding it</button>
+        <button class="opt">It runs backwards</button>
+        <button class="opt">It goes narrow → wide → narrow, the opposite of ResNet’s wide → narrow → wide bottleneck</button>
+        <button class="opt">It has no activation</button>
+      </div>
+      <div class="explain">A 1 × 1 expands channels (×6), a depthwise 3 × 3 filters the wide tensor, a 1 × 1 projects back; the residual joins the narrow ends.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What is the right way to choose between two architectures for a phone app?</p>
+      <div class="opts">
+        <button class="opt">Pick the one with fewer FLOPs</button>
+        <button class="opt">Measure latency on the target phone at the real batch size, alongside accuracy</button>
+        <button class="opt">Pick the one with fewer parameters</button>
+        <button class="opt">Benchmark both on a server GPU</button>
+      </div>
+      <div class="explain">Rankings changed between GPU and CPU and between batch sizes here. Only measurement on the target settles it.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = CV;
+  const D = {"layers":{"64 channels @ 56x56, batch 32":{"standard 3x3":{"params":36864,"gflop":7.399,"gpu_bf16_ms":0.1184,"gpu_fp32_ms":0.3132,"tflops_bf16":62.47,"cpu_ms_bs1":0.264},"grouped 3x3 (g=8)":{"params":4608,"gflop":0.925,"gpu_bf16_ms":0.0993,"gpu_fp32_ms":0.5878,"tflops_bf16":9.31,"cpu_ms_bs1":0.092},"depthwise 3x3 only":{"params":576,"gflop":0.116,"gpu_bf16_ms":0.0378,"gpu_fp32_ms":0.1132,"tflops_bf16":3.06,"cpu_ms_bs1":0.069},"pointwise 1x1 only":{"params":4096,"gflop":0.822,"gpu_bf16_ms":0.0465,"gpu_fp32_ms":0.1176,"tflops_bf16":17.69,"cpu_ms_bs1":0.07},"depthwise-separable":{"params":4672,"gflop":0.938,"gpu_bf16_ms":0.0674,"gpu_fp32_ms":0.1504,"tflops_bf16":13.92,"cpu_ms_bs1":0.142},"inverted residual (t=6)":{"params":54272,"gflop":10.559,"gpu_bf16_ms":1.4199,"gpu_fp32_ms":2.8193,"tflops_bf16":7.44,"cpu_ms_bs1":0.617}},"256 channels @ 14x14, batch 32":{"standard 3x3":{"params":589824,"gflop":7.399,"gpu_bf16_ms":0.1046,"gpu_fp32_ms":0.2247,"tflops_bf16":70.72,"cpu_ms_bs1":0.266},"grouped 3x3 (g=8)":{"params":73728,"gflop":0.925,"gpu_bf16_ms":0.0339,"gpu_fp32_ms":0.2014,"tflops_bf16":27.32,"cpu_ms_bs1":0.134},"depthwise 3x3 only":{"params":2304,"gflop":0.029,"gpu_bf16_ms":0.0233,"gpu_fp32_ms":0.0476,"tflops_bf16":1.24,"cpu_ms_bs1":0.049},"pointwise 1x1 only":{"params":65536,"gflop":0.822,"gpu_bf16_ms":0.0316,"gpu_fp32_ms":0.0706,"tflops_bf16":26.03,"cpu_ms_bs1":0.064},"depthwise-separable":{"params":67840,"gflop":0.851,"gpu_bf16_ms":0.0457,"gpu_fp32_ms":0.0757,"tflops_bf16":18.64,"cpu_ms_bs1":0.141},"inverted residual (t=6)":{"params":806912,"gflop":10.038,"gpu_bf16_ms":0.2698,"gpu_fp32_ms":0.7773,"tflops_bf16":37.21,"cpu_ms_bs1":0.55}}},"nets":{"ResNet-18":{"params_m":11.69,"gflop":3.63,"gpu_bs1_ms":1.113,"gpu_bs64_ips":8816.6,"cpu8_ms":7.2,"cpu1_ms":27.6},"ResNet-50":{"params_m":25.56,"gflop":8.18,"gpu_bs1_ms":6.325,"gpu_bs64_ips":3847.0,"cpu8_ms":14.7,"cpu1_ms":61.6},"MobileNet v2":{"params_m":3.5,"gflop":0.6,"gpu_bs1_ms":2.594,"gpu_bs64_ips":10318.9,"cpu8_ms":5.3,"cpu1_ms":9.5},"MobileNet v3-L":{"params_m":5.48,"gflop":0.43,"gpu_bs1_ms":3.262,"gpu_bs64_ips":10776.3,"cpu8_ms":5.3,"cpu1_ms":7.8},"EfficientNet-B0":{"params_m":5.29,"gflop":0.77,"gpu_bs1_ms":4.079,"gpu_bs64_ips":8245.3,"cpu8_ms":7.1,"cpu1_ms":13.2}},"cifar":{"standard":{"params":1188170,"mflop":305.6,"acc":91.2,"train_secs":43.5},"depthwise-separable":{"params":183434,"mflop":49.3,"acc":88.13,"train_secs":47.6},"depthwise-separable, 2x wider":{"params":629002,"mflop":182.4,"acc":89.6,"train_secs":90.8}},"cifar_why":"<b>Separable convolutions trade a little accuracy for a lot of parameters.<\/b> 6.5× fewer parameters cost 3.1 points; doubling the width recovered half of that. Note the training times: fewer FLOPs, yet slower to train on this GPU."};
+  const cell = (v, max, c, txt) => `<span class="ef-cell"><span class="track"><i style="width:${Math.max(1, v / max * 100)}%;background:${c}"></i></span><span class="n">${txt}</span></span>`;
+  function layers(key) {
+    const L = D.layers[key], rows = Object.entries(L), mf = Math.max(...rows.map(r => r[1].gflop)), mg = Math.max(...rows.map(r => r[1].gpu_bf16_ms)), mc = Math.max(...rows.map(r => r[1].cpu_ms_bs1));
+    $('#efBox').innerHTML = `<div class="ef-row h"><span>layer</span><span>GFLOP</span><span>GPU time (bf16, batch 32)</span><span>CPU time (1 thread, batch 1)</span></div>` + rows.map(([n, r]) => `<div class="ef-row"><span>${n}</span>${cell(r.gflop, mf, 'var(--accent-2)', r.gflop.toFixed(2))}${cell(r.gpu_bf16_ms, mg, 'var(--accent)', r.gpu_bf16_ms.toFixed(3) + ' ms')}${cell(r.cpu_ms_bs1, mc, '#64748b', r.cpu_ms_bs1.toFixed(3) + ' ms')}</div>`).join('');
+    const s = L['standard 3x3'], d = L['depthwise 3x3 only'], p = L['depthwise-separable'];
+    $('#efStats').innerHTML = `<div class="stat"><div class="k">Depthwise: FLOPs saved</div><div class="v">${(s.gflop / d.gflop).toFixed(0)}×</div></div><div class="stat warn"><div class="k">Depthwise: GPU speed-up</div><div class="v">${(s.gpu_bf16_ms / d.gpu_bf16_ms).toFixed(1)}×</div></div><div class="stat"><div class="k">Separable: FLOPs / GPU</div><div class="v">${(s.gflop / p.gflop).toFixed(1)}× / ${(s.gpu_bf16_ms / p.gpu_bf16_ms).toFixed(1)}×</div></div><div class="stat"><div class="k">Standard achieved</div><div class="v">${s.tflops_bf16} TFLOPS</div></div>`;
+    $('#efWhy').innerHTML = key.startsWith('64') ? '<b>Compare the purple and orange bars.</b> FLOPs fall by orders of magnitude from the standard convolution to depthwise, but GPU time falls only a little: those layers wait on memory, not arithmetic. The inverted residual’s 384-channel middle tensor at 56 × 56 makes it the slowest layer by far.' : '<b>At 256 channels and 14 × 14,</b> tensors are smaller and channels deeper, so the dense convolutions run even closer to peak (70.7 TFLOPS) and the inverted residual is no longer a disaster (0.27 ms). Depthwise layers are still the least efficient per FLOP: 1.2 TFLOPS.';
+  }
+  function nets() {
+    const rows = Object.entries(D.nets), m1 = Math.max(...rows.map(r => r[1].gpu_bs1_ms)), m64 = Math.max(...rows.map(r => r[1].gpu_bs64_ips)), mc = Math.max(...rows.map(r => r[1].cpu1_ms));
+    $('#efBox').innerHTML = `<div class="ef-row h"><span>network (GFLOP)</span><span>GPU batch 1 (lower is better)</span><span>GPU batch 64 (higher is better)</span><span>CPU 1 thread (lower is better)</span></div>` + rows.map(([n, r]) => `<div class="ef-row"><span>${n} (${r.gflop})</span>${cell(r.gpu_bs1_ms, m1, 'var(--accent)', r.gpu_bs1_ms + ' ms')}${cell(r.gpu_bs64_ips, m64, 'var(--accent-2)', Math.round(r.gpu_bs64_ips).toLocaleString('en-GB') + '/s')}${cell(r.cpu1_ms, mc, '#64748b', r.cpu1_ms + ' ms')}</div>`).join('');
+    const a = D.nets['ResNet-18'], b = D.nets['MobileNet v2'];
+    $('#efStats').innerHTML = `<div class="stat"><div class="k">FLOPs, R18 / MBv2</div><div class="v">${(a.gflop / b.gflop).toFixed(1)}×</div></div><div class="stat bad"><div class="k">GPU batch 1</div><div class="v">MBv2 ${(b.gpu_bs1_ms / a.gpu_bs1_ms).toFixed(1)}× slower</div></div><div class="stat warn"><div class="k">GPU batch 64</div><div class="v">MBv2 ${(b.gpu_bs64_ips / a.gpu_bs64_ips).toFixed(2)}× faster</div></div><div class="stat good"><div class="k">CPU 1 thread</div><div class="v">MBv2 ${(a.cpu1_ms / b.cpu1_ms).toFixed(1)}× faster</div></div>`;
+    $('#efWhy').innerHTML = '<b>The same networks rank differently on different hardware.</b> One image on a GPU is a launch-overhead problem, where ResNet-18’s few, fat layers win. A full GPU batch is mostly a memory problem. One CPU core is an arithmetic problem, where MobileNet’s FLOP savings finally pay off.';
+  }
+  function cifar() {
+    const rows = Object.entries(D.cifar), mp = Math.max(...rows.map(r => r[1].params)), mf = Math.max(...rows.map(r => r[1].mflop));
+    $('#efBox').innerHTML = `<div class="ef-row h"><span>model</span><span>parameters</span><span>MFLOPs</span><span>test accuracy</span></div>` + rows.map(([n, r]) => `<div class="ef-row"><span>${n}</span>${cell(r.params, mp, 'var(--accent-2)', (r.params / 1e6).toFixed(2) + ' M')}${cell(r.mflop, mf, '#64748b', r.mflop)}${cell(r.acc, 100, 'var(--accent)', r.acc + '%')}</div>`).join('');
+    const s = D.cifar.standard, d = D.cifar['depthwise-separable'];
+    $('#efStats').innerHTML = `<div class="stat"><div class="k">Standard</div><div class="v">${s.acc}%</div></div><div class="stat"><div class="k">Separable</div><div class="v">${d.acc}%</div></div><div class="stat"><div class="k">Parameters saved</div><div class="v">${(s.params / d.params).toFixed(1)}×</div></div><div class="stat"><div class="k">Train time</div><div class="v">${s.train_secs} / ${d.train_secs} s</div></div>`;
+    $('#efWhy').innerHTML = D.cifar_why;
+  }
+  function draw() { const e = $('#efE .active').dataset.v; if (e === 'l64') layers('64 channels @ 56x56, batch 32'); else if (e === 'l256') layers('256 channels @ 14x14, batch 32'); else if (e === 'nets') nets(); else cifar(); }
+  $('#efE').addEventListener('segchange', draw);
+  draw();
+})();
+</script>
+</body>
+</html>
