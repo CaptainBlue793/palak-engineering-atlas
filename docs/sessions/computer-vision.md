@@ -63,3 +63,7 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch38 shipped: R50 bs64 fp32 34.2 -> bf16 16.3 -> compile 11.4 ms, but bf16 bs1 slower than fp32; CPU int8 R50 3.1x, 0 loss; MobileNetV3 int8 -5.4 pts; ONNX RT 2.3-4.6x; pruning 0-90% no speed change; model 76% of a request.
 - Ch35 shipped (after sentencepiece install + case-insensitive TrOCR follow-up): CRNN CER 0.02 / 6.19 / 97.5% (seen / unseen / degraded); TrOCR (writes capitals) ignoring case 3.66 / 2.66 / 12.77%.
 - Ch39 shipped: baseline 88.7; no norm 33.2, low-res 72.0, BGR 76.0, wrong stats 88.0, aug on 87.9, train mode bs16 86.8; 20% noise 85.7; leaked 94.1 vs clean 89.7; 10% cats -> cat recall 26%; top-500 loss 100% mislabelled.
+
+## 2026-10-29 — release prep
+- Done: owner said "release CV". Merged origin/main (already up to date); registry live (chapters 56, hours 42 from chapter minutes); `cv-` sync keys in assets/account.js, api/src/index.js, ACCOUNTS.md and the API test (25/25 pass on a local Worker); README table and tree; study data and dist rebuilt (60 pages, 6.67 MB). Checks: content audit 0 errors, bundle, crosslinks, palette, hub (default, dark, 390 px) all pass.
+- Next: owner merges to main and pushes, runs the Worker deploy and `gh release create computer-vision-v1.0.0`.
