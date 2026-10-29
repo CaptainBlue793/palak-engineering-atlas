@@ -9,3 +9,4 @@ lp-lab` with drive/shot/eval/errs/links/inject and ship_nlp.sh.
 - P1 shipped: café composed vs decomposed -> different cased-BERT tokens; uncased BERT strips Hindi vowel signs; XLM-R NFKC; C4 lines 28% non-ASCII, NFKC changes 1.6%; tweet_eval hub copy 0% non-ASCII (pre-folded).
 - P2 shipped: masked pooling 86.94 vs 84.78; one review 70%→51% positive as padding grows; dynamic padding saved nothing on IMDB (0.853^64), bucketing cut padding 46.3%→1.8%, 1.56x faster.
 - P3 shipped: \S+@\S+ on C4 49% trailing punctuation, 12% not addresses; 29% of strict dates ambiguous; ^(a+)+$ 1.21 s at 26 chars (x4 per 2); stop words -1.21 pts, other cleaning within ±0.25 (s.e. 0.19). Live tester runs in a worker killed at 1.5 s.
+- P4 shipped: 140,665 types, 46.2% hapax; top 100 cover 44.3%; Zipf s=1.12, Heaps beta 0.57 (pred 142.6k vs 140.7k); P(states|united) 64%; product underflows at word 16 (fp32) / 96 (fp64); H 10.93 bits, ppl 1,948.
