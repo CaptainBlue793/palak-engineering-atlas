@@ -3,37 +3,274 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Serving NLP Models</title>
+<title>Serving NLP Models · NLP by Palak Deb Patra</title>
+<meta name="description" content="Chapter 37 of NLP. A fine-tuned DistilBERT and BERT-base measured for serving: batch-1 latency on GPU and CPU at 32, 128 and 512 tokens; GPU throughput against batch size; dynamic padding against fixed padding on SST-2’s real lengths; accuracy, size and latency for fp32, int8, ONNX Runtime and fp16; and the tokeniser’s share of CPU latency.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('nlp-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sv-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .sv-v { display:none; } .sv-v.on { display:block; }
+  .sv-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .sv-box svg { width:100%; height:auto; display:block; } .sv-box text { font-size:11px; fill:var(--muted); }
+  .sv-row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; font-size:13px; margin-top:6px; } .sv-row input[type=range] { flex:1; min-width:140px; }
+  .sv-bar { display:grid; grid-template-columns:minmax(0, 270px) 1fr 110px; gap:8px; align-items:center; padding:2px 0; font-size:13px; }
+  .sv-bar .track { height:12px; border-radius:4px; background:var(--surface); overflow:hidden; } .sv-bar .track i { display:block; height:100%; }
+  .sv-bar .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .sv-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  .sv-key { display:flex; flex-wrap:wrap; gap:6px 14px; font-size:12.5px; margin-top:6px; } .sv-key span::before { content:''; display:inline-block; width:10px; height:10px; border-radius:2px; background:var(--c); margin-right:5px; }
+  @media (max-width:640px) { .sv-bar { grid-template-columns:minmax(0, 110px) 1fr 84px; font-size:12px; } }
+</style>
 </head>
 <body data-chapter="37">
-<!-- nlp:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 37</span><span class="pill">Expert</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Serving NLP <span class="grad">Models</span></h1>
-    <p class="lead">Distillation, quantisation, ONNX, dynamic padding and batching for encoders, latency measured end to end.</p>
+    <h1>Serving <span class="grad">NLP Models</span></h1>
+    <p class="lead">A model that takes 20 ms per text is fine in a notebook and a problem at 2,000 requests a second. Serving is where the cheap wins live: a smaller distilled model, batching, padding only as much as each batch needs, int8 weights, an optimised runtime. Each one is a few lines of code; each needs its accuracy cost measured, because occasionally it is not zero.</p>
+    <p class="lead">This chapter measures them all on one sentiment model, on one machine. One sentence through DistilBERT took 1.95 ms on the GPU and 23.26 ms on 8 CPU threads at 128 tokens. Batching raised GPU throughput 27-fold, dynamic padding made a pass over SST-2 8.3× faster than padding to 512, and ONNX Runtime with int8 weights cut CPU latency from 7.26 ms to 1.28 ms for 0.92 points of accuracy.</p>
+    <ul class="objectives">
+      <li><span>Measure latency and throughput properly: warm-up, synchronisation, medians</span></li>
+      <li><span>Use batching and dynamic padding to raise throughput</span></li>
+      <li><span>Quantise to int8 and export to ONNX Runtime, checking accuracy</span></li>
+      <li><span>Find the tokeniser’s share of end-to-end latency</span></li>
+      <li><span>Choose CPU or GPU serving from measured numbers</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Distillation and DistilBERT:</b> <a href="21-encoder-variants.html">Chapter 21</a>. <b>Fast tokenisers:</b> <a href="02-tokenisation-for-nlp.html">Chapter 2</a>. <b>Encoder vs LLM costs:</b> <a href="36-encoders-vs-llms.html">Chapter 36</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Latency budgets</li>
-    <li>Dynamic padding and batching</li>
-    <li>Distillation</li>
-    <li>Quantisation and ONNX</li>
-    <li>Tokenisation cost</li>
-  </ol>
+  <h2>Measuring correctly</h2>
+  <p>GPU calls return before the work finishes, so a timer without <code>torch.cuda.synchronize()</code> measures nothing. The first calls are slow (kernel selection, memory allocation), so warm up first. Latency varies, so report the median of many runs, and in production the 95th or 99th percentile. All numbers here follow that recipe.</p>
+
+  <h2>Batching and padding</h2>
+  <p>A GPU processing one sentence is mostly idle; processing 64 at once costs little more. Batching raises <b>throughput</b> (texts per second) at the price of <b>latency</b> (each request waits for its batch). Inside a batch, every sequence is padded to the same length. Padding everything to 512 wastes most of the compute on SST-2’s short sentences; <b>dynamic padding</b> pads only to the longest sequence in each batch, and sorting requests by length before batching wastes even less. Try it in the lab.</p>
+  <figure class="flow">
+    <ol>
+      <li><b>Request</b><small>raw text</small></li>
+      <li><b>Tokenise</b><small>fast (Rust) tokeniser</small></li>
+      <li><b>Batch</b><small>wait ≤ a few ms, group by length</small></li>
+      <li><b>Pad</b><small>to the batch’s longest</small></li>
+      <li><b>Model</b><small>int8 / ONNX on CPU, bf16 on GPU</small></li>
+      <li><b>Respond</b><small>label + score</small></li>
+    </ol>
+    <figcaption><b>An encoder serving path.</b> Every box is measured in this chapter; any of them can be the bottleneck.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Serving lab</span><span class="p-tag">Live + measured</span></div>
+    <div class="panel-body">
+      <div class="sv-l">View</div>
+      <div class="seg" id="svE"><button class="active" data-v="pad">padding waste</button><button data-v="lat">latency vs length</button><button data-v="thr">batch size</button><button data-v="fmt">formats</button><button data-v="tok">tokeniser</button></div>
+      <div class="sv-v on" id="svVpad">
+        <div class="sv-row"><span>Batch size</span><input type="range" id="svB" min="1" max="128" step="1" value="32" aria-label="Batch size"><b id="svBv">32</b></div>
+        <div class="sv-box" id="svP"></div>
+      </div>
+      <div class="sv-v" id="svVlat"><div class="sv-box"><svg id="svL" viewBox="0 0 600 260"></svg><div class="sv-key" id="svLk"></div></div></div>
+      <div class="sv-v" id="svVthr"><div class="sv-box"><svg id="svT" viewBox="0 0 600 250"></svg></div></div>
+      <div class="sv-v" id="svVfmt"><div class="sv-box" id="svF"></div></div>
+      <div class="sv-v" id="svVtok"><div class="sv-box" id="svK"></div></div>
+      <div class="stats" id="svStats"></div>
+      <div class="sv-why" id="svWhy"></div>
+    </div>
+    <div class="panel-foot">“Padding waste” simulates 872 sentence lengths in the browser from a log-normal fitted to SST-2 validation’s median (about 25 word pieces), and counts padded positions for each strategy. Measured on one machine with an RTX-class GPU and 8 CPU threads: <code>distilbert-base-uncased-finetuned-sst-2-english</code> and <code>bert-base-uncased</code> (random weights for the classifier head; speed only). Latency: median of 20 runs (10 on CPU) after 3 warm-ups, random token ids, batch 1. Throughput: bf16, 64 tokens. Padding: all 872 validation sentences, batches of 32, bf16. Formats: accuracy on all 872 sentences; latency for one 14-word sentence; int8 = dynamic quantisation of the linear layers; ONNX opset 17, ONNX Runtime CPU provider.</div>
+  </div>
+
+  <h2>Measured: latency and throughput</h2>
+  <p>At batch 1, DistilBERT took 1.6–4.17 ms on the GPU from 32 to 512 tokens and BERT-base about twice that (3.11–8.12 ms), as the halved layer count predicts. On 8 CPU threads the same sentence took 9.4, 23.26 and 78.28 ms for DistilBERT and 18.45, 46.06 and 162.92 ms for BERT-base: on a CPU, length and depth both cost roughly in proportion. bf16 on the GPU made no difference for short inputs, where a single sequence leaves the GPU mostly idle, and was 2.6× faster at 512 tokens.</p>
+  <p>Throughput is a different number. With 64-token inputs on the GPU, batch 1 processed 405 texts a second; batch 64 processed 11,015, 27 times as many, while each batch took 5.81 ms instead of 2.47. Beyond 64 the GPU was saturated: batch 256 gave 10,889 a second and four times the wait. A server that collects requests for a few milliseconds and sends them as one batch gets most of that throughput at a small cost in latency.</p>
+
+  <h2>Measured: padding</h2>
+  <p>SST-2 validation sentences are short (median 24 word pieces, longest 55). Classifying all 872 in batches of 32 processed 42,208 token positions with dynamic padding, 111,616 when every batch was padded to 128 and 446,464 when padded to 512, and took 0.089 s, 0.164 s and 0.743 s respectively. Padding to the model’s maximum made the job 8.3× slower to compute nothing extra. Dynamic padding is one argument to the tokeniser or collator, and there is no reason to serve without it.</p>
+
+  <h2>Measured: quantisation and runtimes</h2>
+  <p><b>Dynamic int8 quantisation</b> stores linear-layer weights as 8-bit integers and quantises activations on the fly: a quarter of the memory for those weights and faster integer matrix multiplication on CPU. <b>ONNX Runtime</b> runs an exported graph with fused operators. Both are a few lines; both can change predictions slightly.</p>
+  <table class="t cmp">
+    <thead><tr><th>DistilBERT, SST-2 (872 sentences)</th><th>Accuracy</th><th>CPU latency, 1 sentence</th><th>Size on disk</th></tr></thead>
+    <tbody>
+      <tr><td>PyTorch fp32 (CPU)</td><td>91.06</td><td>7.26 ms</td><td>255.5 MB</td></tr>
+      <tr><td>PyTorch int8, dynamic quantisation (CPU)</td><td>90.02</td><td>3.57 ms</td><td>132.3 MB</td></tr>
+      <tr><td>ONNX Runtime fp32 (CPU)</td><td>91.06</td><td>3.97 ms</td><td>255.5 MB</td></tr>
+      <tr><td><b>ONNX Runtime int8 (CPU)</b></td><td>90.14</td><td><b>1.28 ms</b></td><td><b>64.2 MB</b></td></tr>
+      <tr><td>PyTorch fp16 (GPU)</td><td>91.06</td><td>–</td><td>–</td></tr>
+    </tbody>
+  </table>
+  <p>Exporting to ONNX Runtime alone, with no change to the weights, cut single-sentence CPU latency from 7.26 to 3.97 ms with identical predictions (91.06%). Quantising to int8 roughly halved latency again in each runtime (7.26 → 3.57 ms in PyTorch, 3.97 → 1.28 ms in ONNX Runtime) and cost about a point of accuracy (90.02% and 90.14% against 91.06%). The ONNX int8 model is 4.0× smaller on disk (64.2 MB), because the embeddings are quantised too; PyTorch’s dynamic quantisation only converts the linear layers (132.3 MB). fp16 on the GPU changed no prediction. A point of accuracy for a 5.7× speed-up is usually a good trade, but it is a trade, and it must be measured on your own data.</p>
+
+  <h2>The tokeniser</h2>
+  <p>Tokenising a batch of 32 sentences took 0.8 ms; running DistilBERT on them on the CPU took 198.97 ms. The tokeniser was 0.4% of the work, negligible here. The “slow” comparison did not measure what it was meant to: in transformers 5 the class still called <code>BertTokenizer</code> appears to use the same fast implementation (the two took similar times (1.86 and 2.12 ms per 256 sentences), since version 5 reworked the tokeniser classes. The old pure-Python tokenisers, still found in older code and some custom pipelines, were typically ten or more times slower and could dominate CPU latency; check which one a deployment actually loads.</p>
+
+  <table class="t cmp">
+    <thead><tr><th>Technique</th><th>Helps</th><th>Cost</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td>Distillation (DistilBERT)</td><td>~2× faster, 40% smaller</td><td>a point or so of accuracy</td><td>almost always worth testing</td></tr>
+      <tr><td>Batching</td><td>throughput</td><td>latency while waiting for a batch</td><td>GPU serving, offline jobs</td></tr>
+      <tr><td>Dynamic padding, length bucketing</td><td>compute on short texts</td><td>none</td><td>always</td></tr>
+      <tr><td>int8 quantisation</td><td>CPU latency, memory</td><td>small accuracy change; check</td><td>CPU serving</td></tr>
+      <tr><td>ONNX Runtime</td><td>CPU latency</td><td>an export step to maintain</td><td>CPU serving, cross-language deployment</td></tr>
+      <tr><td>bf16 / fp16 on GPU</td><td>GPU speed, memory</td><td>almost none for inference</td><td>always on modern GPUs</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout usecase">
+    <div class="ico">🚀</div>
+    <div class="body"><div class="title">Use case: moving a classifier off the GPU</div><p>A team serves a BERT-base intent classifier on a GPU instance that is busy 6% of the time. They switch to DistilBERT, export to ONNX, quantise to int8, and benchmark on the CPU machines they already run: batch-1 latency well inside their 30 ms budget, accuracy within 0.3 points on their own test set, and the GPU instance switched off. The benchmark script, with warm-up, medians and an accuracy check, goes into CI so that a future model or library upgrade cannot quietly slow the service or shift its predictions.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Padding every request to 512:</b> it processed 10.6× the token positions of dynamic padding on SST-2 and took 8.3× as long.</li>
+      <li><b>Serving at batch 1 on a GPU:</b> 405 texts a second against 11,015 at batch 64.</li>
+      <li><b>Shipping a quantised model without its accuracy check:</b> int8 cost about a point here (91.06 → 90.14).</li>
+      <li><b>Timing GPU code without synchronising:</b> you measure how fast work is queued, not done.</li>
+      <li><b>Quantising without re-measuring accuracy</b> on your own data, not just a benchmark.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> How would you make a BERT classifier faster in production?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>In rough order of effort: use a distilled model (DistilBERT was about twice as fast as BERT-base here: 23.26 against 46.06 ms per sentence on CPU); pad dynamically and bucket by length (8.3× faster than padding to 512 on SST-2); batch requests on a GPU (405 → 11,015 texts a second from batch 1 to 64); use bf16 on GPU; and on CPU export to ONNX Runtime and quantise to int8, which took single-sentence latency from 7.26 to 1.28 ms for about a point of accuracy. Truncate to the length the task needs, and measure every step on the real traffic, with warm-up and percentiles, and check accuracy after each change.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Design serving for 5,000 requests a second with a 50 ms p99 budget.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First, measure the model: latency at batch 1 and throughput against batch size, at the real length distribution, for p50 and p99. With the numbers here, an int8 ONNX DistilBERT does one sentence in about 1.28 ms on 8 CPU threads, so a CPU fleet is plausible: 5,000 requests a second at batch 1 needs on the order of 6 concurrent workers. On GPU, batching does the work: a server that collects requests for up to 5–10 ms and sends batches of up to 64 reached about 11,015 texts a second per GPU here, so one or two GPUs with headroom. Either way: dynamic padding and length bucketing; a max-length cap; autoscaling on queue depth; timeouts so a slow batch cannot blow the p99; a cheaper fallback model under overload; and load tests at peak with realistic text before launch, measuring p99 end to end including tokenisation and network.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Measured: batching took GPU throughput from 405 to 11,015 texts a second (batch 1 → 64); dynamic padding was 8.3× faster than padding to 512.</li>
+      <li>Measured: ONNX Runtime int8 cut CPU latency from 7.26 to 1.28 ms and size from 255.5 to 64.2 MB, for 0.92 points of accuracy.</li>
+      <li>Measured: DistilBERT was about twice as fast as BERT-base on CPU at every length; bf16 helped on GPU only for long inputs.</li>
+      <li>Warm up, synchronise and take medians, or the numbers mean nothing.</li>
+      <li>Every speed-up is checked for accuracy on your own test set.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does dynamic padding do?</p>
+      <div class="opts">
+        <button class="opt">Removes padding entirely</button>
+        <button class="opt">Pads each batch only to its own longest sequence, instead of a fixed maximum</button>
+        <button class="opt">Truncates long inputs</button>
+        <button class="opt">Changes the model</button>
+      </div>
+      <div class="explain">Sorting requests by length before batching cuts the waste further.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why must GPU timings call torch.cuda.synchronize()?</p>
+      <div class="opts">
+        <button class="opt">To free memory</button>
+        <button class="opt">To make the model deterministic</button>
+        <button class="opt">To switch to bf16</button>
+        <button class="opt">GPU work is asynchronous; without it the timer stops before the work finishes</button>
+      </div>
+      <div class="explain">Unsynchronised timings can look hundreds of times too fast.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does batching trade?</p>
+      <div class="opts">
+        <button class="opt">Higher throughput for higher per-request latency</button>
+        <button class="opt">Accuracy for speed</button>
+        <button class="opt">Memory for accuracy</button>
+        <button class="opt">Nothing</button>
+      </div>
+      <div class="explain">Measured: batch 1 took 2.47 ms for 405 texts a second; batch 64 took 5.81 ms for 11,015.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does dynamic int8 quantisation change?</p>
+      <div class="opts">
+        <button class="opt">The tokeniser</button>
+        <button class="opt">The number of layers</button>
+        <button class="opt">Linear-layer weights are stored as 8-bit integers and activations are quantised on the fly</button>
+        <button class="opt">The training data</button>
+      </div>
+      <div class="explain">Measured: PyTorch dynamic int8 halved CPU latency (7.26 → 3.57 ms) for about a point of accuracy.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why measure the tokeniser separately?</p>
+      <div class="opts">
+        <button class="opt">It changes accuracy</button>
+        <button class="opt">On CPU it can be a real share of end-to-end latency, and a slow Python tokeniser can dominate it</button>
+        <button class="opt">It runs on the GPU</button>
+        <button class="opt">It is never a bottleneck</button>
+      </div>
+      <div class="explain">Here, with a fast (Rust) tokeniser, it was 0.4% of CPU time for a batch of 32; old pure-Python tokenisers were the problem case.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = NLP;
+  const D = {"params_m":{"distilbert":67.0,"bert-base":109.5},"latency_batch1_ms":{"32":{"distilbert GPU fp32":1.6,"bert-base GPU fp32":3.11,"distilbert GPU bf16":1.68,"distilbert CPU fp32":9.4,"bert-base CPU fp32":18.45},"128":{"distilbert GPU fp32":1.95,"bert-base GPU fp32":3.75,"distilbert GPU bf16":1.82,"distilbert CPU fp32":23.26,"bert-base CPU fp32":46.06},"512":{"distilbert GPU fp32":4.17,"bert-base GPU fp32":8.12,"distilbert GPU bf16":1.59,"distilbert CPU fp32":78.28,"bert-base CPU fp32":162.92}},"throughput":[{"batch":1,"ms":2.47,"per_s":405},{"batch":4,"ms":1.83,"per_s":2186},{"batch":16,"ms":2.27,"per_s":7048},{"batch":64,"ms":5.81,"per_s":11015},{"batch":256,"ms":23.51,"per_s":10889}],"sst2_len":{"median":24,"max":55},"padding":{"dynamic (pad to batch max)":{"secs":0.089,"tokens_processed":42208},"pad everything to 128":{"secs":0.164,"tokens_processed":111616},"pad everything to 512":{"secs":0.743,"tokens_processed":446464}},"formats":{"PyTorch fp32 (CPU)":{"acc":91.06,"ms_batch1":7.26,"mb":255.5},"PyTorch int8 dynamic (CPU)":{"acc":90.02,"ms_batch1":3.57,"mb":132.3},"PyTorch fp16 (GPU)":{"acc":91.06},"ONNX Runtime fp32 (CPU)":{"acc":91.06,"ms_batch1":3.97,"mb":255.5},"ONNX Runtime int8 (CPU)":{"acc":90.14,"ms_batch1":1.28,"mb":64.2}},"tokeniser":{"fast: ms per 256 sentences":2.12,"slow (Python): ms per 256 sentences":1.86,"slow_class":"BertTokenizer","share_of_cpu_batch32_pct":0.4,"tokenise_ms_batch32":0.8,"model_ms_batch32":198.97}};
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+  const bar = (l, v, mx, txt, c, mn) => `<div class="sv-bar"><span>${l}</span><span class="track"><i style="width:${Math.max(0.8, 100 * (v - (mn || 0)) / (mx - (mn || 0)))}%;background:${c}"></i></span><span class="n">${txt}</span></div>`;
+  let s = 11; const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647, gauss = () => Math.sqrt(-2 * Math.log(rnd() + 1e-9)) * Math.cos(2 * Math.PI * rnd());
+  const LENS = Array.from({ length: 872 }, () => Math.max(4, Math.min(80, Math.round(Math.exp(Math.log(25) + 0.5 * gauss())))));
+  function pad() {
+    const b = +$('#svB').value; $('#svBv').textContent = b; const real = LENS.reduce((a, x) => a + x, 0);
+    const cost = arr => { let t = 0; for (let i = 0; i < arr.length; i += b) { const B = arr.slice(i, i + b); t += B.length * Math.max(...B); } return t; };
+    const S = [['pad everything to 512', LENS.length * 512], ['pad everything to 128', LENS.length * 128], ['dynamic (pad to batch max)', cost(LENS)], ['sort by length, then dynamic', cost([...LENS].sort((x, y) => x - y))], ['real tokens (no padding)', real]];
+    const mx = S[0][1];
+    $('#svP').innerHTML = '<div style="margin-bottom:4px"><b>Token positions processed</b> (log scale) · share that is padding</div>' + S.map(([k, v]) => bar(k, Math.log10(v), Math.log10(mx), `${v.toLocaleString()} · ${Math.round(100 * (1 - real / v))}%`, /real/.test(k) ? '#059669' : /sort/.test(k) ? 'var(--accent)' : /dynamic/.test(k) ? '#3b82f6' : '#e11d48', 4)).join('');
+    $('#svStats').innerHTML = `<div class="stat"><div class="k">Median · longest simulated length</div><div class="v">${[...LENS].sort((x, y) => x - y)[436]} · ${Math.max(...LENS)}</div></div>`;
+    $('#svWhy').innerHTML = '<b>Most of a fixed-length batch is padding.</b> Padding to 512 processes about twenty times more positions than there are tokens, and attention makes long padded rows costlier still. Dynamic padding removes most of the waste; sorting by length first leaves almost none. Larger batches waste more under dynamic padding, because one long sentence pads all the others.';
+  }
+  function lat() {
+    const Lt = D.latency_batch1_ms, Ls = Object.keys(Lt).map(Number), ks = Object.keys(Lt[Ls[0]]), CO = ['var(--accent)', '#3b82f6', '#a855f7', '#f59e0b', '#e11d48'], W = 600, H = 260, L = 56, R = 20, T = 16, B = 38;
+    const mx = Math.max(...Ls.flatMap(l => ks.map(k => Lt[l][k]))), ly = v => Math.log10(v), y0 = Math.floor(ly(Math.min(...Ls.flatMap(l => ks.map(k => Lt[l][k]))))), y1 = Math.ceil(ly(mx));
+    const x = i => L + (W - L - R) * i / (Ls.length - 1), y = v => T + (H - T - B) * (1 - (ly(v) - y0) / (y1 - y0));
+    let g = '';
+    for (let e = y0; e <= y1; e++) g += `<line x1="${L}" x2="${W - R}" y1="${y(10 ** e)}" y2="${y(10 ** e)}" stroke="var(--border)" stroke-dasharray="3 4"/><text x="${L - 6}" y="${y(10 ** e) + 4}" text-anchor="end">${10 ** e} ms</text>`;
+    ks.forEach((k, j) => { g += `<polyline points="${Ls.map((l, i) => `${x(i)},${y(Lt[l][k])}`).join(' ')}" fill="none" stroke="${CO[j]}" stroke-width="2.5"/>`; Ls.forEach((l, i) => g += `<circle cx="${x(i)}" cy="${y(Lt[l][k])}" r="3.5" fill="${CO[j]}"/>`); });
+    Ls.forEach((l, i) => g += `<text x="${x(i)}" y="${H - B + 15}" text-anchor="middle">${l} tokens</text>`);
+    $('#svL').innerHTML = g + `<text x="${W / 2}" y="${H - 4}" text-anchor="middle">batch-1 latency (log scale), median</text>`;
+    $('#svLk').innerHTML = ks.map((k, j) => `<span style="--c:${CO[j]}">${k}</span>`).join('');
+    $('#svStats').innerHTML = `<div class="stat"><div class="k">Parameters: DistilBERT · BERT-base</div><div class="v">${D.params_m.distilbert}M · ${D.params_m['bert-base']}M</div></div>`;
+    $('#svWhy').innerHTML = '<b>GPU latency is flat, CPU latency is not.</b> On the GPU one sentence costs 2–8 ms at any length up to 512; on 8 CPU threads it grows from 9.4 to 78.28 ms for DistilBERT and twice that for BERT-base.';
+  }
+  function thr() {
+    const P = D.throughput, W = 600, H = 250, L = 60, R = 60, T = 16, B = 38, mx = Math.max(...P.map(p => p.per_s)) * 1.1, mm = Math.max(...P.map(p => p.ms)) * 1.1;
+    const x = i => L + (W - L - R) * i / (P.length - 1), y = v => T + (H - T - B) * (1 - v / mx), y2 = v => T + (H - T - B) * (1 - v / mm);
+    let g = `<polyline points="${P.map((p, i) => `${x(i)},${y(p.per_s)}`).join(' ')}" fill="none" stroke="var(--accent)" stroke-width="2.5"/><polyline points="${P.map((p, i) => `${x(i)},${y2(p.ms)}`).join(' ')}" fill="none" stroke="#f59e0b" stroke-width="2" stroke-dasharray="5 4"/>`;
+    P.forEach((p, i) => g += `<circle cx="${x(i)}" cy="${y(p.per_s)}" r="4" fill="var(--accent)"/><text x="${x(i)}" y="${y(p.per_s) - 8}" text-anchor="middle" style="fill:var(--accent)">${p.per_s.toLocaleString()}/s</text><circle cx="${x(i)}" cy="${y2(p.ms)}" r="3.5" fill="#f59e0b"/><text x="${x(i)}" y="${y2(p.ms) + 15}" text-anchor="middle" style="fill:#f59e0b">${p.ms} ms</text><text x="${x(i)}" y="${H - B + 15}" text-anchor="middle">batch ${p.batch}</text>`);
+    $('#svT').innerHTML = g + `<text x="${W / 2}" y="${H - 4}" text-anchor="middle">DistilBERT on GPU, bf16, 64 tokens: texts per second (solid) and time per batch (dashed)</text>`;
+    $('#svStats').innerHTML = `<div class="stat"><div class="k">Batch 1 → largest batch throughput</div><div class="v">${Math.round(P[P.length - 1].per_s / P[0].per_s)}×</div></div>`;
+    $('#svWhy').innerHTML = '<b>Batch until the GPU is full.</b> From batch 1 to 64 throughput rises 27× while the batch takes only 2.4× longer; beyond 64 it stops rising.';
+  }
+  function fmt() {
+    const F = D.formats, ks = Object.keys(F), mms = ks.filter(k => F[k].ms_batch1), mxm = Math.max(...mms.map(k => F[k].ms_batch1));
+    $('#svF').innerHTML = '<div style="margin-bottom:4px"><b>SST-2 accuracy</b></div>' + ks.map(k => bar(esc(k), F[k].acc, 100, F[k].acc.toFixed(2), 'var(--accent)', 85)).join('') +
+      '<div style="margin:10px 0 4px"><b>CPU latency, one sentence</b></div>' + mms.map(k => bar(esc(k), F[k].ms_batch1, mxm, F[k].ms_batch1 + ' ms', '#3b82f6')).join('') +
+      '<div style="margin:10px 0 4px"><b>Size on disk</b></div>' + ks.filter(k => F[k].mb).map(k => bar(esc(k), F[k].mb, Math.max(...ks.filter(q => F[q].mb).map(q => F[q].mb)), F[k].mb + ' MB', '#a855f7')).join('');
+    $('#svStats').innerHTML = D.onnx_error ? `<div class="stat"><div class="k">ONNX</div><div class="v">${esc(D.onnx_error)}</div></div>` : '';
+    $('#svWhy').innerHTML = '<b>Runtime first, then quantise.</b> ONNX Runtime alone nearly halves CPU latency with identical predictions; int8 halves it again for about a point of accuracy. The int8 ONNX model is 4.0× smaller.';
+  }
+  function tok() {
+    const T = D.tokeniser, P = D.padding;
+    $('#svK').innerHTML = '<div style="margin-bottom:4px"><b>Tokenising 256 sentences</b></div>' + Object.keys(T).filter(k => /ms per 256/.test(k)).map(k => bar(esc(k.replace(': ms per 256 sentences', '')), T[k], Math.max(...Object.keys(T).filter(q => /ms per 256/.test(q)).map(q => T[q])), T[k] + ' ms', /slow/.test(k) ? '#e11d48' : 'var(--accent)')).join('') +
+      '<div style="margin:10px 0 4px"><b>CPU, batch of 32: tokeniser vs model</b></div>' + bar('tokenise', T.tokenise_ms_batch32, T.tokenise_ms_batch32 + T.model_ms_batch32, T.tokenise_ms_batch32 + ' ms', '#f59e0b') + bar('model forward pass', T.model_ms_batch32, T.tokenise_ms_batch32 + T.model_ms_batch32, T.model_ms_batch32 + ' ms', '#3b82f6') +
+      '<div style="margin:10px 0 4px"><b>Measured padding on GPU</b> (872 sentences, batch 32)</div>' + Object.keys(P).map(k => bar(esc(k), P[k].secs, Math.max(...Object.values(P).map(v => v.secs)), `${P[k].secs} s`, /dynamic/.test(k) ? 'var(--accent)' : '#e11d48')).join('');
+    $('#svStats').innerHTML = `<div class="stat"><div class="k">Tokeniser share of CPU batch time</div><div class="v">${T.share_of_cpu_batch32_pct}%</div></div><div class="stat"><div class="k">SST-2 tokens: median · max</div><div class="v">${D.sst2_len.median} · ${D.sst2_len.max}</div></div>`;
+    $('#svWhy').innerHTML = '<b>Not the bottleneck here.</b> The fast tokeniser was 0.4% of CPU time. Dynamic padding was the big win: 8.3× faster than padding to 512.';
+  }
+  function draw() { const e = $('#svE .active').dataset.v; ['pad', 'lat', 'thr', 'fmt', 'tok'].forEach(k => $('#svV' + k).classList.toggle('on', k === e)); ({ pad, lat, thr, fmt, tok })[e](); }
+  $('#svE').addEventListener('segchange', draw); $('#svB').addEventListener('input', draw); draw();
+})();
+</script>
 </body>
 </html>
