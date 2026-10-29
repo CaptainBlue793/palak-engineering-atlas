@@ -320,7 +320,10 @@
       c1: '#4d7c0f', c2: '#0f766e', d1: '#a3e635', d2: '#2dd4bf',
       soon: true,
       store: 'nlp',
+      indexVar: 'NLP_INDEX',
       dir: 'nlp',
+      first: 'p1-text-unicode-and-normalisation.html',
+      dist: 'nlp-course.html',
     },
     {
       id: 'llms',
