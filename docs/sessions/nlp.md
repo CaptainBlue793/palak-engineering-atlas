@@ -6,3 +6,4 @@
 - Next: course home, glossary, mock interview; lab `atlas-courses\nlp-lab`; then P1.
 - Shell done: home page (4×6 map, code strip with a measured truncation demo), glossary (101 terms), mock interview (24 problems), README. Lab `atlas-courses
 lp-lab` with drive/shot/eval/errs/links/inject and ship_nlp.sh.
+- P1 shipped: café composed vs decomposed -> different cased-BERT tokens; uncased BERT strips Hindi vowel signs; XLM-R NFKC; C4 lines 28% non-ASCII, NFKC changes 1.6%; tweet_eval hub copy 0% non-ASCII (pre-folded).
