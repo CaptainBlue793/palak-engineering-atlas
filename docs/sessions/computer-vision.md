@@ -59,3 +59,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\cv
 - Ch33 shipped: projection matches OpenCV to 6e-14 px; calibration RMS 0.41 px at 3-20 views but fx 814 vs 800 at 3 views, k2 poorly determined; BM 1.21 px on 76% / SGBM 1.45 on 85% / mono 1.55 on 100% (17% >2px).
 - Ch34 shipped: tiny NeRF PE 35.4 vs raw 21.0 dB on held-out views (23 s training); 8/32/64/128 samples 17.9/31.7/35.3/35.8 dB; 2000 2-D Gaussians 38.9 dB w/ 18k params vs PE MLP 39.9 dB w/ 143k, but naive dense render 240x slower.
 - Ch37 shipped: standard ResNet-18 PGD eps 2/255 -> 10%, 4/255 -> 0.15%; adv. training 45.8% at 8/255 for 4.7x time and -18 pts clean; noise 0.16: 15.8 vs 60.1, contrast 0.4: 84.3 vs 33.4 (std vs AT).
+- Ch36 shipped (after GPU-memory fix): Pets R@1 DINO 91.6 / R50 91.2 / CLIP 79.3; heads on 25 breeds all worse on 12 unseen than frozen features (98.2 -> 96.8/96.2/91.5); IVF nprobe16 scans 6.6% for 97.7% recall@10.
