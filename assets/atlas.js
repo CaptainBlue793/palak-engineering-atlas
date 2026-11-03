@@ -284,7 +284,10 @@
       c1: '#7c3aed', c2: '#c026d3', d1: '#a78bfa', d2: '#e879f9',
       soon: true,
       store: 'dl',
+      indexVar: 'DL_INDEX',
       dir: 'deep-learning',
+      first: 'p1-tensors-shapes-and-broadcasting.html',
+      dist: 'deep-learning-course.html',
     },
     {
       id: 'computer-vision',
