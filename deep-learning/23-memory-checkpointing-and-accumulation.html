@@ -3,37 +3,329 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Memory: Activations, Checkpointing &amp; Accumulation</title>
+<title>Memory: Activations, Checkpointing &amp; Accumulation · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 23 of Deep Learning. A training step's memory measured phase by phase on an 87M-parameter transformer: activations were 80% of the peak and grew with tokens, not sequence length squared. Activation checkpointing cut the peak by 69% for 24% more time and tripled the batch that fits; gradient accumulation matched the big batch to 1e-7, except with BatchNorm, and the forgotten division made gradients 4 times too large.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .mm-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .mm-v { display:none; } .mm-v.on { display:block; }
+  .mm-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .mm-box svg { width:100%; height:auto; display:block; } .mm-box text { font-size:12px; fill:var(--muted); }
+  .mm-row { display:grid; grid-template-columns:minmax(0, 200px) 1fr 76px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .mm-row .track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; display:flex; } .mm-row .track i { display:block; height:100%; }
+  .mm-row .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .mm-key { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; margin-top:6px; } .mm-key i { display:inline-block; width:10px; height:10px; border-radius:3px; vertical-align:middle; margin-right:4px; }
+  .mm-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .mm-row { grid-template-columns:minmax(0, 110px) 1fr 62px; font-size:12px; } }
+</style>
 </head>
 <body data-chapter="23">
-<!-- dl:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 23</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
     <h1>Memory: <span class="grad">Activations, Checkpointing &amp; Accumulation</span></h1>
-    <p class="lead">What fills GPU memory during training, activation checkpointing, and gradient accumulation for bigger batches.</p>
+    <p class="lead">“CUDA out of memory” is the error every deep-learning practitioner meets first and most often. Fixing it well needs a picture of what is actually on the GPU during a step, and which of those things grows with the model, which with the batch, and which with the optimiser. This chapter measures that picture phase by phase on an 87-million-parameter transformer, then measures the two standard ways out: <b>activation checkpointing</b>, which recomputes instead of storing, and <b>gradient accumulation</b>, which splits a batch into pieces.</p>
+    <p class="lead">At a batch of 8 sequences of 1,024 tokens in fp32, the saved activations were 4.7 GB of a 5.8 GB peak; weights, gradients and AdamW’s state together were 1.3 GB. Activations grew with the number of tokens and not with the square of the sequence length. Checkpointing every block cut the peak by 69% for 24% more time per step, and raised the largest batch that fits from 32 to at least 96. Accumulating 4 micro-batches of 8 reproduced the batch-32 gradient to within 1 part in 10 million and needed 64% less memory, but with BatchNorm the two were no longer the same, and forgetting to divide the loss made every gradient exactly 4 times too large.</p>
+    <ul class="objectives">
+      <li><span>Account for every megabyte of a training step and know when each appears and goes</span></li>
+      <li><span>Predict how activation memory scales with batch size and sequence length</span></li>
+      <li><span>Apply activation checkpointing and choose how much of the network to checkpoint</span></li>
+      <li><span>Implement gradient accumulation correctly, and know where it is not exact</span></li>
+      <li><span>Order the fixes for an out-of-memory error from cheapest to most expensive</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Allocated vs reserved memory:</b> <a href="p7-the-gpu-for-deep-learning.html">P7</a>. <b>Why autograd keeps activations:</b> <a href="p4-pytorch-modules-and-autograd.html">P4</a>. <b>Mixed precision:</b> <a href="21-mixed-precision-training.html">Chapter 21</a>.</li>
+        <li>The LLM-specific budget (bytes per parameter for real models, the logits and the KV cache) is in LLMs <a href="../llms/p7-gpu-memory-budgets.html">P7</a> and <a href="../llms/13-training-efficiently-on-one-gpu.html">Chapter 13</a>; sharding across GPUs is in <a href="../ml-ai-systems/23-distributed-training-1.html">ML &amp; AI Systems</a>. This chapter is the general mechanism, measured.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Parameters, gradients, optimiser state, activations</li>
-    <li>Measuring peak memory</li>
-    <li>Activation checkpointing</li>
-    <li>Gradient accumulation</li>
-    <li>Trading compute for memory</li>
-  </ol>
+  <h2>Four things in memory, and when they appear</h2>
+  <p>The model: a byte-level GPT with 12 blocks of width 768, 87.0 million parameters, trained with AdamW in fp32 on batches of 8 sequences of 1,024 tokens. <code>torch.cuda.memory_allocated()</code> was read after each phase of the first two steps:</p>
+  <table class="t cmp">
+    <thead><tr><th>Moment</th><th>Step 1</th><th>Step 2</th><th>What changed</th></tr></thead>
+    <tbody>
+      <tr><td>Start</td><td>333 MB</td><td>1,014 MB</td><td>weights (87.0M × 4 bytes = 332 MB), plus AdamW’s state from step 2 on</td></tr>
+      <tr><td>After forward</td><td>5,012 MB</td><td>5,684 MB</td><td>+4.67 GB of <b>activations</b> saved for backward</td></tr>
+      <tr><td>After backward</td><td>682 MB</td><td>1,346 MB</td><td>activations freed, <b>gradients</b> (332 MB) created</td></tr>
+      <tr><td>After optimiser step</td><td>1,346 MB</td><td>1,346 MB</td><td>step 1 creates AdamW’s two moments (664 MB)</td></tr>
+      <tr><td>After <code>zero_grad(set_to_none=True)</code></td><td>1,014 MB</td><td>1,014 MB</td><td>gradients freed</td></tr>
+      <tr><td><b>Peak</b></td><td>5,142 MB</td><td><b>5,806 MB</b></td><td>end of forward, start of backward</td></tr>
+    </tbody>
+  </table>
+  <p>Three lessons sit in that table. The optimiser state is created lazily on the first step, so <b>step 1 is not the peak</b>: a run that survives its first step can still run out of memory on its second, and a memory test must run at least two. The fixed costs follow the parameter count: weights 4 bytes, gradients 4, AdamW 8, the familiar 16 bytes per parameter. And the activations dwarf them: 4.67 GB, 80% of the peak, and the only part that depends on the data.</p>
+<pre class="code">torch.cuda.<span class="f">reset_peak_memory_stats</span>()
+loss = <span class="f">model</span>(x, y); loss.<span class="f">backward</span>(); opt.<span class="f">step</span>(); opt.<span class="f">zero_grad</span>(set_to_none=<span class="k">True</span>)
+<span class="f">print</span>(torch.cuda.<span class="f">max_memory_allocated</span>() / <span class="m">2</span>**<span class="m">20</span>)   <span class="c"># the number that decides out-of-memory; measure step 2, not step 1</span></pre>
+
+  <h2>Activations grow with tokens</h2>
+  <p>Every operation whose backward pass needs its input or output stores it: the input of each linear layer, the output of each normalisation, the pre-activation of each GELU. For this block that added up to about 16 vectors of width 768 per token per layer, or 0.58 MB per token across the model, and the peak grew by 593 MB for every extra 1,024 tokens. Measured both ways:</p>
+  <table class="t cmp">
+    <thead><tr><th>Shape (batch × length)</th><th>Tokens</th><th>Peak memory</th><th>Time per step</th></tr></thead>
+    <tbody>
+      <tr><td>1 × 1,024</td><td>1,024</td><td>1,675 MB</td><td>43 ms</td></tr>
+      <tr><td>4 × 256</td><td>1,024</td><td>1,675 MB</td><td>37 ms</td></tr>
+      <tr><td>4 × 1,024</td><td>4,096</td><td>3,415 MB</td><td>126 ms</td></tr>
+      <tr><td>8 × 1,024</td><td>8,192</td><td>5,788 MB</td><td>238 ms</td></tr>
+      <tr><td>4 × 2,048</td><td>8,192</td><td>5,788 MB</td><td>290 ms</td></tr>
+    </tbody>
+  </table>
+  <p>Equal token counts gave equal memory, to the megabyte, whether the tokens came as more sequences or longer ones. That is not what the textbook formula for attention says: the attention matrix is length × length, so doubling the length should quadruple its memory. It did not here because <code>F.scaled_dot_product_attention</code> runs a fused kernel (FlashAttention or memory-efficient attention) that computes attention in tiles and never stores the full matrix, recomputing what it needs in the backward pass. The quadratic cost is still there in compute: 8,192 tokens as 4 × 2,048 took 22% longer than as 8 × 1,024. At small sizes the peak stops falling, around 1.7 GB, because it is then set by the optimiser step (weights, AdamW state, gradients and the update’s temporary buffers), not by activations.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Memory lab</span><span class="p-tag">Measured on an RTX 5070 Ti</span></div>
+    <div class="panel-body">
+      <div class="mm-l">View</div>
+      <div class="seg" id="mmV"><button class="active" data-v="timeline">one step, phase by phase</button><button data-v="tokens">batch and length</button><button data-v="ckpt">checkpointing</button><button data-v="accum">accumulation</button></div>
+      <div class="mm-v on" id="mmVtimeline"><div class="mm-box" id="mmT"></div></div>
+      <div class="mm-v" id="mmVtokens"><div class="mm-box"><svg id="mmS" viewBox="0 0 600 260"></svg><div class="mm-key" id="mmSk"></div></div></div>
+      <div class="mm-v" id="mmVckpt"><div class="mm-box" id="mmC"></div></div>
+      <div class="mm-v" id="mmVaccum">
+        <div class="mm-l">Show</div>
+        <div class="seg" id="mmA"><button class="active" data-v="cost">cost of splitting</button><button data-v="train">training curves</button><button data-v="bn">with BatchNorm</button></div>
+        <div class="mm-box" id="mmAc"></div>
+      </div>
+      <div class="stats" id="mmStats"></div>
+      <div class="mm-why" id="mmWhy"></div>
+    </div>
+    <div class="panel-foot">Byte-level GPT, 12 blocks, width 768, 12 heads, 87.0M parameters, fused attention (<code>F.scaled_dot_product_attention</code>), AdamW, fp32 unless stated; memory is <code>max_memory_allocated</code> above the empty baseline, on the second or later step; times are medians. Checkpointing wraps whole blocks with <code>torch.utils.checkpoint</code>; “largest batch” is in bf16 at length 1,024 with the allocator capped at 14.3 GB, trying 8 to 96. Accumulation exactness on a 4-block width-256 model with TF32 off; BatchNorm test on a small CIFAR-10 CNN, batch 64; training curves are a 6-block width-384 model, 1,500 updates of 32 × 256 tokens, same data order, validation bits per byte on WikiText-2.</div>
+  </div>
+
+  <h2>Optimiser state and precision</h2>
+  <p>The two levers on the fixed part are the optimiser and the number format. Measured at the same batch of 8 × 1,024:</p>
+  <table class="t cmp">
+    <thead><tr><th>Configuration</th><th>Held between steps</th><th>Peak</th><th>Time per step</th></tr></thead>
+    <tbody>
+      <tr><td>Plain SGD</td><td>332 MB (weights)</td><td>5,124 MB</td><td>232 ms</td></tr>
+      <tr><td>SGD with momentum</td><td>664 MB (+1 buffer)</td><td>5,456 MB</td><td>233 ms</td></tr>
+      <tr><td>AdamW</td><td>996 MB (+2 buffers)</td><td>5,788 MB</td><td>239 ms</td></tr>
+      <tr><td>AdamW, bf16 autocast</td><td>1,012 MB</td><td><b>3,917 MB</b></td><td><b>97 ms</b></td></tr>
+    </tbody>
+  </table>
+  <p>Choosing SGD over AdamW saved 664 MB, 11% of this peak; bf16 autocast saved 1.9 GB, 32%, and ran 2.5 times faster, because most saved activations are now stored in 2 bytes instead of 4. The data-dependent part fell by about 40% rather than half, because autocast keeps some saved tensors, such as normalisation and loss inputs, in fp32. The weights, gradients and optimiser state stay fp32 under autocast. For a small model, activations are where the memory is; for a very large model the 16 bytes per parameter come to dominate, which is the regime of sharded optimisers in ML &amp; AI Systems.</p>
+
+  <h2>Activation checkpointing</h2>
+  <p>Checkpointing a block means storing only its input during the forward pass and throwing away everything computed inside it. In the backward pass, when the block’s gradients are needed, its forward pass is run again from the stored input to rebuild the activations, which are used once and freed. Memory falls to one block’s worth of internals plus the stored inputs; the price is running the forward pass of the checkpointed blocks twice.</p>
+<pre class="code"><span class="k">from</span> torch.utils.checkpoint <span class="k">import</span> checkpoint
+<span class="k">for</span> i, block <span class="k">in</span> <span class="f">enumerate</span>(self.blocks):
+    x = <span class="f">checkpoint</span>(block, x, use_reentrant=<span class="k">False</span>) <span class="k">if</span> i % every == <span class="m">0</span> <span class="k">else</span> <span class="f">block</span>(x)</pre>
+  <table class="t cmp">
+    <thead><tr><th>Blocks checkpointed</th><th>Peak memory</th><th>Time per step</th></tr></thead>
+    <tbody>
+      <tr><td>None</td><td>5,788 MB</td><td>238 ms</td></tr>
+      <tr><td>Every 4th (3 of 12)</td><td>4,707 MB (−19%)</td><td>253 ms (+6%)</td></tr>
+      <tr><td>Every 2nd (6 of 12)</td><td>3,625 MB (−37%)</td><td>267 ms (+12%)</td></tr>
+      <tr><td>Every block</td><td><b>1,812 MB (−69%)</b></td><td>296 ms (+24%)</td></tr>
+    </tbody>
+  </table>
+  <p>The trade is linear: each checkpointed block saves about 330 MB and costs about 5 ms. The full cost, 24%, is within the usual rule of thumb of up to a third: one extra forward pass of every block. The point of checkpointing is what the saved memory buys. In bf16, without it the largest batch that fit was 32 sequences; with every block checkpointed, 96, the largest tried, still fit in 7.8 GB. Throughput fell from 93,600 to 78,700 tokens per second. So checkpointing is not a speed-up: it is how you fit a batch, a sequence length or a model that otherwise would not fit at all.</p>
+
+  <h2>Gradient accumulation</h2>
+  <p>The other way to fit a batch is to not hold it all at once. Split it into k micro-batches, run forward and backward on each, let the gradients add up in <code>.grad</code>, and take one optimiser step. Because the loss is a mean over examples, each micro-batch’s loss must be divided by k so that the sum of the parts equals the mean of the whole.</p>
+<pre class="code">opt.<span class="f">zero_grad</span>(set_to_none=<span class="k">True</span>)
+<span class="k">for</span> xs, ys <span class="k">in</span> <span class="f">zip</span>(x.<span class="f">chunk</span>(k), y.<span class="f">chunk</span>(k)):
+    (<span class="f">loss_fn</span>(<span class="f">model</span>(xs), ys) / k).<span class="f">backward</span>()   <span class="c"># gradients add up; the / k makes the sum a mean</span>
+opt.<span class="f">step</span>()</pre>
+  <p>Checked in fp32 against a single batch of 32: splits of 2 × 16, 4 × 8, 8 × 4 and 32 × 1 all matched it to a relative difference of 1.3 to 1.5 × 10⁻⁷, which is float rounding from adding in a different order. Leaving out the <code>/ k</code> with 4 micro-batches gave a gradient norm exactly 4.0 times too large. With plain SGD that is a learning rate 4 times too large; with Adam it mostly cancels (Adam divides by the gradient’s own scale), but gradient clipping thresholds and the balance against weight decay silently change, so the bug can sit unnoticed in an Adam run and appear when someone switches optimiser.</p>
+  <p>Exactness depends on every example’s loss being independent of the others in its batch, and one common layer breaks that. <b>BatchNorm</b> normalises with the statistics of the batch it sees, so a micro-batch of 8 is normalised differently from the full 64. On a small CIFAR-10 CNN the accumulated gradient’s cosine similarity to the true batch-64 gradient was 0.998 with 2 micro-batches, 0.986 with 8 and 0.954 with 32, a relative error of 31%; without BatchNorm it was identical. The update is still a reasonable gradient, but it is a batch-of-2 BatchNorm gradient, not a batch-of-64 one. LayerNorm, RMSNorm and GroupNorm work per example and accumulate exactly. Losses that average over a variable number of tokens per micro-batch have the same problem in a milder form: divide by the total token count of the whole batch, not by k.</p>
+  <p>What it costs, for the same 32-sequence update in bf16:</p>
+  <table class="t cmp">
+    <thead><tr><th>Split</th><th>Peak memory</th><th>Time per update</th></tr></thead>
+    <tbody>
+      <tr><td>1 × 32</td><td>11,970 MB</td><td>348 ms</td></tr>
+      <tr><td>2 × 16</td><td>6,927 MB</td><td>365 ms (+5%)</td></tr>
+      <tr><td>4 × 8</td><td>4,258 MB (−64%)</td><td>366 ms (+5%)</td></tr>
+      <tr><td>8 × 4</td><td>2,902 MB</td><td>394 ms (+13%)</td></tr>
+      <tr><td>32 × 1</td><td>1,877 MB</td><td>554 ms (+59%)</td></tr>
+    </tbody>
+  </table>
+  <p>As long as each micro-batch keeps the GPU busy, splitting is nearly free, and the training is the same: a small model trained for 1,500 updates with batch 32 reached 2.055 bits per byte, and with 8 accumulated micro-batches of 4 reached 2.053, with curves that lie on top of each other (the small difference is bf16 rounding). On that small model each micro-batch of 4 sequences was too little work for the GPU, so the accumulated run took 74 seconds instead of 24. Use the largest micro-batch that fits, and accumulate only the rest.</p>
+
+  <figure class="flow">
+    <ol>
+      <li><b>bf16 autocast</b><small>−32% memory, and faster</small></li>
+      <li><b>Accumulate</b><small>largest micro-batch that fits</small></li>
+      <li><b>Checkpoint</b><small>as few blocks as needed</small></li>
+      <li><b>Lighter optimiser</b><small>SGD, or 8-bit / factored state</small></li>
+      <li><b>Shard</b><small>across GPUs (ML &amp; AI Systems)</small></li>
+    </ol>
+    <figcaption><b>Out of memory: the order to try the fixes,</b> cheapest first. Measure the peak on the second step before and after each one.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🩻</div>
+    <div class="body"><div class="title">Use case: a 3-D segmentation model on 512³ scans</div><p>A medical-imaging team trains a 3-D U-Net on CT volumes. One volume at full resolution needs 38 GB of activations, and their GPUs have 24 GB. They switch to bf16 autocast first (activations drop by about a third), then checkpoint the two highest-resolution encoder and decoder stages, which hold most of the activation memory, and leave the rest alone: the step is 15% slower and one volume fits. They want an effective batch of 8, so they accumulate 8 micro-batches of 1. Their network uses BatchNorm, which at a micro-batch of 1 normalises each volume by its own statistics and trains badly; they replace it with GroupNorm, which works per example, and accumulation becomes exact.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Testing memory on step 1</b>: AdamW’s 664 MB appeared only at the first optimiser step; step 2’s peak was 664 MB higher.</li>
+      <li><b>Forgetting to divide the loss by k</b> when accumulating: gradients were exactly 4 times too large.</li>
+      <li><b>Accumulating with BatchNorm</b> and expecting the big-batch result: cosine 0.954 at 32 micro-batches. Use a per-example norm.</li>
+      <li><b>Checkpointing everything by default</b>: it cost 24% of the step time; checkpoint only enough to fit.</li>
+      <li><b>Tiny micro-batches</b>: 32 × 1 took 59% longer than 1 × 32. Fill the GPU first, then accumulate.</li>
+      <li><b>Reading <code>nvidia-smi</code></b> instead of <code>max_memory_allocated</code>: it shows the allocator’s reserved pool (P7).</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What uses GPU memory during training, and which part grows with the batch?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Four things. The weights, the gradients (same size as the weights, from backward until they are freed), the optimiser state (two more copies for Adam) and the activations saved in the forward pass for the backward pass. The first three are fixed per parameter, about 16 bytes with fp32 AdamW, and the optimiser state only appears at the first step, so the second step is the real peak. Activations scale with the number of tokens or examples in the batch. On an 87M-parameter transformer at 8 × 1,024 tokens they were 4.7 GB of a 5.8 GB peak, and with fused attention they grew with batch × length, not with length squared.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Your model runs out of memory at the batch size you need. Walk through your options and their costs.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First bf16 autocast, which shrank the peak by a third and was faster. Then gradient accumulation with the largest micro-batch that fits: 4 × 8 instead of 1 × 32 used 64% less memory for 5% more time and gave the same gradient to 1e-7, provided I divide each micro-batch loss by the number of micro-batches and the model has no BatchNorm, which breaks the equivalence. If one micro-batch of the size I need still does not fit, activation checkpointing: every block cut memory by 69% for 24% more time, and partial checkpointing is linear in between, so I checkpoint only what I need. After that, a lighter optimiser state, and finally sharding across GPUs.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Weights, gradients and AdamW state cost about 16 bytes per parameter; the optimiser state appears on step 1, so step 2 is the peak.</li>
+      <li>Activations were 80% of the peak and grew with tokens; fused attention removed the length-squared term from memory, not from compute.</li>
+      <li>Checkpointing every block: −69% memory, +24% time, three times the batch. It buys capacity, not speed.</li>
+      <li>Accumulation is exact to float rounding if each loss is divided by k and the model has no BatchNorm.</li>
+      <li>Fix out-of-memory errors in order: bf16, accumulation, checkpointing, optimiser state, sharding.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why was the peak memory of step 2 higher than step 1?</p>
+      <div class="opts">
+        <button class="opt">The allocator fragments over time</button>
+        <button class="opt">Activations grow as the model trains</button>
+        <button class="opt">AdamW creates its two moment buffers during the first optimiser step, so they are held through step 2’s forward pass</button>
+        <button class="opt">Gradients are never freed</button>
+      </div>
+      <div class="explain">664 MB of optimiser state appeared after step 1’s update.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">8 × 1,024 tokens and 4 × 2,048 tokens used the same peak memory. Why did doubling the length not quadruple attention memory?</p>
+      <div class="opts">
+        <button class="opt">The fused attention kernel never stores the full length × length matrix; it recomputes tiles in the backward pass</button>
+        <button class="opt">Attention has no activations</button>
+        <button class="opt">The allocator reused memory</button>
+        <button class="opt">bf16 halves it</button>
+      </div>
+      <div class="explain">The quadratic cost remained in time: 290 ms against 238 ms.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does activation checkpointing trade?</p>
+      <div class="opts">
+        <button class="opt">Accuracy for memory</button>
+        <button class="opt">Memory for disk space</button>
+        <button class="opt">Batch size for learning rate</button>
+        <button class="opt">Extra forward computation in the backward pass for not storing a block’s internal activations</button>
+      </div>
+      <div class="explain">Every block: −69% memory, +24% time; the result is mathematically the same.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">You accumulate 4 micro-batches but call <code>loss.backward()</code> without dividing by 4. What happens?</p>
+      <div class="opts">
+        <button class="opt">Nothing; PyTorch averages automatically</button>
+        <button class="opt">The accumulated gradient is 4 times the big-batch gradient: a 4× learning rate for SGD, changed clipping and decay balance for Adam</button>
+        <button class="opt">The gradient is 4 times smaller</button>
+        <button class="opt">Training raises an error</button>
+      </div>
+      <div class="explain">Measured: the gradient norm ratio was exactly 4.0.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why is gradient accumulation not exact for a network with BatchNorm?</p>
+      <div class="opts">
+        <button class="opt">BatchNorm has no gradients</button>
+        <button class="opt">Accumulation is never exact</button>
+        <button class="opt">BatchNorm normalises each micro-batch with its own statistics, so each example’s output depends on which micro-batch it is in</button>
+        <button class="opt">BatchNorm runs in fp16</button>
+      </div>
+      <div class="explain">Cosine to the true gradient fell to 0.954 at 32 micro-batches; per-example norms accumulate exactly.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"gpu":"NVIDIA GeForce RTX 5070 Ti","cap_gb":14.3,"accounting":{"parameters (M)":87.02,"after building the model":333.0,"step 1":{"start":333.0,"after forward":5012.0,"after backward":682.0,"after optimiser step":1346.0,"after zero_grad":1014.0,"peak":5142.0},"step 2":{"start":1014.0,"after forward":5684.0,"after backward":1346.0,"after optimiser step":1346.0,"after zero_grad":1014.0,"peak":5806.0},"predicted":{"params fp32":332.0,"grads":332.0,"AdamW state (2 per param)":664.0}},"vs_batch":{"1":{"peak_mb":1675.0,"steady_mb":1000.0,"ms":43.2},"2":{"peak_mb":2208.0,"steady_mb":1000.0,"ms":70.6},"4":{"peak_mb":3415.0,"steady_mb":1014.0,"ms":125.7},"8":{"peak_mb":5788.0,"steady_mb":996.0,"ms":237.5},"12":{"peak_mb":8162.0,"steady_mb":998.0,"ms":354.6}},"vs_seq":{"128":{"peak_mb":1664.0,"steady_mb":997.0,"ms":25.0},"256":{"peak_mb":1675.0,"steady_mb":1000.0,"ms":36.8},"512":{"peak_mb":2208.0,"steady_mb":1000.0,"ms":63.9},"1024":{"peak_mb":3415.0,"steady_mb":1014.0,"ms":125.9},"2048":{"peak_mb":5788.0,"steady_mb":996.0,"ms":290.1}},"optimisers":{"sgd":{"peak_mb":5124.0,"steady_mb":332.0,"ms":231.6},"sgd+momentum":{"peak_mb":5456.0,"steady_mb":664.0,"ms":232.8},"adamw":{"peak_mb":5788.0,"steady_mb":996.0,"ms":239.1}},"bf16":{"peak_mb":3917.0,"steady_mb":1012.0,"ms":97.0},"checkpoint":{"none":{"peak_mb":5788.0,"steady_mb":996.0,"ms":238.2},"every 4th block":{"peak_mb":4707.0,"steady_mb":997.0,"ms":253.4},"every 2nd block":{"peak_mb":3625.0,"steady_mb":996.0,"ms":267.1},"every block":{"peak_mb":1812.0,"steady_mb":997.0,"ms":296.3}},"largest":{"none":{"largest_batch":32,"peak_mb":11969.0,"steady_mb":1007.0,"ms":350.0,"tokens_per_s":93623.0},"every block":{"largest_batch":96,"peak_mb":7790.0,"steady_mb":997.0,"ms":1249.7,"tokens_per_s":78662.0}},"accum_exact":{"2 x 16":{"max_abs_diff":1.49e-08,"rel_diff":1.39e-07},"4 x 8":{"max_abs_diff":1.49e-08,"rel_diff":1.26e-07},"8 x 4":{"max_abs_diff":1.49e-08,"rel_diff":1.26e-07},"32 x 1":{"max_abs_diff":2.98e-08,"rel_diff":1.46e-07},"4 x 8, summed without dividing by 4":{"grad_norm_ratio":4.0}},"accum_bn":{"without BatchNorm":{"2 x 32":{"cosine":1.0,"rel_diff":0.0},"8 x 8":{"cosine":1.0,"rel_diff":0.0},"32 x 2":{"cosine":1.0,"rel_diff":0.0}},"with BatchNorm":{"2 x 32":{"cosine":0.9978,"rel_diff":0.0656},"8 x 8":{"cosine":0.9858,"rel_diff":0.1693},"32 x 2":{"cosine":0.9535,"rel_diff":0.3066}}},"accum_speed":{"1 x 32":{"ms_per_update":348.1,"peak_mb":11970.0},"2 x 16":{"ms_per_update":365.4,"peak_mb":6927.0},"4 x 8":{"ms_per_update":366.2,"peak_mb":4258.0},"8 x 4":{"ms_per_update":393.8,"peak_mb":2902.0},"32 x 1":{"ms_per_update":554.2,"peak_mb":1877.0}},"train":{"batch 32":{"curve_bits_per_byte":[[1,8.1695],[100,3.5803],[200,3.4243],[300,3.0072],[400,2.7434],[500,2.5456],[600,2.4219],[700,2.3222],[800,2.2449],[900,2.1823],[1000,2.139],[1100,2.104],[1200,2.0801],[1300,2.0661],[1400,2.0567],[1500,2.0551]],"seconds":23.5},"8 x 4 accumulated":{"curve_bits_per_byte":[[1,8.1695],[100,3.5803],[200,3.4269],[300,3.0052],[400,2.7387],[500,2.5405],[600,2.4227],[700,2.3246],[800,2.2447],[900,2.1859],[1000,2.1386],[1100,2.1036],[1200,2.0773],[1300,2.0645],[1400,2.0541],[1500,2.0527]],"seconds":73.9}}};
+  const fmt = v => Math.round(v).toLocaleString();
+  const row = (l, segs, mx, n) => `<div class="mm-row"><span>${l}</span><span class="track">${segs.map(([v, c]) => `<i style="width:${100 * v / mx}%;background:${c}"></i>`).join('')}</span><span class="n">${n}</span></div>`;
+  const C = { w: '#2563eb', o: '#a855f7', g: '#f97316', a: '#16a34a' };
+  function timeline() {
+    const A = D.accounting, P = A['after building the model'], G = A.predicted.grads, O = A.predicted['AdamW state (2 per param)'];
+    const ph = ['start', 'after forward', 'after backward', 'after optimiser step', 'after zero_grad'];
+    let h = '';
+    ['step 1', 'step 2'].forEach((s, si) => {
+      h += `<div style="margin:${si ? 12 : 0}px 0 4px"><b>${s[0].toUpperCase() + s.slice(1)}</b> (peak ${fmt(A[s].peak)} MB)</div>`;
+      ph.forEach(p => {
+        const tot = A[s][p], hasO = si === 1 || p === 'after optimiser step' || p === 'after zero_grad', hasG = p === 'after backward' || p === 'after optimiser step';
+        const o = hasO ? O : 0, g = hasG ? G : 0, a = Math.max(0, tot - P - o - g);
+        h += row(p, [[P, C.w], [o, C.o], [g, C.g], [a, C.a]], 6000, fmt(tot) + ' MB');
+      });
+    });
+    h += `<div class="mm-key"><span><i style="background:${C.w}"></i>weights</span><span><i style="background:${C.o}"></i>AdamW state</span><span><i style="background:${C.g}"></i>gradients</span><span><i style="background:${C.a}"></i>activations (and small extras)</span></div>`;
+    $('#mmT').innerHTML = h;
+    $('#mmStats').innerHTML = `<div class="stat"><div class="k">Parameters</div><div class="v">${A['parameters (M)']}M</div></div><div class="stat"><div class="k">Weights + grads + AdamW</div><div class="v">${fmt(P + G + O)} MB</div></div><div class="stat bad"><div class="k">Activations, end of forward</div><div class="v">${fmt(A['step 2']['after forward'] - A['step 2'].start)} MB</div></div>`;
+    $('#mmWhy').innerHTML = '<b>Green is the problem.</b> Saved activations are 80% of the peak and exist only between the end of the forward pass and the backward pass that consumes them. Purple, the optimiser state, appears at step 1’s update and stays, which is why step 2 peaks higher than step 1.';
+  }
+  function tokens() {
+    const W = 600, H = 260, L = 56, R = 14, T = 12, B = 34, xm = 13000, ym = 9000, x = v => L + v / xm * (W - L - R), y = v => T + (1 - v / ym) * (H - T - B);
+    const sb = Object.entries(D.vs_batch).map(([b, v]) => [b * 1024, v.peak_mb, `${b}×1024`]), ss = Object.entries(D.vs_seq).map(([t, v]) => [4 * t, v.peak_mb, `4×${t}`]);
+    let g = '';
+    [0, 3000, 6000, 9000].forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${(v / 1000).toFixed(0)} GB</text>`);
+    [0, 4096, 8192, 12288].forEach(v => g += `<text x="${x(v)}" y="${H - 18}" text-anchor="middle">${v.toLocaleString()}</text>`);
+    g += `<text x="${(W + L) / 2}" y="${H - 2}" text-anchor="middle">tokens per step (batch × length)</text>`;
+    [[sb, '#2563eb', 5.5, 6], [ss, '#f97316', 3, 2]].forEach(([s, c, rr, sw]) => { g += `<polyline fill="none" stroke="${c}" stroke-width="${sw}" opacity="${sw > 2 ? .55 : 1}" points="${s.map(p => x(p[0]) + ',' + y(p[1])).join(' ')}"/>` + s.map(p => `<circle cx="${x(p[0])}" cy="${y(p[1])}" r="${rr}" fill="${c}"><title>${p[2]}: ${fmt(p[1])} MB</title></circle>`).join(''); });
+    $('#mmS').innerHTML = g; $('#mmSk').innerHTML = `<span><i style="background:#2563eb"></i>more sequences (batch 1–12, length 1,024)</span><span><i style="background:#f97316"></i>longer sequences (batch 4, length 128–2,048)</span>`;
+    $('#mmStats').innerHTML = `<div class="stat"><div class="k">8 × 1,024</div><div class="v">${fmt(D.vs_batch['8'].peak_mb)} MB · ${D.vs_batch['8'].ms} ms</div></div><div class="stat"><div class="k">4 × 2,048</div><div class="v">${fmt(D.vs_seq['2048'].peak_mb)} MB · ${D.vs_seq['2048'].ms} ms</div></div><div class="stat good"><div class="k">bf16, 8 × 1,024</div><div class="v">${fmt(D.bf16.peak_mb)} MB · ${D.bf16.ms} ms</div></div>`;
+    $('#mmWhy').innerHTML = '<b>One line, two ways of adding tokens.</b> Whether the extra tokens come as more sequences or longer ones, memory lands on the same straight line: about 593 MB per 1,024 tokens. The fused attention kernel keeps the length-squared attention matrix out of memory. Below about 1,000 tokens the line flattens: the optimiser step, not activations, sets the peak there.';
+  }
+  function ckpt() {
+    const K = D.checkpoint, ks = Object.keys(K), L_ = D.largest;
+    $('#mmC').innerHTML = '<div style="margin-bottom:4px"><b>Peak memory, batch 8 × 1,024, fp32</b></div>' + ks.map(k => row(k, [[K[k].peak_mb, '#16a34a']], 6000, fmt(K[k].peak_mb) + ' MB')).join('') +
+      '<div style="margin:12px 0 4px"><b>Time per step</b></div>' + ks.map(k => row(k, [[K[k].ms, '#f97316']], 320, K[k].ms + ' ms')).join('') +
+      `<div style="margin:12px 0 4px"><b>Largest batch that fit, bf16, length 1,024 (tried 8 to 96)</b></div>` + row('no checkpointing', [[L_.none.largest_batch, '#94a3b8']], 100, L_.none.largest_batch) + row('every block', [[L_['every block'].largest_batch, '#7c3aed']], 100, '≥ ' + L_['every block'].largest_batch);
+    $('#mmStats').innerHTML = `<div class="stat good"><div class="k">Memory, every block</div><div class="v">−${Math.round(100 * (1 - K['every block'].peak_mb / K.none.peak_mb))}%</div></div><div class="stat bad"><div class="k">Time, every block</div><div class="v">+${Math.round(100 * (K['every block'].ms / K.none.ms - 1))}%</div></div><div class="stat"><div class="k">Tokens/s at the largest batch</div><div class="v">${fmt(L_.none.tokens_per_s)} → ${fmt(L_['every block'].tokens_per_s)}</div></div>`;
+    $('#mmWhy').innerHTML = '<b>A dial, not a switch.</b> Each checkpointed block gave back about 330 MB and cost about 5 ms. The batch that fits grew at least threefold, but tokens per second fell: checkpointing is for fitting what would not fit, not for going faster.';
+  }
+  function accum() {
+    const k = $('#mmA .active').dataset.v;
+    if (k === 'cost') {
+      const S = D.accum_speed, ks = Object.keys(S);
+      $('#mmAc').innerHTML = '<div style="margin-bottom:4px"><b>Peak memory for one 32-sequence update, bf16</b></div>' + ks.map(s => row(s, [[S[s].peak_mb, '#16a34a']], 12500, fmt(S[s].peak_mb) + ' MB')).join('') + '<div style="margin:12px 0 4px"><b>Time per update</b></div>' + ks.map(s => row(s, [[S[s].ms_per_update, '#f97316']], 600, S[s].ms_per_update + ' ms')).join('');
+      $('#mmStats').innerHTML = `<div class="stat good"><div class="k">4 × 8 memory</div><div class="v">−${Math.round(100 * (1 - S['4 x 8'].peak_mb / S['1 x 32'].peak_mb))}%</div></div><div class="stat"><div class="k">4 × 8 time</div><div class="v">+${Math.round(100 * (S['4 x 8'].ms_per_update / S['1 x 32'].ms_per_update - 1))}%</div></div><div class="stat bad"><div class="k">32 × 1 time</div><div class="v">+${Math.round(100 * (S['32 x 1'].ms_per_update / S['1 x 32'].ms_per_update - 1))}%</div></div>`;
+      $('#mmWhy').innerHTML = '<b>Nearly free while the GPU stays busy.</b> Memory falls with the micro-batch; time barely moves until the micro-batch is too small to fill the GPU, then each extra forward and backward pass costs mostly launch overhead.';
+    } else if (k === 'train') {
+      const Tr = D.train, ks = Object.keys(Tr), col = ['#2563eb', '#f97316'], W = 600, H = 240, L = 46, R = 14, T = 12, B = 34, x = s => L + s / 1500 * (W - L - R), y = v => T + (1 - (v - 2) / 1.8) * (H - T - B);
+      let g = '';
+      [2, 2.5, 3, 3.5].forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`);
+      [0, 500, 1000, 1500].forEach(v => g += `<text x="${x(v)}" y="${H - 18}" text-anchor="middle">${v}</text>`);
+      g += `<text x="${(W + L) / 2}" y="${H - 2}" text-anchor="middle">update (validation bits per byte)</text>`;
+      ks.forEach((kk, i) => g += `<polyline fill="none" stroke="${col[i]}" stroke-width="${i ? 2 : 4}" opacity="${i ? 1 : .5}" points="${Tr[kk].curve_bits_per_byte.filter(p => p[0] > 1).map(p => x(p[0]) + ',' + y(p[1])).join(' ')}"/>`);
+      $('#mmAc').innerHTML = `<svg viewBox="0 0 600 240">${g}</svg><div class="mm-key">${ks.map((kk, i) => `<span><i style="background:${col[i]}"></i>${kk}</span>`).join('')}</div>`;
+      const f = kk => Tr[kk].curve_bits_per_byte.slice(-1)[0][1];
+      $('#mmStats').innerHTML = `<div class="stat"><div class="k">Batch 32, final</div><div class="v">${f(ks[0])}</div></div><div class="stat"><div class="k">8 × 4 accumulated, final</div><div class="v">${f(ks[1])}</div></div><div class="stat bad"><div class="k">Wall time</div><div class="v">${Tr[ks[0]].seconds} s → ${Tr[ks[1]].seconds} s</div></div>`;
+      $('#mmWhy').innerHTML = `<b>The same training.</b> The two curves lie on top of each other, ending ${f(ks[0])} and ${f(ks[1])} bits per byte. Exactness checked directly: every split matched the batch-32 gradient to about 1.4 × 10⁻⁷, and forgetting the division gave a gradient exactly ${D.accum_exact['4 x 8, summed without dividing by 4'].grad_norm_ratio} times too large.`;
+    } else {
+      const Bn = D.accum_bn, ks = Object.keys(Bn['with BatchNorm']);
+      $('#mmAc').innerHTML = '<div style="margin-bottom:4px"><b>Relative error of the accumulated gradient vs the true batch-64 gradient</b></div>' + ks.map(s => row(`${s}, BatchNorm`, [[Bn['with BatchNorm'][s].rel_diff * 100, '#e11d48']], 35, (Bn['with BatchNorm'][s].rel_diff * 100).toFixed(1) + '%')).join('') + ks.map(s => row(`${s}, no BatchNorm`, [[Bn['without BatchNorm'][s].rel_diff * 100, '#16a34a']], 35, (Bn['without BatchNorm'][s].rel_diff * 100).toFixed(1) + '%')).join('');
+      $('#mmStats').innerHTML = ks.map(s => `<div class="stat${s === '32 x 2' ? ' bad' : ''}"><div class="k">Cosine, ${s}</div><div class="v">${Bn['with BatchNorm'][s].cosine}</div></div>`).join('');
+      $('#mmWhy').innerHTML = '<b>BatchNorm makes examples depend on their batch-mates.</b> Each micro-batch is normalised with its own mean and variance, so the accumulated gradient belongs to a smaller-batch network. Without BatchNorm the error was zero to four decimal places.';
+    }
+  }
+  function draw() { const v = $('#mmV .active').dataset.v; ['timeline', 'tokens', 'ckpt', 'accum'].forEach(x => $('#mmV' + x).classList.toggle('on', x === v)); ({ timeline, tokens, ckpt, accum })[v](); }
+  ['#mmV', '#mmA'].forEach(id => $(id).addEventListener('segchange', draw)); draw();
+})();
+</script>
 </body>
 </html>
