@@ -3,37 +3,295 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mixed Precision Training</title>
+<title>Mixed Precision Training · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 21 of Deep Learning. fp32, TF32, bf16 and fp16 training measured on a CIFAR-10 CNN, a wide MLP and a byte-level transformer: bf16 autocast 1.6 to 2.8 times faster at the same accuracy, most activation gradients below fp16's range, an fp16 language model without loss scaling 0.8 bits per byte worse, and memory layouts that made fp32 four times slower.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .mp-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .mp-v { display:none; } .mp-v.on { display:block; }
+  .mp-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .mp-box svg { width:100%; height:auto; display:block; } .mp-box text { font-size:12px; fill:var(--muted); }
+  .mp-row { display:grid; grid-template-columns:minmax(0, 210px) 1fr 84px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .mp-row .track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; } .mp-row .track i { display:block; height:100%; }
+  .mp-row .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .mp-key { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; margin-top:6px; } .mp-key i { display:inline-block; width:10px; height:10px; border-radius:3px; vertical-align:middle; margin-right:4px; }
+  .mp-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .mp-row { grid-template-columns:minmax(0, 120px) 1fr 66px; font-size:12px; } }
+</style>
 </head>
 <body data-chapter="21">
-<!-- dl:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 21</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
-    <h1>Mixed Precision <span class="grad">Training</span></h1>
-    <p class="lead">fp16 with loss scaling and bf16 with autocast: speed, memory and the numerical traps, measured.</p>
+    <h1>Mixed <span class="grad">Precision Training</span></h1>
+    <p class="lead">A modern GPU does 16-bit matrix arithmetic several times faster than 32-bit, and 16-bit tensors take half the memory and half the bandwidth. <b>Mixed precision</b> training takes that speed without paying for it in accuracy: the expensive operations run in 16 bits, the numerically delicate ones stay in 32, and the weights the optimiser updates stay in 32. Two 16-bit formats compete. <b>bf16</b> has fp32’s range and little precision; <b>fp16</b> has more precision and a range so narrow that gradients fall out of the bottom of it, which is what <b>loss scaling</b> exists to fix.</p>
+    <p class="lead">This chapter measures the whole recipe on an RTX 5070 Ti. bf16 autocast made a CIFAR-10 CNN 1.6 times faster and a matmul-heavy MLP 2.8 times faster, at the same accuracy. Gradients turned out to be far smaller than the textbook picture: in the CNN, the median gradient flowing back through the activations was 2 × 10⁻⁸, and 64% of those values were too small for fp16 to represent at all. The CNN shrugged that off; a small transformer language model trained in fp16 without a loss scaler did not, ending 0.8 bits per byte worse than with one. And one result nobody warns you about: the same CNN in fp32 ran over four times slower when its tensors were stored channels-last.</p>
+    <ul class="objectives">
+      <li><span>Explain what autocast runs in 16 bits, what it keeps in 32, and why the weights stay fp32</span></li>
+      <li><span>Measure the speed, memory and accuracy of fp32, TF32, bf16 and fp16 training</span></li>
+      <li><span>Read a gradient histogram against fp16’s limits and see why loss scaling is needed</span></li>
+      <li><span>Use GradScaler correctly, including with gradient clipping</span></li>
+      <li><span>Choose between bf16 and fp16, and check the memory layout before trusting a timing</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The formats themselves</b> (bits, range, precision, absorption, rounding error in a matmul): <a href="p3-floating-point-for-deep-learning.html">P3</a>. <b>Tensor cores and timing a GPU properly:</b> <a href="p7-the-gpu-for-deep-learning.html">P7</a>.</li>
+        <li>The same recipe applied to GPT-2, with tokens per second and MFU, is in LLMs <a href="../llms/13-training-efficiently-on-one-gpu.html">Chapter 13</a>. This chapter covers the mechanism and its failure modes on several kinds of network.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Why lower precision</li>
-    <li>Autocast</li>
-    <li>Loss scaling for fp16</li>
-    <li>bf16 vs fp16</li>
-    <li>Speed and accuracy measured</li>
-  </ol>
+  <h2>What autocast does</h2>
+  <p>Inside a <code>torch.autocast</code> block, each operation is run in the precision PyTorch has listed for it. Matrix multiplies and convolutions, which are most of the arithmetic and gain the most from tensor cores, run in the 16-bit format. Operations that are sensitive to rounding or range, such as softmax, log, exponentials, normalisation layers, losses and large reductions, are run in fp32. Everything outside the block, including the weights, their gradients and the optimiser state, stays fp32: the weights are cast to 16 bits on the way into each matmul, and the gradients are cast back to fp32 on the way out.</p>
+<pre class="code"><span class="c"># bf16: fp32's range, so no scaler is needed</span>
+<span class="k">with</span> torch.<span class="f">autocast</span>(<span class="s">"cuda"</span>, dtype=torch.bfloat16):
+    loss = <span class="f">loss_fn</span>(<span class="f">model</span>(x), y)
+loss.<span class="f">backward</span>(); opt.<span class="f">step</span>(); opt.<span class="f">zero_grad</span>()
+
+<span class="c"># fp16: scale the loss up so small gradients survive, unscale before the step</span>
+scaler = torch.amp.<span class="f">GradScaler</span>(<span class="s">"cuda"</span>)
+<span class="k">with</span> torch.<span class="f">autocast</span>(<span class="s">"cuda"</span>, dtype=torch.float16):
+    loss = <span class="f">loss_fn</span>(<span class="f">model</span>(x), y)
+scaler.<span class="f">scale</span>(loss).<span class="f">backward</span>()
+scaler.<span class="f">unscale_</span>(opt); torch.nn.utils.<span class="f">clip_grad_norm_</span>(model.<span class="f">parameters</span>(), <span class="m">1.0</span>)   <span class="c"># clip the real gradients, not the scaled ones</span>
+scaler.<span class="f">step</span>(opt); scaler.<span class="f">update</span>(); opt.<span class="f">zero_grad</span>()</pre>
+  <p>Why the weights stay fp32: an update is usually a tiny fraction of the weight it changes, and 16-bit formats cannot represent the sum. A bf16 weight of 1.0 given 1,000 updates of −0.0001 was still exactly 1.0 afterwards, because 0.9999 rounds back to 1.0 in bf16 every time; the fp32 copy reached 0.89998 (the absorption effect from P3). Keeping an fp32 <b>master copy</b> costs memory but lets small updates accumulate.</p>
+
+  <h2>Speed, memory and accuracy</h2>
+  <p>A 5-layer CIFAR-10 CNN (128 to 512 channels, BatchNorm, 2.2 million parameters), trained for 8 epochs with the same seed, schedule and augmentation in each format:</p>
+  <table class="t cmp">
+    <thead><tr><th>Training precision</th><th>Seconds per epoch</th><th>Peak memory</th><th>Test accuracy</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td>5.29</td><td>4,020 MB</td><td>87.58%</td></tr>
+      <tr><td>TF32 (fp32 storage, 10-bit mantissa in the tensor cores)</td><td>5.67</td><td>2,250 MB</td><td>87.21%</td></tr>
+      <tr><td><b>bf16 autocast</b></td><td><b>3.29</b></td><td><b>1,755 MB</b></td><td><b>87.60%</b></td></tr>
+      <tr><td>fp16 autocast, no scaler</td><td>3.37</td><td>1,764 MB</td><td>87.13%</td></tr>
+      <tr><td>fp16 autocast + GradScaler</td><td>3.22</td><td>1,755 MB</td><td>87.50%</td></tr>
+      <tr><td>Pure bf16 (weights and optimiser in bf16 too)</td><td>3.24</td><td>1,741 MB</td><td>86.92%</td></tr>
+    </tbody>
+  </table>
+  <p>Both 16-bit formats ran an epoch about 1.6 times faster than fp32 and used less than half the memory, at the same accuracy: these are single runs, so differences of a few tenths of a point are not a ranking. TF32 did nothing for this network’s speed. A convolutional network at this size spends much of its step on BatchNorm, ReLU and pooling, which are limited by memory bandwidth rather than arithmetic (Chapter 22 profiles it), so faster multiplies help less. Its lower peak is not from smaller tensors, since TF32 stores fp32, but from the convolution algorithms cuDNN chose and the scratch space they need.</p>
+  <p>Where the arithmetic dominates, the gains are larger. One training step of a 4,096 → 8,192 → 8,192 → 8,192 → 10 MLP on a batch of 4,096:</p>
+  <table class="t cmp">
+    <thead><tr><th>Precision</th><th>ms per step</th><th>Speed-up</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td>132.0</td><td>1.0×</td></tr>
+      <tr><td>TF32</td><td>85.7</td><td>1.5×</td></tr>
+      <tr><td>bf16 autocast</td><td>47.1</td><td><b>2.8×</b></td></tr>
+      <tr><td>fp16 autocast</td><td>47.5</td><td>2.8×</td></tr>
+    </tbody>
+  </table>
+  <p>Pure bf16, with the weights themselves in bf16, lost 0.7 points in 8 epochs: absorption swallowed the smallest updates. It is used for very large models where the fp32 master copy is too expensive, usually with tricks such as stochastic rounding or Kahan summation in the optimiser; for everything else, keep fp32 master weights.</p>
+
+  <h2>How small gradients really are</h2>
+  <p>fp16’s smallest normal number is 2⁻¹⁴ ≈ 6.1 × 10⁻⁵; below that it has subnormals with fewer significant bits, down to 2⁻²⁴ ≈ 6 × 10⁻⁸, and anything smaller becomes 0. P3 found that a small MLP’s weight gradients mostly fit. The gradients that flow backwards through the network’s activations, which the backward pass computes in 16 bits under autocast, are much smaller, because the loss is an average over the batch and every element’s share is divided by its size. Measured in fp32 on the CIFAR CNN after 2 epochs:</p>
+  <table class="t cmp">
+    <thead><tr><th>Gradients</th><th>Median magnitude</th><th>fp16 subnormal (precision lost)</th><th>Below fp16’s range (become 0)</th></tr></thead>
+    <tbody>
+      <tr><td>CNN, weights</td><td>4.2 × 10⁻⁴</td><td>8.5%</td><td>0.008%</td></tr>
+      <tr><td>CNN, activations (conv outputs)</td><td>1.9 × 10⁻⁸</td><td>36.0%</td><td><b>64.0%</b></td></tr>
+      <tr><td>Byte-level transformer LM, weights</td><td>1.5 × 10⁻⁴</td><td>30.9%</td><td>0.07%</td></tr>
+      <tr><td>Byte-level transformer LM, activations (block outputs)</td><td>2.0 × 10⁻⁶</td><td><b>98.5%</b></td><td>1.5%</td></tr>
+    </tbody>
+  </table>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Precision lab</span><span class="p-tag">Measured on an RTX 5070 Ti</span></div>
+    <div class="panel-body">
+      <div class="mp-l">View</div>
+      <div class="seg" id="mpV"><button class="active" data-v="speed">speed and memory</button><button data-v="hist">gradient magnitudes</button><button data-v="lm">fp16 without a scaler</button></div>
+      <div class="mp-v on" id="mpVspeed">
+        <div class="mp-l">Memory layout of the CNN’s tensors</div>
+        <div class="seg" id="mpL"><button class="active" data-v="cnn">NCHW (default)</button><button data-v="cnn_cl">channels-last</button></div>
+        <div class="mp-box" id="mpS"></div>
+      </div>
+      <div class="mp-v" id="mpVhist">
+        <div class="mp-l">Gradients of</div>
+        <div class="seg" id="mpH"><button data-v="CNN weight gradients">CNN weights</button><button class="active" data-v="CNN activation gradients">CNN activations</button><button data-v="LM weight gradients">LM weights</button><button data-v="LM activation gradients">LM activations</button></div>
+        <div class="mp-box"><svg id="mpHs" viewBox="0 0 600 250"></svg><div class="mp-key"><span><i style="background:rgba(225,29,72,.25)"></i>becomes 0 in fp16</span><span><i style="background:rgba(234,179,8,.25)"></i>fp16 subnormal</span><span><i style="background:#7c3aed"></i>share of values</span></div></div>
+      </div>
+      <div class="mp-v" id="mpVlm"><div class="mp-box"><svg id="mpC" viewBox="0 0 600 250"></svg><div class="mp-key" id="mpCk"></div></div></div>
+      <div class="stats" id="mpStats"></div>
+      <div class="mp-why" id="mpWhy"></div>
+    </div>
+    <div class="panel-foot">CNN: 5 conv layers (128, 128, 256, 256, 512 channels) with BatchNorm, CIFAR-10, SGD with Nesterov momentum, one-cycle schedule to 0.1, batch 256, flip and crop augmentation, 8 epochs, one seed; seconds per epoch include augmentation. The channels-last run is the same experiment with the model and data stored NHWC. MLP: mean of 10 training steps after 3 warm-up steps. Gradient histograms: fp32 models, one batch, magnitudes in powers of ten; activation gradients taken at conv outputs (CNN, after 2 epochs) and block outputs (LM, at initialisation). LM: a byte-level GPT, 6 blocks of width 384, AdamW 1e-3 with warm-up and cosine decay, gradient clipping 1.0, 2,000 steps of 32 × 256 bytes of WikiText-2, validation bits per byte.</div>
+  </div>
+
+  <p>Most of the CNN’s activation gradients were too small for fp16, and yet the CNN trained in fp16 without a scaler to within half a point of fp32. A weight’s gradient is a sum over every position and example in the batch, and that sum is dominated by the largest terms; losing the smallest ones changed only 0.004% of the weight-gradient values to zero. The transformer was not so lucky. In fp16 it would lose 1.5% of its activation gradients outright, and almost all the rest would be subnormals with reduced precision, and it trained badly:</p>
+  <table class="t cmp">
+    <thead><tr><th>Byte-level LM, 2,000 steps</th><th>Validation bits per byte</th><th>Weight gradients exactly 0</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td>1.954</td><td>0.58%</td></tr>
+      <tr><td>bf16 autocast</td><td>1.957</td><td>0.60%</td></tr>
+      <tr><td>fp16 autocast, no scaler</td><td><b>2.747</b></td><td><b>1.53%</b></td></tr>
+      <tr><td>fp16 autocast + GradScaler</td><td>1.951</td><td>(scale 65,536, no skipped steps)</td></tr>
+    </tbody>
+  </table>
+  <p>(The 0.6% of zeros in fp32 are mostly embedding rows for byte values that did not occur in the batch: Chapter 20’s sparse gradients.) Loss scaling multiplies the loss by a large factor S before <code>backward()</code>, so every gradient in the chain is S times larger and lands inside fp16’s range; the scaler divides the weight gradients by S before the optimiser uses them. <code>GradScaler</code> starts at S = 65,536, halves it and skips the step whenever a gradient overflows to inf or NaN, and doubles it after 2,000 clean steps. In this run it never needed to change: 65,536 moved the gradients into range and nothing overflowed. It cost nothing measurable, which is the point: in fp16, always use it. bf16 needs none, because its range is fp32’s; its 8-bit precision rounds each gradient, but rounding is an error networks tolerate, and a zero is not.</p>
+
+  <h2>The layout trap</h2>
+  <p>The first run of this chapter’s experiment gave absurd numbers: fp32 at 23.4 seconds an epoch, fp16 at 14.8, and bf16 at 2.8. The cause was the memory layout. The data had been loaded in a way that left it stored channels-last (NHWC), and the convolution kernels cuDNN picked for that layout on this GPU were fast in bf16 and very slow in fp32 and fp16:</p>
+  <table class="t cmp">
+    <thead><tr><th>Seconds per epoch</th><th>NCHW (default)</th><th>Channels-last (NHWC)</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td><b>5.29</b></td><td>23.44 (4.4× slower)</td></tr>
+      <tr><td>fp16 autocast + GradScaler</td><td><b>3.22</b></td><td>14.81 (4.6× slower)</td></tr>
+      <tr><td>bf16 autocast</td><td>3.29</td><td><b>2.80</b> (15% faster)</td></tr>
+    </tbody>
+  </table>
+  <p>Channels-last is the layout tensor cores prefer and is usually recommended together with mixed precision, and for bf16 it was indeed the fastest configuration measured. But the right layout depends on the precision, the GPU and the library version, and a layout change can happen by accident: a <code>permute</code> without <code>.contiguous()</code> is enough. Accuracy was unaffected either way; only the clock noticed. Chapter 22 finds this kind of problem with the profiler.</p>
+
+  <figure class="flow">
+    <ol>
+      <li><b>GPU has bf16?</b><small>Ampere or newer</small></li>
+      <li><b>Yes: bf16 autocast</b><small>no scaler, fp32 master weights</small></li>
+      <li><b>No: fp16 autocast</b><small>with GradScaler, always</small></li>
+      <li><b>Clip after unscale_</b><small>if you clip gradients</small></li>
+      <li><b>Time both layouts</b><small>NCHW vs channels-last</small></li>
+    </ol>
+    <figcaption><b>Choosing a precision recipe.</b> Then compare accuracy with an fp32 run once, so you know the recipe cost nothing.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🛰️</div>
+    <div class="body"><div class="title">Use case: moving a satellite-image segmentation model to mixed precision</div><p>A team trains a U-Net on 512 × 512 satellite tiles on older V100 GPUs, which have fp16 tensor cores but no bf16. They wrap the forward pass in fp16 autocast and add GradScaler, but their training loop clips gradients to a norm of 1 and they at first clip the <i>scaled</i> gradients, which are 65,536 times larger, so every step is clipped to almost nothing and the loss stalls. Calling <code>scaler.unscale_(opt)</code> before clipping fixes it. They then check the speed-up properly: 1.9 times faster with NCHW, but slower than fp32 when someone’s data-loading change left the tiles channels-last. A profile shows the convolution kernels as the culprit, and one <code>.contiguous()</code> restores the speed.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>fp16 without GradScaler</b>: fine for the CNN here, 0.8 bits per byte worse for the transformer. You cannot tell in advance which you have.</li>
+      <li><b>Clipping scaled gradients</b>: call <code>scaler.unscale_(opt)</code> first.</li>
+      <li><b>Casting the model to 16 bits</b> (<code>model.half()</code>) instead of autocast: small updates are absorbed; pure bf16 lost 0.7 points.</li>
+      <li><b>Expecting TF32 to speed up every network</b>: 1.5× on matmuls, nothing on this CNN.</li>
+      <li><b>Trusting a timing without checking the layout</b>: channels-last made fp32 4.4× slower and bf16 15% faster.</li>
+      <li><b>Computing the loss on 16-bit logits</b>: cast them to fp32 (<code>.float()</code>) or let autocast run the loss in fp32.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is mixed precision training, and why keep an fp32 copy of the weights?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Running the expensive operations, matmuls and convolutions, in a 16-bit format on tensor cores, while keeping numerically sensitive operations such as softmax, normalisation and the loss in fp32, and keeping the weights, gradients and optimiser state in fp32. The fp32 master weights matter because updates are tiny relative to the weights: a bf16 weight of 1.0 given a thousand updates of 1e-4 never moved, since each result rounded back to 1.0, while fp32 accumulated them to 0.9. Measured, bf16 autocast was 1.6 times faster on a CNN and 2.8 times on a matmul-heavy MLP, at the same accuracy, with less than half the memory.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why does fp16 need loss scaling and bf16 does not?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Range. fp16 has 5 exponent bits, so anything below about 6e-8 becomes zero, and gradients of activations are often smaller than that because the loss averages over the batch: in a CNN I measured, the median activation gradient was 2e-8 and 64% of them would be zero in fp16. Loss scaling multiplies the loss by a large factor, 65,536 by default, so every gradient is shifted into range, then divides it out before the optimiser step, and GradScaler lowers the factor when something overflows. bf16 has fp32’s 8 exponent bits, so nothing underflows, only rounds. In practice the effect varies: the CNN trained fine without scaling, but a small transformer ended 0.8 bits per byte worse, so with fp16 I always use the scaler.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Autocast runs matmuls and convolutions in 16 bits and sensitive operations in fp32; weights and optimiser state stay fp32.</li>
+      <li>bf16 autocast: 1.6× faster on a CNN, 2.8× on a matmul-heavy MLP, less than half the memory, same accuracy.</li>
+      <li>Activation gradients are tiny: median 2 × 10⁻⁸ in the CNN, 64% below fp16’s range.</li>
+      <li>fp16 needs GradScaler: without it a transformer ended 0.8 bits per byte worse. bf16 needs no scaler.</li>
+      <li>Memory layout can change a timing by 4×; time NCHW and channels-last for your precision and GPU.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Inside <code>torch.autocast</code> with bf16, what happens to a matmul and to a softmax?</p>
+      <div class="opts">
+        <button class="opt">Both run in bf16</button>
+        <button class="opt">The matmul runs in bf16; the softmax runs in fp32</button>
+        <button class="opt">Both run in fp32</button>
+        <button class="opt">The matmul runs in fp32; the softmax in bf16</button>
+      </div>
+      <div class="explain">Autocast keeps range- and rounding-sensitive operations in fp32.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why are the optimiser’s weights kept in fp32 during mixed precision training?</p>
+      <div class="opts">
+        <button class="opt">Tensor cores require it</button>
+        <button class="opt">To make checkpoints smaller</button>
+        <button class="opt">fp32 is faster for the optimiser</button>
+        <button class="opt">Updates are tiny relative to the weights and would be rounded away in 16 bits</button>
+      </div>
+      <div class="explain">A bf16 weight of 1.0 stayed 1.0 after 1,000 updates of 1e-4.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why do activation gradients underflow in fp16 more than weight gradients?</p>
+      <div class="opts">
+        <button class="opt">They are individual elements of a loss averaged over the batch, so each is tiny; a weight gradient sums many of them</button>
+        <button class="opt">Activations are stored in fp32</button>
+        <button class="opt">Weight gradients are scaled automatically</button>
+        <button class="opt">They do not; both are the same size</button>
+      </div>
+      <div class="explain">Median 1.9 × 10⁻⁸ for CNN activation gradients against 4.2 × 10⁻⁴ for weight gradients.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">You use fp16 with GradScaler and clip gradients to norm 1.0. Where must <code>scaler.unscale_(opt)</code> go?</p>
+      <div class="opts">
+        <button class="opt">After <code>scaler.step(opt)</code></button>
+        <button class="opt">It is not needed with clipping</button>
+        <button class="opt">After <code>backward()</code> and before clipping, so the clip sees the real gradients</button>
+        <button class="opt">Before the forward pass</button>
+      </div>
+      <div class="explain">Otherwise you clip gradients that are 65,536 times too large.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">The CNN ran fp32 at 5.3 s per epoch with NCHW tensors and 23.4 s channels-last; bf16 was faster channels-last. What is the lesson?</p>
+      <div class="opts">
+        <button class="opt">Never use channels-last</button>
+        <button class="opt">The best memory layout depends on the precision, GPU and library; time it, and watch for accidental layout changes</button>
+        <button class="opt">fp32 is broken on this GPU</button>
+        <button class="opt">Layout changes accuracy</button>
+      </div>
+      <div class="explain">Accuracy was the same; only speed changed, by up to 4.6×.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"cnn":{"fp32":{"acc":87.58,"s_per_epoch":5.29,"peak_mem_mb":4020.0},"TF32":{"acc":87.21,"s_per_epoch":5.67,"peak_mem_mb":2250.0},"bf16 autocast":{"acc":87.6,"s_per_epoch":3.29,"peak_mem_mb":1755.0},"fp16 autocast, no scaler":{"acc":87.13,"s_per_epoch":3.37,"peak_mem_mb":1764.0},"fp16 autocast + GradScaler":{"acc":87.5,"s_per_epoch":3.22,"peak_mem_mb":1755.0,"skipped_steps":0},"pure bf16 weights":{"acc":86.92,"s_per_epoch":3.24,"peak_mem_mb":1741.0}},"cnn_cl":{"fp32":{"acc":87.47,"s_per_epoch":23.44,"peak_mem_mb":7402.0},"TF32":{"acc":87.73,"s_per_epoch":18.33,"peak_mem_mb":2249.0},"bf16 autocast":{"acc":87.79,"s_per_epoch":2.8,"peak_mem_mb":1327.0},"fp16 autocast, no scaler":{"acc":87.2,"s_per_epoch":14.75,"peak_mem_mb":1336.0},"fp16 autocast + GradScaler":{"acc":87.79,"s_per_epoch":14.81,"peak_mem_mb":1327.0},"pure bf16 weights":{"acc":87.11,"s_per_epoch":2.73,"peak_mem_mb":1310.0}},"zero_cnn":0.005,"mlp":{"fp32":132.02,"TF32":85.68,"bf16 autocast":47.09,"fp16 autocast":47.48},"absorb":{"bf16 weight after 1000 updates of 1e-4":1.0,"fp32 weight":0.89998,"expected":0.9},"hist":{"CNN weight gradients":{"edges":[-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,0,1],"pct":[0.0,0.0,0.0,0.0,0.0,0.001,0.013,0.128,1.265,12.466,68.828,17.202,0.097,0.0,0.0],"exact_zero_pct":0.0,"below_fp16_zero_pct":0.0079,"fp16_subnormal_pct":8.5014,"median":0.0004152},"CNN activation gradients":{"edges":[-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,0,1],"pct":[0.0,0.004,0.042,0.431,4.318,31.286,30.985,15.635,15.278,2.019,0.001,0.0,0.0,0.0,0.0],"exact_zero_pct":0.0,"below_fp16_zero_pct":63.9598,"fp16_subnormal_pct":36.0313,"median":1.936e-08},"LM weight gradients":{"edges":[-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,0,1],"pct":[0.0,0.002,0.014,0.004,0.001,0.007,0.071,0.718,6.824,32.92,51.082,7.822,0.026,0.0,0.0],"exact_zero_pct":0.51,"below_fp16_zero_pct":0.0676,"fp16_subnormal_pct":30.9349,"median":0.00015},"LM activation gradients":{"edges":[-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,0,1],"pct":[0.0,0.0,0.0,0.002,0.022,0.221,2.223,22.406,75.124,0.001,0.0,0.0,0.0,0.0,0.0],"exact_zero_pct":0.0,"below_fp16_zero_pct":1.474,"fp16_subnormal_pct":98.526,"median":2.037e-06}},"lm":{"fp32":{"curve":[[200,3.4228],[400,2.7393],[600,2.4194],[800,2.2399],[1000,2.1288],[1200,2.057],[1400,2.0104],[1600,1.9757],[1800,1.9579],[2000,1.9535]],"final":1.9535,"zero":[[0,0.51],[100,0.611],[200,0.583],[300,0.593],[400,0.607],[500,0.58],[600,0.611],[700,0.597],[800,0.611],[900,0.59],[1000,0.53],[1100,0.523],[1200,0.604],[1300,0.604],[1400,0.572],[1500,0.608],[1600,0.509],[1700,0.593],[1800,0.583],[1900,0.579]],"skipped":null,"scale":[]},"bf16 autocast":{"curve":[[200,3.4307],[400,2.7414],[600,2.4177],[800,2.2433],[1000,2.1357],[1200,2.0613],[1400,2.017],[1600,1.981],[1800,1.962],[2000,1.9574]],"final":1.9574,"zero":[[0,0.514],[100,0.624],[200,0.595],[300,0.611],[400,0.625],[500,0.598],[600,0.631],[700,0.616],[800,0.63],[900,0.61],[1000,0.551],[1100,0.544],[1200,0.625],[1300,0.626],[1400,0.594],[1500,0.629],[1600,0.532],[1700,0.615],[1800,0.604],[1900,0.602]],"skipped":null,"scale":[]},"fp16 autocast, no scaler":{"curve":[[200,3.5651],[400,3.3352],[600,3.1185],[800,2.9107],[1000,2.8031],[1200,2.8845],[1400,2.8286],[1600,2.7843],[1800,2.7536],[2000,2.7471]],"final":2.7471,"zero":[[0,0.555],[100,0.805],[200,1.202],[300,0.941],[400,0.88],[500,0.876],[600,0.835],[700,0.84],[800,1.117],[900,0.907],[1000,0.837],[1100,0.982],[1200,1.29],[1300,1.452],[1400,1.417],[1500,1.86],[1600,1.227],[1700,1.564],[1800,1.5],[1900,1.534]],"skipped":null,"scale":[]},"fp16 autocast + GradScaler":{"curve":[[200,3.4226],[400,2.7383],[600,2.4153],[800,2.2393],[1000,2.1326],[1200,2.0551],[1400,2.0101],[1600,1.9737],[1800,1.9553],[2000,1.9509]],"final":1.9509,"zero":null,"skipped":0,"scale":[[1950,65536.0]]}}};
+  const MODES = ['fp32', 'TF32', 'bf16 autocast', 'fp16 autocast, no scaler', 'fp16 autocast + GradScaler', 'pure bf16 weights'];
+  const row = (l, v, mx, n, c) => `<div class="mp-row"><span>${l}</span><span class="track"><i style="width:${Math.max(0.5, 100 * v / mx)}%;background:${c}"></i></span><span class="n">${n}</span></div>`;
+  function speed() {
+    const k = $('#mpL .active').dataset.v, S = D[k], mxT = Math.max(...MODES.map(m => S[m].s_per_epoch));
+    $('#mpS').innerHTML = `<div style="margin-bottom:4px"><b>Seconds per epoch, CIFAR-10 CNN</b></div>` + MODES.map(m => row(m, S[m].s_per_epoch, mxT, S[m].s_per_epoch + ' s', m.startsWith('fp32') || m === 'TF32' ? '#94a3b8' : '#7c3aed')).join('') +
+      `<div style="margin:12px 0 4px"><b>Peak memory</b></div>` + MODES.map(m => row(m, S[m].peak_mem_mb, 7500, Math.round(S[m].peak_mem_mb).toLocaleString() + ' MB', '#16a34a')).join('') +
+      `<div style="margin:12px 0 4px"><b>Wide MLP, ms per step (matmul-bound)</b></div>` + Object.entries(D.mlp).map(([m, v]) => row(m, v, 140, v + ' ms', '#f97316')).join('');
+    $('#mpStats').innerHTML = `<div class="stat"><div class="k">fp32 epoch</div><div class="v">${S.fp32.s_per_epoch} s</div></div><div class="stat good"><div class="k">bf16 epoch</div><div class="v">${S['bf16 autocast'].s_per_epoch} s</div></div><div class="stat"><div class="k">Accuracy range</div><div class="v">${Math.min(...MODES.map(m => S[m].acc))}–${Math.max(...MODES.map(m => S[m].acc))}%</div></div>`;
+    $('#mpWhy').innerHTML = k === 'cnn' ? '<b>NCHW, the default.</b> Both 16-bit formats about 1.6× faster than fp32, TF32 no faster at all: this CNN is limited by memory-bound layers as much as by multiplies. The MLP, which is almost all matmul, shows the full tensor-core gain: 2.8×.' : '<b>Channels-last: same accuracy, very different clocks.</b> bf16 became the fastest configuration measured, while fp32 and fp16 became over four times slower than with NCHW. If your mixed-precision speed-up looks too good or too bad, check the layout before believing it.';
+  }
+  function hist() {
+    const k = $('#mpH .active').dataset.v, H = D.hist[k], W = 600, Ht = 250, L = 40, R = 10, T = 12, B = 36, n = H.pct.length, e0 = H.edges[0], e1 = H.edges[H.edges.length - 1];
+    const x = v => L + (v - e0) / (e1 - e0) * (W - L - R), mx = Math.max(...H.pct), y = v => T + (1 - v / (mx * 1.1)) * (Ht - T - B);
+    let g = `<rect x="${x(e0)}" y="${T}" width="${x(Math.log10(2 ** -24)) - x(e0)}" height="${Ht - T - B}" fill="rgba(225,29,72,.18)"/><rect x="${x(Math.log10(2 ** -24))}" y="${T}" width="${x(Math.log10(2 ** -14)) - x(Math.log10(2 ** -24))}" height="${Ht - T - B}" fill="rgba(234,179,8,.18)"/>`;
+    H.pct.forEach((p, i) => g += `<rect x="${x(H.edges[i]) + 2}" y="${y(p)}" width="${x(H.edges[i] + 1) - x(H.edges[i]) - 4}" height="${Ht - B - y(p)}" fill="#7c3aed" rx="2"><title>10^${H.edges[i]} to 10^${H.edges[i] + 1}: ${p}%</title></rect>`);
+    H.edges.forEach((e, i) => { if (i % 2 === 0) g += `<text x="${x(e)}" y="${Ht - 20}" text-anchor="middle">1e${e}</text>`; });
+    g += `<text x="${(W + L) / 2}" y="${Ht - 3}" text-anchor="middle">gradient magnitude</text><line x1="${L}" x2="${W - R}" y1="${Ht - B}" y2="${Ht - B}" stroke="var(--border)"/>`;
+    $('#mpHs').innerHTML = g;
+    $('#mpStats').innerHTML = `<div class="stat"><div class="k">Median</div><div class="v">${H.median.toExponential(1)}</div></div><div class="stat${H.fp16_subnormal_pct > 30 ? ' bad' : ''}"><div class="k">fp16 subnormal</div><div class="v">${H.fp16_subnormal_pct.toFixed(1)}%</div></div><div class="stat${H.below_fp16_zero_pct > 1 ? ' bad' : ''}"><div class="k">Would become 0</div><div class="v">${H.below_fp16_zero_pct < 0.1 ? H.below_fp16_zero_pct.toFixed(3) : H.below_fp16_zero_pct.toFixed(1)}%</div></div>`;
+    $('#mpWhy').innerHTML = k.includes('activation') ? '<b>The gradients autocast computes in 16 bits.</b> Activation gradients are per-element shares of a loss averaged over the whole batch, so they are tiny. Everything in the red band is zero in fp16; everything in the amber band keeps only a few significant bits. Loss scaling by 65,536 shifts the whole histogram about 4.8 powers of ten to the right.' : '<b>Weight gradients mostly fit.</b> Each weight’s gradient sums contributions from every example and position, so it is many orders of magnitude larger than an activation gradient and mostly inside fp16’s normal range, as P3 found.';
+  }
+  function lm() {
+    const Lm = D.lm, ks = Object.keys(Lm), col = ['#94a3b8', '#2563eb', '#e11d48', '#16a34a'], W = 600, H = 250, L = 46, R = 14, T = 12, B = 34, x = s => L + s / 2000 * (W - L - R), y = v => T + (1 - (v - 1.8) / 2) * (H - T - B);
+    let g = '';
+    [2, 2.5, 3, 3.5].forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`);
+    [0, 500, 1000, 1500, 2000].forEach(v => g += `<text x="${x(v)}" y="${H - 18}" text-anchor="middle">${v}</text>`);
+    g += `<text x="${(W + L) / 2}" y="${H - 2}" text-anchor="middle">step (validation bits per byte, lower is better)</text>`;
+    ks.forEach((k, i) => g += `<polyline fill="none" stroke="${col[i]}" stroke-width="2.5" points="${Lm[k].curve.map(p => x(p[0]) + ',' + y(Math.min(3.8, p[1]))).join(' ')}"/>`);
+    $('#mpC').innerHTML = g; $('#mpCk').innerHTML = ks.map((k, i) => `<span><i style="background:${col[i]}"></i>${k}</span>`).join('');
+    $('#mpStats').innerHTML = ks.map(k => `<div class="stat${k.includes('no scaler') ? ' bad' : ''}"><div class="k">${k}</div><div class="v">${Lm[k].final}</div></div>`).join('');
+    $('#mpWhy').innerHTML = '<b>The red line is what underflow costs.</b> Same model, data and seed; fp16 without a scaler fell behind from the start and finished 0.8 bits per byte worse. With GradScaler at 65,536 it matched fp32 and bf16. The CNN, by contrast, trained fine without one: you cannot tell in advance, so in fp16 always scale.';
+  }
+  function draw() { const v = $('#mpV .active').dataset.v; ['speed', 'hist', 'lm'].forEach(x => $('#mpV' + x).classList.toggle('on', x === v)); ({ speed, hist, lm })[v](); }
+  ['#mpV', '#mpL', '#mpH'].forEach(id => $(id).addEventListener('segchange', draw)); draw();
+})();
+</script>
 </body>
 </html>
