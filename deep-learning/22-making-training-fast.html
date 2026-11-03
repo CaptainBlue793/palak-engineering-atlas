@@ -3,37 +3,277 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Making Training Fast: Profiling &amp; torch.compile</title>
+<title>Making Training Fast: Profiling &amp; torch.compile · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 22 of Deep Learning. A CIFAR-10 training step taken from 11.9 ms to 3.7 ms, one measured change at a time: the profiler's view of where GPU time goes, a CPU input pipeline that left the GPU idle 43% of the time, a memory-layout trap that made a step 3.4 times slower, bf16, torch.compile (cold 15.8 s, cached 1.7 s), CUDA graphs, and the cost of a host sync.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .fs-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .fs-v { display:none; } .fs-v.on { display:block; }
+  .fs-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .fs-row { display:grid; grid-template-columns:minmax(0, 290px) 1fr 80px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .fs-row .track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; position:relative; } .fs-row .track i { display:block; height:100%; }
+  .fs-row .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .fs-key { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; margin-top:8px; } .fs-key i { display:inline-block; width:10px; height:10px; border-radius:3px; vertical-align:middle; margin-right:4px; }
+  .fs-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .fs-row { grid-template-columns:minmax(0, 130px) 1fr 62px; font-size:12px; } }
+</style>
 </head>
 <body data-chapter="22">
-<!-- dl:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 22</span><span class="pill">Advanced</span><span class="pill">⏱ 50 min</span></div>
     <h1>Making Training Fast: <span class="grad">Profiling &amp; torch.compile</span></h1>
-    <p class="lead">Finding the bottleneck with the profiler, fixing the input pipeline, and fusing kernels with torch.compile.</p>
+    <p class="lead">Training speed decides how many experiments you can run, and most training loops leave a large factor on the table. Finding it is a measurement problem, not a bag of tricks: a step’s time is the GPU’s kernels, the CPU’s work launching them, the input pipeline feeding them, and any moment the two processors wait for each other. Each fix helps only if it targets the part that is actually slow, so the method is always the same: time it properly, profile it, fix the largest cost, and time it again.</p>
+    <p class="lead">This chapter runs that loop on a CIFAR-10 CNN step on an RTX 5070 Ti and takes it from 11.9 ms to 3.7 ms, 3.3 times faster, one measured change at a time. Along the way: a CPU augmentation pipeline that left the GPU idle for 43% of every step until it had enough worker processes, a memory-layout setting that made the step 3.4 times <i>slower</i> in fp32 and cut the bf16 step by 31%, a cuDNN flag that did nothing here, torch.compile’s 20% at a one-off cost of 15.8 seconds, and CUDA graphs’ last 5%.</p>
+    <ul class="objectives">
+      <li><span>Time GPU code correctly and decide whether a step is GPU-, CPU- or input-bound</span></li>
+      <li><span>Read a PyTorch profiler table and group the time into what can be fixed</span></li>
+      <li><span>Feed the GPU fast enough: workers, pinned memory, or the data on the GPU</span></li>
+      <li><span>Use bf16 and the right memory layout, and catch a layout regression</span></li>
+      <li><span>Know what torch.compile and CUDA graphs fuse or remove, and what they cost</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Asynchronous execution, timing with <code>synchronize()</code>, launch overhead:</b> <a href="p7-the-gpu-for-deep-learning.html">P7</a>. <b>bf16 and layouts:</b> <a href="21-mixed-precision-training.html">Chapter 21</a>.</li>
+        <li>The same ladder for a transformer (TF32, fused AdamW, compile, MFU) is LLMs <a href="../llms/13-training-efficiently-on-one-gpu.html">Chapter 13</a>; this chapter covers the method on a convolutional network, where the bottlenecks are different.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Where time goes</li>
-    <li>The PyTorch profiler</li>
-    <li>Input pipeline bottlenecks</li>
-    <li>Kernel fusion and torch.compile</li>
-    <li>CUDA graphs and overheads</li>
-  </ol>
+  <h2>Where time goes</h2>
+  <p>The model is a 5-convolution CIFAR-10 network (64 to 256 channels, BatchNorm, ReLU, max-pooling) trained with SGD on batches of 256. Each version of the step was timed over 60 steps after 10 warm-up steps, with <code>torch.cuda.synchronize()</code> before reading the clock, because the GPU runs asynchronously and an unsynchronised timer measures only how fast the CPU queues work (P7). The whole ladder:</p>
+  <table class="t cmp">
+    <thead><tr><th>Step version</th><th>ms per step</th><th>Images per second</th></tr></thead>
+    <tbody>
+      <tr><td>1. fp32, a CPU <code>DataLoader</code> over in-memory tensors</td><td>11.93</td><td>21,454</td></tr>
+      <tr><td>2. fp32, data already on the GPU</td><td>11.69</td><td>21,899</td></tr>
+      <tr><td>3. + <code>cudnn.benchmark = True</code></td><td>11.70</td><td>21,880</td></tr>
+      <tr><td>4. + channels-last, still fp32</td><td>39.72</td><td>6,445</td></tr>
+      <tr><td>4b. bf16 autocast, default NCHW layout</td><td>6.93</td><td>36,956</td></tr>
+      <tr><td>5. bf16 autocast + channels-last</td><td>4.80</td><td>53,313</td></tr>
+      <tr><td>6. + <code>torch.compile</code></td><td>3.86</td><td>66,403</td></tr>
+      <tr><td>7. + CUDA graphs (<code>mode="reduce-overhead"</code>)</td><td><b>3.66</b></td><td><b>70,013</b></td></tr>
+    </tbody>
+  </table>
+  <p>Not every row is an improvement, and that is the most useful thing about the table. Putting the data on the GPU saved 2% because this DataLoader did no per-image work; cuDNN’s autotuner found nothing better than its default choice; channels-last made the fp32 step 3.4 times slower. Precision gave the biggest single gain, then fusion. A ladder like this is only trustworthy if every rung is measured, because the intuitions behind each “optimisation” are hardware- and model-specific.</p>
+
+  <h2>The profiler</h2>
+  <p><code>torch.profiler</code> records every operation the CPU dispatched and every kernel the GPU ran, with their durations. Profiled on step 5 (bf16, channels-last, eager), grouped by the operation that launched each kernel and counting only the GPU time of that operation’s own kernels:</p>
+<pre class="code"><span class="k">from</span> torch.profiler <span class="k">import</span> profile, ProfilerActivity
+<span class="k">with</span> <span class="f">profile</span>(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) <span class="k">as</span> prof:
+    <span class="k">for</span> _ <span class="k">in</span> <span class="f">range</span>(<span class="m">10</span>): <span class="f">step</span>()
+    torch.cuda.<span class="f">synchronize</span>()
+<span class="f">print</span>(prof.<span class="f">key_averages</span>().<span class="f">table</span>(sort_by=<span class="s">"self_cuda_time_total"</span>, row_limit=<span class="m">12</span>))   <span class="c"># self time: no double counting of nested ops</span></pre>
+  <table class="t cmp">
+    <thead><tr><th>Operation</th><th>GPU ms per step</th><th>Share</th></tr></thead>
+    <tbody>
+      <tr><td>Convolution backward (5 layers)</td><td>1.56</td><td>34%</td></tr>
+      <tr><td>Convolution forward</td><td>0.83</td><td>18%</td></tr>
+      <tr><td>BatchNorm backward and forward</td><td>1.04</td><td>23%</td></tr>
+      <tr><td>Max-pooling backward and forward</td><td>0.56</td><td>12%</td></tr>
+      <tr><td>ReLU backward and forward</td><td>0.38</td><td>8%</td></tr>
+      <tr><td>Everything else (optimiser, zeroing, copies)</td><td>0.21</td><td>5%</td></tr>
+      <tr><td><b>Total GPU time</b></td><td><b>4.59</b></td><td>129 kernels per step</td></tr>
+    </tbody>
+  </table>
+  <p>Two readings decide what to do next. First, the GPU was busy for 4.59 ms of a 4.80 ms step, 96%, so this step is <b>GPU-bound</b>: shaving CPU overhead cannot help much, and only less GPU work can. Second, only half of that GPU time is convolutions, the arithmetic the tensor cores accelerate. The other half is BatchNorm, pooling and ReLU, operations that do a few additions per number and spend their time reading and writing memory. Each one reads a full activation tensor from GPU memory and writes another back. That memory-bound half is what kernel fusion attacks.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Speed lab</span><span class="p-tag">Measured on an RTX 5070 Ti</span></div>
+    <div class="panel-body">
+      <div class="fs-l">View</div>
+      <div class="seg" id="fsV"><button class="active" data-v="ladder">the ladder</button><button data-v="profile">the profile</button><button data-v="pipe">input pipeline</button></div>
+      <div class="fs-v on" id="fsVladder"><div class="fs-box" id="fsL"></div></div>
+      <div class="fs-v" id="fsVprofile"><div class="fs-box" id="fsP"></div></div>
+      <div class="fs-v" id="fsVpipe"><div class="fs-box" id="fsI"></div></div>
+      <div class="stats" id="fsStats"></div>
+      <div class="fs-why" id="fsWhy"></div>
+    </div>
+    <div class="panel-foot">CIFAR-10 CNN with 5 convolutions (64, 64, 128, 128, 256 channels), BatchNorm, ReLU and max-pooling; SGD with momentum; batch 256; RTX 5070 Ti, PyTorch 2.11, CUDA 12.8, Windows, 16 CPU threads. Times are the mean of 60 steps after 10 warm-up steps, synchronised. Profile: 10 eager bf16 channels-last steps, self GPU time per operation. Input pipeline: the bf16 channels-last step (4.81 ms on its own) fed by a <code>Dataset</code> doing per-image random crop, flip and normalisation in NumPy, mean of 60 steps; “GPU busy” is the GPU-only step time divided by the measured step time.</div>
+  </div>
+
+  <h2>Feeding the GPU</h2>
+  <p>The ladder’s first two rows hide the usual bottleneck, because that DataLoader only sliced tensors that were already in memory. A real pipeline decodes and augments each image on the CPU. Measured with a typical per-image augmentation (random crop with padding, flip, normalise) feeding the fast bf16 step, which needs 4.81 ms of GPU time on its own:</p>
+  <table class="t cmp">
+    <thead><tr><th>Input pipeline</th><th>ms per step</th><th>GPU busy</th></tr></thead>
+    <tbody>
+      <tr><td>DataLoader, augmentation on the CPU, 0 workers</td><td>8.48</td><td>57%</td></tr>
+      <tr><td>1 worker process</td><td>7.71</td><td>62%</td></tr>
+      <tr><td>2 workers, pinned memory</td><td>5.21</td><td>92%</td></tr>
+      <tr><td>4 workers, pinned memory (unpinned: 6.07)</td><td>5.61</td><td>86%</td></tr>
+      <tr><td>8 workers, pinned memory</td><td>4.97</td><td>97%</td></tr>
+      <tr><td>Data on the GPU as uint8, augmentation on the GPU</td><td><b>4.94</b></td><td><b>97%</b></td></tr>
+    </tbody>
+  </table>
+  <p>With no workers the main process spent 6.2 ms preparing each batch before it could launch the next step, and the GPU sat idle for 43% of the time. One worker produced batches at about the same rate as the main process could, so it helped only a little; with 8 workers in parallel the input kept up and the step ran at the GPU’s speed. Between 2 and 8 workers the differences were a few tenths of a millisecond, close to the run-to-run noise of a 60-step measurement. Pinned (page-locked) memory lets the host-to-device copy run asynchronously with <code>non_blocking=True</code>; it saved 8% at 4 workers. For a dataset that fits in GPU memory, like CIFAR-10 at 150 MB as uint8, the simplest answer is to put it there and augment on the GPU: as fast as 8 workers, with no worker processes at all.</p>
+<pre class="code">loader = <span class="f">DataLoader</span>(ds, batch_size=<span class="m">256</span>, shuffle=<span class="k">True</span>, num_workers=<span class="m">8</span>, pin_memory=<span class="k">True</span>,
+                    persistent_workers=<span class="k">True</span>, prefetch_factor=<span class="m">4</span>)
+<span class="k">for</span> xb, yb <span class="k">in</span> loader:
+    xb = xb.<span class="f">to</span>(<span class="s">"cuda"</span>, non_blocking=<span class="k">True</span>)        <span class="c"># overlaps the copy with GPU work; needs pinned memory</span></pre>
+
+  <h2>The layout and precision rungs</h2>
+  <p>Row 4’s slowdown comes from the memory layout, the order in which a 4-D image tensor’s elements sit in memory. NCHW stores each channel as a full image; channels-last (NHWC) stores the channels of each pixel together, which is what tensor-core convolution kernels read most efficiently. Measured on this step: channels-last made fp32 3.4 times slower (39.7 ms against 11.7) and cut bf16’s step by 31% (4.80 ms against 6.93). The trap is that the layout can change without anyone asking. Feeding channels-last <i>data</i> into an NCHW model gave 39.9 ms, the same slow path, because convolution outputs follow their input’s layout, so one tensor converts the whole network. That is exactly how a <code>permute</code> without <code>.contiguous()</code> in a data loader made Chapter 21’s first fp32 timings four times too slow. When a timing looks wrong, check <code>x.is_contiguous()</code> and <code>x.is_contiguous(memory_format=torch.channels_last)</code> on the input.</p>
+  <p><code>torch.backends.cudnn.benchmark = True</code> makes cuDNN time every available convolution algorithm on the first call for each input shape and keep the fastest. Here it changed nothing (11.69 → 11.70 ms): the default heuristic already chose well for these common shapes. It is worth trying for unusual shapes, and it hurts when input shapes keep changing, because every new shape is benchmarked again.</p>
+
+  <h2>Kernel fusion and torch.compile</h2>
+  <p><code>torch.compile</code> captures the model’s forward and backward computation as a graph and generates new kernels for it. Its main win on a network like this one is <b>fusion</b>: BatchNorm’s normalisation, the ReLU after it and other element-wise operations become one kernel that reads the activation once and writes it once, instead of one round trip to memory per operation. It took the step from 4.80 to 3.86 ms, 20% faster, which is most of the memory-bound half the profile pointed at.</p>
+  <p>The price is compilation. In a fresh process with an empty cache, the first three steps took 15.8 seconds; with the compiled kernels cached on disk from a previous run, 1.7 seconds. On a run of thousands of steps that is nothing, but it dominates a quick experiment, and a model whose input shapes change can trigger recompilation (fix the shapes, or use <code>dynamic=True</code>). On Windows the compiler needs the community <code>triton-windows</code> package; on Linux it works out of the box.</p>
+<pre class="code">model = torch.<span class="f">compile</span>(model)                          <span class="c"># fusion; first steps compile (15.8 s cold, 1.7 s cached)</span>
+model = torch.<span class="f">compile</span>(model, mode=<span class="s">"reduce-overhead"</span>)  <span class="c"># + CUDA graphs: replay the whole step's kernels with one launch</span></pre>
+
+  <h2>CUDA graphs and host syncs</h2>
+  <p>Every kernel launch costs the CPU a few microseconds. A <b>CUDA graph</b> records a whole sequence of kernels once and replays it with a single launch, removing that overhead. Here it gained 5% (3.86 → 3.66 ms): with 129 kernels per step and the GPU already 96% busy, launch overhead was small. It matters more with small batches or small models, where the GPU finishes each kernel faster than the CPU can launch the next one. Graphs need fixed shapes and fixed memory addresses, and no CPU-side decisions inside the captured region.</p>
+  <p>The same applies to anything that makes the CPU wait for the GPU. <code>loss.item()</code>, printing a tensor, <code>if tensor &gt; 0:</code> and <code>.cpu()</code> all force a synchronisation: the CPU stops queueing work until the GPU has caught up, and the queue that hides launch latency drains. Calling <code>loss.item()</code> on every step cost 3.5% here (4.79 → 4.96 ms) because the step is GPU-bound and the queue refills quickly; on a CPU-bound step the cost is much larger. Accumulate the loss on the GPU and read it every hundred steps.</p>
+
+  <figure class="flow">
+    <ol>
+      <li><b>Time it</b><small>synchronised, after warm-up</small></li>
+      <li><b>Profile</b><small>GPU busy %? top kernels?</small></li>
+      <li><b>Input-bound?</b><small>workers, pinning, or data on GPU</small></li>
+      <li><b>GPU-bound?</b><small>bf16, layout, compile</small></li>
+      <li><b>CPU-bound?</b><small>CUDA graphs, fewer syncs, bigger batch</small></li>
+    </ol>
+    <figcaption><b>The speed loop.</b> Fix the largest cost, then measure again: the bottleneck moves after every fix.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🎞️</div>
+    <div class="body"><div class="title">Use case: a video classifier stuck at 40% GPU utilisation</div><p>A team training an action-recognition model sees <code>nvidia-smi</code> report 40% utilisation and plans to buy faster GPUs. A profile shows the GPU idle between steps, waiting on the DataLoader: each sample decodes 16 video frames with a CPU codec and resizes them, about 90 ms per clip, and they were using 4 workers for batches of 32. Raising the workers to 16 helps but saturates the machine’s CPU cores, so they move decoding to the GPU with a hardware video decoder and cache pre-resized clips for the first epochs. Utilisation reaches 95%, and only then does it make sense to try bf16 and torch.compile, which together give a further 1.8 times. Faster GPUs would have sat idle just the same.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Timing without <code>torch.cuda.synchronize()</code></b>: you measure the CPU’s queueing, not the GPU’s work.</li>
+      <li><b>Optimising before profiling</b>: here cudnn.benchmark did nothing and channels-last in fp32 made the step 3.4× slower.</li>
+      <li><b><code>num_workers=0</code> with CPU augmentation</b>: the GPU was idle 43% of the time.</li>
+      <li><b>An accidental layout change</b>: channels-last data into an NCHW model gave 39.9 ms instead of 11.7.</li>
+      <li><b>Benchmarking torch.compile on the first steps</b>: they include 15.8 s of compilation.</li>
+      <li><b><code>.item()</code> or <code>print(loss)</code> every step</b>: a sync each time; worse on CPU-bound steps.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Your training step is slow. How do you find out why?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First time it properly: warm-up steps, then many steps with <code>torch.cuda.synchronize()</code> before reading the clock. Then profile a few steps with torch.profiler and look at two things: how much of the step the GPU is busy, and which operations take its time. If the GPU is mostly idle, the bottleneck is the input pipeline or CPU overhead: in a measured case, CPU augmentation with no workers left the GPU idle 43% of the time, and 8 workers fixed it. If the GPU is busy, I reduce its work: bf16, the right memory layout, and torch.compile to fuse memory-bound operations. Then I measure again, because the bottleneck moves.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> What does torch.compile actually speed up, and when would CUDA graphs help more?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Mostly memory-bound operations. A profile of a CNN step showed about half the GPU time in BatchNorm, ReLU and pooling, each of which reads and writes a whole activation tensor; compile fuses chains of them into one kernel that reads and writes once, which gave 20% there. It does little for the big matmuls and convolutions, which already run optimised library kernels. CUDA graphs remove CPU launch overhead by replaying the step’s kernels with one launch; that gave only 5% because the GPU was 96% busy, but on small batches or small models, where the GPU outruns the CPU, it can matter far more. Both have costs: compile time, 15.8 s cold in my run, and the need for static shapes.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Measure every change: the step went from 11.9 to 3.7 ms, but two “optimisations” did nothing and one made it 3.4× slower.</li>
+      <li>The profiler tells you whether you are GPU-, CPU- or input-bound; the fix depends on which.</li>
+      <li>CPU augmentation needs enough workers, or the data can live and be augmented on the GPU.</li>
+      <li>The best memory layout depends on the precision; one wrong tensor can switch a whole network.</li>
+      <li>torch.compile fuses memory-bound operations (−20% here); CUDA graphs remove launch overhead (−5% here).</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">The profiler shows the GPU busy for 4.59 ms of a 4.80 ms step. What follows?</p>
+      <div class="opts">
+        <button class="opt">The step is input-bound; add DataLoader workers</button>
+        <button class="opt">The step is CPU-bound; use CUDA graphs first</button>
+        <button class="opt">The step is GPU-bound; only reducing GPU work (precision, layout, fusion) will help much</button>
+        <button class="opt">Nothing can be improved</button>
+      </div>
+      <div class="explain">96% busy leaves little to gain from CPU-side fixes: CUDA graphs gave 5%.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">With per-image CPU augmentation and <code>num_workers=0</code>, the GPU was busy only 57% of the time. What fixed it?</p>
+      <div class="opts">
+        <button class="opt">More worker processes (8 reached 97%), or moving the data and augmentation onto the GPU</button>
+        <button class="opt">A bigger learning rate</button>
+        <button class="opt">cudnn.benchmark</button>
+        <button class="opt">torch.compile</button>
+      </div>
+      <div class="explain">The main process spent 6.2 ms per batch on augmentation while the GPU waited.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why did feeding channels-last data into an NCHW model make the fp32 step 3.4 times slower?</p>
+      <div class="opts">
+        <button class="opt">The data was corrupted</button>
+        <button class="opt">It disabled the GPU</button>
+        <button class="opt">It forced fp16</button>
+        <button class="opt">Convolution outputs follow their input’s layout, so the whole network ran channels-last, which was slow in fp32 on this setup</button>
+      </div>
+      <div class="explain">The same layout cut the bf16 step by 31%: the right layout depends on the precision.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What is torch.compile’s main source of speed on a CNN like this one?</p>
+      <div class="opts">
+        <button class="opt">Faster convolution arithmetic</button>
+        <button class="opt">Fusing chains of memory-bound operations such as BatchNorm and ReLU into single kernels that read and write memory once</button>
+        <button class="opt">Running on the CPU</button>
+        <button class="opt">Lower precision</button>
+      </div>
+      <div class="explain">4.80 → 3.86 ms; about half the GPU time had been in memory-bound operations.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why should you avoid <code>loss.item()</code> on every step?</p>
+      <div class="opts">
+        <button class="opt">It changes the loss</button>
+        <button class="opt">It uses GPU memory</button>
+        <button class="opt">It forces the CPU to wait for the GPU, draining the queue of launched work; it also prevents CUDA-graph capture</button>
+        <button class="opt">It is deprecated</button>
+      </div>
+      <div class="explain">+3.5% here on a GPU-bound step; much more on a CPU-bound one.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"steps":{"1. CPU DataLoader, fp32":{"ms":11.93,"img_per_s":21454,"warmup_s":0.7},"2. data already on the GPU":{"ms":11.69,"img_per_s":21899,"warmup_s":0.2},"2b. trap: channels-last data into an NCHW model":{"ms":39.87,"img_per_s":6421,"warmup_s":0.4},"3. + cudnn.benchmark":{"ms":11.7,"img_per_s":21880,"warmup_s":0.1},"4. + channels_last":{"ms":39.72,"img_per_s":6445,"warmup_s":0.4},"4b. bf16 autocast, NCHW":{"ms":6.93,"img_per_s":36956,"warmup_s":3.3},"5. + bf16 autocast":{"ms":4.8,"img_per_s":53313,"warmup_s":1.7},"6. + torch.compile":{"ms":3.86,"img_per_s":66403,"warmup_s":0.9},"7. + CUDA graphs (compile, reduce-overhead)":{"ms":3.66,"img_per_s":70013,"warmup_s":0.2}},"profile":[{"op":"aten::convolution_backward","gpu_ms_per_step":1.558,"calls_per_step":5},{"op":"aten::cudnn_convolution","gpu_ms_per_step":0.831,"calls_per_step":5},{"op":"aten::native_batch_norm_backward","gpu_ms_per_step":0.608,"calls_per_step":5},{"op":"aten::native_batch_norm","gpu_ms_per_step":0.436,"calls_per_step":5},{"op":"aten::max_pool2d_with_indices_backward","gpu_ms_per_step":0.374,"calls_per_step":3},{"op":"aten::threshold_backward","gpu_ms_per_step":0.234,"calls_per_step":5},{"op":"aten::max_pool2d_with_indices","gpu_ms_per_step":0.189,"calls_per_step":3},{"op":"aten::clamp_min","gpu_ms_per_step":0.143,"calls_per_step":5},{"op":"aten::fill_","gpu_ms_per_step":0.044,"calls_per_step":16},{"op":"aten::copy_","gpu_ms_per_step":0.043,"calls_per_step":20},{"op":"aten::_foreach_add_","gpu_ms_per_step":0.027,"calls_per_step":2},{"op":"aten::_foreach_mul_","gpu_ms_per_step":0.013,"calls_per_step":1}],"gpu_ms":4.585,"kernels":129,"item":[4.79,4.96],"pipe":{"GPU-resident data, GPU augmentation":{"ms":4.94,"img_per_s":51841,"gpu_busy_pct":97.3},"DataLoader, CPU augmentation, 0 workers":{"ms":8.48,"img_per_s":30201,"gpu_busy_pct":56.7,"loader_only_ms":6.15},"DataLoader, CPU augmentation, 0 workers, pinned":{"ms":8.81,"img_per_s":29046,"gpu_busy_pct":54.5,"loader_only_ms":6.68},"DataLoader, CPU augmentation, 1 worker, pinned":{"ms":7.71,"img_per_s":33204,"gpu_busy_pct":62.4,"loader_only_ms":null},"DataLoader, CPU augmentation, 2 workers, pinned":{"ms":5.21,"img_per_s":49098,"gpu_busy_pct":92.2,"loader_only_ms":null},"DataLoader, CPU augmentation, 4 workers":{"ms":6.07,"img_per_s":42151,"gpu_busy_pct":79.2,"loader_only_ms":null},"DataLoader, CPU augmentation, 4 workers, pinned":{"ms":5.61,"img_per_s":45611,"gpu_busy_pct":85.6,"loader_only_ms":null},"DataLoader, CPU augmentation, 8 workers, pinned":{"ms":4.97,"img_per_s":51528,"gpu_busy_pct":96.8,"loader_only_ms":null}},"gpu_only":4.81,"compile":{"cold cache":{"first_3_steps_s":15.83,"process_s":19.7},"warm cache":{"first_3_steps_s":1.7,"process_s":5.3}},"cpus":16};
+  const row = (l, v, mx, n, c) => `<div class="fs-row"><span>${l}</span><span class="track"><i style="width:${Math.max(0.5, 100 * v / mx)}%;background:${c}"></i></span><span class="n">${n}</span></div>`;
+  function ladder() {
+    const S = D.steps, ks = Object.keys(S), base = S[ks[0]].ms;
+    const col = k => k.startsWith('2b') || k.startsWith('4. ') ? '#e11d48' : k.startsWith('1.') ? '#94a3b8' : '#7c3aed';
+    $('#fsL').innerHTML = '<div style="margin-bottom:4px"><b>ms per step (shorter is faster)</b></div>' + ks.map(k => row(k.replace('2b. trap: ', 'trap: '), S[k].ms, 42, S[k].ms + ' ms', col(k))).join('') +
+      `<div class="fs-key"><span><i style="background:#94a3b8"></i>starting point</span><span><i style="background:#7c3aed"></i>a real rung</span><span><i style="background:#e11d48"></i>a layout trap</span></div>`;
+    const last = S[ks[ks.length - 1]];
+    $('#fsStats').innerHTML = `<div class="stat"><div class="k">Start</div><div class="v">${base} ms</div></div><div class="stat good"><div class="k">End</div><div class="v">${last.ms} ms</div></div><div class="stat good"><div class="k">Speed-up</div><div class="v">${(base / last.ms).toFixed(1)}×</div></div>`;
+    $('#fsWhy').innerHTML = '<b>Precision and fusion did the work; the red bars are warnings.</b> Channels-last in fp32, or channels-last data reaching an NCHW model, made the same step 3.4× slower. cudnn.benchmark and moving in-memory tensors to the GPU barely moved the needle. Every rung was measured, which is the only way to know.';
+  }
+  function profile() {
+    const P = D.profile, grp = { 'Convolution backward': ['convolution_backward'], 'Convolution forward': ['cudnn_convolution'], 'BatchNorm': ['batch_norm'], 'Max-pooling': ['max_pool'], 'ReLU': ['threshold_backward', 'clamp_min'] };
+    const sums = {}; let used = 0;
+    Object.entries(grp).forEach(([g, keys]) => { sums[g] = P.filter(p => keys.some(k => p.op.includes(k))).reduce((a, p) => a + p.gpu_ms_per_step, 0); used += sums[g]; });
+    sums['Everything else'] = Math.max(0, D.gpu_ms - used);
+    const col = { 'Convolution backward': '#2563eb', 'Convolution forward': '#60a5fa', 'BatchNorm': '#f97316', 'Max-pooling': '#eab308', 'ReLU': '#16a34a', 'Everything else': '#94a3b8' };
+    $('#fsP').innerHTML = `<div style="margin-bottom:4px"><b>GPU time per step by operation, bf16 channels-last, eager</b></div>` + Object.entries(sums).map(([g, v]) => row(g, v, 1.7, v.toFixed(2) + ' ms', col[g])).join('') +
+      `<div style="margin:12px 0 4px"><b>Top operations as the profiler names them</b></div>` + P.slice(0, 8).map(p => row(p.op.replace('aten::', ''), p.gpu_ms_per_step, 1.7, p.gpu_ms_per_step.toFixed(3), '#7c3aed')).join('');
+    const conv = sums['Convolution backward'] + sums['Convolution forward'];
+    $('#fsStats').innerHTML = `<div class="stat"><div class="k">GPU busy</div><div class="v">${Math.round(100 * D.gpu_ms / D.steps['5. + bf16 autocast'].ms)}%</div></div><div class="stat"><div class="k">Convolutions</div><div class="v">${Math.round(100 * conv / D.gpu_ms)}%</div></div><div class="stat bad"><div class="k">Memory-bound ops</div><div class="v">${Math.round(100 * (sums.BatchNorm + sums['Max-pooling'] + sums.ReLU) / D.gpu_ms)}%</div></div>`;
+    $('#fsWhy').innerHTML = `<b>Half the GPU time is not arithmetic.</b> Blue is the convolutions the tensor cores speed up; orange, yellow and green are BatchNorm, pooling and ReLU, which mostly move data between memory and the chip. ${D.kernels} kernels ran per step. Fusing the memory-bound ones is what torch.compile did next: 4.80 → 3.86 ms.`;
+  }
+  function pipe() {
+    const P = D.pipe, ks = Object.keys(P);
+    $('#fsI').innerHTML = `<div style="margin-bottom:4px"><b>ms per step; the GPU alone needs ${D.gpu_only} ms</b></div>` + ks.map(k => row(k.replace('DataLoader, CPU augmentation, ', 'CPU aug, '), P[k].ms, 9.5, P[k].ms + ' ms', P[k].gpu_busy_pct > 90 ? '#16a34a' : P[k].gpu_busy_pct > 75 ? '#eab308' : '#e11d48')).join('') +
+      `<div style="margin:12px 0 4px"><b>torch.compile start-up (first 3 steps, fresh process)</b></div>` + row('cold cache', D.compile['cold cache'].first_3_steps_s, 17, D.compile['cold cache'].first_3_steps_s + ' s', '#e11d48') + row('cached kernels', D.compile['warm cache'].first_3_steps_s, 17, D.compile['warm cache'].first_3_steps_s + ' s', '#16a34a');
+    const w0 = P['DataLoader, CPU augmentation, 0 workers'];
+    $('#fsStats').innerHTML = `<div class="stat bad"><div class="k">0 workers, GPU busy</div><div class="v">${w0.gpu_busy_pct}%</div></div><div class="stat"><div class="k">CPU work per batch</div><div class="v">${w0.loader_only_ms} ms</div></div><div class="stat good"><div class="k">8 workers, GPU busy</div><div class="v">${P['DataLoader, CPU augmentation, 8 workers, pinned'].gpu_busy_pct}%</div></div>`;
+    $('#fsWhy').innerHTML = '<b>The GPU waits for the slowest stage.</b> One process needs 6.2 ms of CPU time per batch, more than the 4.8 ms the GPU needs, so with 0 or 1 workers the GPU idles. Enough parallel workers, or data that lives on the GPU, and the step runs at GPU speed. Green bars are within a few percent of a fully fed GPU.';
+  }
+  function draw() { const v = $('#fsV .active').dataset.v; ['ladder', 'profile', 'pipe'].forEach(x => $('#fsV' + x).classList.toggle('on', x === v)); ({ ladder, profile, pipe })[v](); }
+  $('#fsV').addEventListener('segchange', draw); draw();
+})();
+</script>
 </body>
 </html>
