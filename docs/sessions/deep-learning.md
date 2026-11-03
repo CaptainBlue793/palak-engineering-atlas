@@ -10,3 +10,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\dl
 - Registry stub completed in `assets/atlas.js` (`indexVar: 'DL_INDEX'`, `first`, `dist`; still `soon`) and the shell scaffolded with `tools/new-course.cjs`.
 - Needs a shared change at release: `dl-` sync keys (account.js TRACK regex, api/src/index.js and its test, ACCOUNTS.md, Worker redeploy), registry chapters/hours and remove `soon`, README table/tree, crosslinks topics, METRO station check.
 - Next: course home, glossary, mock interview, README; lab `atlas-courses\dl-lab`; then P1.
+- P1 shipped: transpose 0.0013 ms vs contiguous 1.41 ms (256 MB); expand 0 MB vs repeat 64 MB; (N,1)-(N,) regression learned w=0.000 b=2.12 (mean y), R2 0.98 -> 0.00; log_softmax dim=0 84.04 -> 36.64% on Fashion-MNIST, batch of 1 gives 1.0 for all classes; mse_loss warns, manual loss does not.
