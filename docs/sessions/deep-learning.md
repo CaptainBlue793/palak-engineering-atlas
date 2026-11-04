@@ -67,3 +67,9 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\dl
 - Session 3 end: all of P1-P8 and Ch1-40 written, measured and shipped; case studies 41-48 remain placeholders by plan. Every written page passes content-audit, drive.cjs and links.cjs.
 - Deferred/limits noted on pages: Ch34 selective SSM not run on 784-step sMNIST (naive scan spilled GPU memory); Ch29 covertype nets capped at 30/12 epochs; Ch24 LARS/LAMB/AdamW sweeps peaked at the grid edge; Ch28 LP-FT did worse than plain fine-tuning (reported as measured).
 - Release (owner go-ahead needed, not done): dl- sync keys (account.js TRACK regex, api/src/index.js + its test, ACCOUNTS.md, Worker redeploy); assets/atlas.js registry (chapters/hours, remove soon: true); README table; crosslinks topics; METRO station check; rebuild dist/ and run checks; merge feature/dl-course into main; release.
+
+## 2026-11-04 — release v1.0.0
+- Owner go-ahead given. Merged origin/main (no new commits). Rebuilt study data and deep-learning/dist/deep-learning-course.html (60 pages).
+- Shared changes: assets/atlas.js (soon removed, 56 chapters, 42 hours, blurb updated), README table + tree, dl- sync keys (assets/account.js, api/src/index.js, api/test/api.test.mjs, ACCOUNTS.md), crosslinks map (dl course + 8 new topics, DL added to 6 existing; 64 files rewritten), other courses' dist bundles rebuilt for the new link blocks.
+- Checks: content-audit check (986 chapters, 0 errors), bundle, crosslinks check (182 topics, 0 errors), palette-check, hub-check (default, --theme dark, --width 390), API end-to-end test against a local Worker (25 passed, dl- keys kept).
+- Worker redeploy (`cd api && npm run deploy`) still to be run by the owner: it was not permitted from this session. Until then the live API drops dl- progress keys.

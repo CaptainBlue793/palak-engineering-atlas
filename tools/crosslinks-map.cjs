@@ -18,7 +18,7 @@
 const COURSE = {
   dsa: 'dsa', os: 'os', net: 'networks', db: 'databases', lld: 'lld',
   sd: 'system-design', dist: 'distributed-systems', ops: 'cloud-devops', ml: 'ml-ai-systems', mlf: 'ml-fundamentals',
-  api: 'backend-api', rag: 'rag', agent: 'single-agent', mas: 'multi-agent',
+  api: 'backend-api', rag: 'rag', agent: 'single-agent', mas: 'multi-agent', dl: 'deep-learning',
 };
 
 const TOPICS = [
@@ -27,7 +27,7 @@ const TOPICS = [
   ['Choosing a data structure', ['dsa/p5', 'sd/p7']],
   ['Bits, bytes, hex and byte order', ['dsa/47', 'os/p5', 'net/p1', 'net/p2']],
   ['Powers of two and units', ['dsa/p7', 'os/p5', 'sd/p8']],
-  ['Integer overflow and floating point', ['dsa/p2', 'os/p5', 'db/p4', 'lld/p6', 'ml/p8']],
+  ['Integer overflow and floating point', ['dsa/p2', 'os/p5', 'db/p4', 'lld/p6', 'ml/p8', 'dl/p3']],
   ['The stack, the heap and pointers', ['dsa/p6', 'os/p1', 'os/16', 'lld/p1']],
   ['The call stack', ['dsa/11', 'os/p3']],
   ['Arrays, strings and structs in C and C++', ['dsa/p4', 'os/p2']],
@@ -173,16 +173,24 @@ const TOPICS = [
 
   /* ---------- machine learning ---------- */
   ['ML platforms: leakage, skew, evaluation and drift', ['sd/23', 'ml/01', 'ml/03', 'ml/07', 'ml/29', 'ml/32', 'ml/34', 'mlf/37', 'mlf/39']],
-  ['Gradient descent', ['mlf/05', 'ml/05']],
+  ['Gradient descent', ['mlf/05', 'ml/05', 'dl/08', 'dl/11']],
   ['Classical ML: linear models, trees and ensembles', ['mlf/04', 'mlf/07', 'mlf/17', 'mlf/19', 'ml/06']],
   ['Evaluating and comparing models', ['mlf/08', 'mlf/13', 'mlf/36', 'ml/07']],
   ['Features and data quality', ['mlf/14', 'mlf/15', 'mlf/16', 'ml/03', 'ml/04']],
-  ['Linear algebra for machine learning', ['mlf/p4', 'ml/02']],
+  ['Linear algebra for machine learning', ['mlf/p4', 'ml/02', 'dl/p1', 'dl/p2']],
+  ['Neural networks and backpropagation', ['ml/08', 'dl/02', 'dl/04', 'dl/05']],
+  ['Training deep networks: initialisation, normalisation and residuals', ['ml/09', 'dl/09', 'dl/14', 'dl/15']],
+  ['Attention and transformers', ['ml/13', 'ml/14', 'dl/18', 'dl/19']],
+  ['Regularisation and overfitting', ['mlf/11', 'mlf/12', 'dl/13', 'dl/27']],
+  ['Calibration and uncertainty', ['mlf/32', 'dl/31']],
+  ['Large-batch and distributed training', ['ml/23', 'ml/24', 'dl/23', 'dl/24']],
+  ['Model compression: pruning, quantisation and distillation', ['ml/27', 'dl/32']],
+  ['Hyperparameter tuning', ['mlf/13', 'dl/25']],
   ['Tokens and context windows', ['ml/15', 'rag/p3', 'agent/p4', 'agent/10']],
   ['Prompting a model with context', ['ml/19', 'rag/10', 'rag/16', 'agent/11']],
   ['Retrieval-augmented generation', ['ml/21', 'ml/46', 'rag/01', 'rag/02', 'agent/17']],
   ['Search ranking and ranking metrics', ['ml/42', 'rag/p8', 'rag/13']],
-  ['Fine-tuning models', ['ml/17', 'rag/33', 'agent/38']],
+  ['Fine-tuning models', ['ml/17', 'rag/33', 'agent/38', 'dl/28']],
   ['Evaluating LLM systems', ['ml/35', 'rag/20', 'rag/21', 'agent/27', 'mas/18']],
   ['Agents and tool use', ['ml/22', 'rag/34', 'agent/01', 'agent/03', 'mas/01']],
   ['Planning and splitting up work', ['agent/12', 'agent/13', 'mas/04']],
@@ -201,7 +209,7 @@ const TOPICS = [
   ['Feeds, ranking and recommendations', ['sd/27', 'ml/30', 'ml/41', 'mlf/31']],
   ['Ads: counting clicks and predicting them', ['sd/40', 'ml/43']],
   ['Payments and fraud', ['sd/37', 'ml/44']],
-  ['Hardware: CPUs, GPUs and memory', ['os/p4', 'os/32', 'sd/p1', 'ml/p8', 'ml/10']],
+  ['Hardware: CPUs, GPUs and memory', ['os/p4', 'os/32', 'sd/p1', 'ml/p8', 'ml/10', 'dl/p7']],
 
   /* ---------- the same system, designed at two levels ---------- */
   ['Ride hailing: the classes and the architecture', ['lld/46', 'sd/35']],
@@ -212,7 +220,7 @@ const TOPICS = [
   ['Video streaming', ['net/43', 'sd/32']],
 
   /* ---------- interviews ---------- */
-  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40', 'mlf/40', 'api/40', 'rag/40', 'agent/40', 'mas/23']],
+  ['Interview playbooks in the other courses', ['dsa/54', 'os/40', 'net/40', 'db/40', 'lld/30', 'sd/25', 'dist/40', 'ops/40', 'ml/40', 'mlf/40', 'api/40', 'rag/40', 'agent/40', 'mas/23', 'dl/40']],
 ];
 
 module.exports = { COURSE, TOPICS };
