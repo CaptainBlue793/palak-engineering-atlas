@@ -3,37 +3,289 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Custom Ops: autograd.Function &amp; Triton Kernels</title>
+<title>Custom Ops: autograd.Function &amp; Triton Kernels · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 37 of Deep Learning. Writing your own forward and backward with torch.autograd.Function (a SiLU that saves 256 MB, a straight-through estimator, a sign error that gradcheck catches), then GPU kernels in Triton: vector add, a row softmax that matched torch.softmax, and a fused bias + GELU forward and backward that beat eager PyTorch by 25% and saved its intermediate tensor.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .co-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .co-v { display:none; } .co-v.on { display:block; }
+  .co-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .co-row { display:grid; grid-template-columns:minmax(0, 250px) 1fr 86px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .co-row .track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; } .co-row .track i { display:block; height:100%; }
+  .co-row .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .co-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .co-row { grid-template-columns:minmax(0, 130px) 1fr 70px; font-size:12px; } }
+</style>
 </head>
 <body data-chapter="37">
-<!-- dl:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 37</span><span class="pill">Expert</span><span class="pill">⏱ 50 min</span></div>
     <h1>Custom Ops: <span class="grad">autograd.Function &amp; Triton Kernels</span></h1>
-    <p class="lead">Writing your own forward and backward, a fused kernel in Triton, and checking both against PyTorch.</p>
+    <p class="lead">Most models are built entirely from PyTorch’s operations, and autograd derives every backward pass for you. Two situations push you past that. Sometimes the backward pass you want is not the true derivative (a straight-through estimator for rounding), or the automatic one keeps more memory than necessary. And sometimes no fast kernel exists for the computation you need, so a chain of small operations each reads and writes the whole tensor. The first is solved with <code>torch.autograd.Function</code>, the second with a GPU kernel, and <b>Triton</b> lets you write one in Python.</p>
+    <p class="lead">This chapter writes both and tests them the way a library would. A hand-written SiLU kept 256 MB less memory than the composite version, and ran slower than it, because three separate PyTorch kernels in a custom backward are not one fused kernel. <code>gradcheck</code> passed the correct backward and caught a single flipped sign. A Triton row softmax matched <code>torch.softmax</code> to 10⁻⁸ and reached its speed on wide rows. A fused bias + GELU kernel, forward and backward, was 25% faster than eager PyTorch and slightly faster than <code>torch.compile</code>, and saved no intermediate tensor at all.</p>
+    <ul class="objectives">
+      <li><span>Write a custom forward and backward with torch.autograd.Function and choose what to save</span></li>
+      <li><span>Use a backward that is not the true gradient, such as a straight-through estimator</span></li>
+      <li><span>Verify a custom backward with gradcheck in float64</span></li>
+      <li><span>Write, launch and benchmark Triton kernels, and read the numbers as memory bandwidth</span></li>
+      <li><span>Fuse an operation chain into one kernel and know when that beats torch.compile</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>How autograd records and replays operations:</b> <a href="03-autograd-from-scratch.html">Chapter 3</a> and <a href="p4-pytorch-modules-and-autograd.html">P4</a>. <b>Bandwidth-bound vs compute-bound kernels:</b> <a href="p7-the-gpu-for-deep-learning.html">P7</a>. <b>Fusion and torch.compile:</b> <a href="22-making-training-fast.html">Chapter 22</a>. <b>Straight-through estimators in use:</b> <a href="32-pruning-quantisation-and-distillation.html">Chapter 32</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>torch.autograd.Function</li>
-    <li>Custom backward passes</li>
-    <li>A Triton kernel</li>
-    <li>Fusing an operation</li>
-    <li>Testing gradients and speed</li>
-  </ol>
+  <h2>torch.autograd.Function</h2>
+  <p>A custom Function is a pair of static methods. <code>forward</code> computes the output from plain tensors and stores in <code>ctx</code> whatever the backward will need; <code>backward</code> receives the gradient of the loss with respect to the output and returns one gradient per input. Autograd treats the pair as a single node in its graph and never looks inside.</p>
+<pre class="code"><span class="k">class</span> <span class="t">SiLU</span>(torch.autograd.Function):                      <span class="c"># x · sigmoid(x)</span>
+    <span class="k">@staticmethod</span>
+    <span class="k">def</span> <span class="f">forward</span>(ctx, x):
+        ctx.<span class="f">save_for_backward</span>(x)                         <span class="c"># save only the input...</span>
+        <span class="k">return</span> x * torch.<span class="f">sigmoid</span>(x)
+    <span class="k">@staticmethod</span>
+    <span class="k">def</span> <span class="f">backward</span>(ctx, g):
+        (x,) = ctx.saved_tensors; s = torch.<span class="f">sigmoid</span>(x)     <span class="c"># ...and recompute sigmoid here</span>
+        <span class="k">return</span> g * s * (<span class="m">1</span> + x * (<span class="m">1</span> - s))</pre>
+  <p>Written as plain operations, <code>x * torch.sigmoid(x)</code> makes autograd save both x and sigmoid(x), because the multiply needs both for its backward. The custom version saves only x and recomputes the sigmoid. Measured on 67 million elements:</p>
+  <table class="t cmp">
+    <thead><tr><th>SiLU implementation</th><th>Extra memory held for backward</th><th>Forward + backward</th></tr></thead>
+    <tbody>
+      <tr><td>Composite <code>x * torch.sigmoid(x)</code></td><td>256 MB (the sigmoid output)</td><td>5.87 ms</td></tr>
+      <tr><td>Custom Function, saves x only</td><td><b>0 MB</b></td><td>6.98 ms</td></tr>
+      <tr><td>Built-in <code>F.silu</code></td><td>0 MB</td><td><b>1.78 ms</b></td></tr>
+    </tbody>
+  </table>
+  <p>The custom Function bought its memory saving with time: its backward runs several separate kernels (sigmoid, subtract, multiply, add, multiply), each reading and writing the full tensor, and recomputing the sigmoid adds one more pass. The built-in <code>F.silu</code> is a single fused CUDA kernel in each direction, and was more than three times faster than either. A custom Function changes <i>what</i> is computed and saved; it does not make the arithmetic faster. That takes a kernel.</p>
+
+  <h2>Custom backward passes</h2>
+  <p>The backward does not have to be the true derivative. Rounding has a derivative of zero almost everywhere, so a network that rounds its weights in the forward pass (quantisation-aware training, Chapter 32) would never learn. A <b>straight-through estimator</b> rounds in the forward pass and passes the gradient through unchanged:</p>
+<pre class="code"><span class="k">class</span> <span class="t">RoundSTE</span>(torch.autograd.Function):
+    <span class="k">@staticmethod</span>
+    <span class="k">def</span> <span class="f">forward</span>(ctx, x): <span class="k">return</span> torch.<span class="f">round</span>(x)
+    <span class="k">@staticmethod</span>
+    <span class="k">def</span> <span class="f">backward</span>(ctx, g): <span class="k">return</span> g                   <span class="c"># pretend rounding was the identity</span></pre>
+  <p>For three weights through <code>2 · round(w)</code>, the true gradient was [0, 0, 0] and the straight-through one [2, 2, 2]. Gradient reversal layers, clipped or rescaled gradients and custom numerically stable formulas are written the same way.</p>
+  <p>Because a hand-written backward is easy to get subtly wrong, test it. <code>torch.autograd.gradcheck</code> compares the analytical backward with central finite differences, element by element, and needs float64 so that the finite differences are accurate (P2):</p>
+<pre class="code">x = torch.<span class="f">randn</span>(<span class="m">64</span>, dtype=torch.float64, requires_grad=<span class="k">True</span>)
+torch.autograd.<span class="f">gradcheck</span>(SiLU.apply, (x,))              <span class="c"># True</span>
+torch.autograd.<span class="f">gradcheck</span>(BadSiLU.apply, (x,), raise_exception=<span class="k">False</span>)   <span class="c"># False: (1 - s) written as s</span></pre>
+  <p>The correct version passed; a copy with one sign flipped, <code>x · s</code> in place of <code>x · (1 − s)</code>, failed. That bug would not crash or produce NaNs. A network using it would still train, more slowly, which is exactly the kind of bug Chapter 39 shows going unnoticed.</p>
+
+  <h2>A Triton kernel</h2>
+  <p>Triton (Tillet et al., 2019) is a language for GPU kernels embedded in Python. A kernel is a function run by many <b>programs</b> in parallel; each program handles one block of elements, loads them from GPU memory into registers with <code>tl.load</code>, computes, and writes back with <code>tl.store</code>. A mask stops the last block reading past the end. Triton compiles the function for the GPU on its first call.</p>
+<pre class="code"><span class="k">@triton.jit</span>
+<span class="k">def</span> <span class="f">add_kernel</span>(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.<span class="f">program_id</span>(<span class="m">0</span>)                                <span class="c"># which block am I?</span>
+    offs = pid * BLOCK + tl.<span class="f">arange</span>(<span class="m">0</span>, BLOCK); mask = offs &lt; n
+    tl.<span class="f">store</span>(out_ptr + offs, tl.<span class="f">load</span>(x_ptr + offs, mask=mask) + tl.<span class="f">load</span>(y_ptr + offs, mask=mask), mask=mask)
+
+add_kernel[(triton.<span class="f">cdiv</span>(n, <span class="m">1024</span>),)](x, y, out, n, BLOCK=<span class="m">1024</span>)    <span class="c"># one program per 1,024 elements</span></pre>
+  <p>An addition does almost no arithmetic per byte moved, so its speed is the memory bandwidth it achieves, counted here as three tensors (two read, one written) per call:</p>
+  <table class="t cmp">
+    <thead><tr><th>Elements</th><th>Triton add</th><th>PyTorch <code>a + b</code></th></tr></thead>
+    <tbody>
+      <tr><td>65,536</td><td>66 GB/s</td><td>121 GB/s</td></tr>
+      <tr><td>1,048,576 (12 MB moved)</td><td>963 GB/s</td><td>1,563 GB/s</td></tr>
+      <tr><td>16,777,216</td><td>784 GB/s</td><td>785 GB/s</td></tr>
+      <tr><td>134,217,728 (1.6 GB moved)</td><td>779 GB/s</td><td>778 GB/s</td></tr>
+    </tbody>
+  </table>
+  <p>On large tensors the 30-line Triton kernel matched PyTorch’s and reached about 780 GB/s, 87% of the card’s rated 896 GB/s. Small tensors are dominated by the fixed cost of launching a kernel, where PyTorch’s launch path is cheaper than Triton’s Python-side one. The middle row exceeds the rated bandwidth because 12 MB fits in the GPU’s 48 MB L2 cache, so repeated calls never reach main memory: one reason benchmarks should use realistic sizes.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Kernel lab</span><span class="p-tag">Measured on an RTX 5070 Ti</span></div>
+    <div class="panel-body">
+      <div class="co-l">View</div>
+      <div class="seg" id="coV"><button class="active" data-v="soft">softmax bandwidth</button><button data-v="fuse">fused bias + GELU</button><button data-v="silu">SiLU memory and time</button></div>
+      <div class="co-v on" id="coVsoft">
+        <div class="co-l">Row width</div>
+        <div class="seg" id="coW"><button data-v="256">256</button><button class="active" data-v="1024">1,024</button><button data-v="4096">4,096</button><button data-v="16384">16,384</button></div>
+        <div class="co-box" id="coS"></div>
+      </div>
+      <div class="co-v" id="coVfuse"><div class="co-box" id="coF"></div></div>
+      <div class="co-v" id="coVsilu"><div class="co-box" id="coU"></div></div>
+      <div class="stats" id="coStats"></div>
+      <div class="co-why" id="coWhy"></div>
+    </div>
+    <div class="panel-foot">RTX 5070 Ti (rated 896 GB/s, 48 MB L2), PyTorch 2.11, Triton 3.7.1 (triton-windows). Times are the mean of 50 calls (20 for the fused kernel) after 5 warm-up calls, synchronised. Bandwidth counts each tensor read or written once: 2 tensors for softmax (8,192 rows), 3 for add. Fused bias + GELU: a 16,384 × 4,096 fp32 input with a 4,096 bias, forward and backward. Saved memory is what autograd holds after the forward pass beyond the output itself, on 2²⁶ elements.</div>
+  </div>
+
+  <h2>Fusing an operation</h2>
+  <p>Softmax over each row of a matrix is three passes in plain PyTorch (max, exponentials and sum, divide) or five separate kernels written naively. A Triton kernel can give each row to one program, keep the whole row in registers, and read and write it exactly once:</p>
+<pre class="code"><span class="k">@triton.jit</span>
+<span class="k">def</span> <span class="f">softmax_kernel</span>(x_ptr, out_ptr, stride, n_cols, BLOCK: tl.constexpr):
+    row = tl.<span class="f">program_id</span>(<span class="m">0</span>); offs = tl.<span class="f">arange</span>(<span class="m">0</span>, BLOCK); mask = offs &lt; n_cols
+    x = tl.<span class="f">load</span>(x_ptr + row * stride + offs, mask=mask, other=-<span class="f">float</span>(<span class="s">"inf"</span>))
+    e = tl.<span class="f">exp</span>(x - tl.<span class="f">max</span>(x, <span class="m">0</span>))                               <span class="c"># stable: subtract the row maximum (P3)</span>
+    tl.<span class="f">store</span>(out_ptr + row * stride + offs, e / tl.<span class="f">sum</span>(e, <span class="m">0</span>), mask=mask)</pre>
+  <table class="t cmp">
+    <thead><tr><th>Softmax, 8,192 rows</th><th>256 wide</th><th>1,024</th><th>4,096</th><th>16,384</th></tr></thead>
+    <tbody>
+      <tr><td>Triton, one pass</td><td>1,331 GB/s</td><td><b>940</b></td><td><b>763</b></td><td><b>758</b></td></tr>
+      <tr><td><code>torch.softmax</code></td><td><b>1,883</b></td><td>891</td><td>728</td><td>743</td></tr>
+      <tr><td>Naive eager, 5 kernels</td><td>377</td><td>277</td><td>198</td><td>194</td></tr>
+      <tr><td>Naive + <code>torch.compile</code></td><td>976</td><td>889</td><td>754</td><td>414</td></tr>
+    </tbody>
+  </table>
+  <p>The Triton kernel agreed with <code>torch.softmax</code> to within 3 × 10⁻⁸ and was as fast or slightly faster from 1,024 columns up; the naive five-kernel version moved the data five times and ran at a quarter of the speed. <code>torch.compile</code> fused the naive code well at moderate widths but fell to 414 GB/s on the widest rows, where its generated kernel no longer kept a row in registers. On the narrowest rows PyTorch’s hand-tuned kernel, which packs several short rows into one program, was best. A one-row-per-program design is simple, not universal.</p>
+  <p>The same idea, for an operation PyTorch has no single kernel for: adding a bias and applying GELU, the pattern after every feed-forward layer in a transformer. Eager PyTorch writes x + b to memory, saves it for the backward, then reads it again for the GELU. A fused kernel computes both in registers, and its backward kernel recomputes x + b instead of loading a saved copy. Wrapped in an autograd.Function, its outputs matched PyTorch’s to 4.8 × 10⁻⁷, its input gradients to 6.9 × 10⁻⁶ and its bias gradient to a relative 2.2 × 10⁻⁷:</p>
+  <table class="t cmp">
+    <thead><tr><th>Bias + GELU, 67M elements</th><th>Forward + backward</th><th>Extra memory saved for backward</th></tr></thead>
+    <tbody>
+      <tr><td>Eager PyTorch</td><td>2.73 ms</td><td>256 MB</td></tr>
+      <tr><td><code>torch.compile</code></td><td>2.14 ms</td><td>–</td></tr>
+      <tr><td><b>Triton, fused, with a custom backward</b></td><td><b>2.04 ms</b></td><td><b>0 MB</b></td></tr>
+    </tbody>
+  </table>
+  <p>The hand-written kernel was 25% faster than eager and 5% faster than what the compiler generated, and kept nothing beyond its inputs. For most code <code>torch.compile</code> gets close to a hand-written kernel at no effort, and that is where to start. Hand-written kernels earn their keep for operations used billions of times (attention, normalisation, optimiser updates), where a few percent and a few hundred megabytes matter, and for algorithms a compiler cannot discover, such as FlashAttention’s tiling.</p>
+
+  <h2>Testing gradients and speed</h2>
+  <p>A custom op needs the same tests as a library function. Correctness: compare the forward with a reference implementation on random inputs, including awkward sizes that are not multiples of the block; compare the backward with autograd on the reference, and run gradcheck in float64 where the kernel supports it. Speed: warm up first (the first Triton call compiles), synchronise before reading the clock, use sizes from the real model rather than ones that fit in cache, and report bandwidth or FLOP/s so the number can be compared with the hardware’s limit. A kernel at 87% of peak bandwidth has little left to gain; one at 20% has a bug or a bad memory access pattern.</p>
+
+  <figure class="flow">
+    <ol>
+      <li><b>Composite ops</b><small>autograd does everything</small></li>
+      <li><b>torch.compile</b><small>fusion for free; try it first</small></li>
+      <li><b>autograd.Function</b><small>custom gradient or less memory</small></li>
+      <li><b>Triton kernel</b><small>a hot op the compiler misses</small></li>
+      <li><b>Test</b><small>reference, gradcheck, bandwidth vs peak</small></li>
+    </ol>
+    <figcaption><b>How far to go.</b> Each step costs more effort; stop at the first that meets the need.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🧬</div>
+    <div class="body"><div class="title">Use case: a custom loss for a protein-structure model</div><p>A research team’s loss compares predicted and true atom positions with a function over every pair of residues. Written in PyTorch it creates a residues × residues × 3 tensor and several intermediate copies, and at 1,000 residues training runs out of memory. They first try <code>torch.compile</code>, which fuses some of it but still materialises the pairwise tensor. They then write the loss as a Triton kernel that processes tiles of residue pairs in registers and accumulates the sum, with a second kernel for the backward, wrapped in an autograd.Function. Before using it they compare it with the PyTorch version on 200 random small inputs, forward and backward, and run gradcheck in float64 on tiny ones. Memory for the loss falls from 11 GB to under 100 MB.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Expecting autograd.Function to be faster</b>: the memory-saving SiLU was slower than the composite version.</li>
+      <li><b>Not testing a custom backward</b>: a flipped sign trains silently; gradcheck caught it.</li>
+      <li><b>gradcheck in float32</b>: finite differences need float64 to be accurate.</li>
+      <li><b>Benchmarking tensors that fit in cache</b>: 12 MB showed 1,563 GB/s, above the card’s 896 GB/s rating.</li>
+      <li><b>Timing the first call</b>: it includes Triton’s compilation.</li>
+      <li><b>Writing a kernel before trying torch.compile</b>: it reached 95% of the hand-written fused kernel’s speed.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> When would you write a custom torch.autograd.Function?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>When I need a backward that autograd would not produce: a straight-through estimator for rounding, where the true gradient is zero; gradient reversal; or a more stable formula. Or when the automatic backward saves too much: a SiLU written as x times sigmoid(x) saves the sigmoid output, 256 MB on a 67-million-element tensor, while a custom Function can save only x and recompute. It is not a speed tool by itself: that custom SiLU was slower than the composite one, and the built-in fused F.silu was three times faster than both. I always check a custom backward with gradcheck in float64; it caught a single flipped sign in my test.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How do you know whether a kernel you wrote is any good?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Compare it with the hardware limit, not just with another implementation. Element-wise and reduction kernels are bandwidth-bound, so I count the bytes read and written and divide by the time: my Triton vector add and row softmax reached about 760 to 780 GB/s on large tensors, 85 to 87% of the card’s 896 GB/s, so there was little left to gain. I test on realistic sizes, because a 12 MB tensor sat in the 48 MB L2 cache and showed more than the rated bandwidth. I warm up first, since the first Triton call compiles, and synchronise before timing. And I compare against torch.compile, which got within 5% of my fused bias plus GELU kernel without any effort.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>autograd.Function lets you choose the backward and what is saved; it saved 256 MB but did not add speed.</li>
+      <li>A backward need not be the true gradient: straight-through estimators make rounding trainable.</li>
+      <li>Test every custom backward with gradcheck in float64; it caught one flipped sign.</li>
+      <li>Triton kernels are Python functions over blocks; large element-wise ones reached 87% of peak bandwidth.</li>
+      <li>Fusing bias + GELU was 25% faster than eager and saved its intermediate; torch.compile came within 5%.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why did <code>x * torch.sigmoid(x)</code> hold 256 MB more for its backward than the custom SiLU?</p>
+      <div class="opts">
+        <button class="opt">It stores the output twice</button>
+        <button class="opt">The multiply needs both of its inputs for its backward, so autograd saves sigmoid(x) as well as x</button>
+        <button class="opt">Sigmoid is computed in float64</button>
+        <button class="opt">The custom version does not compute a gradient</button>
+      </div>
+      <div class="explain">The custom Function saves x only and recomputes the sigmoid in backward.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does a straight-through estimator do?</p>
+      <div class="opts">
+        <button class="opt">Computes the exact gradient of rounding</button>
+        <button class="opt">Skips rounding in the forward pass</button>
+        <button class="opt">Sets the gradient to zero</button>
+        <button class="opt">Rounds in the forward pass and passes the incoming gradient through unchanged in the backward pass</button>
+      </div>
+      <div class="explain">True gradient [0, 0, 0]; straight-through [2, 2, 2].</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why must gradcheck run in float64?</p>
+      <div class="opts">
+        <button class="opt">Its finite-difference estimates need the extra precision; in float32 rounding error swamps the comparison</button>
+        <button class="opt">Custom Functions only support float64</button>
+        <button class="opt">GPUs cannot run float32 gradients</button>
+        <button class="opt">It is faster</button>
+      </div>
+      <div class="explain">P2 found float32 finite differences good to only about four digits.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A Triton add on a 12 MB problem showed 963 GB/s, above the card’s 896 GB/s rating. Why?</p>
+      <div class="opts">
+        <button class="opt">Triton compresses data</button>
+        <button class="opt">The timer was wrong</button>
+        <button class="opt">The data fitted in the 48 MB L2 cache, so repeated calls did not reach main memory</button>
+        <button class="opt">The kernel skipped elements</button>
+      </div>
+      <div class="explain">On a 1.6 GB problem it ran at 779 GB/s, 87% of the rating.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why was the fused bias + GELU kernel faster than eager PyTorch?</p>
+      <div class="opts">
+        <button class="opt">It computes GELU with lower precision</button>
+        <button class="opt">It reads the input once and computes x + b and GELU in registers, and its backward recomputes x + b instead of loading a saved copy</button>
+        <button class="opt">It skips the backward pass</button>
+        <button class="opt">It uses tensor cores</button>
+      </div>
+      <div class="explain">2.04 ms against 2.73 ms, with no 256 MB intermediate saved.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"triton":"3.7.1","gradcheck":{"SiLU":true,"SiLU with a sign error":false},"silu_saved_mb":{"composite x * sigmoid(x)":256.0,"custom Function (saves x only)":0.0,"F.silu (built-in)":0.0},"silu_ms_fwd_bwd":{"composite":5.868,"custom Function":6.979,"F.silu":1.777},"ste":{"grad through torch.round":[0.0,0.0,0.0],"grad through the STE":[2.0,2.0,2.0]},"add":{"65536":{"triton_GBps":66.0,"torch_GBps":121.0},"1048576":{"triton_GBps":963.0,"torch_GBps":1563.0},"16777216":{"triton_GBps":784.0,"torch_GBps":785.0},"134217728":{"triton_GBps":779.0,"torch_GBps":778.0}},"softmax":{"256":{"max_abs_diff":3e-08,"triton":1331.0,"torch.softmax":1883.0,"naive eager (5 kernels)":377.0,"naive + torch.compile":976.0},"1024":{"max_abs_diff":1.5e-08,"triton":940.0,"torch.softmax":891.0,"naive eager (5 kernels)":277.0,"naive + torch.compile":889.0},"4096":{"max_abs_diff":3.7e-09,"triton":763.0,"torch.softmax":728.0,"naive eager (5 kernels)":198.0,"naive + torch.compile":754.0},"16384":{"max_abs_diff":9.3e-10,"triton":758.0,"torch.softmax":743.0,"naive eager (5 kernels)":194.0,"naive + torch.compile":414.0}},"bias_gelu_check":{"out_max_diff":4.8e-07,"dx_max_diff":6.9e-06,"db_rel_diff":2.2e-07},"bias_gelu_ms":{"eager PyTorch (x + b, then GELU)":2.733,"torch.compile":2.139,"Triton fused, autograd.Function":2.036},"bias_gelu_saved_mb":{"eager":256.0,"Triton Function":0.0}};
+  const row = (l, v, mx, n, c) => `<div class="co-row"><span>${l}</span><span class="track"><i style="width:${Math.max(0.5, 100 * v / mx)}%;background:${c}"></i></span><span class="n">${n}</span></div>`;
+  function soft() {
+    const w = $('#coW .active').dataset.v, S = D.softmax[w], ks = ['triton', 'torch.softmax', 'naive eager (5 kernels)', 'naive + torch.compile'], col = { 'triton': '#7c3aed', 'torch.softmax': '#2563eb', 'naive eager (5 kernels)': '#e11d48', 'naive + torch.compile': '#16a34a' }, mx = 2000;
+    $('#coS').innerHTML = `<div style="margin-bottom:4px"><b>Effective bandwidth, GB/s (8,192 rows × ${(+w).toLocaleString()})</b></div>` + ks.map(k => row(k, S[k], mx, S[k].toLocaleString(), col[k])).join('') + `<div style="margin-top:6px" class="small">Dashed line in your head: the card’s rated 896 GB/s. Values above it come from data held in the 48 MB L2 cache.</div>`;
+    $('#coStats').innerHTML = `<div class="stat"><div class="k">Max difference vs torch.softmax</div><div class="v">${S.max_abs_diff.toExponential(1)}</div></div><div class="stat good"><div class="k">Triton / torch</div><div class="v">${(S.triton / S['torch.softmax']).toFixed(2)}×</div></div><div class="stat bad"><div class="k">Naive eager / torch</div><div class="v">${(S['naive eager (5 kernels)'] / S['torch.softmax']).toFixed(2)}×</div></div>`;
+    $('#coWhy').innerHTML = w === '256' ? '<b>Narrow rows: the hand-tuned kernel wins.</b> A 256-wide row is only 1 KB, so one program per row leaves most of each program idle; PyTorch’s kernel packs several rows together. The 8 MB matrix also fits in L2, which is why every number here is inflated.' : w === '16384' ? '<b>Wide rows: one pass still wins, the compiler stumbles.</b> The Triton kernel keeps a 64 KB row in registers and stays near the bandwidth limit; torch.compile’s generated kernel for the naive code fell to about half.' : '<b>One read, one write.</b> Keeping each row in registers means the data crosses memory exactly twice, the minimum; the naive version crosses it five times and runs at about a quarter of the speed.';
+  }
+  function fuse() {
+    const M = D.bias_gelu_ms, ks = Object.keys(M), mx = Math.max(...ks.map(k => M[k]));
+    $('#coF').innerHTML = '<div style="margin-bottom:4px"><b>Forward + backward, 16,384 × 4,096 (ms, shorter is faster)</b></div>' + ks.map(k => row(k, M[k], mx, M[k] + ' ms', k.startsWith('Triton') ? '#7c3aed' : k.startsWith('torch') ? '#16a34a' : '#94a3b8')).join('') +
+      '<div style="margin:12px 0 4px"><b>Extra memory held for backward</b></div>' + Object.entries(D.bias_gelu_saved_mb).map(([k, v]) => row(k, v, 260, v + ' MB', v ? '#e11d48' : '#16a34a')).join('');
+    const C = D.bias_gelu_check;
+    $('#coStats').innerHTML = `<div class="stat"><div class="k">Output difference</div><div class="v">${C.out_max_diff.toExponential(1)}</div></div><div class="stat"><div class="k">Input-gradient difference</div><div class="v">${C.dx_max_diff.toExponential(1)}</div></div><div class="stat good"><div class="k">vs eager</div><div class="v">−${Math.round(100 * (1 - M['Triton fused, autograd.Function'] / M['eager PyTorch (x + b, then GELU)']))}%</div></div>`;
+    $('#coWhy').innerHTML = '<b>Fewer trips to memory.</b> Eager PyTorch writes x + b out, saves it, and reads it back for GELU and again in the backward. The fused kernels never store it: the forward computes both steps in registers and the backward recomputes x + b from the inputs. torch.compile finds most of this on its own.';
+  }
+  function silu() {
+    const M = D.silu_ms_fwd_bwd, S = D.silu_saved_mb, ks = Object.keys(M), names = ['composite x * sigmoid(x)', 'custom Function (saves x only)', 'F.silu (built-in)'];
+    $('#coU').innerHTML = '<div style="margin-bottom:4px"><b>Forward + backward, 67M elements (ms)</b></div>' + ks.map((k, i) => row(names[i], M[k], 8, M[k] + ' ms', i === 2 ? '#16a34a' : '#94a3b8')).join('') +
+      '<div style="margin:12px 0 4px"><b>Extra memory held for backward</b></div>' + Object.entries(S).map(([k, v]) => row(k, v, 260, v + ' MB', v ? '#e11d48' : '#16a34a')).join('');
+    $('#coStats').innerHTML = `<div class="stat ${D.gradcheck.SiLU ? 'good' : 'bad'}"><div class="k">gradcheck, correct backward</div><div class="v">${D.gradcheck.SiLU ? 'pass' : 'fail'}</div></div><div class="stat ${D.gradcheck['SiLU with a sign error'] ? 'good' : 'bad'}"><div class="k">gradcheck, one sign flipped</div><div class="v">${D.gradcheck['SiLU with a sign error'] ? 'pass' : 'fail'}</div></div><div class="stat"><div class="k">STE gradient</div><div class="v">[${D.ste['grad through the STE'].join(', ')}]</div></div>`;
+    $('#coWhy').innerHTML = '<b>Memory and speed are different levers.</b> The custom Function saves only its input, which removes 256 MB, but its backward is still several separate PyTorch kernels and runs slower. The built-in F.silu is one fused kernel each way, and both lighter and faster.';
+  }
+  function draw() { const v = $('#coV .active').dataset.v; ['soft', 'fuse', 'silu'].forEach(x => $('#coV' + x).classList.toggle('on', x === v)); ({ soft, fuse, silu })[v](); }
+  ['#coV', '#coW'].forEach(id => $(id).addEventListener('segchange', draw)); draw();
+})();
+</script>
 </body>
 </html>
