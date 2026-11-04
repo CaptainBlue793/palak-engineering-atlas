@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Attention from First Principles · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 18 of Deep Learning. Attention as a differentiable dictionary lookup, written by hand and matched to PyTorch's kernel; why scores are divided by √d (unscaled weights collapse onto one key as d grows); a key-value lookup that attention solves with 14,496 parameters and an MLP with 3.25 million cannot; and the O(n²) memory that fused kernels avoid (8.2 GB vs 16 MB at 16,384 tokens).">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .at-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .at-v { display:none; } .at-v.on { display:block; }
+  .at-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .at-box svg { width:100%; height:auto; display:block; } .at-box text { font-size:12px; fill:var(--muted); }
+  .at-bar { display:grid; grid-template-columns:minmax(0, 210px) 1fr 90px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .at-bar .track { height:13px; border-radius:4px; background:var(--surface); overflow:hidden; } .at-bar .track i { display:block; height:100%; }
+  .at-bar .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .at-kv { display:grid; grid-template-columns:repeat(16, 1fr); gap:3px; font-family:var(--mono); font-size:11.5px; text-align:center; }
+  .at-kv div { padding:4px 0; border-radius:5px; background:var(--surface); border:1px solid var(--border); }
+  .at-key { display:flex; gap:14px; flex-wrap:wrap; font-size:12.5px; margin-top:6px; } .at-key i { display:inline-block; width:14px; height:4px; border-radius:2px; vertical-align:middle; margin-right:5px; }
+  .at-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .at-kv { grid-template-columns:repeat(8, 1fr); } .at-bar { grid-template-columns:minmax(0, 120px) 1fr 76px; font-size:12px; } }
+</style>
+</head>
+<body data-chapter="18">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 18</span><span class="pill">Intermediate</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Attention from <span class="grad">First Principles</span></h1>
+    <p class="lead">A recurrent network passes everything it knows about the past through one hidden vector, step by step (Chapter 17). <b>Attention</b> lets every position look directly at every other position and decide how much of each to use. Mechanically it is a soft dictionary lookup: each position issues a <b>query</b>, every position offers a <b>key</b> and a <b>value</b>, and the result is a weighted average of the values, weighted by how well each key matches the query. Because the weights come from a softmax, the whole lookup is differentiable and can be learned.</p>
+    <p class="lead">This chapter writes attention in four lines and checks it against PyTorch’s kernel (agreement to 8 × 10⁻⁷, causal mask included). It measures why the scores are divided by √d: without it, the attention weights collapse onto a single key as the dimension grows (entropy 0.13 at d = 1,024 against 3.69 when scaled). On a lookup task, “given 16 key-value pairs and a query key, return its value”, a 14,496-parameter attention model scored 100% and a 3.25-million-parameter MLP 12%. And it measures the price: attention’s score matrix grows with the square of the sequence length, 8.2 GB of memory at 16,384 tokens for the textbook version, 16 MB for PyTorch’s fused kernel.</p>
+    <ul class="objectives">
+      <li><span>Explain attention as a soft lookup over queries, keys and values</span></li>
+      <li><span>Implement scaled dot-product attention and a causal mask</span></li>
+      <li><span>Justify the 1/√d scaling with a measurement</span></li>
+      <li><span>Build multi-head attention from single-head attention</span></li>
+      <li><span>Estimate attention’s time and memory cost by sequence length</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Softmax and its saturation:</b> <a href="p2-matrix-calculus.html">P2</a> and <a href="p3-floating-point-for-deep-learning.html">P3</a>. <b>Why recurrence struggles with long range:</b> <a href="17-recurrent-networks-and-bptt.html">Chapter 17</a>. Attention in a translator, its historical origin, is <a href="../nlp/13-attention-for-seq2seq.html">NLP Chapter 13</a>; self-attention inside a GPT is <a href="../llms/04-self-attention.html">LLMs Chapter 4</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>A soft dictionary lookup</h2>
+  <p>A Python dictionary returns the value whose key exactly equals the query. Attention returns a <i>blend</i> of all values, weighted by similarity: score each key against the query with a dot product, turn the scores into weights that sum to 1 with softmax, and average the values with those weights. If one key matches far better than the others, the softmax puts almost all the weight on it and attention behaves like an exact lookup; if several match, it blends them. The weights are smooth functions of the queries and keys, so gradients tell the network how to make better ones.</p>
+<pre class="code"><span class="k">def</span> <span class="f">attention</span>(q, k, v, mask=<span class="k">None</span>):              <span class="c"># q (B, n_q, d), k (B, n_k, d), v (B, n_k, d_v)</span>
+    s = q @ k.<span class="f">transpose</span>(-<span class="m">2</span>, -<span class="m">1</span>) / math.<span class="f">sqrt</span>(q.shape[-<span class="m">1</span>])   <span class="c"># (B, n_q, n_k): every query against every key</span>
+    <span class="k">if</span> mask <span class="k">is not None</span>: s = s.<span class="f">masked_fill</span>(~mask, <span class="f">float</span>(<span class="s">"-inf"</span>))   <span class="c"># forbidden pairs get weight exactly 0</span>
+    w = s.<span class="f">softmax</span>(-<span class="m">1</span>)                                  <span class="c"># each row sums to 1</span>
+    <span class="k">return</span> w @ v                                       <span class="c"># (B, n_q, d_v): weighted average of the values</span>
+<span class="c"># against F.scaled_dot_product_attention: max |difference| 8.3e-7 (no mask), 6.0e-7 (causal)</span></pre>
+
+  <h2>Queries, keys and values</h2>
+  <p>In <b>self-attention</b> the queries, keys and values all come from the same sequence, through three learned linear maps: q = xW_Q, k = xW_K, v = xW_V. Each position decides what it is looking for (its query), what it advertises about itself (its key) and what it contributes if chosen (its value), and these can be quite different things. In <b>cross-attention</b> the queries come from one sequence and the keys and values from another, which is how a decoder reads an encoder’s output (Chapter 19, NLP Chapter 13). The lookup task below makes this concrete: 16 (key, value) pairs and one query key; the network must output the value stored under that key. Attention learned it almost immediately: loss 0.044 after 200 steps, 100% test accuracy, and after training each query put 99.9% of its weight on the matching key. An MLP given the same inputs concatenated, with 224 times as many parameters, reached 12.1%: it has no operation that compares the query with each key, so it would have to learn every combination separately.</p>
+  <table class="t cmp">
+    <thead><tr><th>Key-value lookup, 16 pairs, 32 symbols</th><th>Parameters</th><th>Loss after 200 steps</th><th>Final test accuracy</th></tr></thead>
+    <tbody>
+      <tr><td><b>Attention (one head, d = 64)</b></td><td>14,496</td><td>0.044</td><td><b>100.0%</b></td></tr>
+      <tr><td>MLP on the 33 concatenated embeddings</td><td>3,250,208</td><td>3.13</td><td>12.13%</td></tr>
+    </tbody>
+  </table>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Attention lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="at-l">View</div>
+      <div class="seg" id="atE"><button class="active" data-v="look">a learned lookup</button><button data-v="scale">why divide by √d</button><button data-v="cost">cost by length</button></div>
+      <div class="at-v on" id="atVlook">
+        <div class="at-l">Example</div>
+        <div class="seg" id="atX"><button class="active" data-v="0">1</button><button data-v="1">2</button><button data-v="2">3</button><button data-v="3">4</button><button data-v="4">5</button><button data-v="5">6</button></div>
+        <div class="at-box" id="atL"></div>
+      </div>
+      <div class="at-v" id="atVscale">
+        <div class="at-l">Show</div>
+        <div class="seg" id="atS"><button class="active" data-v="entropy">entropy of the weights</button><button data-v="max_weight">largest weight</button><button data-v="score_std">score spread</button></div>
+        <div class="at-box"><svg id="atG" viewBox="0 0 600 250"></svg><div class="at-key"><span><i style="background:#e11d48"></i>q·k (unscaled)</span><span><i style="background:#16a34a"></i>q·k / √d</span></div></div>
+      </div>
+      <div class="at-v" id="atVcost"><div class="at-box" id="atC"></div></div>
+      <div class="stats" id="atStats"></div>
+      <div class="at-why" id="atWhy"></div>
+    </div>
+    <div class="panel-foot">Lookup: keys are 16 distinct symbols out of 32, values random symbols; one attention head (d = 64) with learned key, query and value maps over symbol embeddings; Adam 1e-3, batch 256, 6,000 steps; weights shown are from the trained model on test examples. Scaling: 512 × 64 random queries and keys with unit-variance entries, 64 keys per query; entropy in nats (uniform over 64 keys = 4.16). Cost: one layer of 8 heads × 64 dimensions in fp16 on the RTX 5070 Ti, the four-line version above against <code>F.scaled_dot_product_attention</code>, synchronised, peak memory above inputs.</div>
+  </div>
+
+  <h2>Why scale by √d</h2>
+  <p>If q and k have d independent entries of variance 1, their dot product has variance d: the scores spread out as the dimension grows. Softmax of widely spread scores is nearly one-hot, and a nearly one-hot softmax is saturated: its gradient is close to zero for every key except the winner (P2’s softmax Jacobian). Dividing by √d brings the scores back to unit variance whatever d is. Measured with random queries and keys, 64 keys per query:</p>
+  <table class="t cmp">
+    <thead><tr><th>Dimension d</th><th>Score spread, unscaled / scaled</th><th>Largest weight, unscaled / scaled</th><th>Entropy of the weights, unscaled / scaled (uniform = 4.16)</th></tr></thead>
+    <tbody>
+      <tr><td>4</td><td>2.0 / 1.0</td><td>0.27 / 0.10</td><td>2.81 / 3.70</td></tr>
+      <tr><td>64</td><td>8.0 / 1.0</td><td>0.79 / 0.11</td><td>0.58 / 3.69</td></tr>
+      <tr><td>1,024</td><td>32.0 / 1.0</td><td><b>0.95</b> / 0.11</td><td><b>0.13</b> / 3.69</td></tr>
+    </tbody>
+  </table>
+  <p>Without scaling, at the head sizes real models use (64 to 128), each query already puts most of its weight on one random key before any training; at d = 1,024, 95%. With scaling the weights start spread out and the same at every d, so learning can decide where to focus. The scale is part of the definition: <code>F.scaled_dot_product_attention</code> applies it by default.</p>
+
+  <h2>Masks</h2>
+  <p>A <b>mask</b> forbids some query-key pairs by setting their scores to −∞ before the softmax, which makes their weights exactly 0 and leaves the rest summing to 1. A <b>causal mask</b> lets position i see only positions ≤ i, so a model trained to predict the next token cannot peek at it; measured, the weights above the diagonal summed to exactly 0. A <b>padding mask</b> hides padded positions in a batch of variable-length sequences (NLP P2). Using a large negative number instead of −∞ almost works; using 0 does nothing at all, because a score of 0 is an ordinary score.</p>
+
+  <h2>Multi-head attention</h2>
+  <p>One attention operation produces one weighted average per position, so it can follow one kind of relationship at a time. <b>Multi-head attention</b> runs h smaller attentions in parallel, each with its own query, key and value maps of width d/h, and concatenates their outputs before a final linear map. With the same total width it costs about the same, and different heads can attend to different things: one to the previous token, one to a matching bracket, one to the subject of a sentence.</p>
+<pre class="code">B, n, d = x.shape; h = <span class="m">8</span>; dk = d // h
+q, k, v = self.<span class="f">qkv</span>(x).<span class="f">chunk</span>(<span class="m">3</span>, -<span class="m">1</span>)                       <span class="c"># each (B, n, d)</span>
+split = <span class="k">lambda</span> t: t.<span class="f">view</span>(B, n, h, dk).<span class="f">transpose</span>(<span class="m">1</span>, <span class="m">2</span>)        <span class="c"># (B, h, n, dk): h independent attentions</span>
+y = F.<span class="f">scaled_dot_product_attention</span>(<span class="f">split</span>(q), <span class="f">split</span>(k), <span class="f">split</span>(v), is_causal=<span class="k">True</span>)
+y = self.<span class="f">out</span>(y.<span class="f">transpose</span>(<span class="m">1</span>, <span class="m">2</span>).<span class="f">reshape</span>(B, n, d))         <span class="c"># concatenate heads, mix them</span></pre>
+  <figure class="flow">
+    <ol>
+      <li><b>Project</b><small>q, k, v = xW_Q, xW_K, xW_V</small></li>
+      <li><b>Split into heads</b><small>(B, h, n, d/h)</small></li>
+      <li><b>Scores</b><small>qkᵀ / √(d/h), mask</small></li>
+      <li><b>Softmax</b><small>weights per query, rows sum to 1</small></li>
+      <li><b>Weighted values</b><small>w · v</small></li>
+      <li><b>Concatenate + mix</b><small>back to (B, n, d)</small></li>
+    </ol>
+    <figcaption><b>Multi-head self-attention.</b> Chapter 19 wraps this in residuals, norms and an MLP to make a transformer block.</figcaption>
+  </figure>
+
+  <h2>The cost of attention</h2>
+  <p>Every query scores every key, so the score matrix has n × n entries per head: compute grows as n² and, in the textbook version, so does memory. For one layer of 8 heads in fp16 the score matrix alone is 4 MB at 512 tokens and 4 GB at 16,384; the four-line implementation needed 8.2 GB at peak there, because the scores and the softmax output both exist at once. PyTorch’s <code>F.scaled_dot_product_attention</code> dispatches to a fused kernel (FlashAttention or a memory-efficient variant) that computes the softmax in tiles and never stores the n × n matrix:</p>
+  <table class="t cmp">
+    <thead><tr><th>Sequence length</th><th>Score matrix (8 heads, fp16)</th><th>Naive: time / peak memory</th><th>Fused kernel: time / peak memory</th></tr></thead>
+    <tbody>
+      <tr><td>1,024</td><td>16 MB</td><td>0.09 ms / 33 MB</td><td>0.07 ms / 1 MB</td></tr>
+      <tr><td>4,096</td><td>256 MB</td><td>2.74 ms / 516 MB</td><td>0.94 ms / 4 MB</td></tr>
+      <tr><td>16,384</td><td>4,096 MB</td><td>38.4 ms / 8,208 MB</td><td><b>13.2 ms / 16 MB</b></td></tr>
+    </tbody>
+  </table>
+  <p>The fused kernel was about three times faster at long lengths and used five hundred times less memory, growing linearly with n. It does not change the n² arithmetic, only the memory traffic; long-context models need further tricks (LLMs, <a href="../llms/17-efficient-attention.html">Efficient Attention</a>; state-space models, Chapter 34).</p>
+
+  <div class="callout usecase">
+    <div class="ico">🧾</div>
+    <div class="body"><div class="title">Use case: matching invoice lines to purchase orders</div><p>A finance team matches each line of an incoming invoice to the most likely line of the corresponding purchase order: different wording, different order, sometimes a line split in two. A cross-attention layer, with invoice lines as queries and purchase-order lines as keys and values, learns the matching directly: each invoice line’s attention weights over the order lines are the match probabilities, readable for an auditor. It is the lookup task of this chapter, with learned keys, and it handles any number of lines without retraining.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Forgetting the 1/√d</b>: weights start nearly one-hot (largest weight 0.79 at d = 64, 0.95 at 1,024).</li>
+      <li><b>Masking with 0 instead of −∞</b>: a score of 0 is not a mask.</li>
+      <li><b>Softmax over the wrong axis</b>: it must normalise over keys, the last dimension of the scores.</li>
+      <li><b>Writing attention by hand for long sequences</b>: 8.2 GB at 16,384 tokens; use the fused kernel.</li>
+      <li><b>Mixing up the transposes when splitting heads</b>: (B, n, h, d/h) must become (B, h, n, d/h) before the matmul.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is attention, and why divide by √d?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Attention is a differentiable lookup. Each position has a query, and every position has a key and a value; the scores are query-key dot products, softmax turns them into weights that sum to 1, and the output is the weighted average of the values. The division by √d keeps the scores at unit variance: with d independent unit-variance entries, a dot product has variance d, and a softmax of widely spread scores is nearly one-hot, saturated, with tiny gradients for most keys. I measured random queries and keys: unscaled, the largest weight was 0.79 at d = 64 and 0.95 at d = 1,024; scaled, it stayed around 0.11 at every d.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> What are attention’s time and memory costs in sequence length, and how do fused kernels change them?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>For n tokens and width d, computing all scores is O(n²d) time and the score matrix is O(n²) memory per head. A naive implementation materialises that matrix and its softmax, so memory grows quadratically: I measured 8.2 GB for one 8-head layer at 16,384 tokens. FlashAttention-style kernels tile the computation, keep running softmax statistics, and never write the n × n matrix to memory, so memory becomes linear in n and the kernel is faster because it moves far less data; I measured 16 MB and about three times the speed. The arithmetic is still O(n²), which is why long-context work also uses sparse or linear attention and state-space models.</div></details>
+  </div></div>
+
+  <!-- xref:start (generated by tools/crosslinks.cjs from tools/crosslinks-map.cjs; do not edit by hand) -->
+  <div class="callout xref">
+    <div class="ico">🧭</div>
+    <div class="body"><div class="title xref-t">Related chapters in other courses</div>
+      <ul class="mb0">
+        <li><b>Attention and transformers:</b> ML &amp; AI <a href="../ml-ai-systems/13-sequences-attention.html">Ch 13: Sequences &amp; Attention</a> · <a href="../ml-ai-systems/14-transformers.html">Ch 14: Transformers End to End</a></li>
+      </ul>
+    </div>
+  </div>
+  <!-- xref:end -->
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Attention = softmax(QKᵀ/√d) V: a weighted average of values, weighted by query-key similarity.</li>
+      <li>It solved a key-value lookup with 14,496 parameters where an MLP with 3.25 million could not.</li>
+      <li>Divide by √d: unscaled weights collapse onto one key as d grows (entropy 0.13 vs 3.69 at d = 1,024).</li>
+      <li>Masks set forbidden scores to −∞; multi-head attention runs several smaller attentions in parallel.</li>
+      <li>Cost is O(n²); fused kernels keep the arithmetic but cut memory from 8.2 GB to 16 MB at 16,384 tokens.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does each row of softmax(QKᵀ/√d) represent?</p>
+      <div class="opts">
+        <button class="opt">The values</button>
+        <button class="opt">One key’s similarity to every query</button>
+        <button class="opt">One query’s weights over all keys, summing to 1</button>
+        <button class="opt">The attention output</button>
+      </div>
+      <div class="explain">Softmax normalises over keys; the output is those weights times V.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why divide the scores by √d?</p>
+      <div class="opts">
+        <button class="opt">Dot products of d unit-variance entries have variance d; without scaling the softmax saturates and weights collapse onto one key</button>
+        <button class="opt">To make the computation faster</button>
+        <button class="opt">To normalise the values</button>
+        <button class="opt">It is only needed in fp16</button>
+      </div>
+      <div class="explain">Measured: largest weight 0.95 unscaled vs 0.11 scaled at d = 1,024.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">How does a causal mask work?</p>
+      <div class="opts">
+        <button class="opt">It sets future values to zero</button>
+        <button class="opt">It multiplies future scores by 0</button>
+        <button class="opt">It removes future tokens from the batch</button>
+        <button class="opt">It sets scores for future keys to −∞ before the softmax, giving them weight exactly 0</button>
+      </div>
+      <div class="explain">Measured: the weights above the diagonal summed to 0.0.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why did attention solve the key-value lookup when a much larger MLP could not?</p>
+      <div class="opts">
+        <button class="opt">It was trained longer</button>
+        <button class="opt">It has a built-in operation that compares the query with every key and retrieves the matching value</button>
+        <button class="opt">It had more parameters</button>
+        <button class="opt">The MLP had a bug</button>
+      </div>
+      <div class="explain">14,496 parameters, 100%, against 3.25 million and 12.1%.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">What does a fused attention kernel like FlashAttention change?</p>
+      <div class="opts">
+        <button class="opt">It makes attention O(n) in arithmetic</button>
+        <button class="opt">It approximates the softmax</button>
+        <button class="opt">It never stores the n × n score matrix, so memory grows linearly and less data moves</button>
+        <button class="opt">It removes the need for the √d scaling</button>
+      </div>
+      <div class="explain">Measured at 16,384 tokens: 16 MB instead of 8.2 GB, about 3× faster; same result.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"scale":[{"d":4,"unscaled":{"score_std":1.998,"max_weight":0.2732,"entropy":2.813,"grad_norm":0.2648},"scaled":{"score_std":0.999,"max_weight":0.1046,"entropy":3.702,"grad_norm":0.1836}},{"d":16,"unscaled":{"score_std":4.001,"max_weight":0.5773,"entropy":1.382,"grad_norm":0.3168},"scaled":{"score_std":1.0,"max_weight":0.1069,"entropy":3.688,"grad_norm":0.185}},{"d":64,"unscaled":{"score_std":7.991,"max_weight":0.792,"entropy":0.582,"grad_norm":0.2687},"scaled":{"score_std":0.999,"max_weight":0.1073,"entropy":3.686,"grad_norm":0.1849}},{"d":256,"unscaled":{"score_std":15.984,"max_weight":0.8973,"entropy":0.264,"grad_norm":0.2085},"scaled":{"score_std":0.999,"max_weight":0.1071,"entropy":3.686,"grad_norm":0.1848}},{"d":1024,"unscaled":{"score_std":31.99,"max_weight":0.9492,"entropy":0.126,"grad_norm":0.1507},"scaled":{"score_std":1.0,"max_weight":0.1072,"entropy":3.685,"grad_norm":0.1845}}],"scale_uniform_entropy":4.159,"lookup":{"attention":{"acc":100.0,"params":14496,"curve":[3.4664,0.044,0.0122,0.0059,0.0036,0.0024,0.0017,0.0013,0.001,0.0008,0.0006,0.0005,0.0004,0.0004,0.0003,0.0002,0.0002,0.0002,0.0002,0.0001,0.0001,0.0001,0.0001,0.0001,0.0001,0.0001,0.0001,0.0,0.0,0.0]},"MLP on the concatenated pairs":{"acc":12.13,"params":3250208,"curve":[3.47,3.1288,2.9321,3.0048,2.8813,2.7578,2.7554,2.7363,2.8135,2.7331,2.7447,2.7163,2.719,2.6931,2.6413,2.6181,2.5632,2.6495,2.593,2.6286,2.6066,2.6215,2.5781,2.5419,2.5942,2.5529,2.5358,2.5405,2.5618,2.5825]}},"lookup_examples":[{"keys":[10,22,17,2,20,24,6,15,1,13,28,26,7,8,18,12],"query":8,"weights":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.999,0.0,0.0],"answer_pos":13},{"keys":[19,31,8,4,16,27,28,7,30,14,0,29,24,23,26,18],"query":18,"weights":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.001,0.0,0.0,0.0,0.0,0.999],"answer_pos":15},{"keys":[5,24,1,30,15,27,28,11,14,31,13,22,20,19,16,29],"query":29,"weights":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.999],"answer_pos":15},{"keys":[12,24,28,7,26,6,17,16,18,20,23,25,0,9,30,27],"query":27,"weights":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0],"answer_pos":15},{"keys":[11,28,5,19,18,25,29,6,1,10,4,24,12,15,7,23],"query":6,"weights":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"answer_pos":7},{"keys":[26,2,27,5,29,19,16,24,17,14,30,4,22,0,1,13],"query":4,"weights":[0.0,0.0,0.0,0.0,0.001,0.0,0.0,0.0,0.0,0.0,0.0,0.999,0.0,0.0,0.0,0.0],"answer_pos":11}],"cost":[{"n":512,"scores_mb":4.0,"naive_ms":0.045,"naive_peak_mb":8.5,"fused_ms":0.028,"fused_peak_mb":0.5},{"n":1024,"scores_mb":16.0,"naive_ms":0.09,"naive_peak_mb":33.0,"fused_ms":0.07,"fused_peak_mb":1.0},{"n":2048,"scores_mb":64.0,"naive_ms":0.59,"naive_peak_mb":130.0,"fused_ms":0.268,"fused_peak_mb":2.0},{"n":4096,"scores_mb":256.0,"naive_ms":2.737,"naive_peak_mb":516.0,"fused_ms":0.938,"fused_peak_mb":4.0},{"n":8192,"scores_mb":1024.0,"naive_ms":10.331,"naive_peak_mb":2056.0,"fused_ms":3.349,"fused_peak_mb":8.0},{"n":16384,"scores_mb":4096.0,"naive_ms":38.43,"naive_peak_mb":8208.0,"fused_ms":13.2,"fused_peak_mb":16.0}]};
+  function look() {
+    const e = D.lookup_examples[+$('#atX .active').dataset.v];
+    let h = `<div class="small" style="margin-bottom:6px">16 keys (symbols 0–31); the query is key <b>${e.query}</b>. Bars show the trained model’s attention weight on each pair.</div><div class="at-kv">` + e.keys.map((k, i) => `<div style="${i === e.answer_pos ? 'border-color:#16a34a;' : ''}background:rgba(124,58,237,${0.08 + 0.8 * e.weights[i]})">${k}</div>`).join('') + '</div>';
+    h += '<div style="margin-top:12px">' + e.keys.map((k, i) => `<div class="at-bar"><span>key ${k}${i === e.answer_pos ? ' (matches)' : ''}</span><span class="track"><i style="width:${Math.max(0.3, 100 * e.weights[i])}%;background:${i === e.answer_pos ? '#16a34a' : '#7c3aed'}"></i></span><span class="n">${e.weights[i].toFixed(3)}</span></div>`).join('') + '</div>';
+    $('#atL').innerHTML = h;
+    const L_ = D.lookup;
+    $('#atStats').innerHTML = `<div class="stat good"><div class="k">Weight on the matching key</div><div class="v">${e.weights[e.answer_pos].toFixed(3)}</div></div><div class="stat good"><div class="k">Attention accuracy</div><div class="v">${L_.attention.acc}% (${L_.attention.params.toLocaleString()} params)</div></div><div class="stat bad"><div class="k">MLP accuracy</div><div class="v">${L_['MLP on the concatenated pairs'].acc}% (${(L_['MLP on the concatenated pairs'].params / 1e6).toFixed(2)} M)</div></div>`;
+    $('#atWhy').innerHTML = '<b>A learned exact lookup.</b> After training, the query’s attention lands almost entirely on the one key that matches, and the output is that pair’s value. The network learned query and key maps that make matching symbols score far above the rest; the softmax did the selecting.';
+  }
+  function scale() {
+    const m = $('#atS .active').dataset.v, S = D.scale, W = 600, H = 250, L = 50, R = 14, T = 12, B = 34, lx = d => L + (Math.log2(d) - 2) / 8 * (W - L - R);
+    const hi = m === 'entropy' ? 4.3 : m === 'max_weight' ? 1 : 33, y = v => T + (1 - v / hi) * (H - T - B);
+    let g = '';
+    for (let i = 0; i <= 4; i++) { const v = hi * i / 4; g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${+v.toFixed(2)}</text>`; }
+    S.forEach(s => g += `<text x="${lx(s.d)}" y="${H - 18}" text-anchor="middle">${s.d}</text>`);
+    g += `<text x="${(W + L) / 2}" y="${H - 2}" text-anchor="middle">dimension d of queries and keys (log scale)</text>`;
+    if (m === 'entropy') g += `<line x1="${L}" x2="${W - R}" y1="${y(D.scale_uniform_entropy)}" y2="${y(D.scale_uniform_entropy)}" stroke="var(--muted)" stroke-dasharray="5 4"/><text x="${W - R}" y="${y(D.scale_uniform_entropy) - 4}" text-anchor="end">uniform over 64 keys</text>`;
+    [['unscaled', '#e11d48'], ['scaled', '#16a34a']].forEach(([k, c]) => g += `<polyline fill="none" stroke="${c}" stroke-width="2.5" points="${S.map(s => lx(s.d) + ',' + y(s[k][m])).join(' ')}"/>` + S.map(s => `<circle cx="${lx(s.d)}" cy="${y(s[k][m])}" r="4" fill="${c}"/>`).join(''));
+    $('#atG').innerHTML = g;
+    const last = S.at(-1);
+    $('#atStats').innerHTML = `<div class="stat bad"><div class="k">d = 1,024 unscaled</div><div class="v">${last.unscaled[m]}</div></div><div class="stat good"><div class="k">d = 1,024 scaled</div><div class="v">${last.scaled[m]}</div></div>`;
+    $('#atWhy').innerHTML = m === 'entropy' ? '<b>Unscaled attention collapses as d grows.</b> High entropy means weight spread over many keys; low means almost all on one. Without the √d, the weights become nearly one-hot purely because the dimension is large, before any learning. Scaled, they look the same at every d.' : m === 'max_weight' ? '<b>One random key takes almost everything.</b> At d = 1,024 the unscaled softmax gives 95% of the weight to a single key chosen by noise.' : '<b>The cause: scores spread as √d.</b> A dot product of d unit-variance terms has standard deviation √d; dividing by √d restores 1.';
+  }
+  function cost() {
+    const C = D.cost, bar = (l, v, mx, u, c) => `<div class="at-bar"><span>${l}</span><span class="track"><i style="width:${Math.max(0.4, 100 * Math.log10(v * 100 + 1) / Math.log10(mx * 100 + 1))}%;background:${c}"></i></span><span class="n">${v.toLocaleString()} ${u}</span></div>`;
+    const mt = Math.max(...C.map(c => c.naive_ms || 0)), mm = Math.max(...C.map(c => c.naive_peak_mb || 0));
+    $('#atC').innerHTML = '<div style="margin-bottom:4px"><b>Time per forward pass (log scale)</b></div>' + C.map(c => bar(`n = ${c.n.toLocaleString()}, naive`, c.naive_ms, mt, 'ms', '#e11d48') + bar(`n = ${c.n.toLocaleString()}, fused`, c.fused_ms, mt, 'ms', '#16a34a')).join('') +
+      '<div style="margin:12px 0 4px"><b>Peak memory (log scale)</b></div>' + C.map(c => bar(`n = ${c.n.toLocaleString()}, naive`, c.naive_peak_mb, mm, 'MB', '#e11d48') + bar(`n = ${c.n.toLocaleString()}, fused`, c.fused_peak_mb, mm, 'MB', '#16a34a')).join('');
+    const l = C.at(-1);
+    $('#atStats').innerHTML = `<div class="stat bad"><div class="k">Naive at ${l.n.toLocaleString()}</div><div class="v">${l.naive_peak_mb.toLocaleString()} MB</div></div><div class="stat good"><div class="k">Fused at ${l.n.toLocaleString()}</div><div class="v">${l.fused_peak_mb} MB</div></div><div class="stat"><div class="k">Speed-up</div><div class="v">${(l.naive_ms / l.fused_ms).toFixed(1)}×</div></div>`;
+    $('#atWhy').innerHTML = '<b>Quadratic memory, unless you never store the matrix.</b> Every doubling of n quadruples the naive version’s memory; the fused kernel’s doubles. Both still do n² work, so time grows quadratically for both, but the fused one moves far less data and runs about three times faster.';
+  }
+  function draw() { const v = $('#atE .active').dataset.v; ['look', 'scale', 'cost'].forEach(x => $('#atV' + x).classList.toggle('on', x === v)); ({ look, scale, cost })[v](); }
+  ['#atE', '#atX', '#atS'].forEach(id => $(id).addEventListener('segchange', draw)); draw();
+})();
+</script>
+</body>
+</html>

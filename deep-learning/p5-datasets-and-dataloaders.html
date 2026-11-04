@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Datasets, DataLoaders &amp; Batching · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Prerequisite 5 of Deep Learning. Dataset and DataLoader, shuffling, worker processes and pinned memory measured on Windows (1.4 s of start-up per worker, then 34k to 161k images per second), whether the loader keeps a GPU busy, label-sorted data without shuffling (86.9% vs 14.9%), and splits that do not leak.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .dl5-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .dl5-v { display:none; } .dl5-v.on { display:block; }
+  .dl5-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .dl5-box svg { width:100%; height:auto; display:block; } .dl5-box text { font-size:12px; fill:var(--muted); }
+  .dl5-bar { display:grid; grid-template-columns:minmax(0, 170px) 1fr 110px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .dl5-bar .track { height:13px; border-radius:4px; background:var(--surface); overflow:hidden; position:relative; } .dl5-bar .track i { display:block; height:100%; }
+  .dl5-bar .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .dl5-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .dl5-bar { grid-template-columns:minmax(0, 100px) 1fr 86px; font-size:12px; } }
+</style>
+</head>
+<body data-chapter="0.5">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Prerequisite 5</span><span class="pill green">Prerequisites</span><span class="pill">⏱ 35 min</span></div>
+    <h1>Datasets, DataLoaders &amp; <span class="grad">Batching</span></h1>
+    <p class="lead">A GPU that waits for data is the most expensive idle hardware in the building. Between the files on disk and the tensor the model sees sits the <b>input pipeline</b>: a <code>Dataset</code> that knows how to fetch and transform one example, and a <code>DataLoader</code> that shuffles, batches, and runs that work in background processes while the GPU trains. Get it right and nobody thinks about it; get it wrong and either the GPU starves or the model learns from data in an order, or a split, that quietly invalidates the result.</p>
+    <p class="lead">This prerequisite measures the pipeline on this machine, a Windows desktop where worker processes are <b>spawned</b>, not forked. Each worker cost about 1.4 seconds to start, so the first epoch with 8 workers was seven times slower than with none; from the second epoch on, with <code>persistent_workers</code>, the same 8 workers delivered 161,000 augmented CIFAR-10 images a second against 34,000 with none. A small CNN consumed 29,600 a second, so a heavier per-image transform with no workers left the GPU waiting. Training on Fashion-MNIST sorted by label without shuffling reached 14.9% instead of 86.9%.</p>
+    <ul class="objectives">
+      <li><span>Write a map-style <code>Dataset</code> and wrap it in a <code>DataLoader</code></span></li>
+      <li><span>Choose workers, pinned memory and persistent workers from measurements</span></li>
+      <li><span>Tell whether the loader or the GPU is the bottleneck</span></li>
+      <li><span>Know what shuffling protects against, and when a custom collate function is needed</span></li>
+      <li><span>Build train, validation and test splits that do not leak</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>The training loop:</b> <a href="p4-pytorch-modules-and-autograd.html">P4</a>. <b>Tensors and dtypes:</b> <a href="p1-tensors-shapes-and-broadcasting.html">P1</a>.</li>
+        <li>Why splits matter in general is taught in ML Fundamentals: <a href="../ml-fundamentals/03-data-splits.html">Train, Validation &amp; Test Splits</a>. Padding variable-length text batches is in NLP: <a href="../nlp/p2-pytorch-for-text.html">PyTorch for Text</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Dataset and DataLoader</h2>
+  <p>A <b>map-style</b> <code>Dataset</code> answers two questions: how many examples there are (<code>__len__</code>) and what example i is (<code>__getitem__</code>), including any per-example work such as decoding, cropping or flipping. A <code>DataLoader</code> asks a <b>sampler</b> for indices, calls <code>__getitem__</code> for each, and hands the list to a <b>collate function</b> that stacks them into batch tensors.</p>
+<pre class="code"><span class="k">class</span> <span class="t">CifarAug</span>(<span class="t">Dataset</span>):
+    <span class="k">def</span> <span class="f">__init__</span>(self, x, y): self.x, self.y = x, y            <span class="c"># x (50000, 32, 32, 3) uint8, y (50000,)</span>
+    <span class="k">def</span> <span class="f">__len__</span>(self): <span class="k">return</span> <span class="f">len</span>(self.x)
+    <span class="k">def</span> <span class="f">__getitem__</span>(self, i):
+        img = torch.<span class="f">from_numpy</span>(self.x[i]).<span class="f">permute</span>(<span class="m">2</span>, <span class="m">0</span>, <span class="m">1</span>).<span class="f">float</span>() / <span class="m">255</span>   <span class="c"># (3, 32, 32)</span>
+        img = F.<span class="f">pad</span>(img, (<span class="m">4</span>, <span class="m">4</span>, <span class="m">4</span>, <span class="m">4</span>), mode=<span class="s">"reflect"</span>)               <span class="c"># (3, 40, 40)</span>
+        dx, dy = np.random.<span class="f">randint</span>(<span class="m">0</span>, <span class="m">9</span>, <span class="m">2</span>); img = img[:, dy:dy + <span class="m">32</span>, dx:dx + <span class="m">32</span>]   <span class="c"># random crop</span>
+        <span class="k">if</span> np.random.<span class="f">rand</span>() &lt; <span class="m">0.5</span>: img = img.<span class="f">flip</span>(<span class="m">2</span>)                    <span class="c"># random horizontal flip</span>
+        <span class="k">return</span> (img - <span class="m">0.47</span>) / <span class="m">0.25</span>, <span class="f">int</span>(self.y[i])
+
+loader = <span class="t">DataLoader</span>(<span class="t">CifarAug</span>(x, y), batch_size=<span class="m">256</span>, shuffle=<span class="k">True</span>,
+                    num_workers=<span class="m">8</span>, pin_memory=<span class="k">True</span>, persistent_workers=<span class="k">True</span>)
+<span class="k">for</span> xb, yb <span class="k">in</span> loader:                                               <span class="c"># xb (256, 3, 32, 32), yb (256,)</span>
+    xb = xb.<span class="f">to</span>(<span class="s">"cuda"</span>, non_blocking=<span class="k">True</span>)                          <span class="c"># overlaps the copy with compute when pinned</span></pre>
+  <p>The default collate function stacks tensors and turns Python numbers into tensors, recursively through tuples, lists and dicts. It fails when examples have different shapes, such as sentences of different lengths or images of different sizes; then you write a <code>collate_fn</code> that pads, crops or keeps a list. With <code>len(dataset) = 50,000</code> and batch 256 the last batch has 80 examples; <code>drop_last=True</code> discards it, which matters for layers whose behaviour depends on batch size, such as batch norm on a batch of 1. An <b>iterable-style</b> dataset (<code>IterableDataset</code>) instead yields examples in a stream, for data too big to index, such as shards read from object storage.</p>
+
+  <h2>Workers and pinned memory</h2>
+  <p>With <code>num_workers=0</code>, the training process itself runs <code>__getitem__</code> for every example, and the GPU waits while it does. With N workers, N separate processes build batches in parallel and queue them, so the next batch is usually ready when the GPU asks. On Linux, workers are created by <code>fork</code>, which copies the parent process almost for free. On Windows and macOS they are <b>spawned</b>: each worker starts a fresh Python interpreter, imports PyTorch and your module again, and receives the dataset by pickling. That is why the training script needs an <code>if __name__ == "__main__":</code> guard, and why start-up time matters.</p>
+  <table class="t cmp">
+    <thead><tr><th>CIFAR-10, batch 256</th><th>Epoch 1 (includes start-up)</th><th>Epoch 2, light transform</th><th>Epoch 2, heavy transform</th></tr></thead>
+    <tbody>
+      <tr><td>0 workers</td><td>1.66 s</td><td>34,000 img/s</td><td>18,300 img/s</td></tr>
+      <tr><td>2 workers</td><td>3.44 s</td><td>60,000 img/s</td><td>30,300 img/s</td></tr>
+      <tr><td>4 workers</td><td>5.92 s</td><td>104,000 img/s</td><td>54,600 img/s</td></tr>
+      <tr><td><b>8 workers</b></td><td>11.65 s</td><td><b>161,000 img/s</b></td><td><b>93,000 img/s</b></td></tr>
+      <tr><td>Augment on the GPU instead (whole batch at once)</td><td colspan="3">1,590,000 img/s: the CPU pipeline is no longer involved</td></tr>
+    </tbody>
+  </table>
+  <p>Three lessons from this table. First, on Windows each worker cost about 1.4 s to start, so without <code>persistent_workers=True</code> you pay that again at the start of every epoch, and short epochs get slower with more workers, not faster. Second, once started, workers scaled almost linearly to 8 on this 16-core CPU. Third, <code>pin_memory</code> made no measurable difference here (34,500 against 33,900 img/s at 0 workers, within noise), because a 3 MB batch copies to the GPU in well under a millisecond; it pays off when batches are large or the copy can overlap a long compute step.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Loader lab</span><span class="p-tag">Measured + simulated</span></div>
+    <div class="panel-body">
+      <div class="dl5-l">View</div>
+      <div class="seg" id="dlE"><button class="active" data-v="tp">throughput</button><button data-v="tl">who is waiting</button><button data-v="sh">shuffling</button></div>
+      <div class="dl5-v on" id="dlVtp">
+        <div class="dl5-l">Per-image transform</div>
+        <div class="seg" id="dlT"><button class="active" data-v="light">light: crop + flip</button><button data-v="heavy">heavy: + blur + colour jitter</button></div>
+        <div class="dl5-box" id="dlB"></div>
+      </div>
+      <div class="dl5-v" id="dlVtl">
+        <div class="dl5-l">Workers</div>
+        <div class="seg" id="dlW"><button data-v="0">0</button><button class="active" data-v="1">1</button><button data-v="2">2</button><button data-v="4">4</button></div>
+        <div class="dl5-l">Transform</div>
+        <div class="seg" id="dlT2"><button data-v="light">light</button><button class="active" data-v="heavy">heavy</button></div>
+        <div class="dl5-box"><svg id="dlG" viewBox="0 0 640 210"></svg></div>
+      </div>
+      <div class="dl5-v" id="dlVsh"><div class="dl5-box" id="dlS"></div></div>
+      <div class="stats" id="dlStats"></div>
+      <div class="dl5-why" id="dlWhy"></div>
+    </div>
+    <div class="panel-foot">Measured on Windows 11, 16 logical CPU cores, RTX 5070 Ti, PyTorch 2.11. Throughput: one pass over the 50,000 CIFAR-10 training images, batch 256, shuffled, each batch copied to the GPU; epoch 2 uses <code>persistent_workers=True</code>. GPU consumption: a 4-conv CNN (64-128-256-256 channels, batch norm, bf16 autocast) training at batch 256 took 8.66 ms per step, 29,600 img/s. The “who is waiting” timeline is a <b>simulation</b> built from those measured costs (CPU time per batch from the 0-worker rate, 8.66 ms per GPU step, a prefetch queue of 2 per worker), not a trace. Shuffling: 784-256-256-10 MLP, Adam 1e-3, batch 128, seed 0.</div>
+  </div>
+
+  <h2>Is the loader the bottleneck?</h2>
+  <p>Compare two rates: how fast the pipeline produces examples and how fast the training step consumes them. The small CNN above consumed 29,600 images per second. With the light transform, even 0 workers produced 34,000, so workers could not speed training up much; with the heavy transform, 0 workers produced only 18,300, and the GPU sat idle for about 40% of every step. Two workers (30,300) were just enough; four gave headroom. The quick test: time an epoch of the loader alone with no model, and an epoch of the model on one cached batch. Whichever is slower sets the pace. Chapter 22 does this with the profiler, and moves augmentation onto the GPU when the CPU cannot keep up.</p>
+  <figure class="flow">
+    <ol>
+      <li><b>Sampler</b><small>shuffled indices</small></li>
+      <li><b>Workers</b><small>__getitem__ × batch, in parallel</small></li>
+      <li><b>Collate</b><small>stack into (B, …) tensors</small></li>
+      <li><b>Pinned buffer</b><small>page-locked host memory</small></li>
+      <li><b>Copy to GPU</b><small>non_blocking, overlaps compute</small></li>
+      <li><b>Training step</b><small>forward, backward, step</small></li>
+    </ol>
+    <figcaption><b>The input pipeline.</b> Workers keep a queue of ready batches (<code>prefetch_factor</code>, 2 per worker by default) so the GPU never asks for one that is not there.</figcaption>
+  </figure>
+
+  <h2>Shuffling and sampling</h2>
+  <p>SGD assumes each mini-batch is a fair, random sample of the training set, so its gradient points, on average, where the full-data gradient points. Data on disk is rarely in random order: it is sorted by class, by date, by user, by the order it was scraped. Train on it in that order and every batch tells the model a different, extreme story. Measured on Fashion-MNIST sorted by label: with shuffling the MLP reached 85.2%, 86.8% and 86.9% after each of three epochs; without shuffling it reached 10.0%, 10.8% and 14.9%, and on the test set it predicted class 8 or 9, the last two classes it had seen, for 98% of images. <code>shuffle=True</code> draws a fresh permutation every epoch. For imbalanced data, a <code>WeightedRandomSampler</code> samples rare classes more often (ML Fundamentals covers imbalance: <a href="../ml-fundamentals/23-imbalanced-data.html">Imbalanced Data</a>).</p>
+  <p>Randomness inside workers also needs care. Older PyTorch on Linux forked every worker with the same NumPy random state, so four workers produced four identical sequences of “random” crops. Current PyTorch seeds Python’s and NumPy’s generators separately in each worker; on this machine, 64 NumPy draws from 4 workers were all distinct and changed between epochs. For reproducible runs, pass a seeded <code>generator</code> to the DataLoader and derive any other library’s seed in a <code>worker_init_fn</code>.</p>
+
+  <h2>Splits that do not leak</h2>
+  <p>A test set is only a test if nothing about it reached training. The usual leaks in deep-learning pipelines:</p>
+  <table class="t cmp">
+    <thead><tr><th>Leak</th><th>How it happens</th><th>Prevention</th></tr></thead>
+    <tbody>
+      <tr><td>Duplicates across splits</td><td>The same image saved twice, or crawled twice</td><td>Hash and de-duplicate before splitting; check near-duplicates with perceptual hashes or embeddings</td></tr>
+      <tr><td>Groups split apart</td><td>Frames of one video, scans of one patient, photos of one product in both train and test</td><td>Split by group ID (<code>GroupShuffleSplit</code>), not by example</td></tr>
+      <tr><td>Time travel</td><td>Random split of time-ordered data</td><td>Train on the past, test on the future</td></tr>
+      <tr><td>Statistics from all data</td><td>Normalisation mean and std computed before splitting</td><td>Compute them on the training split only</td></tr>
+      <tr><td>Tuning on the test set</td><td>Choosing epochs or hyperparameters by test accuracy</td><td>A separate validation split; look at the test set once</td></tr>
+    </tbody>
+  </table>
+  <p>For the three benchmark sets used in this course, an MD5 hash of every image found <b>no exact duplicates</b> between train and test, or within train (Fashion-MNIST 60,000/10,000, MNIST 60,000/10,000, CIFAR-10 50,000/10,000). Exact hashing is a weak test, though: Barz and Denzler (2020) found near-duplicates of training images for about 3% of the CIFAR-10 test set, images that differ by a crop or a colour shift and that an MD5 hash cannot see. Make the validation split with a fixed seed, <code>torch.utils.data.random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(0))</code>, so that every run evaluates on the same examples.</p>
+
+  <div class="callout usecase">
+    <div class="ico">🩻</div>
+    <div class="body"><div class="title">Use case: the X-ray model that recognised patients</div><p>A team trains a chest X-ray classifier on 100,000 images and gets 97% validation accuracy with a random split. On images from a new hospital it scores 71%. Many patients had several scans, and the random split put scans of the same patient in both train and validation, so the network could score well by recognising the patient and their previous diagnosis rather than reading the scan. Re-splitting by patient ID dropped validation accuracy to 82%, a number that matched the new hospital far better. The data loader code did not change; the split did.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>No shuffling on sorted data</b>: measured 14.9% vs 86.9%, the model predicting only the last classes it saw.</li>
+      <li><b>Workers without <code>persistent_workers</code> on Windows</b>: about 1.4 s of start-up per worker, paid every epoch.</li>
+      <li><b>More workers than the bottleneck needs</b>: with a light transform, 0 workers already outpaced the GPU here.</li>
+      <li><b>Missing <code>if __name__ == "__main__":</code></b> with workers on Windows: every worker re-runs the training script.</li>
+      <li><b>Splitting by example when examples come in groups</b> (patients, users, videos): validation accuracy measures memorisation.</li>
+      <li><b>Normalisation statistics from the whole dataset</b>, or tuning on the test set.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Your GPU utilisation is 40% during training. How do you find out whether the data loader is to blame?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Measure the two rates separately. Iterate over the DataLoader alone, with no model, and count images per second; then train the model for a few hundred steps on a single batch already on the GPU and count images per second. If the loader is slower, it is the bottleneck. Then the fixes are more workers with persistent workers, cheaper decoding (smaller stored images, a faster format), and moving augmentation onto the GPU. I measured this on CIFAR-10: a small CNN consumed about 30,000 images per second, a heavy CPU transform with no workers produced 18,000, and two or more workers were enough to keep up.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why does the order of training examples matter for SGD, and what does shuffle=True do?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>SGD treats each mini-batch gradient as a noisy but unbiased estimate of the full-data gradient. That only holds if batches are random samples. If the data is sorted, say by class, consecutive batches pull the weights towards one class at a time and the model ends up fitting whatever it saw last. <code>shuffle=True</code> draws a new random permutation of the indices every epoch, so every batch is a fair sample and successive epochs see different batch compositions. On Fashion-MNIST sorted by label, training without shuffling reached 14.9% after three epochs and predicted the last two classes for almost everything, against 86.9% with shuffling.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A Dataset fetches and transforms one example; a DataLoader samples, batches, collates and parallelises.</li>
+      <li>On Windows, workers are spawned: about 1.4 s each to start. Use <code>persistent_workers=True</code>.</li>
+      <li>Find the bottleneck by measuring the loader alone and the model alone; here 2 workers were enough for a 29,600 img/s CNN.</li>
+      <li>Shuffle: label-sorted data without it gave 14.9% instead of 86.9%.</li>
+      <li>Split by group and by time where they exist, de-duplicate first, and compute statistics on training data only.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">On this Windows machine, why was the first epoch with 8 workers slower than with 0?</p>
+      <div class="opts">
+        <button class="opt">Workers compete for the GPU</button>
+        <button class="opt">pin_memory was off</button>
+        <button class="opt">Each spawned worker starts a new Python process and imports PyTorch, about 1.4 s each, before producing a batch</button>
+        <button class="opt">Workers process images in a different order</button>
+      </div>
+      <div class="explain">From epoch 2, with persistent workers, 8 workers delivered 161,000 img/s against 34,000 with none.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">The loader produces 18,000 img/s and the training step consumes 29,600 img/s. What happens?</p>
+      <div class="opts">
+        <button class="opt">The GPU waits for data for roughly 40% of each step</button>
+        <button class="opt">The loader drops images to keep up</button>
+        <button class="opt">Training runs at 29,600 img/s</button>
+        <button class="opt">The batch size shrinks automatically</button>
+      </div>
+      <div class="explain">The slower stage sets the pace: 18,000/29,600 ≈ 61% busy.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Fashion-MNIST sorted by label, trained without shuffling: what did the model predict on the test set?</p>
+      <div class="opts">
+        <button class="opt">Every class equally</button>
+        <button class="opt">Only class 0</button>
+        <button class="opt">The correct class 86% of the time</button>
+        <button class="opt">Class 8 or 9, the last classes it saw, for about 98% of images</button>
+      </div>
+      <div class="explain">Each run of batches pulled the weights towards one class; it ended fitting the end of the file. Accuracy 14.9%.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">A medical dataset has several images per patient. How should you split it?</p>
+      <div class="opts">
+        <button class="opt">Randomly by image, with a fixed seed</button>
+        <button class="opt">By patient, so all of a patient’s images land in the same split</button>
+        <button class="opt">By image, stratified by label</button>
+        <button class="opt">It does not matter as long as the test set is large</button>
+      </div>
+      <div class="explain">Otherwise the model can score well by recognising patients rather than reading images.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">When does a custom collate_fn become necessary?</p>
+      <div class="opts">
+        <button class="opt">Whenever num_workers is above 0</button>
+        <button class="opt">When labels are integers</button>
+        <button class="opt">When examples have different shapes, such as variable-length sequences, so the default stacking fails</button>
+        <button class="opt">Only for iterable-style datasets</button>
+      </div>
+      <div class="explain">The default collate stacks tensors of equal shape; padding or keeping lists needs your own function.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"loader_steady":[{"transform":"light","workers":0,"pin":false,"epoch1_s":1.66,"epoch2_s":1.48,"img_per_s_epoch2":33865},{"transform":"light","workers":0,"pin":true,"epoch1_s":1.44,"epoch2_s":1.45,"img_per_s_epoch2":34499},{"transform":"light","workers":2,"pin":true,"epoch1_s":3.44,"epoch2_s":0.83,"img_per_s_epoch2":60353},{"transform":"light","workers":4,"pin":false,"epoch1_s":5.92,"epoch2_s":0.48,"img_per_s_epoch2":103600},{"transform":"light","workers":4,"pin":true,"epoch1_s":6.25,"epoch2_s":0.53,"img_per_s_epoch2":95207},{"transform":"light","workers":8,"pin":true,"epoch1_s":11.65,"epoch2_s":0.31,"img_per_s_epoch2":160985},{"transform":"heavy","workers":0,"pin":false,"epoch1_s":2.65,"epoch2_s":2.73,"img_per_s_epoch2":18298},{"transform":"heavy","workers":0,"pin":true,"epoch1_s":2.65,"epoch2_s":2.71,"img_per_s_epoch2":18471},{"transform":"heavy","workers":2,"pin":true,"epoch1_s":4.34,"epoch2_s":1.65,"img_per_s_epoch2":30273},{"transform":"heavy","workers":4,"pin":false,"epoch1_s":6.2,"epoch2_s":0.92,"img_per_s_epoch2":54563},{"transform":"heavy","workers":4,"pin":true,"epoch1_s":6.15,"epoch2_s":0.89,"img_per_s_epoch2":56208},{"transform":"heavy","workers":8,"pin":true,"epoch1_s":12.24,"epoch2_s":0.54,"img_per_s_epoch2":93015}],"gpu_step":{"ms":8.66,"img_per_s":29559},"shuffle":{"shuffled":{"acc_by_epoch":[85.24,86.77,86.85],"pred_share":[10.4,9.7,9.0,9.3,11.3,10.7,10.1,9.4,9.8,10.2]},"sorted by label, no shuffle":{"acc_by_epoch":[10.0,10.82,14.89],"pred_share":[0.0,0.0,0.0,0.0,0.0,0.1,0.1,1.8,52.2,45.8]}}};
+  const S = D.loader_steady, GPU = D.gpu_step;
+  const row = (t, w, pin) => S.find(x => x.transform === t && x.workers === w && (pin === undefined || x.pin === pin));
+
+  function tp() {
+    const t = $('#dlT .active').dataset.v, ws = [0, 2, 4, 8], mx = 165000;
+    const bar = (l, v, c, extra) => `<div class="dl5-bar"><span>${l}</span><span class="track"><i style="width:${100 * v / mx}%;background:${c}"></i></span><span class="n">${v.toLocaleString()}${extra || ''}</span></div>`;
+    let h = '<div style="margin-bottom:4px"><b>Images per second delivered to the GPU, epoch 2 (persistent workers)</b></div>';
+    ws.forEach(w => { const x = row(t, w, true) || row(t, w); h += bar(`${w} worker${w === 1 ? '' : 's'}`, x.img_per_s_epoch2, x.img_per_s_epoch2 >= GPU.img_per_s ? '#16a34a' : '#f97316'); });
+    h += bar('GPU training step consumes', GPU.img_per_s, '#7c3aed');
+    h += '<div style="margin:14px 0 4px"><b>Epoch 1 wall time, including worker start-up (seconds)</b></div>';
+    ws.forEach(w => { const x = row(t, w, true) || row(t, w); h += `<div class="dl5-bar"><span>${w} worker${w === 1 ? '' : 's'}</span><span class="track"><i style="width:${100 * x.epoch1_s / 13}%;background:#e11d48"></i></span><span class="n">${x.epoch1_s} s</span></div>`; });
+    $('#dlB').innerHTML = h;
+    const z = row(t, 0, true), e8 = row(t, 8, true);
+    $('#dlStats').innerHTML = `<div class="stat${z.img_per_s_epoch2 >= GPU.img_per_s ? ' good' : ' bad'}"><div class="k">0 workers</div><div class="v">${z.img_per_s_epoch2.toLocaleString()}/s</div></div><div class="stat good"><div class="k">8 workers</div><div class="v">${e8.img_per_s_epoch2.toLocaleString()}/s</div></div><div class="stat"><div class="k">Start-up per worker</div><div class="v">≈ ${((e8.epoch1_s - e8.epoch2_s) / 8).toFixed(1)} s</div></div>`;
+    $('#dlWhy').innerHTML = t === 'light' ? '<b>A light transform is cheap.</b> Even with no workers, the main process produced more images per second than the CNN could train on (green bars outpace the purple one), so workers would speed this run up very little. They would cost 1.4 s each per epoch without persistent workers.'
+      : '<b>A heavier transform starves the GPU.</b> With no workers, the loader delivers fewer images than the training step consumes (orange), so the GPU waits. Two workers are just enough; with more, the queue stays full.';
+  }
+
+  function tl() {
+    const w = +$('#dlW .active').dataset.v, t = $('#dlT2 .active').dataset.v;
+    const cpu = 256 / row(t, 0, false).img_per_s_epoch2 * 1000, gpu = GPU.ms, N = 14;
+    // simulate: workers each produce batches back to back (prefetch up to 2 per worker); GPU takes the next ready batch in order
+    const ready = [], gStart = [], gEnd = [], wLane = [];
+    if (w === 0) { let tt = 0; for (let i = 0; i < N; i++) { ready.push([tt, tt + cpu]); tt += cpu; gStart.push(tt); tt += gpu; gEnd.push(tt); wLane.push(0); } }
+    else {
+      const free = Array(w).fill(0);
+      for (let i = 0; i < N; i++) {
+        const k = i % w, limit = i >= 2 * w ? gStart[i - 2 * w] : 0; const s = Math.max(free[k], limit || 0), e = s + cpu; free[k] = e; ready.push([s, e]); wLane.push(k);
+        const gs = Math.max(e, i ? gEnd[i - 1] : 0); gStart.push(gs); gEnd.push(gs + gpu);
+      }
+    }
+    const T = gEnd[N - 1], lanes = Math.max(1, w), W = 640, L = 80, Rr = 10, lh = 22, y0 = 16, x = v => L + v / T * (W - L - Rr);
+    let g = '';
+    for (let k = 0; k < lanes; k++) g += `<text x="${L - 6}" y="${y0 + k * lh + 15}" text-anchor="end">${w ? 'worker ' + k : 'main (CPU)'}</text>`;
+    ready.forEach(([s, e], i) => g += `<rect x="${x(s)}" y="${y0 + wLane[i] * lh + 2}" width="${Math.max(1, x(e) - x(s) - 1)}" height="${lh - 6}" rx="3" fill="#f97316" opacity=".85"/>`);
+    const gy = y0 + lanes * lh + 10;
+    g += `<text x="${L - 6}" y="${gy + 15}" text-anchor="end">GPU</text>`;
+    gStart.forEach((s, i) => g += `<rect x="${x(s)}" y="${gy + 2}" width="${Math.max(1, x(gEnd[i]) - x(s) - 1)}" height="${lh - 6}" rx="3" fill="#7c3aed"/>`);
+    g += `<text x="${L}" y="${gy + lh + 22}">0 ms</text><text x="${W - Rr}" y="${gy + lh + 22}" text-anchor="end">${T.toFixed(0)} ms for ${N} batches</text>`;
+    $('#dlG').setAttribute('viewBox', `0 0 640 ${gy + lh + 30}`); $('#dlG').innerHTML = g;
+    const busy = N * gpu / (T - gStart[0]) * 100;
+    $('#dlStats').innerHTML = `<div class="stat"><div class="k">CPU per batch</div><div class="v">${cpu.toFixed(1)} ms</div></div><div class="stat"><div class="k">GPU per batch</div><div class="v">${gpu} ms</div></div><div class="stat${busy > 95 ? ' good' : ' bad'}"><div class="k">GPU busy after warm-up</div><div class="v">${Math.min(100, busy).toFixed(0)}%</div></div>`;
+    $('#dlWhy').innerHTML = w === 0 ? '<b>One process does everything, in turn.</b> The GPU (purple) waits while the main process builds each batch (orange), and the CPU waits while the GPU trains. Neither is ever busy all the time.'
+      : busy > 95 ? `<b>The GPU never waits.</b> ${w} worker${w > 1 ? 's' : ''} build batches in parallel faster than the GPU consumes them, so a ready batch is always queued. Extra workers would only fill the queue.`
+      : `<b>Workers help, but not enough.</b> ${w} worker${w > 1 ? 's' : ''} build a batch every ${(cpu / w).toFixed(1)} ms on average; the GPU needs one every ${gpu} ms. Add workers or make the transform cheaper.`;
+  }
+
+  function sh() {
+    const Sx = D.shuffle, a = Sx.shuffled, b = Sx['sorted by label, no shuffle'];
+    const bar = (l, v, c) => `<div class="dl5-bar"><span>${l}</span><span class="track"><i style="width:${v}%;background:${c}"></i></span><span class="n">${v}%</span></div>`;
+    let h = '<div style="margin-bottom:4px"><b>Test accuracy after each epoch</b></div>';
+    [0, 1, 2].forEach(e => { h += bar(`epoch ${e + 1}, shuffled`, a.acc_by_epoch[e], '#16a34a') + bar(`epoch ${e + 1}, sorted`, b.acc_by_epoch[e], '#e11d48'); });
+    h += '<div style="margin:14px 0 4px"><b>Share of test predictions per class, model trained on sorted data</b></div>' + b.pred_share.map((v, c) => bar(`class ${c}`, v, '#e11d48')).join('');
+    $('#dlS').innerHTML = h;
+    $('#dlStats').innerHTML = `<div class="stat good"><div class="k">Shuffled</div><div class="v">${a.acc_by_epoch[2]}%</div></div><div class="stat bad"><div class="k">Sorted, no shuffle</div><div class="v">${b.acc_by_epoch[2]}%</div></div><div class="stat"><div class="k">Predicted class 8 or 9</div><div class="v">${(b.pred_share[8] + b.pred_share[9]).toFixed(0)}%</div></div>`;
+    $('#dlWhy').innerHTML = '<b>The model fits whatever it saw last.</b> Each epoch walks through 6,000 images of class 0, then 6,000 of class 1, and so on, so the last few hundred steps are all classes 8 and 9. A shuffled epoch mixes every class into every batch.';
+  }
+
+  function draw() { const v = $('#dlE .active').dataset.v; ['tp', 'tl', 'sh'].forEach(x => $('#dlV' + x).classList.toggle('on', x === v)); ({ tp, tl, sh })[v](); }
+  ['#dlE', '#dlT', '#dlW', '#dlT2'].forEach(id => $(id).addEventListener('segchange', draw)); draw();
+})();
+</script>
+</body>
+</html>

@@ -19,6 +19,7 @@ no build step.
 | **[Distributed Systems](distributed-systems/)** | 8 prerequisites + 48 | Clocks, replication, quorums, Paxos and Raft, two-phase commit, CRDTs, Kafka and stream processing in Java — plus 8 case studies |
 | **[Cloud & DevOps](cloud-devops/)** | 8 prerequisites + 48 | Docker, Kubernetes, CI/CD, Terraform and observability, then SLOs, disaster recovery, cost and incident response in Bash, YAML and Terraform — plus 8 case studies |
 | **[ML Fundamentals](ml-fundamentals/)** | 8 prerequisites + 48 | Regression, classification, trees and ensembles, clustering, dimensionality reduction, forecasting, calibration, interpretability, leakage and honest evaluation in Python and scikit-learn — 8 case studies on the way |
+| **[Deep Learning](deep-learning/)** | 8 prerequisites + 48 | Tensors, autograd and backprop from scratch, MLPs, losses, optimisers, schedules, initialisation, normalisation and residuals, CNNs, RNNs, attention and a transformer, embeddings, mixed precision, profiling and torch.compile, memory and checkpointing, batch-size scaling, tuning, loss landscapes, double descent and grokking, transfer, tables, GNNs, calibration, pruning, quantisation and distillation, continual learning, state-space models, deep RL, μP, Triton kernels, reproducibility and debugging, each trained or measured on one GPU in Python — 8 case studies on the way |
 | **[ML & AI Systems](ml-ai-systems/)** | 8 prerequisites + 52 | Transformers, RAG, agents, distributed training, inference, MLOps |
 | **[LLMs](llms/)** | 8 prerequisites + 48 | Tokenisation, attention and a GPT built from scratch, pretraining and scaling laws, the KV cache and efficient attention, SFT, LoRA and QLoRA, RLHF and DPO, quantisation, serving and speculative decoding, evaluation, hallucination, interpretability, mixture of experts, multimodal models, safety and reasoning, each trained or measured on one GPU in Python and PyTorch — 8 case studies on the way |
 | **[Computer Vision](computer-vision/)** | 8 prerequisites + 48 | Convolutions and CNNs trained from scratch, augmentation, normalisation, ResNets and transfer learning, detection from anchors to DETR, semantic and instance segmentation, vision transformers, SimCLR, MAE, DINO and CLIP, SAM, VAEs, GANs and diffusion trained on one GPU, Stable Diffusion taken apart, FID, video, optical flow and tracking, stereo and depth, NeRF, OCR, retrieval, adversarial robustness, deployment and debugging, each measured in Python and PyTorch — 8 case studies on the way |
@@ -89,6 +90,7 @@ palak-engineering-atlas/
 ├── distributed-systems/
 ├── cloud-devops/
 ├── ml-fundamentals/
+├── deep-learning/
 ├── ml-ai-systems/
 ├── llms/
 ├── computer-vision/

@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Backpropagation on Tensors · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 4 of Deep Learning. The backward pass of an MLP written by hand on tensors: linear layers, ReLU, and the fused softmax cross-entropy gradient. It matches autograd to 1e-16, trains Fashion-MNIST to 87.1%, and three planted bugs are measured: two that make training collapse to 10% and one that trains normally but fails a gradient check by 98%. Backward costs 1.4 times the forward pass.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .bp-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .bp-v { display:none; } .bp-v.on { display:block; }
+  .bp-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .bp-box svg { width:100%; height:auto; display:block; } .bp-box text { font-size:12px; fill:var(--muted); }
+  .bp-node rect { fill:var(--surface); stroke:var(--border); stroke-width:1.5; } .bp-node text { fill:var(--text); font-family:var(--mono); font-size:11.5px; }
+  .bp-node.bp-fw rect { stroke:var(--accent); stroke-width:3; } .bp-node.bp-bw rect { stroke:#e11d48; stroke-width:3; }
+  .bp-eq { font-family:var(--mono); font-size:13px; margin-top:8px; line-height:1.6; }
+  .bp-row { display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+  .bp-bar { display:grid; grid-template-columns:minmax(0, 180px) 1fr 90px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .bp-bar .track { height:13px; border-radius:4px; background:var(--surface); overflow:hidden; position:relative; } .bp-bar .track i { display:block; height:100%; }
+  .bp-bar .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .bp-key { display:flex; gap:14px; flex-wrap:wrap; font-size:12.5px; margin-top:6px; } .bp-key i { display:inline-block; width:14px; height:4px; border-radius:2px; vertical-align:middle; margin-right:5px; }
+  .bp-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .bp-bar { grid-template-columns:minmax(0, 110px) 1fr 76px; font-size:12px; } }
+</style>
+</head>
+<body data-chapter="4">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 4</span><span class="pill">Beginner</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Backpropagation on <span class="grad">Tensors</span></h1>
+    <p class="lead">Chapter 3’s engine computed correct gradients one scalar at a time and was 2,479 times slower than PyTorch. The fix is not a cleverer algorithm but a coarser one: treat a whole layer as one operation on tensors, and write its backward rule once, as a few matrix multiplies. A linear layer, a ReLU and a softmax-plus-cross-entropy loss need about fifteen lines of backward code between them, and with those you can train a real network without autograd at all.</p>
+    <p class="lead">This chapter writes that code for a 784-256-256-10 MLP and holds it to account. In float64 its gradients matched PyTorch’s autograd to a relative error of 10⁻¹⁶ in every layer, and finite differences agreed to 4 × 10⁻⁸. Trained on Fashion-MNIST with plain SGD it reached 87.1%, against 86.9% for the identical autograd model. Then three plausible bugs are planted. Forgetting to divide by the batch size, or to subtract 1 at the true class, collapsed training to 10%. Averaging the bias gradient instead of summing it trained to 86.9%, indistinguishable from correct, and only a gradient check, wrong by 98%, gave it away. Backward cost 1.4 times the forward pass.</p>
+    <ul class="objectives">
+      <li><span>Derive and code the backward pass of a linear layer from shapes</span></li>
+      <li><span>Backpropagate through an element-wise activation as a mask</span></li>
+      <li><span>Use the fused softmax cross-entropy gradient, (p − onehot) / B</span></li>
+      <li><span>Gradient-check an implementation and read the relative error</span></li>
+      <li><span>Estimate the cost of backward against forward</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Gradients of a matrix multiply</b> and finite differences: <a href="p2-matrix-calculus.html">P2</a>. <b>The scalar version of everything here:</b> <a href="03-autograd-from-scratch.html">Chapter 3</a>.</li>
+        <li><b>Why cross-entropy and logits:</b> <a href="p6-likelihood-and-losses.html">P6</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Backward of a linear layer</h2>
+  <p>PyTorch stores a linear layer’s weight as (out, in) and computes z = x Wᵀ + b for a batch x of shape (B, in). Backprop hands the layer dz = ∂L/∂z, shape (B, out), and needs three things: dW (shape of W), db (shape of b) and dx (shape of x, to pass to the layer below). As in P2, only one product of the available matrices has each shape:</p>
+<pre class="code"><span class="c"># forward:  z = x @ W.t() + b          x (B, in), W (out, in), b (out,), z (B, out)</span>
+dW = dz.<span class="f">t</span>() @ x                       <span class="c"># (out, B) @ (B, in) = (out, in): sums the B per-example outer products</span>
+db = dz.<span class="f">sum</span>(<span class="m">0</span>)                       <span class="c"># (out,): b was broadcast over the batch, so its gradient sums over it</span>
+dx = dz @ W                           <span class="c"># (B, out) @ (out, in) = (B, in): what the layer below receives</span></pre>
+  <p>The backward pass needs x, the layer’s input, to compute dW. That is why the forward pass keeps activations around (and why P4 measured 3.5 times more memory with autograd on). It does <i>not</i> need z, the output, for these three formulas.</p>
+
+  <h2>Backward of activations</h2>
+  <p>An element-wise activation h = φ(z) has a diagonal Jacobian, so its backward pass is element-wise too: dz = dh ⊙ φ′(z). For ReLU, φ′ is 1 where z &gt; 0 and 0 elsewhere, so the backward pass is a <b>mask</b>, and the network must keep either z or the mask. A unit whose input was negative passes back nothing; if that is true for every example, the unit is dead (Chapter 6).</p>
+<pre class="code">h = z.<span class="f">clamp_min</span>(<span class="m">0</span>)                    <span class="c"># forward ReLU, (B, 256)</span>
+dz = dh * (z > <span class="m">0</span>)                     <span class="c"># backward: gate the gradient with the forward mask</span>
+<span class="c"># tanh:    dz = dh * (1 - h**2)          uses the output h</span>
+<span class="c"># sigmoid: dz = dh * h * (1 - h)         uses the output h</span></pre>
+
+  <h2>The softmax cross-entropy gradient</h2>
+  <p>The loss is the mean over the batch of −log softmax(z)[y]. Backpropagating softmax on its own would mean a (10 × 10) Jacobian per example (P2); combined with the log and the mean, the algebra collapses to something much simpler. With p = softmax(z):</p>
+  <p style="text-align:center;font-family:var(--mono)">∂L/∂z = (p − onehot(y)) / B</p>
+  <p>Each example pushes its own probabilities down and its true class’s probability up, by exactly how wrong it was, and the 1/B comes from taking the mean. Fusing the softmax and the loss into one backward rule is cheaper and avoids the numerical trouble of differentiating a log of a probability that has rounded to 0, which is why frameworks provide <code>cross_entropy</code> rather than <code>softmax</code> followed by <code>log</code> and <code>nll</code>.</p>
+<pre class="code"><span class="k">def</span> <span class="f">backward</span>(params, cache, logits, y):
+    B = <span class="f">len</span>(y)
+    dz = logits.<span class="f">softmax</span>(<span class="m">1</span>)                         <span class="c"># (B, 10)</span>
+    dz[torch.<span class="f">arange</span>(B), y] -= <span class="m">1</span>                    <span class="c"># p - onehot(y)</span>
+    dz /= B                                        <span class="c"># the mean over the batch</span>
+    grads = []
+    <span class="k">for</span> k <span class="k">in</span> <span class="f">reversed</span>(<span class="f">range</span>(<span class="f">len</span>(params))):           <span class="c"># last layer first</span>
+        W, b = params[k]; x_in = cache.inputs[k]   <span class="c"># the input this layer saw in the forward pass</span>
+        grads.<span class="f">insert</span>(<span class="m">0</span>, (dz.<span class="f">t</span>() @ x_in, dz.<span class="f">sum</span>(<span class="m">0</span>)))
+        <span class="k">if</span> k > <span class="m">0</span>:
+            dz = (dz @ W) * (cache.pre[k - <span class="m">1</span>] > <span class="m">0</span>)   <span class="c"># through the linear layer, then the ReLU mask</span>
+    <span class="k">return</span> grads</pre>
+  <figure class="flow">
+    <ol>
+      <li><b>Loss</b><small>dz₃ = (p − onehot) / B, (B, 10)</small></li>
+      <li><b>Layer 3</b><small>dW₃ = dz₃ᵀh₂, dh₂ = dz₃W₃</small></li>
+      <li><b>ReLU 2</b><small>dz₂ = dh₂ ⊙ [z₂ &gt; 0]</small></li>
+      <li><b>Layer 2</b><small>dW₂ = dz₂ᵀh₁, dh₁ = dz₂W₂</small></li>
+      <li><b>ReLU 1</b><small>dz₁ = dh₁ ⊙ [z₁ &gt; 0]</small></li>
+      <li><b>Layer 1</b><small>dW₁ = dz₁ᵀx (no dx needed)</small></li>
+    </ol>
+    <figcaption><b>The whole backward pass of a 3-layer MLP.</b> Two matrix multiplies per linear layer, one mask per ReLU.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Backprop lab</span><span class="p-tag">Measured</span></div>
+    <div class="panel-body">
+      <div class="bp-l">View</div>
+      <div class="seg" id="bpE"><button class="active" data-v="shapes">shapes, step by step</button><button data-v="check">gradient check</button><button data-v="train">training</button><button data-v="cost">backward vs forward</button></div>
+      <div class="bp-v on" id="bpVshapes">
+        <div class="bp-box"><svg id="bpG" viewBox="0 0 660 150"></svg><div class="bp-eq" id="bpEq"></div></div>
+        <div class="bp-row"><button class="btn primary" id="bpNext" type="button">Next step ▶</button><button class="btn" id="bpReset" type="button">↺ Restart</button><span class="small muted" id="bpPos"></span></div>
+      </div>
+      <div class="bp-v" id="bpVcheck">
+        <div class="bp-l">Implementation</div>
+        <div class="seg" id="bpC"><button class="active" data-v="None">correct</button><button data-v="no 1/B">bug: no 1/B</button><button data-v="bias mean">bug: bias mean</button><button data-v="no subtract">bug: no −1</button></div>
+        <div class="bp-box" id="bpCk"></div>
+      </div>
+      <div class="bp-v" id="bpVtrain">
+        <div class="bp-l">Implementation</div>
+        <div class="seg" id="bpT"><button class="active" data-v="manual">hand-written</button><button data-v="autograd">autograd</button><button data-v="no 1/B">bug: no 1/B</button><button data-v="bias mean">bug: bias mean</button><button data-v="no subtract">bug: no −1</button></div>
+        <div class="bp-box"><svg id="bpTr" viewBox="0 0 600 220"></svg><div class="bp-key"><span><i style="background:#7c3aed"></i>selected</span><span><i style="background:var(--muted)"></i>hand-written reference</span></div></div>
+      </div>
+      <div class="bp-v" id="bpVcost"><div class="bp-box" id="bpCo"></div></div>
+      <div class="stats" id="bpStats"></div>
+      <div class="bp-why" id="bpWhy"></div>
+    </div>
+    <div class="panel-foot">784-256-256-10 ReLU MLP, Kaiming-normal weights, zero biases. Gradient check: float64, a batch of 64 Fashion-MNIST images, the relative error ‖hand − autograd‖ / ‖autograd‖ per layer. Training: float32, plain SGD at 0.1, batch 128, 3 epochs, the same initial weights and batch order for every version; loss sampled every 47 steps (blank where it became NaN or infinite). Cost: a 4096-4096-4096-4096-10 MLP on a batch of 4,096, RTX 5070 Ti, fp32 with TF32 off, synchronised, after warm-up.</div>
+  </div>
+
+  <h2>Gradient checking</h2>
+  <p>A hand-written backward pass is checked two ways. Against autograd, compare whole gradient tensors by relative error ‖g_hand − g_auto‖ / ‖g_auto‖: in float64 the correct implementation scored between 0.8 × 10⁻¹⁶ and 2 × 10⁻¹⁶ in every layer, which is rounding error. Without a reference, use finite differences on a sample of individual weights (P2): twenty random weights of the first layer agreed to a relative error of at most 3.6 × 10⁻⁸ at h = 10⁻⁶. The rule of thumb: in float64, below 10⁻⁷ is correct, above 10⁻³ is a bug, and anything in between needs a closer look.</p>
+  <table class="t cmp">
+    <thead><tr><th>Planted bug</th><th>Gradient check (relative error, float64)</th><th>Training: test accuracy after 3 epochs</th><th>Visible without a check?</th></tr></thead>
+    <tbody>
+      <tr><td>None (correct)</td><td>2 × 10⁻¹⁶</td><td>87.1%</td><td>—</td></tr>
+      <tr><td>Forgot the 1/B</td><td>63 in every layer (64× too large)</td><td>10.0%, loss became NaN</td><td>Yes, by step 47</td></tr>
+      <tr><td>Forgot to subtract 1 at the true class</td><td>0.97 – 1.33</td><td>10.0%, loss became NaN</td><td>Yes</td></tr>
+      <tr><td><b>Bias gradient as a mean, not a sum</b></td><td>weights 2 × 10⁻¹⁶, <b>biases 0.984</b></td><td><b>86.9%</b></td><td><b>No</b></td></tr>
+    </tbody>
+  </table>
+  <p>The first two bugs announce themselves. Without the 1/B, every step is 64 or 128 times too large and the loss overflows; without the −1, the gradient pushes every probability down, including the true class’s, so the logits run off to −∞. The third is the dangerous kind. Averaging instead of summing makes every bias gradient B times too small (relative error 1 − 1/64 = 0.984), so the biases barely train, and with zero-initialised biases and ReLU networks that hardly matters on this task: 86.9% against 87.1%. A model shipped with that bug would underperform somewhere it mattered, and nobody would know why. Gradient checks exist for exactly this.</p>
+
+  <h2>Hand-written vs autograd in training</h2>
+  <p>With the same initial weights and the same batches, the hand-written and autograd models produced identical sampled losses for the first 140 steps and then drifted apart slightly: after three epochs their first-layer weights differed by at most 0.0076, and their accuracies were 87.07% and 86.88%. Both are correct; they add the same numbers in a different order (autograd’s fused cross-entropy kernel, for instance), and float32 rounding differs. The difference is well within the seed-to-seed spread of P8 (standard deviation 0.27), a reminder that “matches autograd” means “to rounding error”, not bit-for-bit.</p>
+
+  <h2>Cost of backward vs forward</h2>
+  <p>A linear layer’s forward pass is one matrix multiply; its backward pass is two (dW and dx), so backward costs roughly twice the forward FLOPs, minus the first layer’s dx, which nobody needs. For a 4096-4096-4096-4096-10 MLP on a batch of 4,096 that is 413 GFLOP forward and 688 GFLOP backward. Measured, the forward pass took 15.9 ms and the hand-written backward 22.0 ms, 1.4 times as long, rather than 1.7, because the last, narrow layer and the element-wise work are cheap either way. PyTorch’s autograd did forward plus backward in 38.6 ms, the same as the sum of the two. This is where the familiar estimate comes from: <b>training costs about three forward passes per step</b>, one forward and two for backward.</p>
+  <table class="t cmp">
+    <thead><tr><th></th><th>Scalar engine (Chapter 3)</th><th>Hand-written tensor backward (this chapter)</th><th>PyTorch autograd</th></tr></thead>
+    <tbody>
+      <tr><td>Granularity</td><td>One node per number</td><td>One rule per layer</td><td>One node per tensor operation</td></tr>
+      <tr><td>Who writes the rules</td><td>You, for each scalar op</td><td>You, for each layer</td><td>PyTorch, for every op</td></tr>
+      <tr><td>Speed</td><td>2,479× slower than PyTorch</td><td>Same as PyTorch (same matmuls)</td><td>Reference</td></tr>
+      <tr><td>Risk</td><td>Easy to verify</td><td>Silent bugs; needs gradient checks</td><td>Correct for built-in ops</td></tr>
+      <tr><td>Use it for</td><td>Understanding</td><td>Custom fused ops (Chapter 37), interviews</td><td>Everything else</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout usecase">
+    <div class="ico">🎯</div>
+    <div class="body"><div class="title">Use case: a hand-written loss for a recommender</div><p>A recommendations team needs a sampled softmax over 2 million items: for each user, score the clicked item against 1,000 sampled negatives. They write the forward and backward passes by hand as a fused <code>autograd.Function</code> so that the 2-million-wide logits are never materialised. Their gradient is the same (p − onehot) / B rule as this chapter, applied only to the sampled columns, plus a correction for the sampling probability. Before it goes near training they run <code>torch.autograd.gradcheck</code> in float64 on a 50-item toy problem; it catches a missing 1/B on the correction term, a bug that would otherwise have shown up only as a mysteriously worse model.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Forgetting the 1/B from the mean</b>: gradients 64× too large here; the loss went NaN.</li>
+      <li><b>Averaging a gradient that should be summed</b> (biases over the batch): trained to 86.9%, invisible without a gradient check.</li>
+      <li><b>Dropping the −1 at the true class</b>: the gradient pushes every class down; collapse to 10%.</li>
+      <li><b>Confusing W’s layout</b>: PyTorch’s Linear stores (out, in); dW = dzᵀx has that shape, xᵀdz has its transpose.</li>
+      <li><b>Gradient checking in float32</b>, or expecting bit-identical results to autograd in training.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is the gradient of softmax cross-entropy with respect to the logits, and why is it so simple?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is p minus the one-hot target, divided by the batch size if the loss is a mean. Cross-entropy is −log of the softmax probability of the true class, which is −z_y + log Σ e^z. The derivative of the log-sum-exp with respect to each logit is that logit’s softmax probability, and the −z_y term contributes −1 at the true class, so the Jacobian of softmax never has to be formed. It also means a confident wrong prediction gets a gradient near −1 at the true class, which is why cross-entropy trains well. In my implementation, forgetting either the −1 or the 1/B collapsed training to chance.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Roughly how much does a backward pass cost compared with a forward pass, and why?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>About twice the FLOPs. Each linear layer’s forward pass is one matrix multiply, x times Wᵀ. Its backward pass needs two of the same size: dzᵀx for the weight gradient and dz times W for the input gradient, except at the first layer, where no input gradient is needed. Element-wise operations add a little. So a training step costs about three forward passes, which is the usual estimate of 6 × parameters × tokens FLOPs for training a language model. I measured a deep 4,096-wide MLP at 15.9 ms forward and 22.0 ms backward; the ratio was under 2 because the narrow last layer and element-wise work are cheap.</div></details>
+  </div></div>
+
+  <!-- xref:start (generated by tools/crosslinks.cjs from tools/crosslinks-map.cjs; do not edit by hand) -->
+  <div class="callout xref">
+    <div class="ico">🧭</div>
+    <div class="body"><div class="title xref-t">Related chapters in other courses</div>
+      <ul class="mb0">
+        <li><b>Neural networks and backpropagation:</b> ML &amp; AI <a href="../ml-ai-systems/08-neural-networks.html">Ch 8: Neural Networks &amp; Backpropagation</a></li>
+      </ul>
+    </div>
+  </div>
+  <!-- xref:end -->
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Linear layer backward: dW = dzᵀx, db = Σ dz over the batch, dx = dz W; shapes pick the formulas.</li>
+      <li>Element-wise activations backprop element-wise; ReLU’s backward is a mask.</li>
+      <li>Softmax cross-entropy fuses to (p − onehot) / B: no softmax Jacobian needed.</li>
+      <li>Hand-written gradients matched autograd to 10⁻¹⁶ (float64); one planted bug trained normally and only a gradient check caught it.</li>
+      <li>Backward is about two forward passes of matrix multiplies (1.4× measured); a training step costs about three.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">z = x Wᵀ + b with x (B, in) and W (out, in). Given dz (B, out), what is dW?</p>
+      <div class="opts">
+        <button class="opt">xᵀ dz</button>
+        <button class="opt">dz W</button>
+        <button class="opt">dzᵀ x</button>
+        <button class="opt">dz xᵀ</button>
+      </div>
+      <div class="explain">(out, B) @ (B, in) = (out, in), W’s shape. xᵀdz would be its transpose.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What does the backward pass of ReLU do to the incoming gradient?</p>
+      <div class="opts">
+        <button class="opt">Passes it through where the forward input was positive and zeroes it elsewhere</button>
+        <button class="opt">Multiplies it by the output</button>
+        <button class="opt">Takes its absolute value</button>
+        <button class="opt">Divides it by the batch size</button>
+      </div>
+      <div class="explain">Its Jacobian is diagonal with entries 0 or 1: a mask kept from the forward pass.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">A backward pass averages the bias gradient over the batch instead of summing it. What did that do here?</p>
+      <div class="opts">
+        <button class="opt">Training diverged</button>
+        <button class="opt">PyTorch raised an error</button>
+        <button class="opt">Accuracy fell to chance</button>
+        <button class="opt">Training looked normal (86.9% vs 87.1%) but the gradient check failed with a relative error of 0.984</button>
+      </div>
+      <div class="explain">The most dangerous bugs still train. Gradient checks catch them.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">In float64, a hand-written gradient differs from autograd by a relative error of 2 × 10⁻¹⁶. What does that mean?</p>
+      <div class="opts">
+        <button class="opt">There is a small bug</button>
+        <button class="opt">It is correct: that is rounding error</button>
+        <button class="opt">The step size h is too small</button>
+        <button class="opt">The batch is too small to tell</button>
+      </div>
+      <div class="explain">Below about 10⁻⁷ in float64 is correct; above 10⁻³ is a bug.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why does a training step cost about three forward passes?</p>
+      <div class="opts">
+        <button class="opt">Backward runs the forward pass twice more</button>
+        <button class="opt">The optimiser step is as expensive as a forward pass</button>
+        <button class="opt">Each linear layer’s backward needs two matrix multiplies (dW and dx) of the forward’s size</button>
+        <button class="opt">Autograd adds overhead equal to two forward passes</button>
+      </div>
+      <div class="explain">Measured: 15.9 ms forward, 22.0 ms backward on a deep 4,096-wide MLP.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"check":{"None":[{"layer":1,"dW_rel":2.0504164553445859e-16,"db_rel":1.3823901880607476e-16},{"layer":2,"dW_rel":1.0801067978933364e-16,"db_rel":1.0551540344267023e-16},{"layer":3,"dW_rel":8.369766657011243e-17,"db_rel":7.943934105461218e-17}],"no 1/B":[{"layer":1,"dW_rel":63.0,"db_rel":63.0},{"layer":2,"dW_rel":63.00000000000001,"db_rel":63.00000000000001},{"layer":3,"dW_rel":63.0,"db_rel":63.00000000000001}],"bias mean":[{"layer":1,"dW_rel":2.0504164553445859e-16,"db_rel":0.984375},{"layer":2,"dW_rel":1.0801067978933364e-16,"db_rel":0.9843750000000001},{"layer":3,"dW_rel":8.369766657011243e-17,"db_rel":0.9843750000000001}],"no subtract":[{"layer":1,"dW_rel":0.9694980508127863,"db_rel":1.0298354819539275},{"layer":2,"dW_rel":1.1245075867988026,"db_rel":1.2813830550367313},{"layer":3,"dW_rel":1.204144203958657,"db_rel":1.3329901749377044}]},"finite_diff":{"max_rel":3.597321045995055e-08,"samples":[["-1.911e-02","-1.911e-02"],["1.167e-02","1.167e-02"],["2.546e-02","2.546e-02"],["1.293e-02","1.293e-02"],["-7.684e-03","-7.684e-03"],["-1.683e-02","-1.683e-02"]]},"train":{"manual":{"acc":87.07,"curve":[[0,2.9807],[47,0.5143],[94,0.4051],[141,0.5659],[188,0.5105],[235,0.4728],[282,0.4703],[329,0.4478],[376,0.4723],[423,0.3667],[470,0.3503],[517,0.4641],[564,0.3143],[611,0.3668],[658,0.2705],[705,0.3367],[752,0.3204],[799,0.3722],[846,0.4344],[893,0.3402],[940,0.2047],[987,0.4046],[1034,0.2371],[1081,0.3366],[1128,0.2582],[1175,0.4635],[1222,0.2463],[1269,0.3918],[1316,0.2495],[1363,0.2559]]},"autograd":{"acc":86.88,"curve":[[0,2.9807],[47,0.5143],[94,0.4051],[141,0.5659],[188,0.5105],[235,0.4728],[282,0.4703],[329,0.4478],[376,0.4723],[423,0.3667],[470,0.3503],[517,0.4641],[564,0.3143],[611,0.3668],[658,0.2705],[705,0.3367],[752,0.3204],[799,0.3722],[846,0.4344],[893,0.3411],[940,0.2031],[987,0.4056],[1034,0.2411],[1081,0.3394],[1128,0.2551],[1175,0.4622],[1222,0.2457],[1269,0.3903],[1316,0.2471],[1363,0.2644]]},"no 1/B":{"acc":10.0,"curve":[[0,2.9807],[47,null],[94,null],[141,null],[188,null],[235,null],[282,null],[329,null],[376,null],[423,null],[470,null],[517,null],[564,null],[611,null],[658,null],[705,null],[752,null],[799,null],[846,null],[893,null],[940,null],[987,null],[1034,null],[1081,null],[1128,null],[1175,null],[1222,null],[1269,null],[1316,null],[1363,null]]},"bias mean":{"acc":86.91,"curve":[[0,2.9807],[47,0.5223],[94,0.4088],[141,0.5869],[188,0.5116],[235,0.4814],[282,0.4785],[329,0.4401],[376,0.4754],[423,0.3506],[470,0.371],[517,0.4469],[564,0.3096],[611,0.3564],[658,0.2686],[705,0.3257],[752,0.3178],[799,0.376],[846,0.4402],[893,0.3219],[940,0.1928],[987,0.4043],[1034,0.2444],[1081,0.335],[1128,0.2624],[1175,0.4685],[1222,0.2571],[1269,0.3681],[1316,0.2599],[1363,0.2601]]},"no subtract":{"acc":10.0,"curve":[[0,2.9807],[47,null],[94,null],[141,null],[188,null],[235,null],[282,null],[329,null],[376,null],[423,null],[470,null],[517,null],[564,null],[611,null],[658,null],[705,null],[752,null],[799,null],[846,null],[893,null],[940,null],[987,null],[1034,null],[1081,null],[1128,null],[1175,null],[1222,null],[1269,null],[1316,null],[1363,null]]}},"manual_vs_autograd_weights":{"max_abs_diff_W1":0.0075515080243349075,"bitwise":false},"cost":{"forward_ms":15.9,"manual_backward_ms":21.95,"autograd_forward_plus_backward_ms":38.55,"forward_gflop":412.7,"backward_gflop":687.9}};
+  const B = 128;
+  const NODES = [['x', '(128, 784)'], ['z₁ = xW₁ᵀ + b₁', '(128, 256)'], ['h₁ = relu(z₁)', '(128, 256)'], ['z₂', '(128, 256)'], ['h₂', '(128, 256)'], ['z₃ (logits)', '(128, 10)'], ['loss', 'scalar']];
+  const STEPS = [
+    [0, 'f', 'x: a batch of 128 flattened images, (128, 784).', 'The forward pass keeps every layer’s input (x, h₁, h₂) and every ReLU’s mask: the backward pass will need them.'],
+    [1, 'f', 'z₁ = x W₁ᵀ + b₁: (128, 784) @ (784, 256) + (256,) → (128, 256)', 'W₁ is stored (256, 784), so the forward uses its transpose.'],
+    [2, 'f', 'h₁ = max(0, z₁): (128, 256); keep the mask z₁ > 0', 'Element-wise, so the shape does not change.'],
+    [3, 'f', 'z₂ = h₁ W₂ᵀ + b₂: (128, 256) @ (256, 256) → (128, 256); h₂ = relu(z₂)', 'The second hidden layer.'],
+    [5, 'f', 'z₃ = h₂ W₃ᵀ + b₃: (128, 256) @ (256, 10) → (128, 10)', 'Ten logits per image.'],
+    [6, 'f', 'loss = mean over 128 of −log softmax(z₃)[y]: a scalar', 'Forward done. Now backward, starting from the loss.'],
+    [5, 'b', 'dz₃ = (softmax(z₃) − onehot(y)) / 128: (128, 10)', 'The fused softmax cross-entropy gradient. No 10 × 10 Jacobian per example is ever built.'],
+    [5, 'b', 'dW₃ = dz₃ᵀ h₂: (10, 128) @ (128, 256) → (10, 256);  db₃ = dz₃.sum(0): (10,)', 'Same shapes as W₃ and b₃. The sum over the batch is inside the matrix product.'],
+    [4, 'b', 'dh₂ = dz₃ W₃: (128, 10) @ (10, 256) → (128, 256)', 'Passing the gradient down: the other factor, W₃, untransposed this time.'],
+    [3, 'b', 'dz₂ = dh₂ ⊙ [z₂ > 0]: (128, 256)', 'Through the ReLU: the saved mask zeroes the gradient of every unit that was off for that example.'],
+    [3, 'b', 'dW₂ = dz₂ᵀ h₁: (256, 256);  db₂ = dz₂.sum(0);  dh₁ = dz₂ W₂: (128, 256)', 'The same three lines as layer 3.'],
+    [1, 'b', 'dz₁ = dh₁ ⊙ [z₁ > 0];  dW₁ = dz₁ᵀ x: (256, 128) @ (128, 784) → (256, 784);  db₁', 'Done. The first layer needs no dx: nothing below it learns.'],
+  ];
+  let k = 0;
+  function shapes() {
+    const [on, ph, eq, why] = STEPS[k], W = 660, n = NODES.length, bw = 86, gap = (W - 20 - n * bw) / (n - 1);
+    let g = '';
+    NODES.forEach(([lbl, sh], i) => {
+      const x = 10 + i * (bw + gap);
+      if (i) g += `<line x1="${x - gap}" y1="62" x2="${x}" y2="62" stroke="var(--border)" stroke-width="2"/>`;
+      g += `<g class="bp-node${i === on ? (ph === 'b' ? ' bp-bw' : ' bp-fw') : ''}" transform="translate(${x},38)"><rect width="${bw}" height="48" rx="9"/><text x="${bw / 2}" y="20" text-anchor="middle">${lbl.length > 12 ? lbl.split(' ')[0] : lbl}</text><text x="${bw / 2}" y="37" text-anchor="middle" style="fill:var(--muted)">${sh}</text></g>`;
+    });
+    g += `<text x="10" y="120">${ph === 'b' ? '← backward: gradients flow right to left' : 'forward: activations flow left to right →'}</text>`;
+    $('#bpG').innerHTML = g; $('#bpEq').textContent = eq; $('#bpPos').textContent = `step ${k + 1} of ${STEPS.length}`;
+    $('#bpStats').innerHTML = `<div class="stat"><div class="k">Phase</div><div class="v">${ph === 'b' ? 'backward' : 'forward'}</div></div><div class="stat"><div class="k">Parameters</div><div class="v">${(784 * 256 + 256 + 256 * 256 + 256 + 256 * 10 + 10).toLocaleString()}</div></div><div class="stat"><div class="k">Batch</div><div class="v">${B}</div></div>`;
+    $('#bpWhy').innerHTML = '<b>' + why.split('. ')[0] + '.</b> ' + why.split('. ').slice(1).join('. ');
+  }
+  $('#bpNext').addEventListener('click', () => { k = Math.min(STEPS.length - 1, k + 1); shapes(); });
+  $('#bpReset').addEventListener('click', () => { k = 0; shapes(); });
+
+  function check() {
+    const key = $('#bpC .active').dataset.v, C = D.check[key], lg = v => Math.max(0, (Math.log10(v) + 17) / 19 * 100);
+    const bar = (l, v) => `<div class="bp-bar"><span>${l}</span><span class="track"><i style="width:${lg(v)}%;background:${v < 1e-7 ? '#16a34a' : v < 1e-3 ? '#f59e0b' : '#e11d48'}"></i></span><span class="n">${v.toExponential(1)}</span></div>`;
+    $('#bpCk').innerHTML = '<div style="margin-bottom:4px"><b>Relative error against autograd, float64 (log scale, 10⁻¹⁷ to 10²)</b></div>' + C.map(c => bar(`layer ${c.layer} weights`, c.dW_rel) + bar(`layer ${c.layer} biases`, c.db_rel)).join('') +
+      `<div class="small" style="margin-top:8px">Finite differences on 20 first-layer weights (correct implementation): max relative error ${D.finite_diff.max_rel.toExponential(1)}.</div>`;
+    const worst = Math.max(...C.map(c => Math.max(c.dW_rel, c.db_rel)));
+    $('#bpStats').innerHTML = `<div class="stat${worst < 1e-7 ? ' good' : ' bad'}"><div class="k">Worst relative error</div><div class="v">${worst.toExponential(1)}</div></div><div class="stat"><div class="k">Verdict</div><div class="v">${worst < 1e-7 ? 'correct' : 'bug'}</div></div><div class="stat"><div class="k">Accuracy it trains to</div><div class="v">${D.train[key === 'None' ? 'manual' : key].acc}%</div></div>`;
+    const why = { 'None': '<b>Rounding error only.</b> Every tensor agrees with autograd to about 10⁻¹⁶, the precision of float64.', 'no 1/B': '<b>Uniformly 64 times too large</b> (relative error 63 with a batch of 64) in every layer: every gradient was scaled by the batch size.', 'bias mean': '<b>Weights perfect, biases wrong.</b> Every bias gradient is 64 times too small, a relative error of 1 − 1/64. Training barely notices: this bug would ship.', 'no subtract': '<b>Wrong everywhere.</b> Without the −1, the gradient pushes every class’s probability down, the true one included.' };
+    $('#bpWhy').innerHTML = why[key];
+  }
+
+  function train() {
+    const key = $('#bpT .active').dataset.v, T = D.train, c = T[key].curve, ref = T.manual.curve;
+    const W = 600, H = 220, L = 40, R = 14, Tp = 12, Bt = 30, n = 1363, x = s => L + s / n * (W - L - R), mx = 3, y = v => Tp + (1 - Math.min(v, mx) / mx) * (H - Tp - Bt);
+    let g = '';
+    [0, 1, 2, 3].forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`);
+    g += `<text x="${(W + L) / 2}" y="${H - 6}" text-anchor="middle">SGD step (3 epochs), training loss</text>`;
+    const pl = (pts, col, w, dash) => { const ok = pts.filter(p => p[1] !== null); return ok.length > 1 ? `<polyline fill="none" stroke="${col}" stroke-width="${w}" ${dash ? 'stroke-dasharray="4 4"' : ''} points="${ok.map(p => x(p[0]) + ',' + y(p[1])).join(' ')}"/>` : ''; };
+    g += pl(ref, 'var(--muted)', 1.5, true) + pl(c, '#7c3aed', 2.5);
+    const nanAt = c.find(p => p[1] === null);
+    if (nanAt) g += `<line x1="${x(nanAt[0])}" x2="${x(nanAt[0])}" y1="${Tp}" y2="${H - Bt}" stroke="#e11d48" stroke-dasharray="3 3"/><text x="${x(nanAt[0]) + 6}" y="${Tp + 14}" fill="#e11d48">loss is NaN from here</text>`;
+    $('#bpTr').innerHTML = g;
+    $('#bpStats').innerHTML = `<div class="stat${T[key].acc > 80 ? ' good' : ' bad'}"><div class="k">Test accuracy</div><div class="v">${T[key].acc}%</div></div><div class="stat"><div class="k">Hand-written reference</div><div class="v">${T.manual.acc}%</div></div>${key === 'autograd' ? `<div class="stat"><div class="k">Max weight difference</div><div class="v">${D.manual_vs_autograd_weights.max_abs_diff_W1.toFixed(4)}</div></div>` : ''}`;
+    const why = { manual: '<b>No autograd anywhere.</b> Fifteen lines of backward code train the network to 87.1%.', autograd: '<b>The same model with PyTorch computing the gradients.</b> The curves coincide for the first 140 steps, then drift by rounding: float32 sums done in a different order. 86.9% vs 87.1% is inside seed noise.', 'no 1/B': '<b>Steps 128 times too big.</b> The first sampled loss after step 0 is already NaN.', 'bias mean': '<b>Indistinguishable from correct.</b> The curve sits on the reference. Only the gradient check view shows anything wrong.', 'no subtract': '<b>Every class pushed down.</b> The logits run away and the loss becomes NaN.' };
+    $('#bpWhy').innerHTML = why[key];
+  }
+
+  function cost() {
+    const C = D.cost, bar = (l, v, mx, u, c) => `<div class="bp-bar"><span>${l}</span><span class="track"><i style="width:${100 * v / mx}%;background:${c}"></i></span><span class="n">${v} ${u}</span></div>`;
+    $('#bpCo').innerHTML = '<div style="margin-bottom:4px"><b>4096-4096-4096-4096-10 MLP, batch 4,096</b></div>' + bar('forward', C.forward_ms, 40, 'ms', '#2563eb') + bar('hand-written backward', C.manual_backward_ms, 40, 'ms', '#e11d48') + bar('autograd forward + backward', C.autograd_forward_plus_backward_ms, 40, 'ms', '#7c3aed') +
+      '<div style="margin:14px 0 4px"><b>Arithmetic</b></div>' + bar('forward', C.forward_gflop, 700, 'GFLOP', '#2563eb') + bar('backward', C.backward_gflop, 700, 'GFLOP', '#e11d48');
+    $('#bpStats').innerHTML = `<div class="stat"><div class="k">Backward / forward time</div><div class="v">${(C.manual_backward_ms / C.forward_ms).toFixed(2)}×</div></div><div class="stat"><div class="k">Backward / forward FLOPs</div><div class="v">${(C.backward_gflop / C.forward_gflop).toFixed(2)}×</div></div><div class="stat"><div class="k">Training step</div><div class="v">≈ 3 forward passes</div></div>`;
+    $('#bpWhy').innerHTML = '<b>Two matmuls per layer on the way back.</b> dW and dx each cost as much as the forward multiply (except the first layer’s dx, skipped). The measured ratio is a little below the FLOP ratio because the narrow output layer and the element-wise ReLU work are cheap in both directions.';
+  }
+
+  function draw() { const v = $('#bpE .active').dataset.v; ['shapes', 'check', 'train', 'cost'].forEach(x => $('#bpV' + x).classList.toggle('on', x === v)); ({ shapes, check, train, cost })[v](); }
+  ['#bpE', '#bpC', '#bpT'].forEach(id => $(id).addEventListener('segchange', draw)); draw();
+})();
+</script>
+</body>
+</html>

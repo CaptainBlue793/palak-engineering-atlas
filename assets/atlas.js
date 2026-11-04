@@ -278,13 +278,17 @@
       mark: '<circle cx="4" cy="7" r="1.9"/><circle cx="4" cy="17" r="1.9"/>' +
             '<circle cx="12" cy="4" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="12" cy="20" r="1.9"/><circle cx="20" cy="12" r="1.9"/>' +
             '<path d="M5.8 6.3l4.4-1.6M5.7 8.1l4.6 3M5.7 15.9l4.6-3M5.8 17.7l4.4 1.6M13.5 5.4l5 5.1M13.9 12h4.2M13.5 18.6l5-5.1"/>',
-      blurb: 'Neural networks from the ground up: backpropagation, optimisers and initialisation, CNNs, sequence models and attention, ending with a transformer built from scratch.',
+      blurb: 'Neural networks from the ground up, every chapter trained on one GPU: backpropagation, optimisers, CNNs, RNNs and attention, a transformer from scratch, then mixed precision, scaling, generalisation, GNNs, state-space models and deep RL.',
       topics: ['Backprop', 'Optimisers', 'CNNs', 'Transformers'],
       lang: 'Python + PyTorch',
       c1: '#7c3aed', c2: '#c026d3', d1: '#a78bfa', d2: '#e879f9',
-      soon: true,
+      chapters: 56,
+      hours: 42,
       store: 'dl',
+      indexVar: 'DL_INDEX',
       dir: 'deep-learning',
+      first: 'p1-tensors-shapes-and-broadcasting.html',
+      dist: 'deep-learning-course.html',
     },
     {
       id: 'computer-vision',

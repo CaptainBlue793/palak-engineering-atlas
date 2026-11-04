@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>A Transformer from Scratch · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 19 of Deep Learning. An encoder-decoder transformer written from its parts (multi-head attention, pre-norm blocks, positions) and trained on reversing and sorting 16 digits, with every part ablated: without positions reversal fails (0% of sequences) while sorting does not need them (99%), without residuals both fail, and the learned cross-attention is an exact anti-diagonal.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .tf-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .tf-v { display:none; } .tf-v.on { display:block; }
+  .tf-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .tf-box svg { width:100%; height:auto; display:block; } .tf-box text { font-size:12px; fill:var(--muted); }
+  .tf-bar { display:grid; grid-template-columns:minmax(0, 220px) 1fr 80px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .tf-bar .track { height:13px; border-radius:4px; background:var(--surface); overflow:hidden; } .tf-bar .track i { display:block; height:100%; }
+  .tf-bar .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .tf-key { display:flex; gap:14px; flex-wrap:wrap; font-size:12.5px; margin-top:6px; } .tf-key i { display:inline-block; width:14px; height:4px; border-radius:2px; vertical-align:middle; margin-right:5px; }
+  .tf-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .tf-bar { grid-template-columns:minmax(0, 120px) 1fr 66px; font-size:12px; } }
+</style>
+</head>
+<body data-chapter="19">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 19</span><span class="pill">Intermediate</span><span class="pill">⏱ 55 min</span></div>
+    <h1>A Transformer <span class="grad">from Scratch</span></h1>
+    <p class="lead">A transformer is not a new idea so much as an assembly of the last four chapters: multi-head attention (Chapter 18) to mix information between positions, an MLP (Chapter 5) to transform each position on its own, residual connections (Chapter 15) around both, layer normalisation (Chapter 14) before both, and a way of telling the network where each token is, because attention by itself has no notion of order. This chapter builds an encoder-decoder transformer from those parts, about 80 lines with no <code>nn.Transformer</code>, trains it on two algorithmic tasks, and removes the parts one at a time to see what each is worth.</p>
+    <p class="lead">The tasks are reversing and sorting a sequence of 16 random digits. The full model (two encoder and two decoder blocks, 929,292 parameters, 20 seconds of training) reversed 96.5% of digits correctly and sorted 99.96%. Take away positional information and reversal collapsed to 15.9% of digits and 0% of complete sequences, while sorting was unaffected (99.9%), because sorting does not depend on where a digit started. Take away the residual connections and both tasks failed (18% of digits). Take away layer norm and reversal failed while sorting mostly survived. And the trained model’s cross-attention for reversal is an exact anti-diagonal: output position i reads input position 15 − i, a solution nobody programmed.</p>
+    <ul class="objectives">
+      <li><span>Assemble a transformer block from attention, an MLP, residuals and norms</span></li>
+      <li><span>Add positional information with sinusoidal or learned encodings</span></li>
+      <li><span>Build an encoder-decoder with cross-attention and a causal decoder</span></li>
+      <li><span>Train it with teacher forcing and decode greedily</span></li>
+      <li><span>Measure what each component contributes</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Attention and masks:</b> <a href="18-attention-from-first-principles.html">Chapter 18</a>. <b>Residuals and pre-norm:</b> <a href="15-residual-connections.html">Chapter 15</a>. <b>LayerNorm:</b> <a href="14-normalisation-layers.html">Chapter 14</a>. The decoder-only version, a tiny GPT trained on text, is <a href="../llms/07-build-a-tiny-gpt.html">LLMs Chapter 7</a>; encoders for text are <a href="../nlp/15-transformer-encoders.html">NLP Chapter 15</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>The transformer block</h2>
+  <p>Every block has two sub-layers, each wrapped the same way: normalise the input, apply the sub-layer, add the result back to the input (pre-norm, Chapter 15). The first sub-layer is multi-head self-attention, where positions exchange information; the second is a position-wise MLP, usually 4× wider than the model, applied to each position independently. A decoder block adds a third sub-layer between them, <b>cross-attention</b>, whose queries come from the decoder and whose keys and values come from the encoder’s output.</p>
+<pre class="code"><span class="k">class</span> <span class="t">Block</span>(nn.<span class="t">Module</span>):
+    <span class="k">def</span> <span class="f">__init__</span>(self, d, h, cross=<span class="k">False</span>):
+        <span class="f">super</span>().<span class="f">__init__</span>(); self.cross = cross
+        self.n1, self.att = nn.<span class="t">LayerNorm</span>(d), <span class="t">MHA</span>(d, h)                       <span class="c"># Chapter 18's multi-head attention</span>
+        <span class="k">if</span> cross: self.n2, self.catt = nn.<span class="t">LayerNorm</span>(d), <span class="t">MHA</span>(d, h)
+        self.n3, self.ff = nn.<span class="t">LayerNorm</span>(d), nn.<span class="t">Sequential</span>(nn.<span class="t">Linear</span>(d, <span class="m">4</span> * d), nn.<span class="t">GELU</span>(), nn.<span class="t">Linear</span>(<span class="m">4</span> * d, d))
+    <span class="k">def</span> <span class="f">forward</span>(self, x, mem=<span class="k">None</span>):                                       <span class="c"># x (B, n, d)</span>
+        x = x + self.<span class="f">att</span>(self.<span class="f">n1</span>(x), causal=self.cross)                      <span class="c"># self-attention (causal in the decoder)</span>
+        <span class="k">if</span> self.cross: x = x + self.<span class="f">catt</span>(self.<span class="f">n2</span>(x), mem)                  <span class="c"># cross-attention to the encoder output</span>
+        <span class="k">return</span> x + self.<span class="f">ff</span>(self.<span class="f">n3</span>(x))                                      <span class="c"># position-wise MLP</span>
+<span class="c"># parameters per encoder block at d = 128: attention 4·d² + 4d = 66,048; MLP 8·d² + 5d = 131,712; norms 512</span></pre>
+
+  <h2>Positional information</h2>
+  <p>Attention compares every query with every key regardless of where they are; permute the input tokens and each output is permuted the same way, nothing more. For any task where order matters, the model must be told positions. The original transformer adds a fixed <b>sinusoidal</b> encoding to each token’s embedding, sines and cosines of different frequencies, so each position has a unique pattern and relative offsets correspond to rotations. The alternative is a <b>learned</b> position embedding, one trainable vector per position. Modern language models mostly use rotary encodings (RoPE), which rotate the queries and keys instead (LLMs Chapter 5).</p>
+<pre class="code">p = torch.<span class="f">arange</span>(L)[:, <span class="k">None</span>]; i = torch.<span class="f">arange</span>(<span class="m">0</span>, d, <span class="m">2</span>)[<span class="k">None</span>]
+pe = torch.<span class="f">zeros</span>(L, d)
+pe[:, <span class="m">0</span>::<span class="m">2</span>] = torch.<span class="f">sin</span>(p / <span class="m">10000</span> ** (i / d)); pe[:, <span class="m">1</span>::<span class="m">2</span>] = torch.<span class="f">cos</span>(p / <span class="m">10000</span> ** (i / d))
+x = self.<span class="f">emb</span>(tokens) * math.<span class="f">sqrt</span>(d) + pe[:n]                 <span class="c"># (B, n, d): content plus position</span></pre>
+  <p>The ablation shows exactly when this matters. Reversing a sequence is all about position: output i must copy input 15 − i, and without positional information the model has no way to tell which input digit is which. It reached 15.9% of digits, little more than chance (10%), and not one complete sequence. Sorting is different: the output depends only on <i>which</i> digits are present, not where they were, so a model with no positional information on the encoder side sorted 99.05% of sequences perfectly. (The decoder still needs to know which output position it is producing; with no positions anywhere, it can count through the causal mask, which is enough here.)</p>
+
+  <h2>Encoder and decoder</h2>
+  <p>The <b>encoder</b> is a stack of blocks over the source sequence, bidirectional, with no mask. The <b>decoder</b> generates the target one token at a time. In training it is fed the correct previous tokens, shifted right behind a start token (<b>teacher forcing</b>), and a causal mask stops each position from seeing the ones after it, so all 16 positions are trained in one parallel pass. At test time it decodes <b>greedily</b>: start from the start token, predict the next token, append it, repeat 16 times. All accuracies here are from greedy decoding on 2,000 unseen sequences, so an early mistake can cascade.</p>
+  <figure class="flow">
+    <ol>
+      <li><b>Source digits</b><small>embed + positions</small></li>
+      <li><b>Encoder × 2</b><small>self-attention, MLP</small></li>
+      <li><b>Target so far</b><small>BOS, y₁ … y_{t−1}</small></li>
+      <li><b>Decoder × 2</b><small>causal self-attention, cross-attention to the encoder, MLP</small></li>
+      <li><b>Linear + softmax</b><small>next digit</small></li>
+      <li><b>Repeat</b><small>greedy, 16 times</small></li>
+    </ol>
+    <figcaption><b>The encoder-decoder transformer.</b> Drop the encoder and cross-attention and you have a GPT; drop the decoder and you have BERT.</figcaption>
+  </figure>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Transformer lab</span><span class="p-tag">Trained here, 20 s per model</span></div>
+    <div class="panel-body">
+      <div class="tf-l">View</div>
+      <div class="seg" id="tfE"><button class="active" data-v="map">what it learned</button><button data-v="abl">ablations</button><button data-v="curve">training curves</button></div>
+      <div class="tf-v on" id="tfVmap"><div class="tf-box"><svg id="tfM" viewBox="0 0 600 420"></svg></div></div>
+      <div class="tf-v" id="tfVabl">
+        <div class="tf-l">Task</div>
+        <div class="seg" id="tfT"><button class="active" data-v="reverse">reverse</button><button data-v="sort">sort</button></div>
+        <div class="tf-l">Measure</div>
+        <div class="seg" id="tfQ"><button class="active" data-v="seq_acc">whole sequences right</button><button data-v="token_acc">digits right</button></div>
+        <div class="tf-box" id="tfA"></div>
+      </div>
+      <div class="tf-v" id="tfVcurve">
+        <div class="tf-l">Task</div>
+        <div class="seg" id="tfC"><button class="active" data-v="reverse">reverse</button><button data-v="sort">sort</button></div>
+        <div class="tf-box"><svg id="tfG" viewBox="0 0 600 250"></svg><div class="tf-key" id="tfGk"></div></div>
+      </div>
+      <div class="stats" id="tfStats"></div>
+      <div class="tf-why" id="tfWhy"></div>
+    </div>
+    <div class="panel-foot">Model: d = 128, 4 heads, MLP width 512, pre-norm, GELU, sinusoidal positions unless stated, 2 encoder and 2 decoder blocks (929,292 parameters). Data: 16 random digits; targets are the reversed or sorted sequence. AdamW 1e-3 (weight decay 0.01), 200 warm-up steps, gradient clipping at 1.0, batch 128, 3,000 steps, seed 0, RTX 5070 Ti. Accuracy by greedy decoding of 2,000 new sequences. Ablations remove one component from every block (“no positions” removes positional encodings from both encoder and decoder inputs). Attention map: the last decoder block’s cross-attention, averaged over heads, for one test sequence.</div>
+  </div>
+
+  <h2>Training on a toy task</h2>
+  <p>Loss is cross-entropy over the 16 output positions, with teacher forcing; optimisation uses the recipe of the last few chapters: AdamW, a short warm-up, gradient clipping. The full model trained in 3,000 steps (20 seconds), and the cross-attention map shows what it learned for reversal: the first output position puts its weight on input position 15, the second on 14, and so on down the anti-diagonal, with a single blemish (two adjacent outputs both attending to position 7, which produced an error in that example). For sorting there is no such clean map; the model has to work out, for each output position, which value belongs there, which the encoder can do by comparing every digit with every other.</p>
+
+  <h2>What each piece is worth</h2>
+  <table class="t cmp">
+    <thead><tr><th>Model (greedy, 2,000 test sequences)</th><th>Reverse: sequences / digits</th><th>Sort: sequences / digits</th></tr></thead>
+    <tbody>
+      <tr><td><b>Full: 2 + 2 blocks, sinusoidal positions</b></td><td>75.3% / 96.5%</td><td><b>99.7% / 99.96%</b></td></tr>
+      <tr><td>Learned positions</td><td><b>87.4% / 98.2%</b></td><td>85.2% / 93.7%</td></tr>
+      <tr><td>No positions</td><td><b>0.0% / 15.9%</b></td><td>99.1% / 99.9%</td></tr>
+      <tr><td>No residual connections</td><td><b>0.0% / 18.5%</b></td><td><b>1.5% / 17.6%</b></td></tr>
+      <tr><td>No layer norm in the blocks</td><td>0.0% / 12.3%</td><td>84.4% / 96.9%</td></tr>
+      <tr><td>1 + 1 blocks</td><td>55.0% / 91.5%</td><td>99.2% / 99.8%</td></tr>
+      <tr><td>4 + 4 blocks</td><td>84.3% / 97.9%</td><td>99.6% / 99.97%</td></tr>
+      <tr><td>1 head instead of 4</td><td>79.8% / 97.0%</td><td>99.7% / 99.9%</td></tr>
+      <tr><td>PyTorch <code>nn.Transformer</code>, same sizes</td><td>70.1% / 91.1%</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p>Three components were essential. <b>Residual connections</b>: without them neither task trained beyond chance, the degradation problem of Chapter 15 at only four blocks deep. <b>Positions</b>: essential for reversal, irrelevant for sorting, exactly as the task structure predicts. <b>Layer norm</b>: without it reversal failed and sorting lost 15 points of whole-sequence accuracy. The rest were matters of degree: more depth helped reversal (55% → 75% → 84% of sequences for 1, 2 and 4 blocks per side), learned positions beat sinusoidal ones for reversal and lost for sorting on one seed each, and four heads against one made little difference on tasks this simple. PyTorch’s own <code>nn.Transformer</code> with the same sizes and recipe scored slightly lower (70.1% of sequences); implementation details such as initialisation differ, and with one seed per run differences of a few points are within noise (P8).</p>
+  <table class="t cmp">
+    <thead><tr><th>Component</th><th>What it does</th><th>Measured cost of removing it</th></tr></thead>
+    <tbody>
+      <tr><td>Self-attention</td><td>Mixes information between positions</td><td>(Needed for any interaction; not ablated)</td></tr>
+      <tr><td>Position-wise MLP</td><td>Transforms each position; most of the parameters</td><td>(Not ablated)</td></tr>
+      <tr><td>Residual connections</td><td>Clean gradient path; each block refines rather than replaces</td><td>Both tasks fail</td></tr>
+      <tr><td>LayerNorm (pre-norm)</td><td>Keeps sub-layer inputs on a stable scale</td><td>Reversal fails; sorting −15 points</td></tr>
+      <tr><td>Positional encoding</td><td>Tells attention where each token is</td><td>Reversal fails; sorting unaffected</td></tr>
+      <tr><td>Multiple heads</td><td>Several attention patterns at once</td><td>Small on these tasks</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout usecase">
+    <div class="ico">🧬</div>
+    <div class="body"><div class="title">Use case: a transformer for event sequences</div><p>A payments company models each card’s recent transactions as a sequence of tokens (merchant category, amount bucket, hour, country) to score fraud. A small transformer encoder, exactly the blocks on this page, attends across the last 64 events, and the score comes from a head on the final position. The team’s first version left out positional information to “let attention decide”, and it could not tell a burst of foreign transactions in the last minute from the same events spread over a month. Adding learned position embeddings, plus an embedding of the time gap between events, fixed it: in event data, as in reversal, order is information.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Forgetting positional information</b>: order-dependent tasks fail (reversal: 0% of sequences).</li>
+      <li><b>Removing residuals or norms to “simplify”</b>: both tasks failed without residuals.</li>
+      <li><b>No causal mask in the decoder</b>: teacher-forced training sees the answer and learns to copy it; greedy decoding then fails.</li>
+      <li><b>Not shifting the decoder input</b> right behind a start token: same leak.</li>
+      <li><b>Judging by digit accuracy alone</b>: 96.5% of digits was 75.3% of complete sequences.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> Walk through one transformer block.</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A block takes a sequence of vectors of width d and returns another of the same shape. First, layer-normalise and apply multi-head self-attention, so each position gathers information from the others, and add the result back to the input. Second, layer-normalise and apply a position-wise MLP, usually 4d wide with GELU, to each position independently, and add that back too. In a decoder there is a causal mask on the self-attention and a cross-attention sub-layer between the two that reads the encoder’s output. Positional encodings are added at the input because attention alone ignores order. At d = 128 an encoder block has about 198,000 parameters, two thirds of them in the MLP. In my ablations, removing the residuals made the model fail completely and removing positions broke reversal but not sorting.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why does a transformer need positional encodings, and when does it not?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Self-attention is permutation-equivariant: it scores every query against every key with no reference to where they are, so shuffling the inputs just shuffles the outputs. Any task whose answer depends on order, like language, time series or reversing a list, needs position information injected, through sinusoidal or learned embeddings added to the inputs, or rotary encodings applied to queries and keys. A task whose answer depends only on the set of inputs does not; I trained the same model to sort 16 digits without positional encodings and it got 99% of sequences right, while reversal without them got 0%. In practice the decoder can also recover some position information through the causal mask.</div></details>
+  </div></div>
+
+  <!-- xref:start (generated by tools/crosslinks.cjs from tools/crosslinks-map.cjs; do not edit by hand) -->
+  <div class="callout xref">
+    <div class="ico">🧭</div>
+    <div class="body"><div class="title xref-t">Related chapters in other courses</div>
+      <ul class="mb0">
+        <li><b>Attention and transformers:</b> ML &amp; AI <a href="../ml-ai-systems/13-sequences-attention.html">Ch 13: Sequences &amp; Attention</a> · <a href="../ml-ai-systems/14-transformers.html">Ch 14: Transformers End to End</a></li>
+      </ul>
+    </div>
+  </div>
+  <!-- xref:end -->
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>A block is pre-norm attention plus a pre-norm MLP, each with a residual; decoders add cross-attention and a causal mask.</li>
+      <li>Attention ignores order, so positions are added: essential for reversal (0% without), unnecessary for sorting (99% without).</li>
+      <li>Residual connections were essential: without them neither task trained.</li>
+      <li>Train with teacher forcing and a causal mask; evaluate with greedy decoding and whole-sequence accuracy.</li>
+      <li>The trained cross-attention for reversal was an anti-diagonal: the model found the algorithm itself.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What are the sub-layers of a decoder block in an encoder-decoder transformer?</p>
+      <div class="opts">
+        <button class="opt">Self-attention and an MLP</button>
+        <button class="opt">Causal self-attention, cross-attention to the encoder, and an MLP, each with a residual and a norm</button>
+        <button class="opt">Cross-attention only</button>
+        <button class="opt">An LSTM and an MLP</button>
+      </div>
+      <div class="explain">Encoder blocks have self-attention (no mask) and the MLP.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Without positional encodings, why did reversal fail while sorting succeeded?</p>
+      <div class="opts">
+        <button class="opt">Sorting is easier to learn</button>
+        <button class="opt">The sorting model trained longer</button>
+        <button class="opt">Reversal needs more heads</button>
+        <button class="opt">Attention cannot tell positions apart, and reversal depends on position while sorting depends only on which digits are present</button>
+      </div>
+      <div class="explain">Reversal: 0% of sequences; sorting: 99.05%.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What is teacher forcing?</p>
+      <div class="opts">
+        <button class="opt">Feeding the decoder the correct previous tokens during training, so all positions are trained in one pass</button>
+        <button class="opt">Using a larger model as a teacher</button>
+        <button class="opt">Forcing the attention weights to be one-hot</button>
+        <button class="opt">Training with a high learning rate</button>
+      </div>
+      <div class="explain">With a causal mask, each position still only sees the tokens before it.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">The model got 96.5% of digits right but 75.3% of complete sequences. Why the gap?</p>
+      <div class="opts">
+        <button class="opt">Rounding</button>
+        <button class="opt">The test set was too small</button>
+        <button class="opt">One wrong digit makes a whole sequence wrong, and in greedy decoding an early error can cause later ones</button>
+        <button class="opt">The metric was computed wrongly</button>
+      </div>
+      <div class="explain">16 digits at 96.5% each is about 56% if errors were independent; they are not.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Which component’s removal broke both tasks?</p>
+      <div class="opts">
+        <button class="opt">Positional encodings</button>
+        <button class="opt">The residual connections</button>
+        <button class="opt">Multiple heads</button>
+        <button class="opt">Layer norm</button>
+      </div>
+      <div class="explain">18.5% (reverse) and 17.6% (sort) of digits; Chapter 15’s degradation, at four blocks deep.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"runs":{"reverse: full (2 layers, sinusoidal)":{"token_acc":96.52,"seq_acc":75.3,"curve":[2.613,2.2064,1.8324,1.4383,1.0927,0.8796,0.6979,0.4555,0.3956,0.249,0.2786,0.1838,0.1302,0.1185,0.0945,0.1321,0.0967,0.0659,0.0411,0.0827,0.0411,0.0431,0.0733,0.0646,0.0587,0.1295,0.0229,0.0339,0.1274,0.0455],"params":929292,"seconds":20.7},"reverse: learned positions":{"token_acc":98.18,"seq_acc":87.35,"curve":[2.6147,2.2097,1.8558,1.6625,1.4715,1.2324,1.031,0.7735,0.6845,0.5451,0.4462,0.6185,0.3145,0.309,0.2346,0.213,0.152,0.1258,0.1198,0.0994,0.0532,0.0766,0.1082,0.0399,0.0747,0.0685,0.0196,0.0194,0.0233,0.0621],"params":931468,"seconds":20.3},"reverse: no positions":{"token_acc":15.87,"seq_acc":0.0,"curve":[2.6179,2.2075,1.8551,1.6786,1.6192,1.5608,1.5527,1.531,1.5253,1.5243,1.5292,1.5064,1.5086,1.5056,1.5086,1.4966,1.494,1.4772,1.4959,1.5062,1.5013,1.4993,1.493,1.5116,1.4863,1.4967,1.5024,1.4962,1.4973,1.4849],"params":929292,"seconds":19.7},"reverse: no residuals":{"token_acc":18.51,"seq_acc":0.0,"curve":[2.6866,1.9926,1.9899,1.9731,1.9701,1.9005,1.8961,1.8635,1.8542,1.8454,1.8428,1.8303,1.8214,1.8117,1.7876,1.7579,1.7714,1.7516,1.7649,1.7171,1.7665,1.8293,1.7697,1.7497,1.6961,1.6857,1.7028,1.6894,1.6459,1.6327],"params":929292,"seconds":19.3},"reverse: no layer norm":{"token_acc":12.28,"seq_acc":0.0,"curve":[2.6241,2.2596,2.1562,2.1506,2.1205,2.0844,2.0887,2.0815,2.0822,2.0759,2.0695,2.0695,2.0776,2.154,2.0924,2.066,2.0527,2.0529,2.0738,2.075,2.0777,2.0919,2.0912,2.1008,2.0778,2.1021,2.1728,2.1771,2.1649,2.1544],"params":929292,"seconds":18.1},"reverse: 1 layer":{"token_acc":91.54,"seq_acc":54.95,"curve":[2.6202,2.2521,1.9812,1.7697,1.3796,1.2027,1.0189,0.9794,0.8666,0.8098,0.7479,0.6796,0.6331,0.6185,0.4978,0.4995,0.4343,0.4761,0.4024,0.4012,0.3627,0.3602,0.3324,0.3007,0.2551,0.2194,0.2028,0.2033,0.1624,0.1226],"params":466444,"seconds":12.0},"reverse: 4 layers":{"token_acc":97.88,"seq_acc":84.25,"curve":[2.6502,2.0904,1.6717,1.2519,0.7935,0.4861,0.3807,0.3776,0.2579,0.1773,0.1285,0.1678,0.0708,0.0575,0.0773,0.0562,0.1289,0.0897,0.0572,0.0136,0.0709,0.0289,0.0396,0.0122,0.119,0.0292,0.0259,0.0257,0.0188,0.0681],"params":1854988,"seconds":36.0},"reverse: 1 head":{"token_acc":96.98,"seq_acc":79.75,"curve":[2.6131,2.2235,2.0272,1.7289,1.3409,1.0674,0.7572,0.5287,0.3425,0.3193,0.2711,0.2367,0.1803,0.1838,0.1677,0.1275,0.0893,0.134,0.0824,0.1618,0.0954,0.1053,0.0687,0.0366,0.0399,0.0679,0.0301,0.1908,0.0748,0.0634],"params":929292,"seconds":17.8},"sort: full (2 layers, sinusoidal)":{"token_acc":99.96,"seq_acc":99.7,"curve":[2.6191,0.7611,0.2658,0.11,0.0814,0.05,0.0365,0.0545,0.0296,0.0243,0.0061,0.0066,0.0476,0.0259,0.0386,0.0155,0.0815,0.0353,0.0388,0.0206,0.0008,0.0013,0.01,0.0013,0.0287,0.0027,0.0066,0.0225,0.0007,0.0003],"params":929292,"seconds":18.8},"sort: learned positions":{"token_acc":93.69,"seq_acc":85.15,"curve":[2.5573,0.7502,0.3089,0.2109,0.144,0.0402,0.1739,0.0374,0.0991,0.0272,0.0157,0.0197,0.0267,0.0098,0.0127,0.0063,0.0059,0.0049,0.002,0.027,0.0066,0.0045,0.0013,0.2842,0.0025,0.0016,0.01,0.0016,0.0287,0.0008],"params":931468,"seconds":19.0},"sort: no positions":{"token_acc":99.94,"seq_acc":99.05,"curve":[2.6235,0.7625,0.2806,0.1903,0.1596,0.0711,0.0356,0.0441,0.1031,0.0133,0.0228,0.04,0.01,0.046,0.0089,0.0198,0.0166,0.0209,0.0096,0.0158,0.0059,0.0083,0.0122,0.0161,0.0053,0.0022,0.0081,0.0108,0.1199,0.0286],"params":929292,"seconds":18.6},"sort: no residuals":{"token_acc":17.6,"seq_acc":1.45,"curve":[2.6866,1.9925,1.1053,0.819,0.6584,0.6913,0.5247,0.8212,0.5846,0.5315,0.501,0.685,0.4468,0.4828,0.4652,0.3563,0.3979,0.3077,0.2946,0.3278,0.3243,0.4408,0.3506,0.278,0.286,0.3577,0.2917,0.2741,0.37,0.278],"params":929292,"seconds":18.3},"sort: no layer norm":{"token_acc":96.88,"seq_acc":84.4,"curve":[2.6212,0.7374,0.6134,0.5637,0.4575,0.4886,0.3951,0.362,0.3318,0.34,0.3649,0.2444,0.2669,0.182,0.2757,0.2147,0.2307,0.1917,0.138,0.0777,0.0876,0.0658,0.1768,0.0636,0.1181,0.131,0.0483,0.1544,0.1462,0.1493],"params":929292,"seconds":17.2},"sort: 1 layer":{"token_acc":99.83,"seq_acc":99.15,"curve":[2.7803,0.8595,0.4404,0.2518,0.2142,0.1058,0.0705,0.1205,0.0472,0.1421,0.0718,0.0717,0.0201,0.0377,0.0316,0.0475,0.0759,0.0142,0.1027,0.0222,0.1356,0.0478,0.0076,0.114,0.0116,0.0224,0.04,0.0078,0.0517,0.0973],"params":466444,"seconds":11.1},"sort: 4 layers":{"token_acc":99.97,"seq_acc":99.6,"curve":[2.7399,0.5857,0.233,0.1032,0.0424,0.0917,0.0226,0.016,0.0095,0.0036,0.035,0.0024,0.002,0.0444,0.0048,0.001,0.3085,0.0107,0.0016,0.0401,0.0012,0.001,0.0072,0.0023,0.0076,0.0031,0.007,0.0021,0.0003,0.0002],"params":1854988,"seconds":33.8},"sort: 1 head":{"token_acc":99.93,"seq_acc":99.65,"curve":[2.62,0.7765,0.487,0.2988,0.2006,0.1314,0.1275,0.0726,0.0607,0.0353,0.0367,0.0478,0.0494,0.0363,0.0073,0.0235,0.0175,0.0535,0.0438,0.0082,0.0106,0.0148,0.0015,0.0044,0.0053,0.0107,0.0049,0.0017,0.0143,0.0024],"params":929292,"seconds":17.7}},"attention_map":{"src":[2,8,3,6,3,3,2,5,9,0,5,7,9,0,1,2],"tgt":[2,1,0,9,7,5,0,9,5,2,3,3,6,3,8,2],"att":[[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.018,0.164,0.818],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.008,0.197,0.53,0.265],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.009,0.088,0.432,0.276,0.195],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.002,0.135,0.335,0.206,0.226,0.097],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.018,0.06,0.443,0.202,0.143,0.089,0.044],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.006,0.289,0.514,0.118,0.053,0.013,0.005,0.002],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.006,0.129,0.544,0.287,0.027,0.006,0.001,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.004,0.105,0.515,0.175,0.192,0.007,0.001,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.008,0.062,0.45,0.378,0.068,0.034,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.016,0.166,0.293,0.381,0.142,0.001,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.004,0.132,0.449,0.198,0.194,0.023,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.004,0.153,0.469,0.258,0.094,0.021,0.001,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.001,0.171,0.534,0.249,0.035,0.008,0.001,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.033,0.105,0.779,0.076,0.007,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.287,0.496,0.213,0.004,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.526,0.411,0.062,0.001,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]]},"torch_transformer":{"token_acc":91.06,"seq_acc":70.1,"params":929292,"seconds":19.1}};
+  const bar = (l, v, c) => `<div class="tf-bar"><span>${l}</span><span class="track"><i style="width:${Math.max(0.5, v)}%;background:${c}"></i></span><span class="n">${v}%</span></div>`;
+  function map() {
+    const A = D.attention_map, n = 16, cell = 21, ox = 80, oy = 40, W = 600;
+    let g = `<text x="${ox + n * cell / 2}" y="16" text-anchor="middle">source position (the input digits)</text>`;
+    A.src.forEach((d, j) => g += `<text x="${ox + j * cell + cell / 2}" y="${oy - 6}" text-anchor="middle" style="fill:var(--text);font-family:var(--mono)">${d}</text>`);
+    A.att.forEach((row, i) => { g += `<text x="${ox - 8}" y="${oy + i * cell + 15}" text-anchor="end" style="fill:var(--text);font-family:var(--mono)">${A.tgt[i]}</text>`; row.forEach((v, j) => g += `<rect x="${ox + j * cell}" y="${oy + i * cell}" width="${cell - 1}" height="${cell - 1}" fill="#7c3aed" opacity="${0.05 + 0.95 * v}"/>`); });
+    g += `<text x="20" y="${oy + n * cell / 2}" transform="rotate(-90 20 ${oy + n * cell / 2})" text-anchor="middle">output position (the reversed digits)</text>`;
+    $('#tfM').setAttribute('viewBox', `0 0 ${W} ${oy + n * cell + 20}`); $('#tfM').innerHTML = g;
+    const argmax = A.att.map(r => r.indexOf(Math.max(...r))), exact = argmax.filter((j, i) => j === 15 - i).length;
+    $('#tfStats').innerHTML = `<div class="stat good"><div class="k">Outputs attending to 15 − i</div><div class="v">${exact} of 16</div></div><div class="stat"><div class="k">Reverse, digits right</div><div class="v">${D.runs['reverse: full (2 layers, sinusoidal)'].token_acc}%</div></div>`;
+    $('#tfWhy').innerHTML = '<b>The algorithm, discovered.</b> Each row is one output digit; dark cells are where its cross-attention looks in the input. The anti-diagonal means output 1 reads input 16, output 2 reads input 15, and so on: reversal, learned from examples. Look for the one row that strays.';
+  }
+  const ORDER = ['full (2 layers, sinusoidal)', 'learned positions', 'no positions', 'no residuals', 'no layer norm', '1 layer', '4 layers', '1 head'];
+  function abl() {
+    const t = $('#tfT .active').dataset.v, q = $('#tfQ .active').dataset.v, Rn = D.runs;
+    $('#tfA').innerHTML = ORDER.map(k => { const v = Rn[`${t}: ${k}`][q]; return bar(k.replace('1 layer', '1 + 1 blocks').replace('4 layers', '4 + 4 blocks'), v, v > 90 ? '#16a34a' : v > 50 ? '#f97316' : '#e11d48'); }).join('') + (t === 'reverse' ? bar('nn.Transformer, same sizes', D.torch_transformer[q], '#94a3b8') : '');
+    const full = Rn[`${t}: full (2 layers, sinusoidal)`][q];
+    $('#tfStats').innerHTML = `<div class="stat good"><div class="k">Full model</div><div class="v">${full}%</div></div><div class="stat${Rn[`${t}: no positions`][q] < 50 ? ' bad' : ' good'}"><div class="k">No positions</div><div class="v">${Rn[`${t}: no positions`][q]}%</div></div><div class="stat bad"><div class="k">No residuals</div><div class="v">${Rn[`${t}: no residuals`][q]}%</div></div>`;
+    $('#tfWhy').innerHTML = t === 'reverse' ? '<b>Reversal is about position.</b> Remove positional encodings and the model cannot tell which input digit is which. Remove residuals or layer norm and it does not train at all. Depth helps: four blocks per side beat two, which beat one.' : '<b>Sorting is about content.</b> Which digits are present decides the answer, not where they were, so removing positions changes nothing. Residuals are still indispensable; layer norm is helpful but not essential here.';
+  }
+  function curve() {
+    const t = $('#tfC .active').dataset.v, Rn = D.runs, col = ['#16a34a', '#2563eb', '#e11d48', '#f97316', '#a855f7', '#94a3b8'], ks = ['full (2 layers, sinusoidal)', 'learned positions', 'no positions', 'no residuals', 'no layer norm', '1 layer'];
+    const W = 600, H = 250, L = 40, R = 14, T = 12, B = 30, x = i => L + i / 29 * (W - L - R), y = v => T + (1 - Math.min(v, 2.5) / 2.5) * (H - T - B);
+    let g = '';
+    [0, 0.5, 1, 1.5, 2, 2.5].forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`);
+    g += `<text x="${(W + L) / 2}" y="${H - 6}" text-anchor="middle">step 0 → 3,000, training loss (teacher-forced)</text>`;
+    ks.forEach((k, i) => g += `<polyline fill="none" stroke="${col[i]}" stroke-width="2.2" points="${Rn[`${t}: ${k}`].curve.map((v, j) => v === null ? null : x(j) + ',' + y(v)).filter(Boolean).join(' ')}"/>`);
+    $('#tfG').innerHTML = g; $('#tfGk').innerHTML = ks.map((k, i) => `<span><i style="background:${col[i]}"></i>${k}</span>`).join('');
+    $('#tfStats').innerHTML = ks.slice(0, 4).map(k => `<div class="stat"><div class="k">${k}, final loss</div><div class="v">${Rn[`${t}: ${k}`].curve.at(-1)}</div></div>`).join('');
+    $('#tfWhy').innerHTML = '<b>The failures are visible in the first few hundred steps.</b> Models that will work drop below 0.5 quickly; the ones missing residuals (or, for reversal, positions or norms) plateau high and stay there. A training curve read early saves a wasted run.';
+  }
+  function draw() { const v = $('#tfE .active').dataset.v; ['map', 'abl', 'curve'].forEach(x => $('#tfV' + x).classList.toggle('on', x === v)); ({ map, abl, curve })[v](); }
+  ['#tfE', '#tfT', '#tfQ', '#tfC'].forEach(id => $(id).addEventListener('segchange', draw)); draw();
+})();
+</script>
+</body>
+</html>

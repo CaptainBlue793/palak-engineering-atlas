@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Batch Size, Scaling Rules &amp; Large Batches · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 24 of Deep Learning. Batch size on a CIFAR-10 CNN from 32 to 8,192: how well a mini-batch gradient points the right way, the linear and square-root scaling rules failing at a fixed epoch budget, steps and samples to 85% accuracy with a tuned learning rate per batch (perfect scaling up to a few hundred, then diminishing returns), a noise-scale estimate that missed by an order of magnitude, and LARS, LAMB and AdamW at batch 8,192.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .bs-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .bs-v { display:none; } .bs-v.on { display:block; }
+  .bs-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .bs-box svg { width:100%; height:auto; display:block; } .bs-box text { font-size:12px; fill:var(--muted); }
+  .bs-key { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; margin-top:6px; } .bs-key i { display:inline-block; width:10px; height:10px; border-radius:3px; vertical-align:middle; margin-right:4px; }
+  .bs-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+</style>
+</head>
+<body data-chapter="24">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 24</span><span class="pill">Advanced</span><span class="pill">⏱ 45 min</span></div>
+    <h1>Batch Size, <span class="grad">Scaling Rules &amp; Large Batches</span></h1>
+    <p class="lead">A larger batch does more work per step and uses the GPU better, and with many GPUs it is the only way to use them all at once. The question is what it does to learning. A gradient averaged over more examples is less noisy, so each step can be larger, but there are fewer steps per epoch, and past some batch size a cleaner gradient stops helping. Practitioners scale the learning rate with the batch by a rule, and the rules hold only so far.</p>
+    <p class="lead">This chapter measures that on a CIFAR-10 CNN with batches from 32 to 8,192. With 15 epochs of training, the linear scaling rule worked at batch 512 and failed badly beyond it: at 2,048 it gave 68.9% where leaving the learning rate alone gave 80.6%, and at 8,192 it did not train at all. With the learning rate tuned for each batch and no limit on epochs, the steps needed to reach 85% test accuracy halved every time the batch doubled, up to a few hundred; beyond that each doubling saved less, and batch 8,192 never reached 85% in 40 epochs. A popular estimate of where that turn comes, the gradient noise scale, put it at 16 to 39, an order of magnitude too small. Layer-wise optimisers did help at 8,192: LARS, LAMB and AdamW reached about 80% where SGD peaked at 74%, still ten points short of batch 256.</p>
+    <ul class="objectives">
+      <li><span>Measure how gradient noise falls with batch size and how it changes during training</span></li>
+      <li><span>Apply and test the linear and square-root learning-rate scaling rules</span></li>
+      <li><span>Read a steps-to-target versus batch-size curve and find the critical batch size</span></li>
+      <li><span>Know what LARS and LAMB change and when they are worth using</span></li>
+      <li><span>Choose a batch size for a fixed compute or time budget</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Mini-batch noise and the 1/√B law:</b> <a href="08-sgd-and-mini-batches.html">Chapter 8</a>. <b>Warm-up and schedules:</b> <a href="12-learning-rate-schedules.html">Chapter 12</a>. <b>Fitting a large batch in memory:</b> <a href="23-memory-checkpointing-and-accumulation.html">Chapter 23</a>.</li>
+        <li>Data parallelism across GPUs, which is where large batches come from, is in <a href="../ml-ai-systems/23-distributed-training-1.html">ML &amp; AI Systems</a>; pretraining at scale is in <a href="../ml-ai-systems/16-pretraining-scaling.html">ML &amp; AI Systems Chapter 16</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Batch size and gradient noise</h2>
+  <p>Chapter 8 showed that the error of a mini-batch gradient falls as 1/√B. What matters for a step is direction: does the mini-batch gradient point the way the full-data gradient does? Measured as the cosine between them on the CNN, at four points in training (BatchNorm in evaluation mode, so a gradient does not depend on its batch-mates):</p>
+  <table class="t cmp">
+    <thead><tr><th>Batch</th><th>At initialisation</th><th>After 1 epoch</th><th>After 5</th><th>After 20</th></tr></thead>
+    <tbody>
+      <tr><td>16</td><td>0.10</td><td>0.71</td><td>0.70</td><td>0.54</td></tr>
+      <tr><td>64</td><td>0.17</td><td>0.90</td><td>0.91</td><td>0.78</td></tr>
+      <tr><td>256</td><td>0.42</td><td>0.97</td><td>0.97</td><td>0.93</td></tr>
+      <tr><td>1,024</td><td>0.66</td><td>0.99</td><td>0.99</td><td>0.99</td></tr>
+      <tr><td>4,096</td><td>0.87</td><td>0.998</td><td>0.998</td><td>0.996</td></tr>
+    </tbody>
+  </table>
+  <p>Two things stand out. At initialisation even 1,024 examples gave a direction only 0.66 aligned with the truth, because the full gradient was tiny (norm 0.035) and the per-example gradients pointed every which way. After one epoch the full gradient was 250 times larger and a batch of 256 was already 0.97 aligned. And as training continued the gradients became noisier again: by epoch 20 a batch of 16 was only 0.54 aligned. Early in training the signal is strong and small batches suffice; late in training, near a minimum, the useful signal shrinks relative to the noise, which is one argument for growing the batch as training proceeds.</p>
+  <p>McCandlish et al. (2018) turn this into a number, the <b>simple noise scale</b> B<sub>noise</sub> = tr(Σ)/|G|², the batch size at which noise and signal are about equal, and argue that it predicts the <b>critical batch size</b> beyond which larger batches stop paying. Measured here: 1,340 at initialisation, then 16 after one epoch, 18 after five and 39 after twenty. Keep those numbers in mind for the next section.</p>
+
+  <h2>The linear scaling rule</h2>
+  <p>If B examples give a gradient with noise ∝ 1/√B, multiplying the batch by k means k times fewer steps, and to cover the same distance each step should be k times longer: the <b>linear scaling rule</b> (Goyal et al., 2017), used with a warm-up. The <b>square-root rule</b> scales by √k, keeping the update’s noise constant instead. Tested from a tuned base of batch 256 at learning rate 0.1, 15 epochs each, one-cycle schedule, 5% warm-up:</p>
+  <table class="t cmp">
+    <thead><tr><th>Batch</th><th>No scaling (lr 0.1)</th><th>Square-root rule</th><th>Linear rule</th><th>Linear, no warm-up</th></tr></thead>
+    <tbody>
+      <tr><td>128</td><td><b>89.65%</b></td><td>88.89%</td><td>88.88%</td><td>88.96%</td></tr>
+      <tr><td>512</td><td>87.28%</td><td>88.02%</td><td><b>88.09%</b></td><td>83.92%</td></tr>
+      <tr><td>2,048</td><td><b>80.58%</b></td><td>79.86%</td><td>68.87% (lr 0.8)</td><td>43.31%</td></tr>
+      <tr><td>8,192</td><td><b>61.95%</b></td><td>20.44%</td><td>10.03% (lr 3.2)</td><td>10.52%</td></tr>
+    </tbody>
+  </table>
+  <p>At a fixed number of epochs both rules held up to batch 512, and warm-up mattered there (83.9% without, 88.1% with). Beyond that they failed, because at 8,192 fifteen epochs are only 105 optimiser steps: no learning rate can make 105 steps do the work of 2,940, and the large rates the rules prescribe made those few steps unstable. Goyal et al. trained ImageNet at batch 8,192 with the linear rule because 90 epochs of 1.28 million images still gave about 14,000 steps. The rule is a statement about step size, not a promise that fewer steps are enough.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Batch-size lab</span><span class="p-tag">Trained here</span></div>
+    <div class="panel-body">
+      <div class="bs-l">View</div>
+      <div class="seg" id="bsV"><button class="active" data-v="steps">steps vs samples</button><button data-v="rules">scaling rules</button><button data-v="opt">optimisers at 8,192</button></div>
+      <div class="bs-v on" id="bsVsteps"><div class="bs-box"><svg id="bsS" viewBox="0 0 600 270"></svg><div class="bs-key"><span><i style="background:#7c3aed"></i>optimiser steps to 85% (left)</span><span><i style="background:#f97316"></i>training examples processed (right)</span><span>dashed: perfect scaling from batch 32</span></div></div></div>
+      <div class="bs-v" id="bsVrules"><div class="bs-box"><svg id="bsR" viewBox="0 0 600 250"></svg><div class="bs-key" id="bsRk"></div></div></div>
+      <div class="bs-v" id="bsVopt"><div class="bs-box"><svg id="bsO" viewBox="0 0 600 250"></svg><div class="bs-key" id="bsOk"></div></div></div>
+      <div class="stats" id="bsStats"></div>
+      <div class="bs-why" id="bsWhy"></div>
+    </div>
+    <div class="panel-foot">CIFAR-10, a 5-convolution CNN with BatchNorm (64–256 channels), flips and per-image crops on the GPU, bf16, channels-last. Steps to target: SGD with Nesterov momentum 0.9, weight decay 5e-4, constant learning rate after a 2% warm-up, test accuracy checked four times an epoch, up to 40 epochs; the learning rate searched on a factor-2 grid per batch, walking outward while the best was at an edge. Scaling rules: 15 epochs, one-cycle. Optimisers: batch 8,192, 30 epochs (210 steps), 15% warm-up, cosine; batch 256 SGD for 30 epochs as the reference. One seed throughout; Chapter 38 measured this network’s seed spread at about 0.2 points.</div>
+  </div>
+
+  <h2>Critical batch size: steps versus samples</h2>
+  <p>A fair comparison gives every batch size its own tuned learning rate and enough epochs, and asks how many optimiser steps, and how many training examples, it takes to reach a target, here 85% test accuracy (Shallue et al., 2019):</p>
+  <table class="t cmp">
+    <thead><tr><th>Batch</th><th>Best constant lr</th><th>Steps to 85%</th><th>Examples processed</th><th>Steps saved by doubling</th></tr></thead>
+    <tbody>
+      <tr><td>32</td><td>0.006</td><td>15,600</td><td>0.50M</td><td>–</td></tr>
+      <tr><td>64</td><td>0.0125</td><td>10,140</td><td>0.65M</td><td>35%</td></tr>
+      <tr><td>128</td><td>0.0125</td><td>5,432</td><td>0.70M</td><td>46%</td></tr>
+      <tr><td>256</td><td>0.05</td><td>2,940</td><td>0.75M</td><td>46%</td></tr>
+      <tr><td>512</td><td>0.1</td><td>1,680</td><td>0.86M</td><td>43%</td></tr>
+      <tr><td>1,024</td><td>0.4</td><td>1,032</td><td>1.06M</td><td>39%</td></tr>
+      <tr><td>2,048</td><td>0.1</td><td>732</td><td>1.50M</td><td>29%</td></tr>
+      <tr><td>4,096</td><td>0.1</td><td>519</td><td>2.13M</td><td>29%</td></tr>
+      <tr><td>8,192</td><td>–</td><td>not reached in 40 epochs (best 80.5%)</td><td>–</td><td>–</td></tr>
+    </tbody>
+  </table>
+  <p>The curve has the shape Shallue et al. found across many models. From 64 to 512, doubling the batch nearly halved the steps while the examples processed rose only slowly (0.65M to 0.86M): close to <b>perfect scaling</b>, where a step on twice the data is worth two steps. From about 1,024 the savings fell to 29% per doubling, and the examples needed rose steeply: 2.1 million at 4,096 against 0.75 million at 256. That turn is the <b>critical batch size</b>, here somewhere between 512 and 1,024. Beyond it, larger batches still finish in fewer steps, which is what matters when steps are spread across many GPUs, but they waste compute. The best learning rate did not follow either scaling rule: it grew from 0.006 to 0.4 and then fell back to 0.1, because at large batches the binding constraint became stability rather than noise.</p>
+  <p>The gradient noise scale, 16 to 39 after the first epoch, predicted the turn an order of magnitude too early. The estimate assumes plain SGD at its optimal learning rate on a quadratic model of the loss; this network has momentum, BatchNorm and augmentation, and the noise scale changed fourfold during training. It is a useful order-of-magnitude tool for very large models, where it was calibrated, and here a direct measurement was worth more.</p>
+
+  <h2>LARS and LAMB</h2>
+  <p>At very large batches, the update that suits one layer can be far too big for another, because layers differ in the ratio of gradient norm to weight norm. <b>LARS</b> (You et al., 2017) gives each layer a learning rate proportional to ‖w‖/‖g‖, a “trust ratio”, on top of SGD with momentum; <b>LAMB</b> (You et al., 2020) does the same on top of Adam. At batch 8,192, 30 epochs (210 steps), each with a learning-rate sweep:</p>
+  <table class="t cmp">
+    <thead><tr><th>Optimiser at batch 8,192</th><th>Learning rates tried</th><th>Best test accuracy</th></tr></thead>
+    <tbody>
+      <tr><td>SGD + Nesterov momentum</td><td>0.1 – 3.2</td><td>74.17% (lr 0.2)</td></tr>
+      <tr><td>LARS</td><td>1 – 10</td><td>80.13% (lr 10, the edge of the sweep)</td></tr>
+      <tr><td>LAMB</td><td>0.0025 – 0.02</td><td>80.10% (lr 0.02, the edge)</td></tr>
+      <tr><td>AdamW</td><td>0.001 – 0.008</td><td>80.23% (lr 0.008, the edge)</td></tr>
+      <tr><td><i>Reference: SGD at batch 256, 30 epochs</i></td><td>0.1</td><td><i>90.24%</i></td></tr>
+    </tbody>
+  </table>
+  <p>All three adaptive optimisers beat tuned SGD by about six points, and all three peaked at the largest learning rate tried, so their true best is likely somewhat higher: the sweeps were not wide enough, a mistake worth naming because it is so common. Plain AdamW did as well as the trust-ratio methods here; per-parameter adaptivity was already enough at this scale. And none came within ten points of batch 256 trained for the same 30 epochs, which had 28 times as many steps. Large-batch optimisers make large batches workable; they do not make 210 steps equal to 5,880.</p>
+
+  <h2>Steps versus samples to a target</h2>
+  <p>The right batch size depends on what is scarce. If compute is scarce (one GPU, a fixed bill), choose a batch near or below the critical batch size, where each example does the most work: here 128 to 512. If time is scarce and hardware plentiful, go larger, accept that each doubling buys less, and pay for it in compute: batch 4,096 used three times the examples of 256 to reach the same accuracy, in a sixth of the steps. Either way, re-tune the learning rate and warm-up at the new batch size, and give the schedule enough steps.</p>
+
+  <figure class="flow">
+    <ol>
+      <li><b>Tune at a modest batch</b><small>learning rate and warm-up</small></li>
+      <li><b>Scale the batch</b><small>start the lr with the linear or √ rule</small></li>
+      <li><b>Re-tune the lr</b><small>the rules are only a starting point</small></li>
+      <li><b>Watch steps and samples</b><small>past the critical batch, samples climb</small></li>
+      <li><b>Very large batches</b><small>LARS, LAMB or AdamW, long warm-up</small></li>
+    </ol>
+    <figcaption><b>Changing the batch size.</b> Below the critical batch size, doubling the batch halves the steps; above it, it mostly doubles the bill.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🛰️</div>
+    <div class="body"><div class="title">Use case: moving a training job from 1 GPU to 32</div><p>A team trains an image model at batch 256 on one GPU in two days and gets access to 32 GPUs. Scaling to batch 8,192 with the linear rule and the same 90 epochs, the run diverges in the first epoch; with a 5-epoch warm-up it trains but finishes 3 points worse, and the hoped-for 32-times speed-up is 18 times. They measure steps to their target accuracy at batches 256, 1,024, 2,048 and 4,096 for one epoch budget each and find the curve bending at about 2,048. They settle on batch 2,048 across 32 GPUs with gradient accumulation off, LAMB, and a longer schedule, which reaches the single-GPU accuracy in 6 hours instead of two days, and they stop expecting batch size alone to buy the rest.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Scaling the batch at a fixed epoch budget</b>: at 8,192, 15 epochs were 105 steps and the linear rule gave 10%.</li>
+      <li><b>Dropping warm-up with a scaled learning rate</b>: at batch 512, 83.9% without against 88.1% with.</li>
+      <li><b>Trusting a scaling rule instead of re-tuning</b>: the best rate rose from 0.006 to 0.4 and fell back to 0.1.</li>
+      <li><b>Taking the noise-scale estimate as the answer</b>: it said 16–39; the measured turn was near 1,000.</li>
+      <li><b>Sweeps that stop at the best value</b>: LARS, LAMB and AdamW all peaked at the edge.</li>
+      <li><b>Expecting large-batch runs to reproduce</b>: rerunning batch 8,192 at lr 0.2 gave 43.7% where an earlier run gave 54.0%; few, large steps amplify every small difference (Chapter 38).</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> You increase the batch size by 8×. What do you do to the learning rate?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Start from the linear scaling rule, multiplying it by 8 with a warm-up, or the square-root rule, multiplying by about 2.8, and then re-tune, because the rules are only a starting point. They come from noise: a gradient averaged over 8 times the data is less noisy and can take a longer step. They break down when there are too few steps or the step becomes unstable: on a CIFAR CNN at a fixed 15 epochs the linear rule worked at batch 512, gave 68.9% against 80.6% at 2,048, and failed to train at 8,192. I would also check that the run still has enough optimiser steps, and lengthen the schedule if not.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> What is the critical batch size and how would you find it?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is the batch size beyond which doubling the batch no longer halves the number of steps to a target, so larger batches start wasting compute. I find it directly: tune the learning rate at several batch sizes, measure steps to a fixed accuracy, and look for where steps stop halving and examples processed start climbing. On a CIFAR CNN steps halved from 64 to 512 with almost constant examples, and from about 1,024 each doubling saved only 29% while examples tripled by 4,096. The gradient noise scale is a cheap estimate, but it said 16 to 39 there, an order of magnitude too small, so I would trust the measurement.</div></details>
+  </div></div>
+
+  <!-- xref:start (generated by tools/crosslinks.cjs from tools/crosslinks-map.cjs; do not edit by hand) -->
+  <div class="callout xref">
+    <div class="ico">🧭</div>
+    <div class="body"><div class="title xref-t">Related chapters in other courses</div>
+      <ul class="mb0">
+        <li><b>Large-batch and distributed training:</b> ML &amp; AI <a href="../ml-ai-systems/23-distributed-training-1.html">Ch 23: Distributed Training I: Data Parallel, ZeRO &amp; FSDP</a> · <a href="../ml-ai-systems/24-distributed-training-2.html">Ch 24: Distributed Training II: Tensor, Pipeline &amp; MoE</a></li>
+      </ul>
+    </div>
+  </div>
+  <!-- xref:end -->
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Larger batches point the gradient more truly, but the signal weakens late in training (batch 16: 0.71 → 0.54 alignment).</li>
+      <li>Scaling rules set a step size; at a fixed epoch budget they failed beyond batch 512 because steps ran out.</li>
+      <li>With tuned rates, steps halved per doubling up to ~512, then savings fell to 29%: the critical batch size.</li>
+      <li>The noise-scale estimate (16–39) missed the measured turn (~1,000) by an order of magnitude.</li>
+      <li>At 8,192, LARS, LAMB and AdamW reached ~80% vs SGD’s 74%, still ten points below batch 256.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why did the linear scaling rule fail at batch 8,192 with 15 epochs?</p>
+      <div class="opts">
+        <button class="opt">The rule is wrong in principle</button>
+        <button class="opt">BatchNorm cannot handle large batches</button>
+        <button class="opt">15 epochs were only 105 steps, too few for any learning rate, and the large rate made them unstable</button>
+        <button class="opt">The GPU ran out of memory</button>
+      </div>
+      <div class="explain">ImageNet at 8,192 for 90 epochs still has about 14,000 steps.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What marks the critical batch size on a steps-to-target curve?</p>
+      <div class="opts">
+        <button class="opt">The point where doubling the batch stops roughly halving the steps and the examples processed start to climb</button>
+        <button class="opt">The largest batch that fits in memory</button>
+        <button class="opt">The batch with the highest final accuracy</button>
+        <button class="opt">The batch where training diverges</button>
+      </div>
+      <div class="explain">Here between 512 and 1,024.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">How well did the gradient noise scale predict the critical batch size here?</p>
+      <div class="opts">
+        <button class="opt">Exactly</button>
+        <button class="opt">It overestimated it</button>
+        <button class="opt">It could not be computed</button>
+        <button class="opt">It said 16–39, an order of magnitude below the measured turn near 1,000</button>
+      </div>
+      <div class="explain">Its assumptions (plain SGD, a quadratic loss) did not match this network.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does LARS add to SGD?</p>
+      <div class="opts">
+        <button class="opt">A second-order Hessian step</button>
+        <button class="opt">A per-layer learning rate proportional to the ratio of weight norm to gradient norm</button>
+        <button class="opt">Gradient accumulation</button>
+        <button class="opt">A larger batch</button>
+      </div>
+      <div class="explain">LAMB applies the same trust ratio on top of Adam.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">LARS, LAMB and AdamW all scored best at the largest learning rate in their sweeps. What should you conclude?</p>
+      <div class="opts">
+        <button class="opt">That rate is the optimum</button>
+        <button class="opt">The optimisers are equivalent</button>
+        <button class="opt">The sweeps were too narrow; their true best is probably at a higher rate</button>
+        <button class="opt">Large learning rates are always better</button>
+      </div>
+      <div class="explain">A best value at the edge of a sweep is a reason to extend the sweep.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"noise":{"after 0 epochs":{"by_batch":{"16":0.099,"64":0.173,"256":0.42,"1024":0.662,"4096":0.865},"noise_scale":1340,"grad_norm":0.0346,"test_acc":10.0},"after 1 epochs":{"by_batch":{"16":0.71,"64":0.901,"256":0.974,"1024":0.994,"4096":0.998},"noise_scale":16,"grad_norm":8.7344,"test_acc":45.34},"after 5 epochs":{"by_batch":{"16":0.703,"64":0.909,"256":0.968,"1024":0.993,"4096":0.998},"noise_scale":18,"grad_norm":7.7381,"test_acc":71.01},"after 20 epochs":{"by_batch":{"16":0.543,"64":0.778,"256":0.928,"1024":0.985,"4096":0.996},"noise_scale":39,"grad_norm":5.6473,"test_acc":77.28}},"scaling":{"128":{"no scaling":{"lr":0.1,"acc":89.65},"square-root":{"lr":0.0707,"acc":88.89},"linear":{"lr":0.05,"acc":88.88},"linear, no warm-up":{"lr":0.05,"acc":88.96}},"512":{"no scaling":{"lr":0.1,"acc":87.28},"square-root":{"lr":0.1414,"acc":88.02},"linear":{"lr":0.2,"acc":88.09},"linear, no warm-up":{"lr":0.2,"acc":83.92}},"2048":{"no scaling":{"lr":0.1,"acc":80.58},"square-root":{"lr":0.2828,"acc":79.86},"linear":{"lr":0.8,"acc":68.87},"linear, no warm-up":{"lr":0.8,"acc":43.31}},"8192":{"no scaling":{"lr":0.1,"acc":61.95},"square-root":{"lr":0.5657,"acc":20.44},"linear":{"lr":3.2,"acc":10.03},"linear, no warm-up":{"lr":3.2,"acc":10.52}}},"to_target":{"32":{"best_lr":0.00625,"steps":15600,"samples":499200,"tried":{"0.0125":23010,"0.025":null,"0.00625":15600,"0.00313":19890},"best_acc_reached":85.54},"64":{"best_lr":0.0125,"steps":10140,"samples":648960,"tried":{"0.025":14040,"0.05":null,"0.0125":10140,"0.00625":11895},"best_acc_reached":85.33},"128":{"best_lr":0.0125,"steps":5432,"samples":695296,"tried":{"0.05":6984,"0.1":null,"0.025":6305,"0.0125":5432,"0.00625":8633},"best_acc_reached":85.67},"256":{"best_lr":0.05,"steps":2940,"samples":752640,"tried":{"0.1":3773,"0.2":null,"0.05":2940,"0.025":3675},"best_acc_reached":85.77},"512":{"best_lr":0.1,"steps":1680,"samples":860160,"tried":{"0.2":2496,"0.4":null,"0.1":1680,"0.05":1728},"best_acc_reached":85.74},"1024":{"best_lr":0.4,"steps":1032,"samples":1056768,"tried":{"0.2":1644,"0.4":1032,"0.1":1428,"0.8":null},"best_acc_reached":85.36},"2048":{"best_lr":0.1,"steps":732,"samples":1499136,"tried":{"0.2":810,"0.4":null,"0.1":732,"0.05":930},"best_acc_reached":85.75},"4096":{"best_lr":0.1,"steps":519,"samples":2125824,"tried":{"0.2":null,"0.4":null,"0.1":519,"0.05":null},"best_acc_reached":85.07},"8192":{"best_lr":0.00625,"steps":null,"samples":null,"tried":{"0.2":null,"0.4":null,"0.1":null,"0.05":null,"0.025":null,"0.0125":null,"0.00625":null},"best_acc_reached":80.5}},"lbo":{"SGD + Nesterov":{"0.1":73.91,"0.2":74.17,"0.4":71.62,"0.8":67.93,"1.6":60.12,"3.2":33.47},"LARS":{"1.0":63.78,"2.0":68.75,"5.0":75.79,"10.0":80.13},"LAMB":{"0.0025":60.08,"0.005":68.51,"0.01":75.47,"0.02":80.1},"AdamW":{"0.001":72.21,"0.002":76.56,"0.004":79.39,"0.008":80.23}},"base":90.24};
+  const W = 600, H = 270, L = 56, R = 56, T = 14, B = 34;
+  function steps() {
+    const tt = D.to_target, bs = Object.keys(tt).map(Number).filter(b => tt[b].steps), lx = b => L + Math.log2(b / 32) / 8 * (W - L - R);
+    const ys = v => T + (1 - (Math.log10(v) - 2) / 2.5) * (H - T - B), ye = v => T + (1 - (v - 0) / 2.5e6) * (H - T - B);
+    let g = '';
+    [100, 1000, 10000].forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${ys(v)}" y2="${ys(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${ys(v) + 4}" text-anchor="end">${v.toLocaleString()}</text>`);
+    [0, 1e6, 2e6].forEach(v => g += `<text x="${W - R + 6}" y="${ye(v) + 4}">${v / 1e6}M</text>`);
+    [32, 128, 512, 2048, 8192].forEach(b => g += `<text x="${lx(b)}" y="${H - 18}" text-anchor="middle">${b.toLocaleString()}</text>`); g += `<text x="${(W + L - R) / 2 + 20}" y="${H - 2}" text-anchor="middle">batch size (log scale)</text>`;
+    const s0 = tt['32'].steps; g += `<polyline fill="none" stroke="var(--muted)" stroke-dasharray="6 5" points="${[32, 64, 128, 256, 512, 1024, 2048, 4096].map(b => lx(b) + ',' + ys(s0 * 32 / b)).join(' ')}"/>`;
+    g += `<polyline fill="none" stroke="#7c3aed" stroke-width="3" points="${bs.map(b => lx(b) + ',' + ys(tt[b].steps)).join(' ')}"/>` + bs.map(b => `<circle cx="${lx(b)}" cy="${ys(tt[b].steps)}" r="4.5" fill="#7c3aed"><title>batch ${b}: ${tt[b].steps} steps at lr ${tt[b].best_lr}</title></circle>`).join('');
+    g += `<polyline fill="none" stroke="#f97316" stroke-width="2.5" points="${bs.map(b => lx(b) + ',' + ye(tt[b].samples)).join(' ')}"/>` + bs.map(b => `<circle cx="${lx(b)}" cy="${ye(tt[b].samples)}" r="4" fill="#f97316"/>`).join('');
+    g += `<text x="${lx(8192)}" y="${T + 16}" text-anchor="middle" fill="#e11d48">8,192: never</text>`;
+    $('#bsS').innerHTML = g;
+    $('#bsStats').innerHTML = `<div class="stat"><div class="k">Steps, batch 256</div><div class="v">${tt['256'].steps.toLocaleString()}</div></div><div class="stat"><div class="k">Steps, batch 4,096</div><div class="v">${tt['4096'].steps.toLocaleString()}</div></div><div class="stat bad"><div class="k">Examples, 4,096 vs 256</div><div class="v">${(tt['4096'].samples / tt['256'].samples).toFixed(1)}×</div></div>`;
+    $('#bsWhy').innerHTML = '<b>Two regimes.</b> While the purple line follows the dashed one, a step on twice the data is worth two steps and the orange line, the examples consumed, stays flat. From about 1,024 the purple line flattens and the orange one climbs: bigger batches still save steps, but each example does less. Batch 8,192 never reached the target at all within 40 epochs.';
+  }
+  function rules() {
+    const S = D.scaling, bs = Object.keys(S).map(Number), ks = ['no scaling', 'square-root', 'linear', 'linear, no warm-up'], col = ['#94a3b8', '#2563eb', '#7c3aed', '#e11d48'];
+    const lx = b => L + Math.log2(b / 128) / 6 * (W - L - R), y = v => T + (1 - v / 100) * (250 - T - B);
+    let g = '';
+    [0, 25, 50, 75, 100].forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}%</text>`);
+    bs.forEach(b => g += `<text x="${lx(b)}" y="${250 - 18}" text-anchor="middle">${b.toLocaleString()}</text>`); g += `<text x="${(W + L - R) / 2}" y="${248}" text-anchor="middle">batch size, 15 epochs each (test accuracy)</text>`;
+    ks.forEach((k, i) => g += `<polyline fill="none" stroke="${col[i]}" stroke-width="2.5" points="${bs.map(b => lx(b) + ',' + y(S[b][k].acc)).join(' ')}"/>` + bs.map(b => `<circle cx="${lx(b)}" cy="${y(S[b][k].acc)}" r="4" fill="${col[i]}"><title>${k}, batch ${b}: lr ${S[b][k].lr}, ${S[b][k].acc}%</title></circle>`).join(''));
+    $('#bsR').innerHTML = g; $('#bsRk').innerHTML = ks.map((k, i) => `<span><i style="background:${col[i]}"></i>${k}</span>`).join('');
+    $('#bsStats').innerHTML = `<div class="stat good"><div class="k">Linear, batch 512</div><div class="v">${S['512'].linear.acc}%</div></div><div class="stat bad"><div class="k">Linear, batch 2,048</div><div class="v">${S['2048'].linear.acc}%</div></div><div class="stat"><div class="k">No scaling, batch 2,048</div><div class="v">${S['2048']['no scaling'].acc}%</div></div>`;
+    $('#bsWhy').innerHTML = '<b>The rules run out of steps.</b> At batch 512 scaling the rate, with warm-up, helped. Past it, a fixed 15 epochs is too few steps, and the larger the prescribed rate, the less stable those few steps are: at 8,192 the linear rule never trained, while the untouched rate at least reached 62%.';
+  }
+  function opt() {
+    const O = D.lbo, ks = Object.keys(O), col = ['#94a3b8', '#7c3aed', '#16a34a', '#f97316'];
+    const allLr = ks.flatMap(k => Object.keys(O[k]).map(Number)), lx = v => L + (Math.log10(v) + 3) / 4.1 * (W - L - R), y = v => T + (1 - v / 100) * (250 - T - B);
+    let g = '';
+    [0, 25, 50, 75, 100].forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}%</text>`);
+    [0.001, 0.01, 0.1, 1, 10].forEach(v => g += `<text x="${lx(v)}" y="${250 - 18}" text-anchor="middle">${v}</text>`); g += `<text x="${(W + L - R) / 2}" y="${248}" text-anchor="middle">learning rate (log scale), batch 8,192, 30 epochs</text>`;
+    g += `<line x1="${L}" x2="${W - R}" y1="${y(D.base)}" y2="${y(D.base)}" stroke="#2563eb" stroke-dasharray="6 4"/><text x="${W - R}" y="${y(D.base) - 5}" text-anchor="end" fill="#2563eb">batch 256: ${D.base}%</text>`;
+    ks.forEach((k, i) => { const pts = Object.entries(O[k]).map(([l, v]) => [+l, v || 10]).sort((a, b) => a[0] - b[0]); g += `<polyline fill="none" stroke="${col[i]}" stroke-width="2.5" points="${pts.map(p => lx(p[0]) + ',' + y(p[1])).join(' ')}"/>` + pts.map(p => `<circle cx="${lx(p[0])}" cy="${y(p[1])}" r="4" fill="${col[i]}"><title>${k}, lr ${p[0]}: ${p[1]}%</title></circle>`).join(''); });
+    $('#bsO').innerHTML = g; $('#bsOk').innerHTML = ks.map((k, i) => `<span><i style="background:${col[i]}"></i>${k}</span>`).join('');
+    const best = k => Math.max(...Object.values(O[k]).map(v => v || 0));
+    $('#bsStats').innerHTML = ks.map((k, i) => `<div class="stat${i ? ' good' : ''}"><div class="k">${k}</div><div class="v">${best(k)}%</div></div>`).join('');
+    $('#bsWhy').innerHTML = '<b>Adaptive steps help, a lot of steps help more.</b> The three adaptive optimisers climb to about 80% and are still rising at the right-hand end of their sweeps, so their best is probably higher. Plain SGD peaks at 74%. All of them sit far below the dashed line, batch 256 trained for the same number of epochs with 28 times as many steps.';
+  }
+  function draw() { const v = $('#bsV .active').dataset.v; ['steps', 'rules', 'opt'].forEach(x => $('#bsV' + x).classList.toggle('on', x === v)); ({ steps, rules, opt })[v](); }
+  $('#bsV').addEventListener('segchange', draw); draw();
+})();
+</script>
+</body>
+</html>

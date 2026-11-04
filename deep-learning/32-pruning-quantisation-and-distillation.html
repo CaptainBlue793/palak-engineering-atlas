@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pruning, Quantisation &amp; Distillation · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 32 of Deep Learning. Shrinking a trained CIFAR-10 CNN, measured: 90% of the weights pruned for 2.6 points with no speed-up, half the channels removed for 2.6 times the throughput, lottery-ticket rewinding, int8 quantisation that cost nothing and ran 3.2 times faster on a CPU, 4-bit and 2-bit weights rescued by quantisation-aware training, and a 16-times-smaller student taught by a teacher.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .pq-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .pq-v { display:none; } .pq-v.on { display:block; }
+  .pq-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .pq-box svg { width:100%; height:auto; display:block; } .pq-box text { font-size:12px; fill:var(--muted); }
+  .pq-row { display:grid; grid-template-columns:minmax(0, 260px) 1fr 76px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .pq-row .track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; } .pq-row .track i { display:block; height:100%; }
+  .pq-row .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .pq-key { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; margin-top:6px; } .pq-key i { display:inline-block; width:10px; height:10px; border-radius:3px; vertical-align:middle; margin-right:4px; }
+  .pq-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .pq-row { grid-template-columns:minmax(0, 130px) 1fr 62px; font-size:12px; } }
+</style>
+</head>
+<body data-chapter="32">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 32</span><span class="pill">Expert</span><span class="pill">⏱ 50 min</span></div>
+    <h1>Pruning, <span class="grad">Quantisation</span> &amp; Distillation</h1>
+    <p class="lead">A trained network is usually bigger and slower than it needs to be. Three families of techniques shrink it after the fact or during a second round of training. <b>Pruning</b> removes weights or whole channels. <b>Quantisation</b> stores and computes with fewer bits per number. <b>Distillation</b> trains a smaller network to imitate the large one. Each trades a little accuracy for size or speed, and each has a trap: a smaller model on disk is not necessarily a faster one.</p>
+    <p class="lead">This chapter applies all three to a CIFAR-10 CNN with 559,000 parameters and 90.8% accuracy. Pruning 90% of its weights and fine-tuning for 5 epochs kept 88.2%, but the pruned network ran at exactly the dense network’s speed, because dense GPU kernels multiply zeros like any other number. Removing half the <i>channels</i> instead kept 88.2% and ran 2.6 times faster. Converting to int8 cost no accuracy at all and ran 3.2 times faster on a CPU. At 4 bits post-training quantisation lost 6 points, and quantisation-aware training recovered all but one. A student a sixteenth of the size gained 1.8 points from learning on the teacher’s soft predictions.</p>
+    <ul class="objectives">
+      <li><span>Prune by magnitude, globally or per layer, and know why fine-tuning is essential</span></li>
+      <li><span>Tell unstructured from structured sparsity, and which one makes a network faster</span></li>
+      <li><span>Test the lottery-ticket hypothesis and explain why rewinding helps</span></li>
+      <li><span>Quantise weights and activations, per tensor and per channel, and calibrate activation ranges</span></li>
+      <li><span>Use quantisation-aware training and knowledge distillation when post-training methods fall short</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Number formats and rounding:</b> <a href="p3-floating-point-for-deep-learning.html">P3</a>. <b>BatchNorm:</b> <a href="14-normalisation-layers.html">Chapter 14</a>. <b>Straight-through estimators and custom backward passes:</b> <a href="37-custom-ops-and-kernels.html">Chapter 37</a>.</li>
+        <li>Weight-only quantisation of large language models (GPTQ, AWQ, GGUF) is in LLMs <a href="../llms/25-quantisation.html">Chapter 25</a>, LLM distillation in <a href="../llms/29-distillation.html">Chapter 29</a>, and the serving trade-offs in <a href="../ml-ai-systems/27-compression.html">ML &amp; AI Systems</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Magnitude pruning</h2>
+  <p>The simplest pruning rule is that small weights matter least: set the smallest fraction s of them to zero, keep a binary mask so they stay zero, and fine-tune the rest. <b>Global</b> pruning ranks all weights in the network together; <b>layer-wise</b> pruning removes the same fraction from every layer.</p>
+  <table class="t cmp">
+    <thead><tr><th>Weights removed</th><th>Global, no fine-tuning</th><th>Global, 5 epochs fine-tuning</th><th>Layer-wise, 5 epochs fine-tuning</th></tr></thead>
+    <tbody>
+      <tr><td>0% (dense)</td><td colspan="3">90.79%</td></tr>
+      <tr><td>50%</td><td>89.81%</td><td>90.46%</td><td>90.50%</td></tr>
+      <tr><td>80%</td><td>56.01%</td><td>89.82%</td><td>89.54%</td></tr>
+      <tr><td>90%</td><td>11.72%</td><td><b>88.20%</b></td><td>87.17%</td></tr>
+      <tr><td>95%</td><td>10.00%</td><td>85.04%</td><td>81.47%</td></tr>
+      <tr><td>98%</td><td>10.00%</td><td>73.98%</td><td>64.11%</td></tr>
+    </tbody>
+  </table>
+  <p>Without fine-tuning, accuracy collapsed beyond half the weights: at 90% the network was at chance. Five epochs of fine-tuning with the mask fixed brought 90% sparsity back to 88.2%. The pruned weights were small, but the remaining ones had been trained to work alongside them, and need a short retraining to compensate. Global pruning beat layer-wise at high sparsity because layers differ in redundancy: at 90% overall, it removed only 31% of the first convolution, which has just 1,728 weights and sees raw pixels, and 98.5% of the last convolution, which has the most. Pruning gradually, 20% of the remaining weights per round with 2 epochs of fine-tuning each, was no better than one shot here: 87.6% at 89.3% sparsity and 85.4% at 95.6%, despite 28 epochs of fine-tuning in total.</p>
+
+  <h2>Structured pruning and real speed</h2>
+  <p>A network with 90% of its weights set to zero is still stored and run as dense matrices, so it does exactly the same arithmetic. Measured inference throughput on the RTX 5070 Ti, bf16, batch 1,024:</p>
+  <table class="t cmp">
+    <thead><tr><th>Model</th><th>Parameters</th><th>Accuracy</th><th>Images per second</th></tr></thead>
+    <tbody>
+      <tr><td>Dense</td><td>559k</td><td>90.79%</td><td>106,496 (1.0×)</td></tr>
+      <tr><td>90% of weights zeroed (unstructured)</td><td>57k non-zero</td><td>88.20%</td><td>107,431 (1.0×)</td></tr>
+      <tr><td>25% of channels removed</td><td>315k</td><td>89.71%</td><td>136,880 (1.3×)</td></tr>
+      <tr><td><b>50% of channels removed</b></td><td>141k</td><td><b>88.22%</b></td><td><b>271,911 (2.6×)</b></td></tr>
+      <tr><td>75% of channels removed</td><td>36k</td><td>81.52%</td><td>566,117 (5.3×)</td></tr>
+    </tbody>
+  </table>
+  <p><b>Structured</b> pruning removes whole output channels, here the ones whose BatchNorm scale γ is smallest, and rebuilds a genuinely smaller dense network: half the channels in every layer means a quarter of the multiplies in every convolution. At the same 88.2% accuracy as the 90%-unstructured network, it was 2.6 times faster. Unstructured sparsity pays off only with hardware or kernels that skip zeros: sparse kernels at very high sparsity, or the 2:4 pattern (two zeros in every four weights) that recent NVIDIA tensor cores accelerate. Otherwise it saves only storage, and only if the zeros are stored compressed.</p>
+
+  <h2>Lottery tickets</h2>
+  <p>Frankle and Carbin (2019) asked whether the sparse sub-network found by pruning could have been trained in isolation from the start. Their test: keep the mask, reset the surviving weights to their original initial values, and train only those. Measured with the global masks at 90% and 97% sparsity, 30 epochs each:</p>
+  <table class="t cmp">
+    <thead><tr><th>Surviving weights start from</th><th>90% sparse</th><th>97% sparse</th></tr></thead>
+    <tbody>
+      <tr><td>Their original initial values (the “winning ticket”)</td><td>87.34%</td><td>79.44%</td></tr>
+      <tr><td>Their values after 1 epoch of training (rewinding)</td><td><b>88.79%</b></td><td><b>80.70%</b></td></tr>
+      <tr><td>A fresh random initialisation, same mask</td><td>85.83%</td><td>78.92%</td></tr>
+    </tbody>
+  </table>
+  <p>The original initialisation beat a random one by 1.5 points at 90% sparsity, so the mask and the initial values do work together. Rewinding to the weights after one epoch, as Frankle et al. later proposed for larger networks, did better still. The gaps shrank at 97%, and none of the sparse networks trained from the start matched simply pruning the trained dense network and fine-tuning (88.2% at 90%), which needed far less compute. The lottery ticket is a finding about how training works more than a practical shortcut. The case study at the end of the course follows it further.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Compression lab</span><span class="p-tag">Measured here</span></div>
+    <div class="panel-body">
+      <div class="pq-l">View</div>
+      <div class="seg" id="pqV"><button class="active" data-v="prune">pruning curve</button><button data-v="speed">size vs speed</button><button data-v="quant">quantisation</button><button data-v="kd">distillation</button></div>
+      <div class="pq-v on" id="pqVprune"><div class="pq-box"><svg id="pqP" viewBox="0 0 600 260"></svg><div class="pq-key" id="pqPk"></div></div></div>
+      <div class="pq-v" id="pqVspeed"><div class="pq-box" id="pqS"></div></div>
+      <div class="pq-v" id="pqVquant"><div class="pq-box" id="pqQ"></div></div>
+      <div class="pq-v" id="pqVkd"><div class="pq-box" id="pqK"></div></div>
+      <div class="stats" id="pqStats"></div>
+      <div class="pq-why" id="pqWhy"></div>
+    </div>
+    <div class="panel-foot">CIFAR-10 CNN, 5 convolutions (64, 64, 128, 128, 256 channels) with BatchNorm, 558,538 parameters, 30 epochs of SGD with one-cycle, flips and crops: 90.79%. Pruning: magnitude masks on all conv and linear weights, fine-tuning at lr 0.02 with cosine decay. Throughput: bf16 inference, batch 1,024, RTX 5070 Ti. Quantisation: BatchNorm folded into the convolutions, then weights fake-quantised (symmetric, per tensor or per output channel) and layer inputs fake-quantised (asymmetric, range from 2,000 training images by min-max or the 0.01–99.99 percentiles); QAT fine-tunes with straight-through gradients. CPU int8: PyTorch FX quantisation, x86 backend, 8 threads, batch 64. Distillation: teacher 2× wider (2.2M parameters, 91.98%), student ¼ as wide (36k parameters), KL loss on softened probabilities with weight 0.9.</div>
+  </div>
+
+  <h2>Post-training quantisation</h2>
+  <p>Quantising a number to b bits maps it to one of 2<sup>b</sup> evenly spaced levels between a minimum and a maximum, so the work is choosing that range. For weights the range is known: symmetric around zero, either one scale for a whole tensor or one per output channel. For activations, which change with every input, the range is estimated by running a few hundred <b>calibration</b> images through the network and recording what each layer sees, either the full min-to-max or a percentile range that ignores rare outliers. BatchNorm is first folded into the preceding convolution, since at inference it is just a per-channel scale and shift.</p>
+  <table class="t cmp">
+    <thead><tr><th>Bits: weights / activations</th><th>Per-tensor weights</th><th>Per-channel weights</th><th>Per-channel, percentile activation range</th></tr></thead>
+    <tbody>
+      <tr><td>fp32 reference</td><td colspan="3">90.80%</td></tr>
+      <tr><td>8 / 8</td><td>90.71%</td><td>90.74%</td><td><b>90.81%</b></td></tr>
+      <tr><td>4 / 8</td><td>82.28%</td><td>89.08%</td><td>–</td></tr>
+      <tr><td>4 / 4</td><td>–</td><td>83.93%</td><td>84.63%</td></tr>
+      <tr><td>2 / 8</td><td>–</td><td>10.02%</td><td>–</td></tr>
+    </tbody>
+  </table>
+  <p>Eight bits is free for a CNN like this: every variant was within 0.1 points of fp32. Run for real with PyTorch’s int8 CPU kernels, the network was 3.8 times smaller (2.13 MB to 0.56 MB), ran a batch of 64 in 4.6 ms instead of 14.5 ms, and scored 90.85% against 90.80%. At 4 bits the choices start to matter. Per-tensor weight scales lost 8.5 points because one channel with large weights forces a coarse grid on all the others; per-channel scales cut the loss to 1.7. With 4-bit activations as well the loss was 6 to 7 points, and at 2-bit weights the network was at chance.</p>
+
+  <h2>Quantisation-aware training</h2>
+  <p>When post-training quantisation loses too much, train with the rounding in the loop. The forward pass quantises weights and activations exactly as deployment will; the backward pass uses a <b>straight-through estimator</b> that treats rounding as the identity, since its true gradient is zero almost everywhere. The network learns weights that sit well on the quantisation grid.</p>
+  <table class="t cmp">
+    <thead><tr><th>Bits</th><th>Post-training</th><th>After QAT (lr 10⁻³)</th><th>Epochs of QAT</th></tr></thead>
+    <tbody>
+      <tr><td>8 / 8</td><td>90.69%</td><td>90.84%</td><td>3</td></tr>
+      <tr><td>4 / 4</td><td>84.82%</td><td><b>89.68%</b></td><td>10</td></tr>
+      <tr><td>2 / 8</td><td>13.90%</td><td><b>75.96%</b></td><td>10</td></tr>
+    </tbody>
+  </table>
+  <p>QAT recovered all but 1.1 points at 4 bits and turned a useless 2-bit network into a 76% one. One honest note from running it: the first attempt used the original training learning rate, 0.01, with no warm-up, and QAT destroyed the network (4-bit accuracy fell to 19.8%). With BatchNorm folded away, nothing renormalises the activations, and large updates on top of rounding noise diverged. A learning rate ten times smaller worked; three times smaller again recovered less in the same 10 epochs.</p>
+
+  <h2>Knowledge distillation</h2>
+  <p>A small network trained on hard labels learns only which class is right. A <b>teacher</b>’s full probability vector also says which wrong classes are plausible (a cat that looks somewhat like a dog), and <b>distillation</b> (Hinton et al., 2015) trains the student to match it. Both distributions are softened with a temperature T to expose those small probabilities, and the KL divergence between them is mixed with the ordinary loss. Teacher: twice as wide, 2.2M parameters, 91.98%. Student: a quarter as wide, 36,000 parameters.</p>
+  <table class="t cmp">
+    <thead><tr><th>Student trained with</th><th>30 epochs</th><th>60 epochs</th></tr></thead>
+    <tbody>
+      <tr><td>Hard labels only</td><td>83.32%</td><td>84.71%</td></tr>
+      <tr><td>Distillation, T = 1</td><td>84.02%</td><td>–</td></tr>
+      <tr><td><b>Distillation, T = 4</b></td><td><b>85.07%</b></td><td><b>85.93%</b></td></tr>
+      <tr><td>Distillation, T = 8</td><td>84.95%</td><td>–</td></tr>
+    </tbody>
+  </table>
+  <p>The student gained 1.75 points at 30 epochs, more than doubling its training time gained without a teacher (+1.4), and the two gains added up: distilled for 60 epochs it reached 85.9%. A temperature of 4 to 8 worked better than 1, which leaves the teacher’s probabilities almost one-hot. The student remained 6 points short of the teacher: a sixteen-fold cut in parameters has a cost that no training signal removes, but distillation made the cut cheaper.</p>
+
+  <figure class="flow">
+    <ol>
+      <li><b>int8 first</b><small>post-training, calibrated; usually free</small></li>
+      <li><b>Need speed?</b><small>structured pruning or a smaller student</small></li>
+      <li><b>Need size?</b><small>unstructured pruning + compressed storage</small></li>
+      <li><b>Below 8 bits?</b><small>per-channel scales, then QAT</small></li>
+      <li><b>Measure on the target</b><small>latency on the real device, not parameters</small></li>
+    </ol>
+    <figcaption><b>Choosing a compression method.</b> Fewer parameters and faster inference are different goals.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">📷</div>
+    <div class="body"><div class="title">Use case: a defect detector on a factory camera</div><p>A manufacturer runs a defect classifier on a small ARM board next to a production line, and needs 30 frames per second where the fp32 model manages 9. Unstructured pruning to 80% shrinks the file but leaves the frame rate unchanged, which surprises the team until they profile: the board’s kernels are dense. Int8 post-training quantisation, calibrated on 500 frames from the line, gives 2.7 times the speed at no measurable accuracy cost. For the remaining margin they distil the model into a student with half the channels, which with int8 reaches 34 frames per second and loses 0.6 points of recall, a trade the quality engineers sign off after checking it on a month of labelled defects.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Expecting unstructured sparsity to run faster</b>: 90% zeros ran at exactly the dense speed.</li>
+      <li><b>Pruning without fine-tuning</b>: 90% sparsity fell to chance; 5 epochs restored 88.2%.</li>
+      <li><b>Per-tensor scales at low bit widths</b>: 4-bit weights lost 8.5 points per tensor, 1.7 per channel.</li>
+      <li><b>Forgetting to fold BatchNorm or calibrate activations</b> before quantising.</li>
+      <li><b>QAT at the original learning rate</b>: it collapsed the BN-folded network to 19.8%.</li>
+      <li><b>Counting parameters instead of measuring latency</b> on the device you deploy to.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> You need a model twice as fast at inference. What do you try?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>First int8 post-training quantisation, because it is cheap and usually free in accuracy: on a CIFAR CNN it cost nothing and ran 3.2 times faster on a CPU. If that is not enough, I make the network genuinely smaller: structured pruning of whole channels, which at half the channels was 2.6 times faster for 2.6 points, or distillation into a smaller student. I would not rely on unstructured pruning for speed; 90% zeros ran exactly as fast as the dense model on a GPU, because dense kernels still multiply the zeros. And I measure latency on the target hardware rather than counting parameters.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why does 4-bit quantisation lose accuracy, and how do you get it back?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>With 16 levels, the rounding error is large compared with the spread of the weights, and one outlier channel can force a coarse grid on a whole tensor. Per-channel scales fix the outlier problem: 4-bit weights lost 8.5 points with one scale per tensor and 1.7 with one per channel. For activations, a percentile range that ignores rare extremes helps a little. Beyond that, quantisation-aware training puts the rounding in the forward pass and passes gradients straight through it, so the weights adapt to the grid: 4-bit weights and activations went from 84.8% to 89.7%, and 2-bit weights from chance to 76%. It needs a smaller learning rate than the original training, or it diverges.</div></details>
+  </div></div>
+
+  <!-- xref:start (generated by tools/crosslinks.cjs from tools/crosslinks-map.cjs; do not edit by hand) -->
+  <div class="callout xref">
+    <div class="ico">🧭</div>
+    <div class="body"><div class="title xref-t">Related chapters in other courses</div>
+      <ul class="mb0">
+        <li><b>Model compression: pruning, quantisation and distillation:</b> ML &amp; AI <a href="../ml-ai-systems/27-compression.html">Ch 27: Making Models Cheap &amp; Fast</a></li>
+      </ul>
+    </div>
+  </div>
+  <!-- xref:end -->
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Magnitude pruning plus fine-tuning kept 88.2% at 90% sparsity; global beat layer-wise.</li>
+      <li>Unstructured zeros gave no speed-up; removing half the channels gave 2.6×.</li>
+      <li>Lottery tickets are real (original init beat random) but rewinding beat them, and neither beat prune-then-fine-tune.</li>
+      <li>int8 was free and 3.2× faster on a CPU; at 4 bits, per-channel scales and QAT matter.</li>
+      <li>Distillation at T = 4 gave a 16× smaller student 1.75 points, on top of longer training.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">A network with 90% of its weights set to zero ran at the same speed as the dense one. Why?</p>
+      <div class="opts">
+        <button class="opt">The GPU was overloaded</button>
+        <button class="opt">Pruning was undone during inference</button>
+        <button class="opt">Dense kernels still multiply every weight, zero or not; only structured removal or sparse-aware hardware skips the work</button>
+        <button class="opt">bf16 cancels sparsity</button>
+      </div>
+      <div class="explain">Removing half the channels instead ran 2.6× faster.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Why did global magnitude pruning beat removing the same fraction from every layer at high sparsity?</p>
+      <div class="opts">
+        <button class="opt">Layers differ in redundancy; global ranking kept most of the small first layer and pruned the large last layer hard</button>
+        <button class="opt">Global pruning removes fewer weights</button>
+        <button class="opt">Layer-wise pruning is not allowed with BatchNorm</button>
+        <button class="opt">They are always equal</button>
+      </div>
+      <div class="explain">At 90% overall: 31% of the first convolution, 98.5% of the last.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">4-bit weights lost 8.5 points with one scale per tensor and 1.7 with one per output channel. What explains the difference?</p>
+      <div class="opts">
+        <button class="opt">Per-channel uses more bits</button>
+        <button class="opt">Per-tensor scales are not symmetric</button>
+        <button class="opt">Activations were quantised differently</button>
+        <button class="opt">A single channel with large weights forces a coarse grid on every channel when they share one scale</button>
+      </div>
+      <div class="explain">Per-channel scales give each channel a grid fitted to its own range.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">What does a straight-through estimator do in quantisation-aware training?</p>
+      <div class="opts">
+        <button class="opt">Skips the quantisation in the forward pass</button>
+        <button class="opt">Rounds in the forward pass but passes the gradient through as if rounding were the identity</button>
+        <button class="opt">Computes the exact gradient of rounding</button>
+        <button class="opt">Freezes the weights</button>
+      </div>
+      <div class="explain">Rounding’s true gradient is zero almost everywhere, which would stop learning.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why does distillation with a temperature of 4 help more than T = 1?</p>
+      <div class="opts">
+        <button class="opt">It makes the student larger</button>
+        <button class="opt">It speeds up training</button>
+        <button class="opt">Softening exposes the teacher’s small probabilities on plausible wrong classes, which at T = 1 are nearly zero</button>
+        <button class="opt">It removes the need for labels</button>
+      </div>
+      <div class="explain">85.07% at T = 4 against 84.02% at T = 1 and 83.32% with hard labels.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"base":{"acc":90.79,"params":558538},"prune":{"0.5":{"global, no fine-tuning":89.81,"global, 5 epochs fine-tuning":90.46,"layer-wise, no fine-tuning":86.9,"layer-wise, 5 epochs fine-tuning":90.5},"0.7":{"global, no fine-tuning":81.46,"global, 5 epochs fine-tuning":90.3,"layer-wise, no fine-tuning":59.0,"layer-wise, 5 epochs fine-tuning":90.09},"0.8":{"global, no fine-tuning":56.01,"global, 5 epochs fine-tuning":89.82,"layer-wise, no fine-tuning":26.57,"layer-wise, 5 epochs fine-tuning":89.54},"0.9":{"global, no fine-tuning":11.72,"global, 5 epochs fine-tuning":88.2,"layer-wise, no fine-tuning":11.88,"layer-wise, 5 epochs fine-tuning":87.17},"0.95":{"global, no fine-tuning":10.0,"global, 5 epochs fine-tuning":85.04,"layer-wise, no fine-tuning":10.41,"layer-wise, 5 epochs fine-tuning":81.47},"0.98":{"global, no fine-tuning":10.0,"global, 5 epochs fine-tuning":73.98,"layer-wise, no fine-tuning":10.0,"layer-wise, 5 epochs fine-tuning":64.11}},"global_layer_sparsity_90":[31.2,80.4,75.5,84.6,98.5,15.1],"gradual":[[20.0,90.33],[36.0,90.22],[48.8,89.96],[59.0,89.61],[67.2,89.36],[73.8,89.26],[79.0,88.98],[83.2,88.29],[86.6,88.26],[89.3,87.57],[91.4,87.4],[93.1,86.69],[94.5,86.31],[95.6,85.37]],"structured":{"dense":{"acc":90.79,"params":558538,"img_per_s":106496},"unstructured 90% (dense kernels)":{"acc":88.2,"params_nonzero":57015,"img_per_s":107431},"25% of channels removed":{"acc_before_ft":24.8,"acc":89.71,"params":315226,"img_per_s":136880},"50% of channels removed":{"acc_before_ft":11.79,"acc":88.22,"params":141034,"img_per_s":271911},"75% of channels removed":{"acc_before_ft":10.0,"acc":81.52,"params":35962,"img_per_s":566117}},"lottery":{"0.9":{"rewind to initialisation":87.34,"rewind to epoch 1":88.79,"random re-initialisation":85.83},"0.97":{"rewind to initialisation":79.44,"rewind to epoch 1":80.7,"random re-initialisation":78.92}},"ptq":{"fp32 (BN folded)":90.8,"W8A8, per-tensor weights, minmax activations":90.71,"W8A8, per-channel weights, minmax activations":90.74,"W8A8, per-channel weights, percentile activations":90.81,"W4A8, per-tensor weights, minmax activations":82.28,"W4A8, per-channel weights, minmax activations":89.08,"W4A4, per-channel weights, minmax activations":83.93,"W4A4, per-channel weights, percentile activations":84.63,"W2A8, per-channel weights, minmax activations":10.02},"cpu_int8":{"fp32":{"ms_per_64":14.52,"acc":90.8,"mb":2.13},"int8":{"ms_per_64":4.58,"acc":90.85,"mb":0.56}},"teacher":{"acc":91.98,"params":2222986},"distill":{"hard labels":83.32,"KD, T=1":84.02,"KD, T=4":85.07,"KD, T=8":84.95,"hard labels, 60 epochs":84.71,"KD, T=4, 60 epochs":85.93},"student_params":35962,"qat_first_attempt":{"W4A4":{"PTQ":84.56,"after 5 epochs QAT":19.81},"W2A8":{"PTQ":10.0,"after 5 epochs QAT":10.0}},"qat":{"W8A8, lr 0.001":{"PTQ":90.69,"after QAT":90.84,"epochs":3},"W8A8, lr 0.0003":{"PTQ":90.73,"after QAT":90.8,"epochs":3},"W4A4, lr 0.001":{"PTQ":84.82,"after QAT":89.68,"epochs":10},"W4A4, lr 0.0003":{"PTQ":84.59,"after QAT":89.53,"epochs":10},"W2A8, lr 0.001":{"PTQ":13.9,"after QAT":75.96,"epochs":10},"W2A8, lr 0.0003":{"PTQ":14.09,"after QAT":54.56,"epochs":10}}};
+  const row = (l, v, mx, n, c, lo) => `<div class="pq-row"><span>${l}</span><span class="track"><i style="width:${Math.max(0.5, 100 * (v - (lo || 0)) / (mx - (lo || 0)))}%;background:${c}"></i></span><span class="n">${n}</span></div>`;
+  function prune() {
+    const P = D.prune, ss = Object.keys(P).map(Number), W = 600, H = 260, L = 46, R = 14, T = 12, B = 34, x = s => L + s * (W - L - R), y = v => T + (1 - v / 100) * (H - T - B);
+    const lines = [['global, 5 epochs fine-tuning', '#16a34a'], ['layer-wise, 5 epochs fine-tuning', '#2563eb'], ['global, no fine-tuning', '#e11d48']];
+    let g = '';
+    [0, 25, 50, 75, 100].forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}%</text>`);
+    [0, 0.5, 0.8, 0.9, 1].forEach(v => g += `<text x="${x(v)}" y="${H - 18}" text-anchor="middle">${Math.round(v * 100)}%</text>`); g += `<text x="${(W + L) / 2}" y="${H - 2}" text-anchor="middle">weights removed (test accuracy)</text>`;
+    lines.forEach(([k, c]) => g += `<polyline fill="none" stroke="${c}" stroke-width="2.5" points="${[[0, D.base.acc], ...ss.map(s => [s, P[s][k]])].map(p => x(p[0]) + ',' + y(p[1])).join(' ')}"/>` + ss.map(s => `<circle cx="${x(s)}" cy="${y(P[s][k])}" r="4" fill="${c}"><title>${Math.round(s * 100)}%: ${P[s][k]}%</title></circle>`).join(''));
+    g += `<polyline fill="none" stroke="#a855f7" stroke-width="2" stroke-dasharray="5 4" points="${D.gradual.map(p => x(p[0] / 100) + ',' + y(p[1])).join(' ')}"/>`;
+    $('#pqP').innerHTML = g; $('#pqPk').innerHTML = lines.map(([k, c]) => `<span><i style="background:${c}"></i>${k}</span>`).join('') + '<span><i style="background:#a855f7"></i>gradual (dashed)</span>';
+    $('#pqStats').innerHTML = `<div class="stat"><div class="k">Dense</div><div class="v">${D.base.acc}%</div></div><div class="stat bad"><div class="k">90%, no fine-tuning</div><div class="v">${P['0.9']['global, no fine-tuning']}%</div></div><div class="stat good"><div class="k">90%, fine-tuned</div><div class="v">${P['0.9']['global, 5 epochs fine-tuning']}%</div></div>`;
+    $('#pqWhy').innerHTML = `<b>Fine-tuning is most of the method.</b> Zeroing small weights alone wrecks the network past 50%; five epochs with the mask fixed bring 90% sparsity back within 2.6 points. Global ranking pays off at the extreme end, where it leaves the small first layer mostly intact (only ${D.global_layer_sparsity_90[0]}% pruned) and empties the large last convolution (${D.global_layer_sparsity_90[4]}%).`;
+  }
+  function speed() {
+    const S = D.structured, ks = Object.keys(S), mx = Math.max(...ks.map(k => S[k].img_per_s));
+    $('#pqS').innerHTML = '<div style="margin-bottom:4px"><b>Inference throughput, images per second</b></div>' + ks.map(k => row(k, S[k].img_per_s, mx, (S[k].img_per_s / S.dense.img_per_s).toFixed(1) + '×', k.startsWith('unstr') ? '#e11d48' : k === 'dense' ? '#94a3b8' : '#16a34a')).join('') +
+      '<div style="margin:12px 0 4px"><b>Accuracy</b></div>' + ks.map(k => row(k, S[k].acc, 92, S[k].acc + '%', '#7c3aed', 70)).join('') +
+      `<div style="margin:12px 0 4px"><b>Real int8 on the CPU (batch 64)</b></div>` + row('fp32', D.cpu_int8.fp32.ms_per_64, 16, D.cpu_int8.fp32.ms_per_64 + ' ms', '#94a3b8') + row('int8', D.cpu_int8.int8.ms_per_64, 16, D.cpu_int8.int8.ms_per_64 + ' ms', '#16a34a');
+    $('#pqStats').innerHTML = `<div class="stat bad"><div class="k">90% zeros: speed-up</div><div class="v">${(S['unstructured 90% (dense kernels)'].img_per_s / S.dense.img_per_s).toFixed(2)}×</div></div><div class="stat good"><div class="k">Half the channels</div><div class="v">${(S['50% of channels removed'].img_per_s / S.dense.img_per_s).toFixed(1)}× at ${S['50% of channels removed'].acc}%</div></div><div class="stat good"><div class="k">CPU int8</div><div class="v">${(D.cpu_int8.fp32.ms_per_64 / D.cpu_int8.int8.ms_per_64).toFixed(1)}× at ${D.cpu_int8.int8.acc}%</div></div>`;
+    $('#pqWhy').innerHTML = '<b>Speed comes from doing less arithmetic.</b> Zeroed weights are still multiplied by dense kernels, so the red bar is exactly as fast as the dense one. Removing channels shrinks every matrix and the gain is real; so is int8, where the CPU kernels move and multiply four times smaller numbers.';
+  }
+  function quant() {
+    const Q = D.ptq, ks = Object.keys(Q);
+    $('#pqQ').innerHTML = '<div style="margin-bottom:4px"><b>Post-training quantisation (accuracy, bars from 0%)</b></div>' + ks.map(k => row(k, Q[k], 92, Q[k] + '%', Q[k] > 89 ? '#16a34a' : Q[k] > 80 ? '#eab308' : '#e11d48')).join('') +
+      '<div style="margin:12px 0 4px"><b>Quantisation-aware training</b></div>' + Object.entries(D.qat).filter(([k]) => k.includes('0.001')).map(([k, v]) => row(`${k.split(',')[0]}: PTQ → QAT`, v['after QAT'], 92, `${v.PTQ} → ${v['after QAT']}`, '#7c3aed')).join('');
+    $('#pqStats').innerHTML = `<div class="stat good"><div class="k">W8A8</div><div class="v">${Q['W8A8, per-channel weights, percentile activations']}%</div></div><div class="stat"><div class="k">W4, per tensor → per channel</div><div class="v">${Q['W4A8, per-tensor weights, minmax activations']} → ${Q['W4A8, per-channel weights, minmax activations']}</div></div><div class="stat good"><div class="k">W4A4 after QAT</div><div class="v">${D.qat['W4A4, lr 0.001']['after QAT']}%</div></div>`;
+    $('#pqWhy').innerHTML = '<b>Eight bits are free; four need care; two need training.</b> Per-channel weight scales and a percentile activation range each recover accuracy at 4 bits, and quantisation-aware training, with rounding in the forward pass and straight-through gradients, recovers most of the rest.';
+  }
+  function kd() {
+    const K = D.distill, ks = Object.keys(K);
+    $('#pqK').innerHTML = `<div style="margin-bottom:4px"><b>Student accuracy (36k parameters; teacher ${D.teacher.acc}% with 2.2M; bars from 80%)</b></div>` + ks.map(k => row(k, K[k], 92, K[k] + '%', k.startsWith('KD') ? '#16a34a' : '#94a3b8', 80)).join('') + row('teacher', D.teacher.acc, 92, D.teacher.acc + '%', '#2563eb', 80);
+    $('#pqStats').innerHTML = `<div class="stat"><div class="k">Hard labels, 30 epochs</div><div class="v">${K['hard labels']}%</div></div><div class="stat good"><div class="k">KD T=4, 30 epochs</div><div class="v">${K['KD, T=4']}%</div></div><div class="stat good"><div class="k">KD T=4, 60 epochs</div><div class="v">${K['KD, T=4, 60 epochs']}%</div></div>`;
+    $('#pqWhy').innerHTML = '<b>Soft targets carry more than labels.</b> The teacher’s probabilities on the wrong classes tell the student which mistakes are reasonable, and a temperature of 4 makes those probabilities large enough to learn from. The gain stacks with longer training, but a student 60 times smaller than its teacher stays well short of it.';
+  }
+  function draw() { const v = $('#pqV .active').dataset.v; ['prune', 'speed', 'quant', 'kd'].forEach(x => $('#pqV' + x).classList.toggle('on', x === v)); ({ prune, speed, quant, kd })[v](); }
+  $('#pqV').addEventListener('segchange', draw); draw();
+})();
+</script>
+</body>
+</html>

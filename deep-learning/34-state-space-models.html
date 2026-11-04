@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>State-Space Models &amp; Long Sequences · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 34 of Deep Learning. Linear state-space layers built from scratch: an S4D layer that is both a recurrence and a convolution (checked to 10⁻⁵), a selective Mamba-style layer with a parallel scan, their training and generation cost against fused attention from 1k to 262k tokens, sequential MNIST at 784 steps, and selective copying, a task that needs memory that depends on content.">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .sm-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .sm-v { display:none; } .sm-v.on { display:block; }
+  .sm-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .sm-box svg { width:100%; height:auto; display:block; } .sm-box text { font-size:12px; fill:var(--muted); }
+  .sm-key { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; margin-top:6px; } .sm-key i { display:inline-block; width:10px; height:10px; border-radius:3px; vertical-align:middle; margin-right:4px; }
+  .sm-row { display:grid; grid-template-columns:minmax(0, 220px) 1fr 76px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .sm-row .track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; } .sm-row .track i { display:block; height:100%; }
+  .sm-row .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .sm-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .sm-row { grid-template-columns:minmax(0, 120px) 1fr 62px; font-size:12px; } }
+</style>
+</head>
+<body data-chapter="34">
+<main class="content">
+
+  <section class="hero">
+    <div class="eyebrow"><span class="pill accent">Chapter 34</span><span class="pill">Expert</span><span class="pill">⏱ 50 min</span></div>
+    <h1>State-Space Models &amp; <span class="grad">Long Sequences</span></h1>
+    <p class="lead">Attention compares every position with every other, so its cost grows with the square of the sequence length, and generating each new token means reading a cache of every previous one. Recurrent networks carry a fixed-size state instead, but train one step at a time and forget (Chapter 17). <b>State-space models</b> (SSMs) are linear recurrences designed to get the best of both: during training the whole sequence is processed in parallel, as a convolution or a scan, and during generation they run as a recurrence with a state that does not grow.</p>
+    <p class="lead">This chapter builds two from scratch and measures them. An S4D layer computed as a recurrence and as an FFT convolution agreed to 9 × 10⁻⁶. A selective, Mamba-style layer, whose dynamics depend on the input, computed with a parallel scan matched a step-by-step loop to 8 × 10⁻⁵. On sequential MNIST, digits read one pixel at a time for 784 steps, S4D reached 98.9% with 43,000 parameters where an LSTM managed 85.6% and a transformer 96.3%. On selective copying the tables turned: S4D managed 50.3%, while attention and the selective SSM reached 100% and 99.9%. Generating a token cost an SSM a constant 0.031 ms, against 10.2 ms for attention over a 262,144-token cache. And the honest part of the comparison: in training at these lengths, a fused attention kernel was faster and leaner than my straightforward SSM implementations, which shows how much of the SSM advantage lives in specialised kernels.</p>
+    <ul class="objectives">
+      <li><span>Compare the cost of recurrence and attention in training and in generation</span></li>
+      <li><span>Discretise a continuous linear state-space system and run it as a recurrence</span></li>
+      <li><span>Compute the same layer as a convolution with the FFT, and verify the equivalence</span></li>
+      <li><span>Explain selective state spaces and why they need a scan instead of a convolution</span></li>
+      <li><span>Measure SSMs against an LSTM and a transformer on long-range and selective tasks</span></li>
+    </ul>
+  </section>
+
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Recurrences and vanishing memory:</b> <a href="17-recurrent-networks-and-bptt.html">Chapter 17</a>. <b>Attention and its quadratic cost:</b> <a href="18-attention-from-first-principles.html">Chapter 18</a>. <b>Convolution:</b> <a href="16-convolutional-networks.html">Chapter 16</a>. Long-context language models and the KV cache: <a href="../llms/p7-gpu-memory-budgets.html">LLMs</a>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Recurrence vs attention cost</h2>
+  <p>For a sequence of length L, attention does work proportional to L² in training and, when generating, reads all L cached keys and values for every new token. A recurrence does work proportional to L and carries a fixed-size state. Generating one token after a context of length L, measured for one layer of width 256 (attention with 8 heads over a bf16 KV cache; an SSM state of 512 channels × 16):</p>
+  <table class="t cmp">
+    <thead><tr><th>Context length</th><th>Attention, per new token</th><th>SSM state update, per new token</th><th>Attention KV cache per layer</th></tr></thead>
+    <tbody>
+      <tr><td>1,024</td><td>0.041 ms</td><td>0.032 ms</td><td>1 MB</td></tr>
+      <tr><td>8,192</td><td>0.30 ms</td><td>0.031 ms</td><td>8 MB</td></tr>
+      <tr><td>65,536</td><td>2.55 ms</td><td>0.031 ms</td><td>64 MB</td></tr>
+      <tr><td>262,144</td><td><b>10.2 ms</b></td><td><b>0.031 ms</b></td><td>256 MB</td></tr>
+    </tbody>
+  </table>
+  <p>The SSM’s step cost and its 32 KB state were the same at every length; attention’s grew in proportion to the context, 330 times slower at 262,144 tokens. That is the property that makes SSMs attractive for long-context generation, streaming audio and genomics: memory and latency that do not depend on how much has been seen. The training side, measured below, is more nuanced.</p>
+
+  <h2>Linear state-space layers</h2>
+  <p>A state-space model describes a continuous system: a hidden state x(t) evolves as x′ = A x + B u, driven by the input u, and the output is y = C x + D u. To run it on a sequence, it is discretised with a step size Δ. With zero-order hold, Ā = exp(ΔA) and B̄ = (Ā − 1)A⁻¹B, and the layer becomes a linear recurrence:</p>
+<pre class="code">x_k = Ā · x_{k−1} + B̄ · u_k          <span class="c"># a fixed-size state, updated once per step</span>
+y_k = Re(C · x_k) + D · u_k</pre>
+  <p><b>S4D</b> (Gu et al., 2022) makes A diagonal and complex, so each state dimension is an independent damped oscillator, initialised with decay rates and frequencies spread out so that some remember for a few steps and others for thousands. That initialisation, not the architecture alone, is what lets these models hold information across very long sequences, where an LSTM’s memory fades. Each layer here has 256 channels × 32 complex modes; layers are stacked with a non-linearity and a mixing linear layer between them.</p>
+
+  <h2>The convolutional view for training</h2>
+  <p>Because the recurrence is linear and time-invariant, unrolling it gives y = K ∗ u + D·u, a convolution with the kernel K_l = Re(C · Ā^l · B̄). The whole kernel for a sequence of length L can be computed at once, and the convolution done with the FFT in O(L log L), all positions in parallel. Run both ways on the same random input, the S4D layer’s outputs agreed to a maximum difference of 8.8 × 10⁻⁶ on values of size about 1: train as a convolution, generate as a recurrence.</p>
+<pre class="code">K = 2 * (C * (A_bar - 1) / A)[..., None] * A_bar[..., None] ** torch.<span class="f">arange</span>(L)   <span class="c"># (H, modes, L), summed over modes</span>
+y = torch.fft.<span class="f">irfft</span>(torch.fft.<span class="f">rfft</span>(u, n=<span class="m">2</span>*L) * torch.fft.<span class="f">rfft</span>(K.<span class="f">sum</span>(<span class="m">1</span>).real, n=<span class="m">2</span>*L), n=<span class="m">2</span>*L)[..., :L]</pre>
+  <p>Measured cost of one layer, forward and backward, batch 1, width 256:</p>
+  <table class="t cmp">
+    <thead><tr><th>Sequence length</th><th>Fused attention (FlashAttention)</th><th>S4D via FFT (this chapter’s code)</th><th>Selective scan (this chapter’s code)</th></tr></thead>
+    <tbody>
+      <tr><td>1,024</td><td>1.5 ms · 29 MB</td><td>2.6 ms · 260 MB</td><td>10.9 ms · 629 MB</td></tr>
+      <tr><td>4,096</td><td>2.4 ms · 71 MB</td><td>5.8 ms · 1.0 GB</td><td>47 ms · 2.5 GB</td></tr>
+      <tr><td>16,384</td><td>17.3 ms · 238 MB</td><td>23.7 ms · 4.1 GB</td><td>186 ms · 10.0 GB</td></tr>
+      <tr><td>65,536</td><td>230 ms · 860 MB</td><td>610 ms · 16.6 GB</td><td>out of memory</td></tr>
+    </tbody>
+  </table>
+  <p>Attention’s time grew close to quadratically beyond 4,096 tokens, as theory says, yet it was still the fastest and leanest at every length measured. The reason is implementation, not mathematics. FlashAttention is a fused kernel that never stores the attention matrix (Chapter 23). My S4D materialises the whole kernel as a (channels × modes × length) complex tensor before summing it, 16.6 GB at 65,536 tokens; production S4 implementations compute it with a specialised Cauchy or Vandermonde kernel in a fraction of the memory. My selective scan, below, materialises its full (length × channels × state) tensor, which real Mamba avoids with a fused CUDA kernel that keeps the state in on-chip memory. The asymptotic advantage of SSMs is real; collecting it needs kernels as engineered as attention’s.</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Sequence lab</span><span class="p-tag">Measured here</span></div>
+    <div class="panel-body">
+      <div class="sm-l">View</div>
+      <div class="seg" id="smV"><button class="active" data-v="dec">generation cost</button><button data-v="train">training cost</button><button data-v="tasks">tasks</button></div>
+      <div class="sm-v on" id="smVdec"><div class="sm-box"><svg id="smD" viewBox="0 0 600 250"></svg><div class="sm-key"><span><i style="background:#e11d48"></i>attention, per new token</span><span><i style="background:#16a34a"></i>SSM state update, per new token</span></div></div></div>
+      <div class="sm-v" id="smVtrain">
+        <div class="sm-l">Measure</div>
+        <div class="seg" id="smT"><button class="active" data-v="ms">time</button><button data-v="peak_mb">memory</button></div>
+        <div class="sm-box"><svg id="smTs" viewBox="0 0 600 250"></svg><div class="sm-key"><span><i style="background:#e11d48"></i>fused attention</span><span><i style="background:#2563eb"></i>S4D (FFT)</span><span><i style="background:#a855f7"></i>selective scan</span></div></div>
+      </div>
+      <div class="sm-v" id="smVtasks"><div class="sm-box" id="smK"></div></div>
+      <div class="stats" id="smStats"></div>
+      <div class="sm-why" id="smWhy"></div>
+    </div>
+    <div class="panel-foot">RTX 5070 Ti, PyTorch 2.11, bf16 autocast (SSM recurrences in fp32). Cost: one block of width 256 at batch 1, forward and backward, mean of 2 after a warm-up; attention is <code>F.scaled_dot_product_attention</code> with 4 heads and a causal mask. Generation: one query against a bf16 KV cache of the given length (8 heads), and one SSM state update with 512 channels × 16 states, mean of 200. Tasks: 4 blocks of width 64 for the transformer, S4D (64 complex modes) and selective SSM (expand 2, state 8, checkpointed), an LSTM of 128 units; AdamW with one-cycle, gradient clipping 1.0. Sequential MNIST: pixel by pixel, mean-pooled output, 3 epochs. Selective copying: 16 tokens from 8 values at random positions among 256, reproduced after 16 markers, 4,000 steps of batch 64.</div>
+  </div>
+
+  <h2>Selective state spaces</h2>
+  <p>S4D’s dynamics are the same at every step: Ā, B̄ and C do not depend on the input. That is what makes the convolution possible, and it is also a limit. A time-invariant system cannot decide, based on what it is reading, to remember this token and ignore that one; every input is mixed in with the same fixed weights. <b>Selective</b> SSMs (Mamba, Gu and Dao, 2023) make the step size Δ, and B and C, functions of the current input. A large Δ lets the input overwrite the state; a small one keeps the state and largely ignores the input. The price is that the kernel is no longer fixed, so there is no convolution; instead the recurrence h_t = a_t h_{t−1} + b_t is computed for all t with a <b>parallel scan</b>, here in log space:</p>
+<pre class="code"><span class="c"># h_t = Σ_{s≤t} (Π_{r=s+1..t} a_r) b_s  =  exp(P_t) · Σ_{s≤t} exp(−P_s) b_s,  with P = cumsum(log a)</span>
+P = torch.<span class="f">cumsum</span>(log_a, -<span class="m">1</span>)
+h = torch.<span class="f">exp</span>(P + torch.<span class="f">logcumsumexp</span>(torch.<span class="f">log</span>(b_pos) - P, -<span class="m">1</span>)) - (same for b_neg)   <span class="c"># signs handled separately</span></pre>
+  <p>Against a plain loop over time steps on the same input, the scan’s outputs agreed to 8.2 × 10⁻⁵, a little looser than the convolution because of the exponentials. It is a parallel algorithm, but a memory-hungry one written this way, as the training-cost table showed.</p>
+
+  <h2>Long-range tasks measured</h2>
+  <p>Two tasks with opposite demands. <b>Sequential MNIST</b> feeds a 28 × 28 digit one pixel at a time, 784 steps, and asks for its class at the end: a long-range dependency with no need to be selective. <b>Selective copying</b> scatters 16 data tokens among 240 blanks at random positions and asks for the 16 tokens in order at the end: the model must decide, based on content, what to store.</p>
+  <table class="t cmp">
+    <thead><tr><th>Model (4 layers, width 64)</th><th>Parameters</th><th>Sequential MNIST</th><th>Selective copying</th></tr></thead>
+    <tbody>
+      <tr><td>LSTM (128 units)</td><td>101k</td><td>85.6%</td><td>54.5%</td></tr>
+      <tr><td>Transformer</td><td>251k</td><td>96.3%</td><td><b>100.0%</b></td></tr>
+      <tr><td>S4D (time-invariant)</td><td>43k</td><td><b>98.9%</b></td><td>50.3%</td></tr>
+      <tr><td>Selective SSM</td><td>182k</td><td>not run (see below)</td><td><b>99.9%</b></td></tr>
+    </tbody>
+  </table>
+  <p>The two tasks separate the models cleanly. On sequential MNIST, where the answer depends on the whole 784-step sequence but nothing has to be chosen, the time-invariant S4D was the best model by 2.6 points with a sixth of the transformer’s parameters, and the LSTM, whose memory fades over hundreds of steps (Chapter 17), was far behind. On selective copying the order flipped. Chance is 12.5%; S4D reached only 50.3% and the LSTM 54.5%, while attention, which can look up any earlier position, solved it, and so did the selective SSM, at 99.9%: making Δ, B and C depend on the token lets the state ignore the blanks and store the data tokens. That is the result Gu and Dao used to motivate Mamba, reproduced. One honest gap: the selective SSM was not run on sequential MNIST, because my naive scan at 784 steps and batch 64 filled the 16 GB GPU, spilled into system memory and slowed to a crawl; a fused scan kernel is what makes that length practical.</p>
+
+  <figure class="flow">
+    <ol>
+      <li><b>Short context</b><small>attention: simplest, best kernels</small></li>
+      <li><b>Long, fixed patterns</b><small>time-invariant SSM (S4-style)</small></li>
+      <li><b>Long, content-dependent memory</b><small>selective SSM or attention</small></li>
+      <li><b>Long generation</b><small>SSM or hybrid: constant state</small></li>
+      <li><b>Check the kernels</b><small>asymptotics need fused implementations</small></li>
+    </ol>
+    <figcaption><b>Choosing a sequence layer.</b> Many recent long-context models are hybrids: mostly SSM layers, a few attention layers.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">🎧</div>
+    <div class="body"><div class="title">Use case: wake-word detection on a smart speaker</div><p>A device team needs a model that listens continuously and flags a wake word, running on a small processor with a fixed memory budget. A transformer over a sliding window of the last two seconds would recompute attention for every new frame and hold a growing cache. A stack of S4-style layers is trained in parallel on recorded audio as a convolution, then exported as a recurrence: each new 10 ms frame updates a state of a few kilobytes in constant time, no matter how long the speaker has been listening. The team checks the exported recurrent model against the convolutional one on a test set, frame by frame, before shipping, exactly the equivalence measured in this chapter.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Assuming O(L) beats O(L²) in practice</b>: a fused attention kernel beat my naive SSMs at every length up to 65k.</li>
+      <li><b>Materialising kernels or states</b>: my S4D kernel took 16.6 GB at 65k tokens; production code avoids it.</li>
+      <li><b>Using a time-invariant SSM for content-dependent memory</b>: it cannot choose what to store.</li>
+      <li><b>Skipping the recurrence check</b>: verify that the convolutional and recurrent forms agree before deploying the recurrent one.</li>
+      <li><b>Ignoring initialisation</b>: SSMs owe their long memory to carefully spread decay rates, not to the recurrence alone.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> What is a state-space model, and why can it train like a convolution and run like an RNN?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>It is a linear recurrence: a hidden state updated as x_k = Ā x_{k−1} + B̄ u_k, with output y_k = C x_k, discretised from a continuous system. Because it is linear and the matrices do not change over time, unrolling it gives a convolution with kernel C Ā^l B̄, which can be applied to a whole sequence at once with the FFT for training. At generation time you run the recurrence: one small state update per token. I checked both forms of an S4D layer and they agreed to 9e-6. The payoff is generation cost: a constant 0.03 ms per token, against attention’s 10 ms at a 262k-token context.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> Why did Mamba make the SSM parameters depend on the input, and what did that cost?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>A time-invariant SSM mixes every input into its state with the same fixed weights, so it cannot decide based on content what to keep, which matters for tasks like selective copying or in-context recall. Making the step size and the B and C projections functions of the input lets the model gate what it writes and reads. The cost is that the convolution no longer exists, so training needs a parallel scan over the sequence, and a naive scan materialises a length by channels by state tensor: mine ran out of memory at 65k tokens. Mamba’s contribution was as much the fused, hardware-aware scan kernel as the selectivity itself.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>SSMs generate with a fixed-size state: 0.031 ms per token at any context, against attention’s 10.2 ms at 262k.</li>
+      <li>A time-invariant SSM is both a recurrence and a convolution; both forms agreed to 9 × 10⁻⁶.</li>
+      <li>On 784-step sequential MNIST, S4D reached 98.9% with 43k parameters (LSTM 85.6%, transformer 96.3%).</li>
+      <li>Selective SSMs make dynamics input-dependent, which needs a scan instead of a convolution.</li>
+      <li>Asymptotic advantages need engineered kernels: fused attention beat my naive SSM code in training.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why does a time-invariant linear SSM have a convolutional form?</p>
+      <div class="opts">
+        <button class="opt">Because it uses convolution layers internally</button>
+        <button class="opt">Unrolling a linear recurrence with fixed matrices gives y = K ∗ u with kernel K_l = C Ā^l B̄</button>
+        <button class="opt">Because the FFT is faster</button>
+        <button class="opt">It does not; only RNNs are convolutions</button>
+      </div>
+      <div class="explain">Both forms agreed to 8.8 × 10⁻⁶ here.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">Why was SSM generation cost the same at 1k and 262k tokens of context?</p>
+      <div class="opts">
+        <button class="opt">It ignores the context</button>
+        <button class="opt">It uses a smaller model</button>
+        <button class="opt">It caches attention</button>
+        <button class="opt">It carries a fixed-size state, so each new token costs one state update regardless of history</button>
+      </div>
+      <div class="explain">0.031 ms per token; attention grew to 10.2 ms.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">What can a selective SSM do that a time-invariant one cannot?</p>
+      <div class="opts">
+        <button class="opt">Decide, based on the current input, how much to write into or keep in its state</button>
+        <button class="opt">Run on a GPU</button>
+        <button class="opt">Use the FFT</button>
+        <button class="opt">Have more layers</button>
+      </div>
+      <div class="explain">Input-dependent Δ, B and C act as gates.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">In training, fused attention was faster and used less memory than this chapter’s SSM code even at 65k tokens. Why?</p>
+      <div class="opts">
+        <button class="opt">SSMs are quadratic</button>
+        <button class="opt">Attention is linear in length</button>
+        <button class="opt">The SSM code materialised large kernels and states, while FlashAttention is a fused kernel that stores neither</button>
+        <button class="opt">The GPU does not support FFTs</button>
+      </div>
+      <div class="explain">Asymptotic advantages are collected by engineered kernels.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Why does a selective SSM need a scan instead of a convolution?</p>
+      <div class="opts">
+        <button class="opt">Scans are always faster</button>
+        <button class="opt">Its dynamics change at every step with the input, so there is no single fixed kernel to convolve with</button>
+        <button class="opt">Convolutions cannot be computed on GPUs</button>
+        <button class="opt">It has no state</button>
+      </div>
+      <div class="explain">A parallel scan computes h_t = a_t h_{t−1} + b_t for all t at once.</div>
+    </div>
+  </div>
+
+</main>
+<script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"check":{"s4d_conv_vs_recurrent_max_diff":8.82e-06,"scan_vs_loop_max_diff":8.21e-05,"output_scale":1.111},"cost":{"attention":{"1024":{"ms":1.5,"peak_mb":29.0},"4096":{"ms":2.4,"peak_mb":71.0},"16384":{"ms":17.3,"peak_mb":238.0},"65536":{"ms":229.7,"peak_mb":860.0}},"s4d":{"1024":{"ms":2.6,"peak_mb":260.0},"4096":{"ms":5.8,"peak_mb":1037.0},"16384":{"ms":23.7,"peak_mb":4145.0},"65536":{"ms":609.7,"peak_mb":16578.0}},"selective":{"1024":{"ms":10.9,"peak_mb":629.0},"4096":{"ms":47.1,"peak_mb":2502.0},"16384":{"ms":185.5,"peak_mb":9998.0},"65536":{"oom":true}}},"decode":{"attention":{"1024":0.0406,"8192":0.2955,"65536":2.5539,"262144":10.2144},"ssm state update":{"1024":0.0317,"8192":0.0313,"65536":0.0308,"262144":0.0309}},"decode_state_bytes":{"attention KV cache per layer at length L (bf16, d=256)":"2 x L x 256 x 2 bytes","SSM state per layer (fp32, E=512, N=16)":32768},"smnist":{"lstm":{"acc":85.62,"seconds":16.3,"params":100746},"attention":{"acc":96.25,"seconds":43.5,"params":251018},"s4d":{"acc":98.9,"seconds":26.8,"params":43146}},"selcopy":{"lstm":{"curve":[[500,12.49],[1000,17.0],[1500,24.61],[2000,33.77],[2500,43.72],[3000,50.68],[3500,54.01],[4000,54.5]],"acc":54.5,"seconds":10.3},"attention":{"curve":[[500,37.19],[1000,51.49],[1500,64.78],[2000,92.24],[2500,97.46],[3000,99.99],[3500,100.0],[4000,100.0]],"acc":100.0,"seconds":21.0},"s4d":{"curve":[[500,21.69],[1000,32.56],[1500,39.72],[2000,43.93],[2500,47.1],[3000,49.08],[3500,49.92],[4000,50.29]],"acc":50.29,"seconds":28.9},"selective":{"curve":[[500,25.61],[1000,61.51],[1500,84.94],[2000,87.74],[2500,95.91],[3000,99.48],[3500,99.86],[4000,99.91]],"acc":99.91,"seconds":438.8}},"smnist_selective_note":"not run: the naive scan at 784 steps filled the 16 GB GPU and spilled into system memory"};
+  const W = 600, H = 250, L = 56, R = 14, T = 12, B = 34;
+  function logChart(svg, series, xs, ylo, yhi, ylab, unit) {
+    const x = v => L + (Math.log2(v) - Math.log2(xs[0])) / (Math.log2(xs[xs.length - 1]) - Math.log2(xs[0])) * (W - L - R), y = v => T + (1 - (Math.log10(v) - Math.log10(ylo)) / (Math.log10(yhi) - Math.log10(ylo))) * (H - T - B);
+    let g = '';
+    for (let e = Math.ceil(Math.log10(ylo)); e <= Math.log10(yhi); e++) { const v = 10 ** e; g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v >= 1 ? v.toLocaleString() : v}${unit}</text>`; }
+    xs.forEach(v => g += `<text x="${x(v)}" y="${H - 18}" text-anchor="middle">${v >= 1024 ? (v / 1024) + 'k' : v}</text>`); g += `<text x="${(W + L) / 2}" y="${H - 2}" text-anchor="middle">${ylab}</text>`;
+    series.forEach(([pts, c]) => g += `<polyline fill="none" stroke="${c}" stroke-width="2.6" points="${pts.map(p => x(p[0]) + ',' + y(p[1])).join(' ')}"/>` + pts.map(p => `<circle cx="${x(p[0])}" cy="${y(p[1])}" r="4" fill="${c}"/>`).join(''));
+    $(svg).innerHTML = g;
+  }
+  function dec() {
+    const A = D.decode.attention, S = D.decode['ssm state update'], xs = Object.keys(A).map(Number);
+    logChart('#smD', [[xs.map(v => [v, A[v]]), '#e11d48'], [xs.map(v => [v, S[v]]), '#16a34a']], xs, 0.01, 20, 'context length (tokens, log scale), ms per generated token', '');
+    $('#smStats').innerHTML = `<div class="stat"><div class="k">Attention at 1k</div><div class="v">${A['1024']} ms</div></div><div class="stat bad"><div class="k">Attention at 262k</div><div class="v">${A['262144']} ms</div></div><div class="stat good"><div class="k">SSM at any length</div><div class="v">${S['262144']} ms</div></div>`;
+    $('#smWhy').innerHTML = '<b>Flat versus rising.</b> An SSM’s cost per generated token is one update of a fixed-size state, so the green line does not move. Attention must read the whole cache for every token, so its cost and its memory grow with everything the model has seen.';
+  }
+  function train() {
+    const k = $('#smT .active').dataset.v, C = D.cost, xs = [1024, 4096, 16384, 65536], col = { attention: '#e11d48', s4d: '#2563eb', selective: '#a855f7' };
+    const series = Object.keys(C).map(m => [xs.filter(v => !C[m][v].oom).map(v => [v, C[m][v][k]]), col[m]]);
+    logChart('#smTs', series, xs, k === 'ms' ? 1 : 10, k === 'ms' ? 1000 : 20000, `sequence length, one layer forward + backward (${k === 'ms' ? 'ms' : 'MB'}, log scale)`, '');
+    $('#smStats').innerHTML = xs.slice(2).map(v => `<div class="stat"><div class="k">${v / 1024}k: attention · S4D · selective</div><div class="v">${C.attention[v][k]} · ${C.s4d[v][k]} · ${C.selective[v].oom ? 'OOM' : C.selective[v][k]}</div></div>`).join('');
+    $('#smWhy').innerHTML = k === 'ms' ? '<b>Theory says the red line should lose; the kernels say otherwise.</b> Attention’s time does bend upwards quadratically, but from a far lower starting point, because FlashAttention is a heavily optimised fused kernel. The SSM lines are this chapter’s straightforward PyTorch code.' : '<b>Memory is where naive SSM code pays.</b> The S4D kernel and the selective scan’s states are materialised in full, so memory grows steeply with length and the selective scan ran out at 64k. Fused attention never stores its attention matrix and stays below 1 GB.';
+  }
+  function tasks() {
+    const M = D.smnist, Sc = D.selcopy || {}, ks = ['lstm', 'attention', 's4d', 'selective'], name = { lstm: 'LSTM', attention: 'transformer', s4d: 'S4D', selective: 'selective SSM' }, col = { lstm: '#94a3b8', attention: '#e11d48', s4d: '#2563eb', selective: '#a855f7' };
+    const row = (l, v, n, c) => `<div class="sm-row"><span>${l}</span><span class="track"><i style="width:${Math.max(0.5, v)}%;background:${c}"></i></span><span class="n">${n}</span></div>`;
+    $('#smK').innerHTML = '<div style="margin-bottom:4px"><b>Sequential MNIST, 784 steps (test accuracy)</b></div>' + ks.filter(k => M[k]).map(k => row(`${name[k]} (${(M[k].params / 1000).toFixed(0)}k params)`, M[k].acc, M[k].acc + '%', col[k])).join('') +
+      '<div style="margin:12px 0 4px"><b>Selective copying (token accuracy; 12.5% is chance)</b></div>' + ks.filter(k => Sc[k]).map(k => row(name[k], Sc[k].acc, Sc[k].acc + '%', col[k])).join('');
+    $('#smStats').innerHTML = ks.filter(k => M[k]).map(k => `<div class="stat${k === 's4d' ? ' good' : ''}"><div class="k">${name[k]}</div><div class="v">${M[k].acc}% · ${Sc[k] ? Sc[k].acc + '%' : '–'}</div></div>`).join('');
+    $('#smWhy').innerHTML = '<b>Long memory is not the same as selective memory.</b> On sequential MNIST the fixed dynamics of S4D were exactly right and it won. On selective copying only the models that can choose what to keep, attention and the selective SSM, got past half the tokens.';
+  }
+  function draw() { const v = $('#smV .active').dataset.v; ['dec', 'train', 'tasks'].forEach(x => $('#smV' + x).classList.toggle('on', x === v)); ({ dec, train, tasks })[v](); }
+  ['#smV', '#smT'].forEach(id => $(id).addEventListener('segchange', draw)); draw();
+})();
+</script>
+</body>
+</html>
