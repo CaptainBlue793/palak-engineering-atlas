@@ -74,3 +74,4 @@ Measurement scripts live outside the repo in `C:\Users\StarBlue\atlas-courses\dl
 - Checks: content-audit check (986 chapters, 0 errors), bundle, crosslinks check (182 topics, 0 errors), palette-check, hub-check (default, --theme dark, --width 390), API end-to-end test against a local Worker (25 passed, dl- keys kept).
 - Worker redeploy (`cd api && npm run deploy`) still to be run by the owner: it was not permitted from this session. Until then the live API drops dl- progress keys.
 - Merged into main (71d4797), Pages deployed (live at palakdebpatra.com/palak-engineering-atlas/deep-learning/), release deep-learning-v1.0.0 published with deep-learning-course.html. Remaining: owner runs the Worker deploy for dl- sync keys.
+- Owner deployed the Worker (version d8686aa5-384f-40f0-bc07-8e03cae2ec7b): dl- progress keys now sync. Release complete.
