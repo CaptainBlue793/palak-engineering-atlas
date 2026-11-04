@@ -3,37 +3,275 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Reproducibility &amp; GPU Nondeterminism</title>
+<title>Reproducibility &amp; GPU Nondeterminism · Deep Learning by Palak Deb Patra</title>
+<meta name="description" content="Chapter 38 of Deep Learning. Same seed, fresh processes: bitwise-identical weights by default, different weights with cudnn.benchmark, and deterministic mode at no measurable cost for a CIFAR-10 CNN; an atomic-add kernel that gave 20 different answers in 20 calls; float sums that change with order; and ten seeds showing a real 0.28-point gain that one seed per side would have reversed 13% of the time.">
 <link rel="stylesheet" href="assets/style.css">
 <script>try{var t=JSON.parse(localStorage.getItem('dl-theme'));if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+  .rp-l { font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); margin:10px 0 5px; }
+  .rp-v { display:none; } .rp-v.on { display:block; }
+  .rp-box { margin-top:10px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); padding:12px 14px; overflow-x:auto; }
+  .rp-box svg { width:100%; height:auto; display:block; } .rp-box text { font-size:12px; fill:var(--muted); }
+  .rp-key { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; margin-top:6px; } .rp-key i { display:inline-block; width:10px; height:10px; border-radius:50%; vertical-align:middle; margin-right:4px; }
+  .rp-row { display:grid; grid-template-columns:minmax(0, 240px) 1fr 90px; gap:8px; align-items:center; padding:3px 0; font-size:13px; }
+  .rp-row .track { height:14px; border-radius:4px; background:var(--surface); overflow:hidden; } .rp-row .track i { display:block; height:100%; }
+  .rp-row .n { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .rp-why { margin-top:12px; padding:10px 14px; border-radius:12px; background:var(--accent-soft); font-size:14px; }
+  @media (max-width:640px) { .rp-row { grid-template-columns:minmax(0, 120px) 1fr 70px; font-size:12px; } }
+</style>
 </head>
 <body data-chapter="38">
-<!-- dl:placeholder -->
 <main class="content">
 
   <section class="hero">
     <div class="eyebrow"><span class="pill accent">Chapter 38</span><span class="pill">Expert</span><span class="pill">⏱ 40 min</span></div>
-    <h1>Reproducibility &amp; GPU <span class="grad">Nondeterminism</span></h1>
-    <p class="lead">Why the same code gives different numbers, deterministic modes and their cost, and how many seeds to run.</p>
+    <h1>Reproducibility &amp; <span class="grad">GPU Nondeterminism</span></h1>
+    <p class="lead">Run the same training script twice and you may get two different models. Some of the difference is intended randomness that a seed controls: the initial weights, the data order, dropout masks, augmentation. Some is not: GPU kernels that add numbers in whatever order their threads finish, libraries that pick a different algorithm on each run, and floating-point addition, whose result depends on that order. Reproducibility means knowing which sources you have controlled, and the rest of the chapter is about what to do with the variation that remains.</p>
+    <p class="lead">Measured on a CIFAR-10 CNN, in fresh processes with the same seed: by default the two runs produced bitwise-identical weights; with <code>cudnn.benchmark</code> switched on they did not (a weight difference of 0.039 after two epochs); with PyTorch’s deterministic mode they were identical again, at no measurable cost for this network. An <code>index_add_</code> on a million numbers gave 20 different answers in 20 calls. Then the question that matters for research: across 10 seeds the CNN’s accuracy ranged over 0.58 points, a label-smoothing gain of 0.28 points was statistically clear, and yet comparing one seed of each would have ranked the two the wrong way round 13% of the time.</p>
+    <ul class="objectives">
+      <li><span>List the sources of randomness in training and how to control each one</span></li>
+      <li><span>Explain why some GPU kernels are nondeterministic and which ones</span></li>
+      <li><span>Use deterministic mode and measure what it costs</span></li>
+      <li><span>Measure seed variance and separate initialisation from data-order noise</span></li>
+      <li><span>Decide how many seeds a comparison needs and report results honestly</span></li>
+    </ul>
   </section>
 
-  <div class="callout warn">
-    <div class="ico">🚧</div>
-    <div class="body"><b>This chapter is being written.</b>
-      The outline below is the plan. Diagrams, a simulator, Python + PyTorch listings, an interview drill and a five-question quiz are on the way.
+  <div class="callout tip">
+    <div class="ico">📚</div>
+    <div class="body"><div class="title">What you need before this chapter</div>
+      <ul class="mb0">
+        <li><b>Seeding everything, seed variance and the standard error of a difference:</b> <a href="p8-experiments-seeds-and-curves.html">P8</a>. <b>Rounding and non-associative addition:</b> <a href="p3-floating-point-for-deep-learning.html">P3</a>. <b>Tuning and the winner’s curse:</b> <a href="25-hyperparameter-tuning.html">Chapter 25</a>.</li>
+      </ul>
     </div>
   </div>
 
-  <h2>What this chapter will cover</h2>
-  <ol>
-    <li>Sources of randomness</li>
-    <li>Nondeterministic GPU kernels</li>
-    <li>Deterministic mode and its cost</li>
-    <li>Seed variance in results</li>
-    <li>Reporting results honestly</li>
-  </ol>
+  <h2>Sources of randomness</h2>
+  <table class="t cmp">
+    <thead><tr><th>Source</th><th>Controlled by</th><th>Bitwise reproducible once controlled?</th></tr></thead>
+    <tbody>
+      <tr><td>Weight initialisation</td><td><code>torch.manual_seed</code></td><td>yes</td></tr>
+      <tr><td>Data order, augmentation, dropout</td><td>seeded generators (one per DataLoader and per augmentation stream)</td><td>yes</td></tr>
+      <tr><td>DataLoader workers</td><td><code>worker_init_fn</code> and a seeded generator</td><td>yes</td></tr>
+      <tr><td>cuDNN algorithm selection</td><td><code>torch.backends.cudnn.benchmark = False</code></td><td>yes, if the chosen algorithms are deterministic</td></tr>
+      <tr><td>Kernels with atomic floating-point adds</td><td><code>torch.use_deterministic_algorithms(True)</code></td><td>yes, or an error naming the op</td></tr>
+      <tr><td>Hardware, driver, library versions</td><td>pin the environment</td><td>only on the same stack</td></tr>
+    </tbody>
+  </table>
+  <p>The last row is the one people forget: bitwise reproducibility holds on one GPU model with one version of the driver, CUDA, cuDNN and PyTorch. A different GPU picks different kernels, so the target across machines is reproducing the <i>distribution</i> of results, not the bits.</p>
+
+  <h2>Nondeterministic GPU kernels</h2>
+  <p>A GPU sums thousands of values in parallel, and when many threads add into the same memory location they use atomic adds, which complete in whatever order the hardware schedules them. Floating-point addition is not associative, so a different order gives a different rounding. Scattering a million random numbers into 100 bins with <code>index_add_</code>, 20 times with identical inputs, gave <b>20 distinct results</b>, differing by up to 1.2 × 10⁻³ on bin totals of about 78. The order effect itself, summing ten million random numbers in fp32:</p>
+  <table class="t cmp">
+    <thead><tr><th>Order of addition (fp32)</th><th>Sum</th><th>Error vs fp64</th></tr></thead>
+    <tbody>
+      <tr><td>fp64 reference</td><td>1432.36149</td><td>–</td></tr>
+      <tr><td>As stored</td><td>1432.36108</td><td>−0.0004</td></tr>
+      <tr><td>Reversed</td><td>1432.36084</td><td>−0.0007</td></tr>
+      <tr><td>In 1,000-element chunks, then the chunk totals</td><td>1432.36206</td><td>+0.0006</td></tr>
+      <tr><td><b>Sorted, smallest first</b></td><td><b>1431.875</b></td><td><b>−0.49</b></td></tr>
+    </tbody>
+  </table>
+  <p>Every order gave a different answer, and sorting, which pushes the running total far from zero before the positive values arrive, lost nearly half a unit. The differences inside one training step are tiny, but training is chaotic: a difference in the last bit of one gradient changes the next update, which changes every later one, and two runs drift apart until they end at different accuracies (P8 showed a CNN doing this).</p>
+
+  <div class="panel">
+    <div class="panel-head"><div class="dots"><i></i><i></i><i></i></div><span class="p-title">Reproducibility lab</span><span class="p-tag">Measured here</span></div>
+    <div class="panel-body">
+      <div class="rp-l">View</div>
+      <div class="seg" id="rpV"><button class="active" data-v="seeds">seed spread</button><button data-v="modes">two runs, three modes</button><button data-v="pairs">one seed each</button></div>
+      <div class="rp-v on" id="rpVseeds"><div class="rp-box"><svg id="rpS" viewBox="0 0 600 230"></svg><div class="rp-key"><span><i style="background:#2563eb"></i>baseline, 10 seeds</span><span><i style="background:#16a34a"></i>label smoothing 0.1, 10 seeds</span><span><i style="background:#f97316"></i>only the init seed varied (5)</span><span><i style="background:#a855f7"></i>only the data order varied (5)</span></div></div></div>
+      <div class="rp-v" id="rpVmodes"><div class="rp-box" id="rpM"></div></div>
+      <div class="rp-v" id="rpVpairs"><div class="rp-box" id="rpP"></div></div>
+      <div class="stats" id="rpStats"></div>
+      <div class="rp-why" id="rpWhy"></div>
+    </div>
+    <div class="panel-foot">CIFAR-10 CNN with 5 convolutions and BatchNorm, SGD with Nesterov momentum and one-cycle to 0.1, batch 256, flips and crops, bf16. Modes: 2 epochs, each run in a fresh Python process with the same seed and <code>CUBLAS_WORKSPACE_CONFIG=:4096:8</code>; weights compared element by element. Seeds: 15 epochs; “both” varies the initialisation and data-order seeds together; Welch’s t-test for the label-smoothing comparison; “wrong order” counts the 100 pairings of one baseline seed with one label-smoothing seed in which the baseline came out ahead.</div>
+  </div>
+
+  <h2>Deterministic mode and its cost</h2>
+  <p><code>torch.use_deterministic_algorithms(True)</code> makes PyTorch use deterministic implementations where they exist and raise an error, naming the operation, where they do not; cuBLAS also needs the environment variable <code>CUBLAS_WORKSPACE_CONFIG=:4096:8</code>. Each mode was run twice for two epochs, each time in a fresh process with the same seed:</p>
+  <table class="t cmp">
+    <thead><tr><th>Mode</th><th>Weights identical across runs?</th><th>Largest weight difference</th><th>Time for 2 epochs</th></tr></thead>
+    <tbody>
+      <tr><td>Default (<code>cudnn.benchmark = False</code>)</td><td><b>yes</b></td><td>0</td><td>4.0 s</td></tr>
+      <tr><td><code>cudnn.benchmark = True</code></td><td><b>no</b></td><td>0.039</td><td>9.8 s</td></tr>
+      <tr><td>Deterministic algorithms</td><td><b>yes</b></td><td>0</td><td>3.8 s</td></tr>
+    </tbody>
+  </table>
+  <p>For this network the default kernels were already deterministic; the variation came from <code>cudnn.benchmark</code>, which times several convolution algorithms on the first call and keeps the fastest, and the fastest can differ from run to run when two are close. It was also slower here, most likely because the timing trials run again for every new input shape (the smaller last batch, the evaluation batches) and a two-epoch run never earns them back. Deterministic mode cost nothing measurable. That is not universal: P8 measured a different CNN whose convolution backward was nondeterministic by default, and operations such as scatter-adds, embedding backward with repeated indices, and some pooling and interpolation backwards fall back to slower deterministic versions, or have none. Turn it on, time a step, and keep it if the cost is acceptable.</p>
+<pre class="code"><span class="c"># before CUDA is initialised</span>
+os.environ[<span class="s">"CUBLAS_WORKSPACE_CONFIG"</span>] = <span class="s">":4096:8"</span>
+torch.<span class="f">use_deterministic_algorithms</span>(<span class="k">True</span>)          <span class="c"># errors on ops with no deterministic version</span>
+torch.backends.cudnn.benchmark = <span class="k">False</span>
+torch.<span class="f">manual_seed</span>(<span class="m">0</span>); g = torch.<span class="f">Generator</span>(device=<span class="s">"cuda"</span>).<span class="f">manual_seed</span>(<span class="m">0</span>)   <span class="c"># one generator per random stream</span></pre>
+
+  <h2>Seed variance in results</h2>
+  <p>Determinism makes a run repeatable; it does not make it representative. A different seed is a different, equally valid run. Ten seeds of the CNN, 15 epochs each:</p>
+  <table class="t cmp">
+    <thead><tr><th>What varied</th><th>Seeds</th><th>Mean</th><th>Standard deviation</th><th>Range</th></tr></thead>
+    <tbody>
+      <tr><td>Initialisation and data order</td><td>10</td><td>89.01%</td><td>0.18</td><td>88.73 – 89.31</td></tr>
+      <tr><td>Initialisation only</td><td>5</td><td>88.97%</td><td>0.15</td><td>88.76 – 89.13</td></tr>
+      <tr><td>Data order only</td><td>5</td><td>88.83%</td><td>0.05</td><td>88.76 – 88.90</td></tr>
+      <tr><td>Label smoothing 0.1 (both varied)</td><td>10</td><td>89.29%</td><td>0.18</td><td>88.90 – 89.50</td></tr>
+    </tbody>
+  </table>
+  <p>Most of this network’s run-to-run spread came from the initialisation; varying only the data order moved accuracy three times less, although five seeds is too few to rank the two sources firmly. Either way, the spread is the yardstick for every comparison: a change smaller than about 0.2 points cannot be seen with one run of each.</p>
+
+  <h2>Reporting results honestly</h2>
+  <p>Label smoothing raised the mean by 0.28 points. With 10 seeds each, Welch’s t-test gave p = 0.004: a real if small effect. But among the 100 ways of pairing one baseline seed with one label-smoothing seed, the baseline came out ahead in <b>13</b>. A paper comparing one run of each would have reported the wrong winner one time in eight, for an effect that genuinely exists; for a smaller effect it becomes a coin toss, as P8 found. The habits that follow:</p>
+  <ul>
+    <li>Run several seeds of every configuration you compare, five as a minimum and more when the expected effect is near the seed spread, and report the mean and the spread.</li>
+    <li>Use the same seeds for both arms where possible and compare seed by seed, which removes shared noise.</li>
+    <li>Fix the evaluation set and the metric before looking at results, and report every configuration you tried, not only the winner (Chapter 25’s winner’s curse).</li>
+    <li>Record the environment: GPU, driver, CUDA, cuDNN, PyTorch, and the commit of the code.</li>
+  </ul>
+
+  <figure class="flow">
+    <ol>
+      <li><b>Seed every stream</b><small>init, data order, augmentation, workers</small></li>
+      <li><b>Pin the stack</b><small>GPU, driver, CUDA, library versions</small></li>
+      <li><b>Deterministic mode</b><small>if the cost is acceptable</small></li>
+      <li><b>Several seeds</b><small>mean and spread for every arm</small></li>
+      <li><b>Test the difference</b><small>against the seed noise</small></li>
+    </ol>
+    <figcaption><b>From repeatable to trustworthy.</b> Determinism repeats one run; seeds show what a run is worth.</figcaption>
+  </figure>
+
+  <div class="callout usecase">
+    <div class="ico">⚖️</div>
+    <div class="body"><div class="title">Use case: a model audit that must be reproduced</div><p>A lender’s credit model must be reproducible for regulators: an auditor re-runs training from the archived code and data and expects the same model. The team’s first attempt differs in the fifth decimal place, enough to change a handful of decisions at the threshold. They pin the container image and GPU type, seed every random stream, set <code>cudnn.benchmark = False</code> and turn on deterministic mode, which raises an error on one scatter operation in their feature pipeline; they replace it with a sorted, deterministic version. Two runs now match bit for bit. Separately, they report the model’s performance as the mean over five seeds, because the regulator also asks how much a retraining could change the outcome.</p></div>
+  </div>
+
+  <div class="callout danger"><div class="ico">⚠️</div><div class="body"><div class="title">Common mistakes</div>
+    <ul class="mb0">
+      <li><b>Seeding only torch</b>: data order, augmentation and worker processes need their own seeded generators.</li>
+      <li><b>Leaving cudnn.benchmark on</b> when you need identical runs: it changed the weights by 0.039 in two epochs.</li>
+      <li><b>Expecting bitwise reproducibility across GPUs or library versions</b>: different hardware picks different kernels.</li>
+      <li><b>Reporting one seed</b>: one seed per side reversed a real 0.28-point gain 13% of the time.</li>
+      <li><b>Mistaking determinism for reliability</b>: a deterministic run is still one sample from the seed distribution.</li>
+      <li><b>Assuming deterministic mode is expensive</b>, or free: it cost nothing here; measure it on your model.</li>
+    </ul></div></div>
+
+  <div class="callout interview"><div class="ico">🎤</div><div class="body"><div class="title">Interview drill</div>
+    <p class="small" style="margin:10px 0 0"><b>Explain it simply:</b> You set the seed and still get different results each run. Why?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Either something random is not seeded (the DataLoader’s shuffle, worker processes, augmentation, a separate library), or a GPU operation is nondeterministic. Some kernels use atomic floating-point adds, whose order varies, and floating-point addition is not associative: an index_add_ gave 20 different answers in 20 identical calls. cuDNN’s benchmark mode can also choose different algorithms per run; in my measurement it was the only thing that made two same-seed CNN runs differ. The fixes are cudnn.benchmark off, torch.use_deterministic_algorithms(True) with the cuBLAS workspace variable, and the same software and hardware stack.</div></details>
+    <p class="small" style="margin:10px 0 0"><b>Deeper:</b> How many seeds do you need to claim one configuration beats another?</p>
+    <details class="ans"><summary>How a strong answer sounds</summary><div>Enough that the difference is clearly larger than its standard error, which depends on the seed spread and the size of the effect. On a CIFAR CNN the spread was about 0.18 points; label smoothing gained 0.28 points, which ten seeds per side established at p = 0.004, but comparing a single seed of each got the order wrong 13% of the time. So five seeds as a minimum, ten when the effect is near the spread, paired seeds where possible, and I report the mean and spread of every configuration I tried rather than the best run.</div></details>
+  </div></div>
+
+  <div class="takeaways">
+    <h3>🧠 Key takeaways</h3>
+    <ul>
+      <li>Seeds control intended randomness; nondeterministic kernels and algorithm selection are separate sources.</li>
+      <li>Atomic adds made index_add_ give 20 answers in 20 calls; addition order changes float sums.</li>
+      <li>Here, only cudnn.benchmark broke bitwise reproducibility; deterministic mode cost nothing measurable.</li>
+      <li>Reproducible is not representative: 10 seeds spanned 0.58 points, mostly from initialisation.</li>
+      <li>One seed per side reversed a real 0.28-point gain 13% of the time; report means and spreads.</li>
+    </ul>
+  </div>
+
+  <div class="quiz-wrap">
+    <h2>Check your understanding</h2>
+    <div class="quiz-score"></div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">Why can a GPU kernel give different results for identical inputs?</p>
+      <div class="opts">
+        <button class="opt">GPUs have random hardware faults</button>
+        <button class="opt">The seed is reset between calls</button>
+        <button class="opt">Atomic adds complete in a varying order, and floating-point addition is not associative</button>
+        <button class="opt">Kernels use random numbers internally</button>
+      </div>
+      <div class="explain">index_add_ gave 20 distinct results in 20 calls.</div>
+    </div>
+
+    <div class="quiz" data-answer="0">
+      <p class="q">Two same-seed CNN runs differed only when cudnn.benchmark was on. Why?</p>
+      <div class="opts">
+        <button class="opt">Benchmark mode times several convolution algorithms and keeps the fastest, which can differ between runs</button>
+        <button class="opt">It changes the learning rate</button>
+        <button class="opt">It disables the seed</button>
+        <button class="opt">It uses lower precision</button>
+      </div>
+      <div class="explain">Different algorithms round differently, and the difference grows through training.</div>
+    </div>
+
+    <div class="quiz" data-answer="3">
+      <p class="q">What does torch.use_deterministic_algorithms(True) do when an operation has no deterministic version?</p>
+      <div class="opts">
+        <button class="opt">Silently uses the nondeterministic one</button>
+        <button class="opt">Runs it on the CPU</button>
+        <button class="opt">Skips the operation</button>
+        <button class="opt">Raises an error naming the operation</button>
+      </div>
+      <div class="explain">You then replace the op or accept nondeterminism knowingly.</div>
+    </div>
+
+    <div class="quiz" data-answer="1">
+      <p class="q">Label smoothing gained 0.28 points over 10 seeds (p = 0.004). Why is one seed of each still risky?</p>
+      <div class="opts">
+        <button class="opt">Label smoothing needs more epochs</button>
+        <button class="opt">The seed spread (about 0.18) is comparable to the effect, so single runs ranked them the wrong way 13% of the time</button>
+        <button class="opt">t-tests need one seed</button>
+        <button class="opt">It is not risky</button>
+      </div>
+      <div class="explain">Smaller effects make single-seed comparisons a coin toss.</div>
+    </div>
+
+    <div class="quiz" data-answer="2">
+      <p class="q">You need bitwise-identical retraining for an audit. Which is not enough on its own?</p>
+      <div class="opts">
+        <button class="opt">Pinning GPU type and library versions</button>
+        <button class="opt">Deterministic algorithms with cudnn.benchmark off</button>
+        <button class="opt">Calling torch.manual_seed once</button>
+        <button class="opt">Seeding the DataLoader’s generator</button>
+      </div>
+      <div class="explain">All the others are needed too; a single torch seed misses data order, workers and kernel choice.</div>
+    </div>
+  </div>
 
 </main>
 <script src="assets/app.js"></script>
+<script>
+(function(){
+  const { $ } = DL;
+  const D = {"repeat":{"default":{"runs":[{"acc":73.45,"seconds":4.01},{"acc":73.45,"seconds":3.57}],"bitwise_identical_weights":true,"max_weight_diff":0.0},"benchmark":{"runs":[{"acc":73.66,"seconds":9.82},{"acc":73.55,"seconds":9.48}],"bitwise_identical_weights":false,"max_weight_diff":0.0386},"deterministic":{"runs":[{"acc":73.45,"seconds":3.83},{"acc":73.45,"seconds":3.85}],"bitwise_identical_weights":true,"max_weight_diff":0.0}},"atomics":{"distinct_results_in_20_calls":20,"max_diff":0.00122,"value_scale":78.5},"sum_order":{"fp64 reference":1432.3614942822965,"fp32 forward":1432.361083984375,"fp32 reversed":1432.36083984375,"fp32 sorted":1431.875,"fp32 in 1000-element chunks":1432.362060546875},"seeds":{"both":[88.76,89.06,88.73,89.19,89.31,89.15,89.01,89.07,88.93,88.91],"init only (data order fixed)":[88.76,89.13,89.11,88.94,88.93],"data order only (init fixed)":[88.76,88.85,88.9,88.79,88.83],"label smoothing 0.1":[89.24,89.2,89.5,89.49,88.9,89.21,89.22,89.42,89.45,89.24]},"seed_stats":{"both":{"mean":89.01,"std":0.18,"min":88.73,"max":89.31},"init only (data order fixed)":{"mean":88.97,"std":0.15,"min":88.76,"max":89.13},"data order only (init fixed)":{"mean":88.83,"std":0.05,"min":88.76,"max":88.9},"label smoothing 0.1":{"mean":89.29,"std":0.18,"min":88.9,"max":89.5}},"compare":{"mean_diff_ls_minus_base":0.275,"welch_p":0.0036,"one_seed_each_wrong_order_pct":13.0},"det_cost":{"default":4.01,"benchmark":9.82,"deterministic":3.83}};
+  function seeds() {
+    const S = D.seeds, groups = [['both', '#2563eb', 'baseline'], ['label smoothing 0.1', '#16a34a', 'label smoothing'], ['init only (data order fixed)', '#f97316', 'init only'], ['data order only (init fixed)', '#a855f7', 'data order only']];
+    const W = 600, H = 230, L = 130, R = 20, T = 14, rowH = 46, lo = 88.6, hi = 89.6, x = v => L + (v - lo) / (hi - lo) * (W - L - R);
+    let g = '';
+    [88.6, 88.8, 89.0, 89.2, 89.4, 89.6].forEach(v => g += `<line x1="${x(v)}" x2="${x(v)}" y1="${T}" y2="${T + 4 * rowH}" stroke="var(--border)" stroke-dasharray="2 5"/><text x="${x(v)}" y="${H - 8}" text-anchor="middle">${v.toFixed(1)}%</text>`);
+    groups.forEach(([k, c, lab], i) => {
+      const y = T + i * rowH + rowH / 2, st = D.seed_stats[k];
+      g += `<text x="${L - 10}" y="${y + 4}" text-anchor="end">${lab}</text><line x1="${x(st.mean)}" x2="${x(st.mean)}" y1="${y - 14}" y2="${y + 14}" stroke="${c}" stroke-width="2"/>`;
+      S[k].forEach((v, j) => g += `<circle cx="${x(v)}" cy="${y + ((j % 3) - 1) * 5}" r="5" fill="${c}" opacity=".75"><title>${v}%</title></circle>`);
+    });
+    $('#rpS').innerHTML = g;
+    $('#rpStats').innerHTML = `<div class="stat"><div class="k">Baseline, 10 seeds</div><div class="v">${D.seed_stats.both.mean} ± ${D.seed_stats.both.std}</div></div><div class="stat good"><div class="k">Label smoothing</div><div class="v">${D.seed_stats['label smoothing 0.1'].mean} ± ${D.seed_stats['label smoothing 0.1'].std}</div></div><div class="stat"><div class="k">Welch p</div><div class="v">${D.compare.welch_p}</div></div>`;
+    $('#rpWhy').innerHTML = '<b>Each dot is a complete, valid training run.</b> The vertical bars are the means. The two top rows overlap heavily even though the difference between their means is statistically clear; the bottom two show that the initialisation moved this network’s accuracy more than the data order did.';
+  }
+  function modes() {
+    const M = D.repeat, ks = Object.keys(M);
+    const row = (l, v, mx, n, c) => `<div class="rp-row"><span>${l}</span><span class="track"><i style="width:${Math.max(0.5, 100 * v / mx)}%;background:${c}"></i></span><span class="n">${n}</span></div>`;
+    $('#rpM').innerHTML = '<div style="margin-bottom:4px"><b>Largest weight difference between two same-seed runs (fresh processes)</b></div>' + ks.map(k => row(k, M[k].max_weight_diff, 0.04, M[k].bitwise_identical_weights ? 'identical' : M[k].max_weight_diff, M[k].bitwise_identical_weights ? '#16a34a' : '#e11d48')).join('') +
+      '<div style="margin:12px 0 4px"><b>Time for 2 epochs</b></div>' + ks.map(k => row(k, M[k].runs[0].seconds, 10, M[k].runs[0].seconds + ' s', '#7c3aed')).join('') +
+      `<div style="margin:12px 0 4px"><b>One kernel, 20 identical calls</b></div><div class="small">index_add_ of 1,000,000 numbers into 100 bins: ${D.atomics.distinct_results_in_20_calls} distinct results, largest difference ${D.atomics.max_diff} on totals of about ${D.atomics.value_scale}.</div>`;
+    $('#rpStats').innerHTML = ks.map(k => `<div class="stat ${M[k].bitwise_identical_weights ? 'good' : 'bad'}"><div class="k">${k}: test accuracy, run 1 / run 2</div><div class="v">${M[k].runs[0].acc} / ${M[k].runs[1].acc}</div></div>`).join('');
+    $('#rpWhy').innerHTML = '<b>Benchmark mode is the odd one out.</b> With it on, cuDNN picks its convolution algorithms by timing them, and two runs picked differently: the weights diverged within two epochs and the accuracies differ. Default mode and deterministic mode reproduced every bit, at the same speed.';
+  }
+  function pairs() {
+    const a = D.seeds.both, b = D.seeds['label smoothing 0.1'], W = 600, H = 300, pad = 40, cell = (Math.min(W, H) - 2 * pad) / 10;
+    let h = '<div style="margin-bottom:6px"><b>All 100 single-seed comparisons: green = label smoothing ahead, red = baseline ahead</b></div><svg viewBox="0 0 600 300">';
+    a.forEach((va, i) => b.forEach((vb, j) => h += `<rect x="${pad + 150 + j * cell}" y="${pad + i * cell}" width="${cell - 2}" height="${cell - 2}" rx="3" fill="${vb > va ? '#16a34a' : '#e11d48'}" opacity=".8"><title>baseline seed ${i}: ${va}% vs label smoothing seed ${j}: ${vb}%</title></rect>`));
+    h += `<text x="${pad + 150 + 5 * cell}" y="${pad - 10}" text-anchor="middle">label-smoothing seed →</text><text x="${pad + 140}" y="${pad + 5 * cell}" text-anchor="end">baseline seed ↓</text></svg>`;
+    $('#rpP').innerHTML = h;
+    $('#rpStats').innerHTML = `<div class="stat"><div class="k">Mean difference</div><div class="v">+${D.compare.mean_diff_ls_minus_base}</div></div><div class="stat bad"><div class="k">Wrong order, one seed each</div><div class="v">${D.compare.one_seed_each_wrong_order_pct}%</div></div>`;
+    $('#rpWhy').innerHTML = '<b>Every square is a paper that ran one seed of each.</b> The red ones reached the wrong conclusion about an effect that is real. Ten seeds per side make the answer clear; one seed per side leaves it to luck.';
+  }
+  function draw() { const v = $('#rpV .active').dataset.v; ['seeds', 'modes', 'pairs'].forEach(x => $('#rpV' + x).classList.toggle('on', x === v)); ({ seeds, modes, pairs })[v](); }
+  $('#rpV').addEventListener('segchange', draw); draw();
+})();
+</script>
 </body>
 </html>
